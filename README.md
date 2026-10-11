@@ -39,8 +39,8 @@ extracted files, decompiled code, or database files.
   RGBA8) and shows it as a stretched fullscreen quad in a winit/wgpu
   window. Bad magic, unsupported `dxgiFormat`, and unreadable paths
   fail loud (stderr + nonzero exit, no guessing).
-- `bc7-cpu-decode`: `cargo run -- <path-to-a-BC7-DDS>`
-  (`dxgiFormat` 98) CPU-decodes the base-mip blocks to RGBA8 (pinned
+- `bc7-cpu-decode`: BC7 textures via CPU decode (playtest-accepted):
+  `cargo run -- <path-to-a-BC7-DDS>` (`dxgiFormat` 98) CPU-decodes the base-mip blocks to RGBA8 (pinned
   `bcdec_rs` 0.2.0, MIT — see `THIRD-PARTY-NOTICES.md`) and shows them
   through the same `Rgba8Unorm` upload as slice 1, so it works on GPUs
   WITHOUT `TEXTURE_COMPRESSION_BC`. Malformed BC7 input fails loud via
@@ -51,8 +51,10 @@ extracted files, decompiled code, or database files.
 
 ## What's missing
 
-- [ ] BC7 (`dxgiFormat` 98) textures: currently fail loud with
-      `UnsupportedFormat(98)` — planned as slice 2 `bc7-texture-support`.
+- [ ] Texture gallery (NEXT milestone): browse multiple textures instead
+      of one-file-per-run.
+- [ ] sRGB correctness pass, resize handling, full mipmap-chain UI —
+      still deferred; `dxgiFormat` 99 (BC7 sRGB) still fails loud.
 - [ ] Visual playtest confirmation against a reference DDS viewer
       (done by the user per slice; see the change PR).
 - [ ] Everything after that (BIGFILE index, models, audio, gameplay) — unscoped
