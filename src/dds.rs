@@ -1,8 +1,11 @@
-//! DDS parsing + decoding for slice 1 (`dds-texture-viewer`).
+//! DDS parsing + decoding for slice 3 (`bc7-cpu-decode`).
 //!
 //! One job: read a `.DDS` file, validate the `DDS ` magic, extract the
-//! DX10 extended-header `dxgiFormat` (when present), and decode the base
-//! mip level to RGBA8 via the `image` crate.
+//! DX10 extended-header `dxgiFormat` (when present), and produce RGBA8
+//! pixels for the base mip level — via the `image` crate for legacy
+//! formats, via CPU decode ([`decode_bc7_to_rgba8`], backed by the pinned
+//! `bcdec_rs` crate) for BC7 (`dxgiFormat` 98) so it renders on GPUs
+//! without `TEXTURE_COMPRESSION_BC`.
 //!
 //! Failure policy (LOUD, never guess): bad magic is [`ViewerError::NotDds`];
 //! ANY decode failure on a DX10-extended file is
@@ -58,7 +61,8 @@ pub struct DecodedImage {
     pub rgba8: Vec<u8>,
 }
 
-/// Raw BC7 base-mip blocks, uploaded to the GPU as-is (no CPU decode).
+/// Raw BC7 base-mip blocks, decoded to RGBA8 on the CPU via
+/// [`decode_bc7_to_rgba8`] (never uploaded compressed).
 #[derive(Debug, Clone)]
 pub struct CompressedBc7 {
     pub width: u32,
@@ -139,19 +143,7 @@ pub fn dxgi_format_of(bytes: &[u8]) -> Option<u32> {
         .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
 }
 
-/// Load `path`, validate it, decode the base mip to RGBA8.
-///
-/// Game paths arrive via CLI arg at runtime only; nothing here ever
-/// embeds a game path, and tests use synthetic bytes, never game files.
-pub fn load_rgba8(path: impl AsRef<Path>) -> Result<DecodedImage, ViewerError> {
-    let bytes = std::fs::read(path.as_ref()).map_err(ViewerError::Io)?;
-    if !has_dds_magic(&bytes) {
-        return Err(ViewerError::NotDds);
-    }
-    decode_rgba8(&bytes)
-}
-
-/// Shared RGBA8 decode used by [`load_rgba8`] and the non-BC7 arm of
+/// Shared RGBA8 decode used by the non-BC7 arm of
 /// [`load_texture`]. Behavior is slice-1 verbatim: every DX10 decode
 /// failure reports its `dxgiFormat` value (loud, no guessing).
 fn decode_rgba8(bytes: &[u8]) -> Result<DecodedImage, ViewerError> {
@@ -230,17 +222,44 @@ pub fn load_bc7_from_bytes(bytes: &[u8]) -> Result<CompressedBc7, ViewerError> {
     })
 }
 
-/// Load `path` as BC7 blocks. Convenience wrapper over
-/// [`load_bc7_from_bytes`] for callers that already know the format.
-pub fn load_bc7(path: impl AsRef<Path>) -> Result<CompressedBc7, ViewerError> {
-    let bytes = std::fs::read(path.as_ref()).map_err(ViewerError::Io)?;
-    load_bc7_from_bytes(&bytes)
+/// Decode BC7 base-mip blocks to RGBA8 on the CPU (pure: no I/O, no GPU).
+///
+/// Each 16-byte block holds one 4x4 tile in row-major order; decoding goes
+/// straight into the output buffer with row pitch `width * 4`. The shape
+/// contract comes from [`load_bc7_from_bytes`] (nonzero dims, multiples of
+/// the 4x4 block, exact block count), which the only caller upholds.
+/// Decoder: `bcdec_rs` 0.2.0, exact pin (see design for the rationale).
+pub fn decode_bc7_to_rgba8(c: &CompressedBc7) -> DecodedImage {
+    let width = c.width as usize;
+    let height = c.height as usize;
+    let blocks_wide = width / BC7_BLOCK_DIM as usize;
+    let pitch = width * 4;
+    debug_assert_eq!(
+        c.blocks.len(),
+        blocks_wide * (height / BC7_BLOCK_DIM as usize) * BC7_BLOCK_BYTES,
+        "decode needs exactly one 16-byte block per 4x4 tile"
+    );
+    let mut rgba = vec![0u8; width * height * 4];
+    for (i, block) in c.blocks.chunks_exact(BC7_BLOCK_BYTES).enumerate() {
+        let bx = i % blocks_wide;
+        let by = i / blocks_wide;
+        let dst = by * BC7_BLOCK_DIM as usize * pitch + bx * BC7_BLOCK_DIM as usize * 4;
+        bcdec_rs::bc7(block, &mut rgba[dst..], pitch);
+    }
+    DecodedImage {
+        width: c.width,
+        height: c.height,
+        rgba8: rgba,
+    }
 }
 
 /// Load `path`, dispatching on the DX10 `dxgiFormat`: `98` takes the
-/// native BC7 block path, everything else takes the legacy RGBA8
+/// BC7 block path (CPU-decoded to RGBA8 by the caller), everything else
 /// decode path (whose `UnsupportedFormat` loud-error behavior is
 /// preserved verbatim for all other undecodable formats).
+///
+/// Game paths arrive via CLI arg at runtime only; nothing here ever
+/// embeds a game path, and tests use synthetic bytes, never game files.
 pub fn load_texture(path: impl AsRef<Path>) -> Result<LoadedTexture, ViewerError> {
     let bytes = std::fs::read(path.as_ref()).map_err(ViewerError::Io)?;
     if !has_dds_magic(&bytes) {
@@ -279,7 +298,7 @@ mod tests {
         let bytes = synthetic_dx10_header(98);
         assert!(has_dds_magic(&bytes));
         let path = write_temp("valid-magic", &bytes);
-        let err = load_rgba8(&path).expect_err("header-only file cannot decode");
+        let err = load_texture(&path).expect_err("header-only file cannot decode");
         assert!(
             !matches!(err, ViewerError::NotDds),
             "valid magic must not be NotDds, got: {err}"
@@ -293,7 +312,7 @@ mod tests {
         bytes[0..4].copy_from_slice(b"NOT!");
         assert!(!has_dds_magic(&bytes));
         let path = write_temp("bad-magic", &bytes);
-        let err = load_rgba8(&path).expect_err("bad magic must fail");
+        let err = load_texture(&path).expect_err("bad magic must fail");
         assert!(
             matches!(err, ViewerError::NotDds),
             "expected NotDds, got: {err}"
@@ -321,7 +340,7 @@ mod tests {
     fn unsupported_format_error_names_value() {
         let bogus: u32 = 987_654;
         let path = write_temp("unsupported", &synthetic_dx10_header(bogus));
-        let err = load_rgba8(&path).expect_err("bogus dxgi must fail");
+        let err = load_texture(&path).expect_err("bogus dxgi must fail");
         match err {
             ViewerError::UnsupportedFormat(v) => assert_eq!(v, bogus),
             other => panic!("expected UnsupportedFormat({bogus}), got: {other}"),
@@ -342,7 +361,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&p);
-        assert!(matches!(load_rgba8(&p), Err(ViewerError::Io(_))));
+        assert!(matches!(load_texture(&p), Err(ViewerError::Io(_))));
     }
 
     /// Synthetic BC7 file: magic + DX10 FourCC + dxgi 98 + dims at the
@@ -378,14 +397,81 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Decode `blocks` as one BC7 image of `width` x `height` (synthetic
+    /// blocks only — never game bytes).
+    fn decode_synthetic(width: u32, height: u32, blocks: &[u8]) -> DecodedImage {
+        decode_bc7_to_rgba8(&CompressedBc7 {
+            width,
+            height,
+            blocks: blocks.to_vec(),
+        })
+    }
+
+    /// One fixed synthetic 16-byte BC7 block (invented here, never game
+    /// bytes). First byte 0x90 selects mode 4. The expected output below
+    /// was recorded from the pinned `bcdec_rs` 0.2.0 decoder during apply:
+    /// it is a REGRESSION gate (bit-stability under the exact pin), not a
+    /// correctness proof — pixel correctness is the user playtest.
+    const GOLDEN_BLOCK: [u8; 16] = [
+        0x90, 0x55, 0x33, 0x12, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0x10,
+        0xfe, 0xdc, 0xba,
+    ];
+    const GOLDEN_RGBA8: [u8; 64] = [
+        190, 71, 154, 227, 197, 61, 159, 227, 202, 52, 164, 243, 197, 61, 159, 243,
+        173, 99, 140, 219, 179, 90, 145, 219, 197, 61, 159, 219, 173, 99, 140, 235,
+        208, 42, 168, 227, 214, 33, 173, 219, 190, 71, 154, 227, 208, 42, 168, 235,
+        202, 52, 164, 235, 202, 52, 164, 219, 208, 42, 168, 235, 202, 52, 164, 235,
+    ];
+
     #[test]
-    fn bc7_path_wrapper_loads_blocks() {
-        let bytes = synthetic_bc7(8, 8, 4);
-        let path = write_temp("bc7-path", &bytes);
-        let c = load_bc7(&path).expect("valid synthetic BC7 must load");
-        assert_eq!((c.width, c.height), (8, 8));
-        assert_eq!(c.blocks.len(), 4 * BC7_BLOCK_BYTES);
-        let _ = std::fs::remove_file(&path);
+    fn bc7_decode_single_block_shape() {
+        let img = decode_synthetic(4, 4, &GOLDEN_BLOCK);
+        assert_eq!((img.width, img.height), (4, 4));
+        assert_eq!(img.rgba8.len(), 4 * 4 * 4);
+    }
+
+    #[test]
+    fn bc7_decode_multi_block_places_every_tile() {
+        // 8x8 = 2x2 tiles; each quadrant must equal that block decoded
+        // alone, proving the per-block destination offsets (not just the
+        // total byte count).
+        let zero = [0u8; 16];
+        let mut blocks = Vec::new();
+        blocks.extend_from_slice(&GOLDEN_BLOCK);
+        blocks.extend_from_slice(&zero);
+        blocks.extend_from_slice(&zero);
+        blocks.extend_from_slice(&GOLDEN_BLOCK);
+        let img = decode_synthetic(8, 8, &blocks);
+        assert_eq!((img.width, img.height), (8, 8));
+        assert_eq!(img.rgba8.len(), 8 * 8 * 4);
+        let tile = |pixels: &[u8], tx: usize, ty: usize| -> Vec<u8> {
+            let mut out = Vec::with_capacity(64);
+            for row in 0..4 {
+                let start = ((ty * 4 + row) * 8 + tx * 4) * 4;
+                out.extend_from_slice(&pixels[start..start + 16]);
+            }
+            out
+        };
+        assert_eq!(tile(&img.rgba8, 0, 0), GOLDEN_RGBA8);
+        assert_eq!(tile(&img.rgba8, 1, 1), GOLDEN_RGBA8);
+        assert_eq!(tile(&img.rgba8, 1, 0), vec![0u8; 64]);
+        assert_eq!(tile(&img.rgba8, 0, 1), vec![0u8; 64]);
+    }
+
+    #[test]
+    fn bc7_decode_golden_block() {
+        let img = decode_synthetic(4, 4, &GOLDEN_BLOCK);
+        assert_eq!(img.rgba8, GOLDEN_RGBA8);
+    }
+
+    #[test]
+    fn bc7_all_zero_block_decodes_to_transparent_black() {
+        // OBSERVED pinned-decoder behavior (`bcdec_rs` 0.2.0, verified by
+        // running it during apply): the all-zero block yields 16
+        // transparent-black pixels — alpha 0, NOT opaque black. Recorded
+        // here as a regression gate on that exact behavior.
+        let img = decode_synthetic(4, 4, &[0u8; 16]);
+        assert_eq!(img.rgba8, vec![0u8; 64]);
     }
 
     #[test]
