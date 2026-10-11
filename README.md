@@ -27,7 +27,7 @@ extracted files, decompiled code, or database files.
 
 ## Checklist
 
-- [ ] Slice 1 `dds-texture-viewer`: load one real `.DDS` from the install, show it in a window
+- [x] Slice 1 `dds-texture-viewer`: load one real `.DDS` from the install, show it in a window
 - [ ] `THIRD-PARTY-NOTICES.md` created on first community-code reuse
 - [ ] README "What works" updated every slice
 
@@ -38,9 +38,13 @@ extracted files, decompiled code, or database files.
   RGBA8) and shows it as a stretched fullscreen quad in a winit/wgpu
   window. Bad magic, unsupported `dxgiFormat`, and unreadable paths
   fail loud (stderr + nonzero exit, no guessing).
+- Slice 1 done: renders legacy DXT1 DDS in a window, playtest-accepted
+  (2026-10-11, flame sprite; see `docs/changes/dds-texture-viewer/archive.md`).
 
 ## What's missing
 
+- [ ] BC7 (`dxgiFormat` 98) textures: currently fail loud with
+      `UnsupportedFormat(98)` — planned as slice 2 `bc7-texture-support`.
 - [ ] Visual playtest confirmation against a reference DDS viewer
       (done by the user per slice; see the change PR).
 - [ ] Everything after that (BIGFILE index, models, audio, gameplay) — unscoped
