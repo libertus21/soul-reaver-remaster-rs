@@ -1,0 +1,16 @@
+# Whitelist .gitignore (legal guardrail, Guide 6): ignore EVERYTHING by
+# default so game assets, extracted files, decompiled code, Ghidra DBs,
+# or any game bytes can never be committed by accident. Only our own
+# source, manifests, docs, and this file are allowed back in.
+*
+!*/
+!*.rs
+!Cargo.toml
+!Cargo.lock
+!*.md
+!.gitignore
+!.gitattributes
+
+# Build output is never committed (later rules win over the *.rs
+# re-allow above, so generated sources under target/ stay ignored).
+/target/
