@@ -1,9 +1,12 @@
-//! wgpu fullscreen-quad renderer for slice 1 (`dds-texture-viewer`).
+//! wgpu fullscreen-quad renderer (`dds-texture-viewer` + `bc7-texture-support`).
 //!
-//! One job: take decoded RGBA8 pixels, upload them to a GPU texture, and
-//! draw them as a stretched fullscreen quad in a winit window until the
-//! user closes it. Deliberately deferred (see design): sRGB correctness,
-//! resize sophistication beyond re-configuring the surface, mip selection.
+//! One job: take image bytes, upload them to a GPU texture, and draw
+//! them as a stretched fullscreen quad in a winit window until the user
+//! closes it. Two upload flavors share one pipeline: [`show_rgba8`] for
+//! decoded RGBA8 pixels and [`show_bc7`] for raw BC7 blocks uploaded to
+//! a natively-compressed texture. Deliberately deferred (see design):
+//! sRGB correctness, resize sophistication beyond re-configuring the
+//! surface, mip selection.
 
 use std::sync::Arc;
 
@@ -65,11 +68,26 @@ impl<'window> State<'window> {
         width: u32,
         height: u32,
         pixels: &[u8],
+        format: wgpu::TextureFormat,
+        required_features: wgpu::Features,
     ) -> Result<Self, String> {
+        // Expected upload size depends on the format: RGBA8 is 4 bytes
+        // per texel; block-compressed formats store one fixed-size block
+        // per block-dimensions tile (BC7: 16 bytes per 4x4 tile).
+        let expected_len = match format {
+            wgpu::TextureFormat::Bc7RgbaUnorm => {
+                let (block_w, block_h) = format.block_dimensions();
+                let block_size = format.block_copy_size(None).unwrap_or(16) as usize;
+                width.div_ceil(block_w) as usize
+                    * height.div_ceil(block_h) as usize
+                    * block_size
+            }
+            _ => (width as usize) * (height as usize) * 4,
+        };
         assert_eq!(
             pixels.len(),
-            (width as usize) * (height as usize) * 4,
-            "RGBA8 buffer must hold exactly width*height*4 bytes"
+            expected_len,
+            "upload buffer must hold exactly one {format:?} image ({width}x{height})"
         );
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -84,6 +102,17 @@ impl<'window> State<'window> {
             })
             .await
             .map_err(|e| format!("no usable GPU adapter: {e}"))?;
+        // Compressed formats need an explicit device feature (e.g. BC7
+        // needs TEXTURE_COMPRESSION_BC). Fail loud before opening the
+        // device so headless/software GPUs report the missing feature
+        // instead of a cryptic validation error.
+        if !adapter.features().contains(required_features) {
+            // Only `show_bc7` requests non-empty features (exactly
+            // TEXTURE_COMPRESSION_BC), so name it literally per spec R7.
+            return Err(format!(
+                "GPU adapter lacks TEXTURE_COMPRESSION_BC (required for {format:?} textures)"
+            ));
+        }
         // Request the adapter's own limits (not `Limits::default()`): this
         // viewer needs nothing special, so take whatever the GPU offers.
         // `Limits::default()` can exceed what low-capability / software
@@ -91,7 +120,7 @@ impl<'window> State<'window> {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("dds viewer"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: adapter.limits(),
                 ..Default::default()
             })
@@ -116,10 +145,21 @@ impl<'window> State<'window> {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
+        // Row pitch follows the format: RGBA8 packs 4 bytes per texel;
+        // BC7 packs one 16-byte block per 4-texel-wide tile (2048 for a
+        // 512-wide texture — a multiple of wgpu's 256-byte row alignment,
+        // so no padding path is needed).
+        let bytes_per_row = match format {
+            wgpu::TextureFormat::Bc7RgbaUnorm => {
+                let (block_w, _) = format.block_dimensions();
+                Some(width.div_ceil(block_w) * format.block_copy_size(None).unwrap_or(16) as u32)
+            }
+            _ => Some(4 * width),
+        };
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -130,7 +170,7 @@ impl<'window> State<'window> {
             pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * width),
+                bytes_per_row,
                 rows_per_image: Some(height),
             },
             tex_size,
@@ -284,6 +324,8 @@ struct App<'a> {
     width: u32,
     height: u32,
     pixels: &'a [u8],
+    format: wgpu::TextureFormat,
+    required_features: wgpu::Features,
     state: Option<State<'a>>,
     init_error: Option<String>,
 }
@@ -303,7 +345,14 @@ impl<'a> ApplicationHandler for App<'a> {
                 return;
             }
         };
-        match pollster::block_on(State::new(window, self.width, self.height, self.pixels)) {
+        match pollster::block_on(State::new(
+            window,
+            self.width,
+            self.height,
+            self.pixels,
+            self.format,
+            self.required_features,
+        )) {
             Ok(state) => self.state = Some(state),
             Err(e) => {
                 self.init_error = Some(e);
@@ -346,6 +395,30 @@ impl<'a> ApplicationHandler for App<'a> {
 /// until the user closes it. Returns `Err` with a displayable message
 /// when no window/GPU is available (e.g. headless environments).
 pub fn show_rgba8(width: u32, height: u32, pixels: &[u8]) -> Result<(), String> {
+    show(width, height, pixels, wgpu::TextureFormat::Rgba8Unorm, wgpu::Features::empty())
+}
+
+/// Open a window showing raw BC7 base-mip `blocks` (`width` x `height`)
+/// via a natively-uploaded `Bc7RgbaUnorm` texture and block until the
+/// user closes it. Needs the `TEXTURE_COMPRESSION_BC` device feature;
+/// returns a loud `Err` naming it when the adapter lacks it.
+pub fn show_bc7(width: u32, height: u32, blocks: &[u8]) -> Result<(), String> {
+    show(
+        width,
+        height,
+        blocks,
+        wgpu::TextureFormat::Bc7RgbaUnorm,
+        wgpu::Features::TEXTURE_COMPRESSION_BC,
+    )
+}
+
+fn show(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    format: wgpu::TextureFormat,
+    required_features: wgpu::Features,
+) -> Result<(), String> {
     if width == 0 || height == 0 {
         return Err("cannot show an empty (0x0) image".to_string());
     }
@@ -355,6 +428,8 @@ pub fn show_rgba8(width: u32, height: u32, pixels: &[u8]) -> Result<(), String> 
         width,
         height,
         pixels,
+        format,
+        required_features,
         state: None,
         init_error: None,
     };
