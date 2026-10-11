@@ -38,8 +38,13 @@ extracted files, decompiled code, or database files.
   RGBA8) and shows it as a stretched fullscreen quad in a winit/wgpu
   window. Bad magic, unsupported `dxgiFormat`, and unreadable paths
   fail loud (stderr + nonzero exit, no guessing).
-- Slice 1 done: renders legacy DXT1 DDS in a window, playtest-accepted
-  (2026-10-11, flame sprite; see `docs/changes/dds-texture-viewer/archive.md`).
+- `bc7-texture-support`: `cargo run -- <path-to-a-BC7-DDS>`
+  (`dxgiFormat` 98) uploads the raw base-mip blocks to a
+  `Bc7RgbaUnorm` wgpu texture (no CPU decode) and shows them in the
+  same window. Malformed BC7 input fails loud via `InvalidBc7`; any
+  other undecodable `dxgiFormat` (including 99) still fails loud via
+  `UnsupportedFormat`; a GPU without `TEXTURE_COMPRESSION_BC` fails
+  loud naming the feature.
 
 ## What's missing
 
