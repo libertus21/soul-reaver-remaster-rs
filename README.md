@@ -27,7 +27,7 @@ extracted files, decompiled code, or database files.
 
 ## Checklist
 
-- [ ] Slice 1 `dds-texture-viewer`: load one real `.DDS` from the install, show it in a window
+- [x] Slice 1 `dds-texture-viewer`: load one real `.DDS` from the install, show it in a window
 - [ ] `THIRD-PARTY-NOTICES.md` created on first community-code reuse
 - [ ] README "What works" updated every slice
 
@@ -48,6 +48,8 @@ extracted files, decompiled code, or database files.
 
 ## What's missing
 
+- [ ] BC7 (`dxgiFormat` 98) textures: currently fail loud with
+      `UnsupportedFormat(98)` — planned as slice 2 `bc7-texture-support`.
 - [ ] Visual playtest confirmation against a reference DDS viewer
       (done by the user per slice; see the change PR).
 - [ ] Everything after that (BIGFILE index, models, audio, gameplay) — unscoped
