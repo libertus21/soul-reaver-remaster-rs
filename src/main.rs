@@ -1,11 +1,12 @@
-//! DDS texture viewer (`dds-texture-viewer` + `bc7-texture-support`).
+//! DDS texture viewer (`dds-texture-viewer` + `bc7-cpu-decode`).
 //!
 //! Usage: `cargo run -- <path-to-DDS>` — opens a window showing the
-//! texture. BC7 (`dxgiFormat` 98) files render via a natively-uploaded
-//! compressed texture; everything else decodes to RGBA8 as before. The
-//! game path arrives via CLI arg at runtime only and is never
-//! committed. Every [`dds::ViewerError`] maps to a clear stderr message
-//! + `ExitCode(1)`; closing the window exits `0`.
+//! texture. BC7 (`dxgiFormat` 98) files are CPU-decoded to RGBA8 and
+//! render through the same upload path as everything else, so they work
+//! on GPUs without BC compression support. The game path arrives via
+//! CLI arg at runtime only and is never committed. Every
+//! [`dds::ViewerError`] maps to a clear stderr message + `ExitCode(1)`;
+//! closing the window exits `0`.
 
 mod dds;
 mod render;
@@ -33,7 +34,8 @@ fn main() -> ExitCode {
             render::show_rgba8(image.width, image.height, &image.rgba8)
         }
         dds::LoadedTexture::Bc7(compressed) => {
-            render::show_bc7(compressed.width, compressed.height, &compressed.blocks)
+            let image = dds::decode_bc7_to_rgba8(compressed);
+            render::show_rgba8(image.width, image.height, &image.rgba8)
         }
     };
     if let Err(e) = result {
