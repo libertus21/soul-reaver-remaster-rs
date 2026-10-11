@@ -84,11 +84,15 @@ impl<'window> State<'window> {
             })
             .await
             .map_err(|e| format!("no usable GPU adapter: {e}"))?;
+        // Request the adapter's own limits (not `Limits::default()`): this
+        // viewer needs nothing special, so take whatever the GPU offers.
+        // `Limits::default()` can exceed what low-capability / software
+        // adapters allow and fail device creation there.
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("dds viewer"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: adapter.limits(),
                 ..Default::default()
             })
             .await
