@@ -11,9 +11,10 @@ extracted files, decompiled code, or database files.
 ## Quick path
 
 1. Install the game (GOG/Steam build) and verify it runs.
-2. `cargo test` — runs the suite (empty at bootstrap).
-3. `cargo run -- <path-to-a-DDS>` — planned DDS viewer entry point
-   (not implemented yet; see "What works / What's missing").
+2. `cargo test` — runs the suite (DDS header/error unit tests on
+   synthetic bytes; no game files in tests).
+3. `cargo run -- <path-to-a-DDS>` — opens a window showing that
+   texture (pass your own install path at runtime; never committed).
 
 ## Details
 
@@ -32,11 +33,16 @@ extracted files, decompiled code, or database files.
 
 ## What works
 
-- (nothing yet — bootstrap only)
+- `dds-texture-viewer`: `cargo run -- <path-to-a-DDS>` decodes one
+  `.DDS` (DX10 extended header via the `image` crate, base mip to
+  RGBA8) and shows it as a stretched fullscreen quad in a winit/wgpu
+  window. Bad magic, unsupported `dxgiFormat`, and unreadable paths
+  fail loud (stderr + nonzero exit, no guessing).
 
 ## What's missing
 
-- [ ] `dds-texture-viewer`: parse DDS/DX10 header, upload to wgpu, render in a winit window
+- [ ] Visual playtest confirmation against a reference DDS viewer
+      (done by the user per slice; see the change PR).
 - [ ] Everything after that (BIGFILE index, models, audio, gameplay) — unscoped
 
 ## Next step
