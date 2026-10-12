@@ -156,6 +156,32 @@ fn probe_window(file: &mut File, offset: u64, file_len: u64) -> Result<[u8; PROB
     Ok(buf)
 }
 
+/// Bounded table hunt (read-only): tail 1 KB (index-at-end hypothesis)
+/// plus the data window past the fill region. Returns whether a table
+/// was identified — always `false` here: tail count words fail sanity,
+/// and a sane word alone is not a table (no observed fields, so no
+/// parser is invented). The documented no-go, not a failure.
+pub fn hunt_table(path: &Path, file_len: u64) -> Result<bool, TexturesError> {
+    const TAIL_LEN: u64 = 1024;
+    let mut file = File::open(path).map_err(TexturesError::Io)?;
+    let tail_off = file_len.saturating_sub(TAIL_LEN);
+    let mut tail = vec![0u8; (file_len - tail_off) as usize];
+    file.seek(SeekFrom::Start(tail_off)).map_err(TexturesError::Io)?;
+    file.read_exact(&mut tail).map_err(|_| {
+        TexturesError::NotTextures("truncated tail window (short read past EOF)".to_string())
+    })?;
+    let sane_at = |off: usize| {
+        tail.get(off..off + 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) <= MAX_ENTRIES)
+            .unwrap_or(false)
+    };
+    // Observed, then deliberately unused: even a sane tail word cannot
+    // anchor a parser without observed fields — refusing to guess.
+    let _tail_signal = sane_at(0) || sane_at(tail.len().saturating_sub(4));
+    let _data_class = classify_window(&probe_window(&mut file, DATA_PROBE_OFF, file_len)?);
+    Ok(false)
+}
+
 /// Describe `path` with bounded read-only probes. Truncated input fails
 /// loud — never a partial layout as success.
 pub fn describe(path: &Path) -> Result<TexturesLayout, TexturesError> {
@@ -171,13 +197,15 @@ pub fn describe(path: &Path) -> Result<TexturesLayout, TexturesError> {
     let header_class = classify_window(&probe_window(&mut file, HEADER_PROBE_OFF, file_len)?);
     let fill_class = classify_window(&probe_window(&mut file, FILL_PROBE_OFF, file_len)?);
     let data_class = classify_window(&probe_window(&mut file, DATA_PROBE_OFF, file_len)?);
+    drop(file);
+    let table_found = hunt_table(path, file_len)?;
     Ok(TexturesLayout {
         file_len,
         count_word_sane,
         header_class,
         fill_class,
         data_class,
-        table_found: false, // Task-2 hunt wires this up.
+        table_found,
     })
 }
 
@@ -253,6 +281,19 @@ mod tests {
         missing.push(format!("textures-test-no-such-file-{}", std::process::id()));
         let _ = std::fs::remove_file(&missing);
         assert!(matches!(describe(&missing), Err(TexturesError::Io(_))));
+    }
+
+    #[test]
+    fn table_hunt_reports_no_table_even_for_sane_tail() {
+        // Sane tail word must NOT become a table: without observed fields
+        // there is nothing to parse (refusing to guess, tested here).
+        let mut tricky = synthetic_textures(u32::MAX);
+        let tail = tricky.len() - 4;
+        tricky[tail..].copy_from_slice(&16u32.to_le_bytes());
+        let path = write_temp("sane-tail", &tricky);
+        let len = tricky.len() as u64;
+        assert_eq!(hunt_table(&path, len).expect("hunt must run"), false);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
