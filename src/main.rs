@@ -12,6 +12,7 @@
 //! error (unchanged). Every [`dds::ViewerError`] maps to a clear stderr
 //! message + `ExitCode(1)`; closing the window exits `0`.
 
+mod bigfile;
 mod dds;
 mod gallery;
 mod render;
