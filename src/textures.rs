@@ -54,7 +54,7 @@ pub fn classify_window(bytes: &[u8]) -> RegionClass {
 }
 
 /// Every textures failure maps to stderr + nonzero exit in `main`.
-/// `BadEntry`/`BadSelector`/`NotDds` are for the Task-3 `--tshow` arm.
+/// `BadEntry`/`NotDds` await a future table parser (no-go: unset).
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum TexturesError {

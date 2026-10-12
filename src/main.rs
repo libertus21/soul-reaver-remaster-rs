@@ -189,29 +189,33 @@ fn run_textures(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     };
     let path = Path::new(path_arg);
-    match args.get(1).map(String::as_str) {
-        Some("--tlist") if args.len() == 2 => {
-            let layout = match textures::describe(path) {
-                Ok(layout) => layout,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    return ExitCode::from(1);
-                }
-            };
-            // `table_found` wires up in Task 2; until then this is the
-            // specified no-table behavior (never invented entry lines).
-            println!("{}", layout.summary());
-            eprintln!(
-                "error: no entry table identified in '{}' ({}; next candidate: {})",
-                path.display(),
-                layout.size_class(),
-                textures::NEXT_CANDIDATE
-            );
-            ExitCode::from(1)
-        }
-        _ => {
-            eprintln!("usage: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tlist");
-            ExitCode::from(1)
-        }
+    let tlist = matches!(args.get(1).map(String::as_str), Some("--tlist") if args.len() == 2);
+    let tshow = matches!(args.get(1).map(String::as_str), Some("--tshow") if args.len() == 3);
+    if !tlist && !tshow {
+        eprintln!("usage: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tlist");
+        eprintln!("   or: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tshow <entry>");
+        return ExitCode::from(1);
     }
+    let layout = match textures::describe(path) {
+        Ok(layout) => layout,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    // Task-2 hunt verdict: no table identified (specified no-go). `--tlist`
+    // carries the summary on stdout; `--tshow` reports the selector loud.
+    // Both name the file and the next candidate on stderr and exit 1.
+    if tlist {
+        println!("{}", layout.summary());
+    } else {
+        eprintln!("error: {}", textures::TexturesError::BadSelector(args[2].clone()));
+    }
+    eprintln!(
+        "error: no entry table identified in '{}' ({}; next candidate: {})",
+        path.display(),
+        layout.size_class(),
+        textures::NEXT_CANDIDATE
+    );
+    ExitCode::from(1)
 }
