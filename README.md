@@ -78,9 +78,15 @@ extracted files, decompiled code, or database files.
   (GPL-3.0-only, mirror `github.com/TheSerioliOfNosgoth/SoulSpiral-Official`;
   NO Soul Spiral code copied — facts only, so no THIRD-PARTY-NOTICES.md
    entry; see `docs/changes/bigfile-index/design.md`).
-   Playtest-accepted on the real archive: `--list` exits 0 with
-   1325 entries; `--show` on a non-DDS entry fails loud (stderr +
-   exit 1, no window).
+- `textures-big` (documented no-go): `TEXTURES.BIG` is a CUSTOM layout,
+  not SR1PC (count-at-0 exceeds the sanity limit; `bigfile.rs` must not
+  parse it). `cargo run -- --textures <TEXTURES.BIG> --tlist` prints the
+  layout summary (size class + region classes + table status, shapes
+  only) to stdout and exits 1 loud naming the next candidate;
+  `--tshow <entry>` fails loud the same way (no table, nothing listed,
+  nothing decoded). A tail + data-window hunt found no entry table, so
+  this slice lands as docs + loud stubs + synthetic-only tests; next
+  candidate: the SR2-side sibling named in the error.
 
 ## What's missing
 
