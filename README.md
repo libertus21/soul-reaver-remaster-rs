@@ -77,17 +77,21 @@ extracted files, decompiled code, or database files.
   clean-room from Soul Spiral's `BenLincoln.TheLostWorlds.CDBigFile`
   (GPL-3.0-only, mirror `github.com/TheSerioliOfNosgoth/SoulSpiral-Official`;
   NO Soul Spiral code copied — facts only, so no THIRD-PARTY-NOTICES.md
-  entry; see `docs/changes/bigfile-index/design.md`).
+   entry; see `docs/changes/bigfile-index/design.md`).
+   Playtest-accepted on the real archive: `--list` exits 0 with
+   1325 entries; `--show` on a non-DDS entry fails loud (stderr +
+   exit 1, no window).
 
 ## What's missing
 
-- [ ] BIGFILE.DAT (NEXT milestone): index and read textures from
-      the archive instead of loose files.
+- [ ] TEXTURES.BIG (NEXT milestone): index and read the remaster's
+      packed textures (a 2236-entry sibling container is noted as a
+      candidate for the scoping probe).
 - [ ] sRGB correctness pass, resize handling, full mipmap-chain UI —
       still deferred; `dxgiFormat` 99 (BC7 sRGB) still fails loud.
 - [ ] Visual playtest confirmation against a reference DDS viewer
       (done by the user per slice; see the change PR).
-- [ ] Everything after that (BIGFILE index, models, audio, gameplay) — unscoped
+- [ ] Everything after that (models, audio, gameplay) — unscoped
 
 ## Next step
 
