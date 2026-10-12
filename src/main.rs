@@ -22,6 +22,10 @@ mod bigfile;
 mod dds;
 mod gallery;
 mod render;
+// Transitional: Task 2 wires the mesh arm; until then the parser is
+// test-only so dead-code warnings are allowed here, nowhere else.
+#[allow(dead_code)]
+mod srm;
 mod textures;
 
 use std::path::Path;
