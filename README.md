@@ -59,7 +59,24 @@ extracted files, decompiled code, or database files.
   Gallery skip policy: an undecodable entry prints
   `warning: skipping <filename>: <error>` to stderr and browsing
   continues; an empty or all-undecodable directory exits 1 with no
-  window. Single-file mode is unchanged.
+   window. Single-file mode is unchanged.
+- `bigfile-index`: `cargo run -- --bigfile <BIGFILE.DAT> --list`
+  prints the SR1PC archive index (one `index hash offset length` line
+  per entry; `hash` is the stored 8-hex-digit name hash) and exits 0;
+  `cargo run -- --bigfile <BIGFILE.DAT> --show <index|hash>` reads
+  that entry IN MEMORY (extracted bytes are never written to disk or
+  repo) and, when it is a DDS texture, shows it through the existing
+  single-file window (close/Esc exits 0). The selector is the decimal
+  list index from `--list` or the stored name hash (case-insensitive,
+  optional `0x`); DDS entries only — any other archived type is
+  listed, never decoded (loud stderr + exit 1). Corrupt/truncated
+  containers, out-of-range selectors, and unknown hashes all fail
+  loud (stderr + nonzero exit, no guessing). Single-file and gallery
+  modes are byte-for-byte unchanged. Layout facts reimplemented
+  clean-room from Soul Spiral's `BenLincoln.TheLostWorlds.CDBigFile`
+  (GPL-3.0-only, mirror `github.com/TheSerioliOfNosgoth/SoulSpiral-Official`;
+  NO Soul Spiral code copied — facts only, so no THIRD-PARTY-NOTICES.md
+  entry; see `docs/changes/bigfile-index/design.md`).
 
 ## What's missing
 

@@ -17,11 +17,6 @@
 //! caller exits nonzero. Tests use synthetic bytes only — never game
 //! files.
 
-//! Temporary until the `--bigfile` dispatch (next work unit) becomes the
-//! first caller: this module's public API is exercised by its unit tests
-//! only, so release builds would warn on dead code.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
