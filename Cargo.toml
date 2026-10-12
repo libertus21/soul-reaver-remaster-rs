@@ -9,3 +9,6 @@ image = "0.25.10"
 pollster = "1.0.1"
 wgpu = "30.0.1"
 winit = "0.30.13"
+
+[dev-dependencies]
+tempfile = "3"

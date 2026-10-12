@@ -94,6 +94,9 @@ pub enum ViewerError {
     /// multiples of the 4x4 BC7 block, or file shorter than header +
     /// base mip); carries a message naming the offending values.
     InvalidBc7(String),
+    /// Gallery listing found zero `.DDS` files; carries the directory
+    /// path for the loud error message (slice `texture-gallery`).
+    NoDdsFiles(String),
 }
 
 impl fmt::Display for ViewerError {
@@ -107,6 +110,9 @@ impl fmt::Display for ViewerError {
             ),
             ViewerError::Decode(msg) => write!(f, "failed to decode DDS: {msg}"),
             ViewerError::InvalidBc7(msg) => write!(f, "invalid BC7 texture: {msg}"),
+            ViewerError::NoDdsFiles(dir) => {
+                write!(f, "no .DDS files found in directory: {dir}")
+            }
         }
     }
 }
