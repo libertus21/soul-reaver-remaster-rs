@@ -734,6 +734,14 @@ fn mul4(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
 
 /// Y-rotation by `angle` radians, then a fixed camera (translate `-2.2`
 /// in Z) under a 45-degree perspective: hand-rolled, no new crates.
+///
+/// WebGPU/DirectX NDC convention: z maps into [0, 1]. The `proj` row
+/// carrying the perspective divide must produce a POSITIVE `clip.w`
+/// for points in front of the camera (view-space z is negative there);
+/// the `z` row must produce a `clip.z / clip.w` inside [0, 1]. The
+/// signs below are the ones that satisfy both — flipping either back
+/// (the pre-fix `far / (far - near)` / `1.0` pair) sends every vertex
+/// behind the camera and the rasterizer discards the whole mesh.
 fn mvp_for(angle: f32, aspect: f32) -> [[f32; 4]; 4] {
     let (s, c) = angle.sin_cos();
     let rot = [
@@ -753,7 +761,7 @@ fn mvp_for(angle: f32, aspect: f32) -> [[f32; 4]; 4] {
     let proj = [
         [f / aspect, 0.0, 0.0, 0.0],
         [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, far / (far - near), 1.0],
+        [0.0, 0.0, far / (near - far), -1.0],
         [0.0, 0.0, -far * near / (far - near), 0.0],
     ];
     mul4(&proj, &mul4(&view, &rot))
@@ -1101,7 +1109,7 @@ pub fn show_mesh(positions: &[[f32; 3]], indices: &[u16], title: &str) -> Result
 
 #[cfg(test)]
 mod mesh_tests {
-    use super::fit_positions;
+    use super::{fit_positions, mvp_for};
 
     #[test]
     fn autofit_centers_and_scales_to_unit_extent() {
@@ -1118,5 +1126,28 @@ mod mesh_tests {
         assert!(fit_positions(&[[1.0, 1.0, 1.0]; 3]).is_err());
         assert!(fit_positions(&[[f32::INFINITY, 0.0, 0.0], [0.0, 0.0, 0.0]]).is_err());
     }
-}
 
+    /// Regression: a mesh at the origin (post auto-fit) must land in
+    /// front of the camera, i.e. with `clip.w > 0` and `clip.z / clip.w`
+    /// inside the WebGPU [0, 1] NDC range. The pre-fix projection matrix
+    /// produced `clip.w = -2.2` for this exact point, which the
+    /// rasterizer interprets as "behind the camera" and discards — the
+    /// symptom was a fully black window despite a successful parse.
+    #[test]
+    fn origin_lands_in_front_of_camera() {
+        let m = mvp_for(0.0, 1.0);
+        // Apply m to (0, 0, 0, 1) in column-major order:
+        // clip.i = m[0][i]*0 + m[1][i]*0 + m[2][i]*0 + m[3][i]*1 = m[3][i].
+        let clip_z = m[3][2];
+        let clip_w = m[3][3];
+        assert!(
+            clip_w > 0.0,
+            "clip.w must be positive for a point in front of the camera, got {clip_w}"
+        );
+        let ndc_z = clip_z / clip_w;
+        assert!(
+            (0.0..=1.0).contains(&ndc_z),
+            "NDC z must lie in [0, 1] for WebGPU, got {ndc_z}"
+        );
+    }
+}
