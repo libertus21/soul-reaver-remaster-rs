@@ -48,7 +48,8 @@ extracted files, decompiled code, or database files.
   fails loud via `UnsupportedFormat`. Supersedes the slice-2 native
   BC7 upload (kept in git history), which this machine's adapter cannot
   run.
-- `texture-gallery`: `cargo run -- <directory>` browses that
+- `texture-gallery` (playtest-accepted: browses 8066 TEX with
+  arrows): `cargo run -- <directory>` browses that
   directory's direct-child `*.DDS` files (case-insensitive extension,
   sorted ascending by file name, no recursion) one at a time in the
   existing window through the existing decode + upload path (lazy
@@ -63,8 +64,8 @@ extracted files, decompiled code, or database files.
 
 ## What's missing
 
-- [ ] Texture gallery (NEXT milestone): browse multiple textures instead
-      of one-file-per-run.
+- [ ] BIGFILE.DAT (NEXT milestone): index and read textures from
+      the archive instead of loose files.
 - [ ] sRGB correctness pass, resize handling, full mipmap-chain UI —
       still deferred; `dxgiFormat` 99 (BC7 sRGB) still fails loud.
 - [ ] Visual playtest confirmation against a reference DDS viewer
