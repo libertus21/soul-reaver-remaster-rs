@@ -268,12 +268,21 @@ pub fn decode_bc7_to_rgba8(c: &CompressedBc7) -> DecodedImage {
 /// embeds a game path, and tests use synthetic bytes, never game files.
 pub fn load_texture(path: impl AsRef<Path>) -> Result<LoadedTexture, ViewerError> {
     let bytes = std::fs::read(path.as_ref()).map_err(ViewerError::Io)?;
-    if !has_dds_magic(&bytes) {
+    decode_memory(&bytes)
+}
+
+/// Decode in-memory DDS bytes through the SAME validation as
+/// [`load_texture`] (magic + DX10/`dxgiFormat` + BC7-shape checks;
+/// `dxgiFormat` 99 stays loud). Shared by single-file mode (which
+/// reads the file, then calls this) and `--show` on a bigfile entry
+/// (which reads the entry range, then calls this). No new decoder.
+pub fn decode_memory(bytes: &[u8]) -> Result<LoadedTexture, ViewerError> {
+    if !has_dds_magic(bytes) {
         return Err(ViewerError::NotDds);
     }
-    match dxgi_format_of(&bytes) {
-        Some(DXGI_BC7_UNORM) => load_bc7_from_bytes(&bytes).map(LoadedTexture::Bc7),
-        _ => decode_rgba8(&bytes).map(LoadedTexture::Rgba8),
+    match dxgi_format_of(bytes) {
+        Some(DXGI_BC7_UNORM) => load_bc7_from_bytes(bytes).map(LoadedTexture::Bc7),
+        _ => decode_rgba8(bytes).map(LoadedTexture::Rgba8),
     }
 }
 
@@ -560,5 +569,57 @@ mod tests {
             msg.contains("expected 212 vs 100"),
             "Display must carry the detail, got: {msg}"
         );
+    }
+
+    #[test]
+    fn decode_memory_accepts_synthetic_bc7_bytes() {
+        // 4x4 needs exactly 1 block; no disk touched (the `--show` path
+        // feeds entry bytes straight here).
+        let bytes = synthetic_bc7(4, 4, 1);
+        match decode_memory(&bytes) {
+            Ok(LoadedTexture::Bc7(c)) => {
+                assert_eq!((c.width, c.height), (4, 4));
+                assert_eq!(c.blocks, bytes[BC7_DATA_OFFSET..]);
+            }
+            other => panic!("expected LoadedTexture::Bc7, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_memory_rejects_non_dds_magic_without_disk() {
+        let mut bytes = synthetic_bc7(4, 4, 1);
+        bytes[0..4].copy_from_slice(b"NOPE");
+        assert!(matches!(
+            decode_memory(&bytes),
+            Err(ViewerError::NotDds)
+        ));
+    }
+
+    #[test]
+    fn decode_memory_matches_load_texture_on_synthetic_bc7() {
+        // Refactor parity: reading a file then decoding must equal
+        // decoding the same bytes from memory (single-file behavior
+        // byte-for-byte unchanged).
+        let bytes = synthetic_bc7(8, 8, 4);
+        let path = write_temp("decode-memory-parity", &bytes);
+        let from_file = load_texture(&path).expect("synthetic BC7 must load");
+        let from_memory = decode_memory(&bytes).expect("same bytes must decode");
+        match (from_file, from_memory) {
+            (LoadedTexture::Bc7(a), LoadedTexture::Bc7(b)) => {
+                assert_eq!((a.width, a.height), (b.width, b.height));
+                assert_eq!(a.blocks, b.blocks);
+            }
+            pair => panic!("both paths must yield Bc7, got: {pair:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn decode_memory_keeps_bogus_dxgi_loud() {
+        let bogus: u32 = 424_242;
+        match decode_memory(&synthetic_dx10_header(bogus)) {
+            Err(ViewerError::UnsupportedFormat(v)) => assert_eq!(v, bogus),
+            other => panic!("expected UnsupportedFormat({bogus}), got: {other:?}"),
+        }
     }
 }
