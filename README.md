@@ -48,6 +48,18 @@ extracted files, decompiled code, or database files.
   fails loud via `UnsupportedFormat`. Supersedes the slice-2 native
   BC7 upload (kept in git history), which this machine's adapter cannot
   run.
+- `texture-gallery`: `cargo run -- <directory>` browses that
+  directory's direct-child `*.DDS` files (case-insensitive extension,
+  sorted ascending by file name, no recursion) one at a time in the
+  existing window through the existing decode + upload path (lazy
+  decode, no pre-scan). ArrowRight steps forward, ArrowLeft steps back
+  (clamped at the ends, key auto-repeat ignored); the window title and
+  one console line both show `<index>/<total> <filename>` (1-based;
+  `index/total` counts list entries). Esc or window close exits 0.
+  Gallery skip policy: an undecodable entry prints
+  `warning: skipping <filename>: <error>` to stderr and browsing
+  continues; an empty or all-undecodable directory exits 1 with no
+  window. Single-file mode is unchanged.
 
 ## What's missing
 
