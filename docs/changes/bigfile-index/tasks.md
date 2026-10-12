@@ -34,7 +34,7 @@ Ordered work units. Each is independently committable, each keeps tests/docs wit
 | 400-line budget risk | Low (forecast ~360 max vs 400 budget) |
 | Decision needed before apply | No — proceed as SINGLE PR to main (chain strategy stays deferred: chaining is not needed) |
 | Work-unit mapping | Task 1 -> commit 1, Task 2 -> commit 2, Task 3 -> commit 3 + playtest evidence (tests travel with their behavior per work-unit-commits) |
-| Rebase point for apply | Updated `main` at `530ec61` (gallery archived); this plan branch carries docs only, so apply branches fresh from `main` |
+| Rebase point for apply | Updated `main` at `eccd80a` (merge of slice 4 gallery); this plan branch carries docs only, so apply branches fresh from `main` |
 
 ## Apply gate
 
