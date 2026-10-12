@@ -90,9 +90,16 @@ extracted files, decompiled code, or database files.
 
 ## What's missing
 
-- [ ] TEXTURES.BIG (NEXT milestone): index and read the remaster's
-      packed textures (a 2236-entry sibling container is noted as a
-      candidate for the scoping probe).
+- [x] TEXTURES.BIG (documented no-go, see
+      `docs/changes/textures-big/archive.md`): custom layout, no entry
+      table found with bounded read-only probes; `--tlist`/`--tshow`
+      stay as loud playtest-accepted no-go arms (summary + exit 1,
+      nothing listed, nothing decoded). Other SR1 `.BIG` files
+      (`E3.BIG`, `BONUS.BIG`, `MOVIES.BIG`) remain unprobed — each
+      needs its own probe before any claim.
+- [ ] 3D models (NEXT milestone): index and read the remaster's packed
+      models — scoping probe first, same slice discipline
+      (proposal → spec → tasks → code → playtest report).
 - [ ] sRGB correctness pass, resize handling, full mipmap-chain UI —
       still deferred; `dxgiFormat` 99 (BC7 sRGB) still fails loud.
 - [ ] Visual playtest confirmation against a reference DDS viewer
