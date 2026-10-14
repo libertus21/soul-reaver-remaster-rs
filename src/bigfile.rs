@@ -43,8 +43,14 @@ pub struct BigfileEntry {
 /// maps to a clear stderr message + nonzero exit in `main`.
 #[derive(Debug)]
 pub enum BigfileError {
-    /// File could not be read (missing path, permissions, ...);
-    /// carries the OS error.
+    /// The archive could not be OPENED (missing path, permissions,
+    /// ...); carries the path plus the OS detail. Pre-open stage only:
+    /// mirrors the original loader's open-stage message family
+    /// (`docs/notes/s1-bigfile-loader-behavior.md`, O1 CONFIRMED).
+    OpenFailed { path: String, detail: String },
+    /// File IO AFTER a successful open (seek, entry-byte reads);
+    /// carries the OS error. Post-open routing in the original is
+    /// UNKNOWN, so this keeps its own text (excluded per spec R3).
     Io(std::io::Error),
     /// Bytes at offset 0 are not a sane SR1PC index (bad count,
     /// truncated index table); carries a detail message.
@@ -62,6 +68,9 @@ pub enum BigfileError {
 impl fmt::Display for BigfileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            BigfileError::OpenFailed { path, detail } => {
+                write!(f, "Can't load big file named \"{path}\" ({detail})")
+            }
             BigfileError::Io(e) => write!(f, "cannot read bigfile: {e}"),
             BigfileError::NotBigfile(msg) => write!(f, "not a BIGFILE index: {msg}"),
             BigfileError::BadEntry(msg) => write!(f, "bad bigfile entry: {msg}"),
@@ -80,6 +89,15 @@ impl std::error::Error for BigfileError {
             BigfileError::Io(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+/// Build the pre-open failure for `path`: the original loader's
+/// open-stage message family with our OS detail kept as the suffix.
+fn open_failed(path: &Path, e: &std::io::Error) -> BigfileError {
+    BigfileError::OpenFailed {
+        path: path.display().to_string(),
+        detail: e.to_string(),
     }
 }
 
@@ -149,8 +167,10 @@ pub fn parse_index(bytes: &[u8], file_len: u64) -> Result<Vec<BigfileEntry>, Big
 /// to [`parse_index`]. Only index bytes are read — entry data stays
 /// on disk until [`read_entry`] is asked for one entry.
 pub fn load_index(path: &Path) -> Result<Vec<BigfileEntry>, BigfileError> {
-    let file_len = std::fs::metadata(path).map_err(BigfileError::Io)?.len();
-    let mut file = File::open(path).map_err(BigfileError::Io)?;
+    let file_len = std::fs::metadata(path)
+        .map_err(|e| open_failed(path, &e))?
+        .len();
+    let mut file = File::open(path).map_err(|e| open_failed(path, &e))?;
     let mut count_buf = [0u8; 4];
     file.read_exact(&mut count_buf).map_err(|_| {
         BigfileError::NotBigfile(format!(
@@ -183,7 +203,9 @@ pub fn load_index(path: &Path) -> Result<Vec<BigfileEntry>, BigfileError> {
 /// size (an out-of-range entry is [`BigfileError::BadEntry`], never a
 /// panic or a short read presented as success). Nothing is written.
 pub fn read_entry(path: &Path, entry: &BigfileEntry) -> Result<Vec<u8>, BigfileError> {
-    let file_len = std::fs::metadata(path).map_err(BigfileError::Io)?.len();
+    let file_len = std::fs::metadata(path)
+        .map_err(|e| open_failed(path, &e))?
+        .len();
     let end = entry.offset + entry.length;
     if end > file_len {
         return Err(BigfileError::BadEntry(format!(
@@ -194,7 +216,7 @@ pub fn read_entry(path: &Path, entry: &BigfileEntry) -> Result<Vec<u8>, BigfileE
     let length = usize::try_from(entry.length).map_err(|_| {
         BigfileError::BadEntry(format!("entry length {} does not fit memory", entry.length))
     })?;
-    let mut file = File::open(path).map_err(BigfileError::Io)?;
+    let mut file = File::open(path).map_err(|e| open_failed(path, &e))?;
     file.seek(SeekFrom::Start(entry.offset))
         .map_err(BigfileError::Io)?;
     let mut buf = vec![0u8; length];
@@ -386,11 +408,11 @@ mod tests {
     }
 
     #[test]
-    fn load_index_on_missing_file_is_io() {
+    fn load_index_on_missing_file_is_open_failed() {
         let mut p = std::env::temp_dir();
         p.push(format!("bigfile-test-no-such-file-{}", std::process::id()));
         let _ = std::fs::remove_file(&p);
-        assert!(matches!(load_index(&p), Err(BigfileError::Io(_))));
+        assert!(matches!(load_index(&p), Err(BigfileError::OpenFailed { .. })));
     }
 
     #[test]
