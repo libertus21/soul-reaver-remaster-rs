@@ -18,15 +18,15 @@ S1 confirmed the two message families at xref level (each format has exactly one
 | O2 | Seek/size/read fails after a successful open (family CONFIRMED, per-case routing = S2 target) | Read-failure format + seek/size/read cluster (`SetFilePointerEx`/`GetFileSizeEx`/`ReadFile`) | `Can't read from bigfile: %s` |
 | O3 | Process termination on loader failure | UNKNOWN — static headless only; S2 re-checks for any observable, else stays UNKNOWN | UNKNOWN |
 
-## Parity table (per S1-held row; verdict targets for Task 2)
+## Parity table (per S1-held row; Task 2 verdicts recorded 2026-10-14)
 
-| Failure case | Ours today (`src/bigfile.rs`) | S2 verdict target → apply action |
+| Failure case | Ours today (`src/bigfile.rs`) | Task 2 verdict → apply action |
 |---|---|---|
-| Truncated count word / bad count | `not a BIGFILE index: {detail}`, exit 1 | PROVE (which function reads the count word + its error edge) → adopt read-failure prefix if edge leads to read-error-half; else HOLD, text unchanged, hold test stays |
-| Truncated index table mid-read | `not a BIGFILE index: truncated index table`, exit 1 | PROVE (table-read stage + error edge) → adopt read-failure prefix if edge leads to read-error-half; else HOLD |
-| Entry range past EOF (bad index data) | `bad bigfile entry: {detail}`, exit 1 | LIKELY HOLD — our range check may have no original counterpart; aligns ONLY if the trace shows a bounds check feeding an error half |
-| Seek failure during entry read | `cannot read bigfile: {os}`, exit 1 | PROVE (seek-extra/seek-size-pair caller → error-half edge) → adopt `Can't read from bigfile:` prefix; else HOLD |
-| Short read of entry bytes | `cannot read bigfile: {os}`, exit 1 | PROVE (read-cluster caller → error-half edge) → adopt `Can't read from bigfile:` prefix; else HOLD |
+| Truncated count word / bad count | `not a BIGFILE index: {detail}`, exit 1 | HELD — no count-word reader identified, no edge to either half (addendum § Per-row verdicts); text unchanged, hold test stays |
+| Truncated index table mid-read | `not a BIGFILE index: truncated index table`, exit 1 | HELD — no table-read stage identified, no edge (addendum); text unchanged, hold test stays |
+| Entry range past EOF (bad index data) | `bad bigfile entry: {detail}`, exit 1 | HELD — no bounds-check → error-half edge, as predicted (addendum); text unchanged, hold test stays |
+| Seek failure during entry read | `cannot read bigfile: {os}`, exit 1 | HELD — no seek-cluster → `read-error-half` edge after 2 probe passes (addendum); text unchanged, hold test stays |
+| Short read of entry bytes | `cannot read bigfile: {os}`, exit 1 | HELD — no read-cluster → `read-error-half` edge after 2 probe passes (addendum); text unchanged, hold test stays |
 | Termination behavior | stderr + exit 1, no window | NO CHANGE expected — static analysis cannot observe termination; record observable only, never invent parity |
 
 Rules: the adopted prefix is the original O2 format with the archive identity substituted; our diagnostic detail survives as a parenthesized suffix (same discipline as S1). Selector (`BadSelector`) and non-DDS (`NotDds`) errors have no original counterpart in scope — UNCHANGED.
@@ -42,10 +42,10 @@ Rules: the adopted prefix is the original O2 format with the archive identity su
 
 ## Acceptance scenarios
 
-- [ ] **Proven row (e.g. short read):** synthetic entry bytes cut after index parse exits 1; stderr starts with `Can't read from bigfile:`.
-- [ ] **Held row:** keeps its current prefix (pinned by test); stderr still names the entry/detail; exit 1.
+- [ ] **Proven row:** VACUOUS for this slice — no row resolved to PROVEN, so Task 3 makes zero production-line changes (box rule).
+- [ ] **Held row:** every row keeps its current prefix (to be pinned by test in Task 4); stderr still names the entry/detail; exit 1.
 - [ ] **Happy path unchanged:** valid synthetic index still lists / reads exact bytes; existing `cargo test` suite stays green.
-- [ ] **Unit level:** `cargo test` covers each parity-table row with message-prefix + `ExitCode(1)` assertions on synthetic bytes.
+- [ ] **Unit level:** `cargo test` covers each parity-table row with message-prefix assertions on synthetic bytes (hold pins, Task 4).
 - [ ] **Legal:** `git status --short` shows only intended source/doc/test files; no listings, DBs, or game data committed.
 
 ## Next step
