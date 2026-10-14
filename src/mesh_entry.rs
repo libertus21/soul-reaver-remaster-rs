@@ -19,6 +19,9 @@ use crate::textures_object::{self, MaterialTextures};
 /// A parsed mesh with every material's D/N/S textures already loaded.
 #[derive(Debug)]
 pub struct MeshEntry {
+    /// Path the entry was loaded from. Kept for future use (tooling,
+    /// save paths, error context). Not read yet.
+    #[allow(dead_code)]
     pub srm_path: PathBuf,
     pub title: String,
     pub positions: Vec<[f32; 3]>,

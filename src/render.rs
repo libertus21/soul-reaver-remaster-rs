@@ -786,14 +786,20 @@ impl<'window> MeshState<'window> {
         let core = open_core(window.clone(), "srm mesh").await?;
         let GpuCore { surface, device, queue, config } = core;
         let depth_view = Self::make_depth(&device, config.width, config.height);
+        // Pad every upload to COPY_BUFFER_ALIGNMENT (4 bytes); zero
+        // padding is inert and the GPU never reads past the real size.
         fn upload(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, bytes: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
+            let mut padded = bytes.to_vec();
+            while padded.len() % 4 != 0 {
+                padded.push(0);
+            }
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                size: bytes.len() as u64,
+                size: padded.len() as u64,
                 usage: usage | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            queue.write_buffer(&buf, 0, bytes);
+            queue.write_buffer(&buf, 0, &padded);
             buf
         }
         let vertex_buffer = upload(&device, &queue, "srm vertices", &vbytes, wgpu::BufferUsages::VERTEX);
@@ -1430,13 +1436,20 @@ impl<'window> TexturedMeshState<'window> {
             })
             .collect();
         let vbytes: &[u8] = bytemuck::cast_slice(&vertices);
+        // wgpu requires write_buffer sizes to be a multiple of
+        // COPY_BUFFER_ALIGNMENT (4). Pad with zeros; the GPU never reads
+        // past the real data, so trailing padding is inert.
+        let mut vbytes_padded = vbytes.to_vec();
+        while vbytes_padded.len() % 4 != 0 {
+            vbytes_padded.push(0);
+        }
         let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("srm textured vertices"),
-            size: vbytes.len() as u64,
+            size: vbytes_padded.len() as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.queue.write_buffer(&vertex_buffer, 0, vbytes);
+        self.queue.write_buffer(&vertex_buffer, 0, &vbytes_padded);
 
         let mut ranges: Vec<(usize, Vec<u16>)> =
             (0..entry.materials.len()).map(|i| (i + 1, Vec::new())).collect();
@@ -1451,7 +1464,12 @@ impl<'window> TexturedMeshState<'window> {
             if tri_indices.is_empty() {
                 continue;
             }
-            let ibytes: Vec<u8> = tri_indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+            let mut ibytes: Vec<u8> = tri_indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+            // Pad to COPY_BUFFER_ALIGNMENT (4); the GPU never reads past
+            // index_count, so the trailing padding is inert.
+            while ibytes.len() % 4 != 0 {
+                ibytes.push(0);
+            }
             let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("srm textured indices"),
                 size: ibytes.len() as u64,
@@ -1867,7 +1885,7 @@ mod mesh_tests {
             srm_path: std::path::PathBuf::from("x.srm"),
             title: "x.srm".to_string(),
             positions: vec![[0.0; 3]; 3],
-            uvs: vec![[0, 0]; 2], // wrong length
+            uvs: vec![[0, 0]; 2],
             indices: vec![0, 1, 2],
             material_indices: vec![1, 1, 1],
             materials: Vec::new(),
@@ -1885,12 +1903,11 @@ mod mesh_tests {
             positions: vec![[0.0; 3]; 3],
             uvs: vec![[0, 0]; 3],
             indices: vec![0, 1, 2],
-            material_indices: vec![2, 2, 2], // but only 1 material
+            material_indices: vec![2, 2, 2],
             materials: vec![crate::srm::Material { name: "M".into(), flags: 0x07 }],
             textures: vec![],
         };
         let e = validate_entry_shape(&entry).unwrap_err();
-        // Fails first on the materials/textures length mismatch.
         assert!(e.contains("materials/textures disagree") || e.contains("references material index"));
     }
 
@@ -1901,7 +1918,7 @@ mod mesh_tests {
             title: "x.srm".to_string(),
             positions: vec![[0.0; 3]; 3],
             uvs: vec![[0, 0]; 3],
-            indices: vec![0, 1], // not multiple of 3
+            indices: vec![0, 1],
             material_indices: vec![1, 1, 1],
             materials: Vec::new(),
             textures: Vec::new(),
