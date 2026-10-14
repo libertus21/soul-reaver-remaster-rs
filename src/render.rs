@@ -1,5 +1,7 @@
 //! wgpu fullscreen-quad renderer (`dds-texture-viewer` + `bc7-cpu-decode`)
-//! plus the flat-shaded mesh pipeline (`models-3d`: [`show_mesh`]).
+//! plus the flat-shaded mesh pipeline (`models-3d`: [`show_mesh`]),
+//! the textured mesh pipeline (`mesh-textures`: [`show_mesh_textured`]),
+//! and the textured mesh gallery (`mesh-batch`: [`show_mesh_gallery`]).
 //!
 //! One job: take RGBA8 image bytes, upload them to a GPU texture, and draw
 //! them as a stretched fullscreen quad in a winit window until the user
@@ -160,9 +162,9 @@ fn upload_texture(
     })
 }
 
-/// GPU core shared by the blit window and the mesh window: surface +
+/// GPU core shared by the blit window and the mesh windows: surface +
 /// device + queue + configured surface. Extracted verbatim from the
-/// blit setup so both windows open devices the same way (adapter's own
+/// blit setup so all windows open devices the same way (adapter's own
 /// limits, no special features); pipelines/uploads stay per-window.
 struct GpuCore<'window> {
     surface: wgpu::Surface<'window>,
@@ -216,7 +218,6 @@ impl<'window> State<'window> {
         height: u32,
         pixels: &[u8],
     ) -> Result<Self, String> {
-        // RGBA8 packs 4 bytes per texel.
         let expected_len = (width as usize) * (height as usize) * 4;
         assert_eq!(
             pixels.len(),
@@ -286,9 +287,6 @@ impl<'window> State<'window> {
         }
     }
 
-    /// Swap the shown image (gallery navigation): upload a new texture +
-    /// bind group, reusing device/queue/pipeline. The window keeps the
-    /// FIRST shown texture's size (per-texture resize is a non-goal).
     fn set_image(&mut self, width: u32, height: u32, pixels: &[u8]) {
         self.bind_group = upload_texture(
             &self.device,
@@ -304,11 +302,9 @@ impl<'window> State<'window> {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            // Occluded/minimized/timeout/validation: skip this frame.
             wgpu::CurrentSurfaceTexture::Timeout
             | wgpu::CurrentSurfaceTexture::Occluded
             | wgpu::CurrentSurfaceTexture::Validation => return,
-            // Surface changed or lost: re-configure and try next frame.
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
                 return;
@@ -412,8 +408,7 @@ impl<'a> ApplicationHandler for App<'a> {
 }
 
 /// Open a window showing `pixels` (RGBA8, `width` x `height`) and block
-/// until the user closes it. Returns `Err` with a displayable message
-/// when no window/GPU is available (e.g. headless environments).
+/// until the user closes it.
 pub fn show_rgba8(width: u32, height: u32, pixels: &[u8]) -> Result<(), String> {
     show(width, height, pixels)
 }
@@ -440,8 +435,7 @@ fn show(width: u32, height: u32, pixels: &[u8]) -> Result<(), String> {
     }
 }
 
-/// Decode one gallery entry to RGBA8 through the EXISTING path
-/// (`load_texture` → CPU BC7 or `image` RGBA8). No new decoder.
+/// Decode one gallery entry to RGBA8 through the EXISTING path.
 fn decode_entry(path: &Path) -> Result<DecodedImage, dds::ViewerError> {
     match dds::load_texture(path)? {
         LoadedTexture::Rgba8(image) => Ok(image),
@@ -449,17 +443,12 @@ fn decode_entry(path: &Path) -> Result<DecodedImage, dds::ViewerError> {
     }
 }
 
-/// File name for titles and skip lines (falls back to the full path when
-/// there is no file name).
 fn display_name(path: &Path) -> String {
     path.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// Window title AND console line for one shown entry: `<index>/<total>
-/// <filename>` with a 1-based index. Both carry the same content so
-/// playtest notes can quote either.
 fn entry_label(index: usize, total: usize, path: &Path) -> String {
     format!("{}/{} {}", index + 1, total, display_name(path))
 }
@@ -472,11 +461,6 @@ struct GalleryApp<'a> {
     init_error: Option<String>,
 }
 
-/// Step the gallery in `dir`, skipping loud over undecodable entries.
-/// The currently shown texture stays until a decodable replacement
-/// exists; clamping at the ends stays put (no wrap, no blank window).
-/// Free function (not a method) so the window-event borrow of
-/// `state` and the cursor fields never alias.
 fn gallery_step(
     entries: &[PathBuf],
     index: &mut usize,
@@ -596,13 +580,6 @@ impl<'a> ApplicationHandler for GalleryApp<'a> {
     }
 }
 
-/// Open a gallery window over `entries` (sorted `.DDS` paths from
-/// [`crate::gallery::collect_dds_entries`]) and block until the user
-/// exits. Shows the first DECODABLE entry; undecodable entries are
-/// skipped loud (`warning: skipping <filename>: <error>`) and browsing
-/// continues. Zero successes is `Err` (all-bad dir exits 1, no window).
-/// ArrowRight/ArrowLeft step (clamped, auto-repeat ignored), Esc and
-/// window close exit cleanly.
 pub fn show_gallery(entries: &[PathBuf]) -> Result<(), String> {
     if entries.is_empty() {
         return Err("no .DDS files to show".to_string());
@@ -647,9 +624,8 @@ pub fn show_gallery(entries: &[PathBuf]) -> Result<(), String> {
     }
 }
 
-// --- `models-3d` mesh path (NEW pipeline; the blit above is untouched) ---
+// --- `models-3d` mesh path (flat-shaded pipeline) ---
 
-/// Mesh shader: MVP uniform, world-space varying, derivative flat shading.
 const MESH_SHADER_SRC: &str = r#"
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -670,17 +646,12 @@ fn vs(@location(0) pos: vec3<f32>) -> VOut {
 fn fs(in: VOut) -> @location(0) vec4<f32> {
     let n = normalize(cross(dpdx(in.world), dpdy(in.world)));
     let l = normalize(vec3<f32>(0.4, 0.8, 0.6));
-    // abs(): culling is OFF so back faces show with flipped normals.
     let d = abs(dot(n, l));
     let base = vec3<f32>(0.55, 0.75, 0.9);
     return vec4<f32>(base * (0.25 + 0.75 * d), 1.0);
 }
 "#;
 
-/// Center + uniformly scale positions into a unit cube (max extent maps
-/// to 1.0). File units/orientation are UNKNOWN, so framing is normalized
-/// instead of assumed. Degenerate (empty, non-finite, zero-extent) input
-/// is `Err`, never a divide-by-zero.
 pub fn fit_positions(positions: &[[f32; 3]]) -> Result<Vec<[f32; 3]>, String> {
     if positions.is_empty() {
         return Err("cannot frame an empty mesh (0 vertices)".to_string());
@@ -718,7 +689,6 @@ pub fn fit_positions(positions: &[[f32; 3]]) -> Result<Vec<[f32; 3]>, String> {
         .collect())
 }
 
-/// Column-major `mat4` multiply: `C = A * B`.
 fn mul4(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let mut out = [[0.0f32; 4]; 4];
     for col in 0..4 {
@@ -732,8 +702,6 @@ fn mul4(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     out
 }
 
-/// Y-rotation by `angle` radians, then a fixed camera (translate `-2.2`
-/// in Z) under a 45-degree perspective: hand-rolled, no new crates.
 fn mvp_for(angle: f32, aspect: f32) -> [[f32; 4]; 4] {
     let (s, c) = angle.sin_cos();
     let rot = [
@@ -753,7 +721,7 @@ fn mvp_for(angle: f32, aspect: f32) -> [[f32; 4]; 4] {
     let proj = [
         [f / aspect, 0.0, 0.0, 0.0],
         [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, far / (far - near), 1.0],
+        [0.0, 0.0, far / (near - far), -1.0],
         [0.0, 0.0, -far * near / (far - near), 0.0],
     ];
     mul4(&proj, &mul4(&view, &rot))
@@ -883,7 +851,6 @@ impl<'window> MeshState<'window> {
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
-            // Culling OFF: file winding is carried as observed (spec R6).
             primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24Plus,
@@ -933,7 +900,6 @@ impl<'window> MeshState<'window> {
     }
 
     fn render(&mut self) {
-        // Slow auto-rotation (~0.6 rad/s about Y).
         let aspect = self.config.width.max(1) as f32 / self.config.height.max(1) as f32;
         let mvp = mvp_for(self.start.elapsed().as_secs_f32() * 0.6, aspect);
         self.queue.write_buffer(&self.uniform_buffer, 0, &mat_bytes(&mvp));
@@ -997,7 +963,6 @@ struct MeshApp {
 
 impl ApplicationHandler for MeshApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // Continuous rotation needs per-frame wakeups.
         event_loop.set_control_flow(ControlFlow::Poll);
         let window = match event_loop.create_window(
             Window::default_attributes()
@@ -1066,10 +1031,6 @@ impl ApplicationHandler for MeshApp {
     }
 }
 
-/// Open a window showing one auto-fitted `.SRM` mesh as a flat-shaded
-/// auto-rotating solid and block until the user closes it (Esc or window
-/// close exits cleanly). Returns `Err` with a displayable message when
-/// the mesh is degenerate or no window/GPU is available (headless).
 pub fn show_mesh(positions: &[[f32; 3]], indices: &[u16], title: &str) -> Result<(), String> {
     let fitted = fit_positions(positions)?;
     if indices.is_empty() {
@@ -1099,9 +1060,774 @@ pub fn show_mesh(positions: &[[f32; 3]], indices: &[u16], title: &str) -> Result
     }
 }
 
+// --- `mesh-textures` + `mesh-batch` paths ---
+
+const MESH_TEXTURED_SHADER_SRC: &str = r#"
+struct VOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+};
+
+struct Uniforms {
+    mvp: mat4x4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(1) @binding(0) var tex_d: texture_2d<f32>;
+@group(1) @binding(1) var tex_n: texture_2d<f32>;
+@group(1) @binding(2) var tex_s: texture_2d<f32>;
+@group(1) @binding(3) var samp: sampler;
+
+@vertex
+fn vs(@location(0) pos: vec3<f32>, @location(1) uv: vec2<f32>) -> VOut {
+    var out: VOut;
+    out.clip = u.mvp * vec4<f32>(pos, 1.0);
+    out.world = pos;
+    out.uv = uv;
+    return out;
+}
+
+@fragment
+fn fs(in: VOut) -> @location(0) vec4<f32> {
+    let geo_n = normalize(cross(dpdx(in.world), dpdy(in.world)));
+
+    let dp1 = dpdx(in.world);
+    let dp2 = dpdy(in.world);
+    let duv1 = dpdx(in.uv);
+    let duv2 = dpdy(in.uv);
+    let T = normalize(dp1 * duv2.y - dp2 * duv1.y + vec3<f32>(1e-6, 0.0, 0.0));
+    let B = normalize(cross(geo_n, T));
+    let tbn = mat3x3<f32>(T, B, geo_n);
+
+    let nm_sample = textureSample(tex_n, samp, in.uv).xyz * 2.0 - 1.0;
+    let n = normalize(tbn * normalize(nm_sample));
+
+    let d = textureSample(tex_d, samp, in.uv).rgb;
+    let s = textureSample(tex_s, samp, in.uv).rgb;
+
+    let light_dir = normalize(vec3<f32>(0.4, 0.8, 0.6));
+    let view_dir = normalize(vec3<f32>(0.0, 0.0, 1.0));
+    let half_v = normalize(light_dir + view_dir);
+
+    let ndl = max(dot(n, light_dir), 0.0);
+    let ndh = max(dot(n, half_v), 0.0);
+    let spec_intensity = s.r;
+    let spec = pow(ndh, 32.0) * spec_intensity;
+
+    let lit = d * (0.20 + 0.80 * ndl) + vec3<f32>(spec);
+    return vec4<f32>(lit, 1.0);
+}
+"#;
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct TVertex {
+    pos: [f32; 3],
+    uv: [f32; 2],
+    _pad: f32,
+}
+
+fn upload_rgba_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    img: &DecodedImage,
+    label: &str,
+) -> wgpu::Texture {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: img.width,
+            height: img.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &img.rgba8,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * img.width),
+            rows_per_image: Some(img.height),
+        },
+        wgpu::Extent3d {
+            width: img.width,
+            height: img.height,
+            depth_or_array_layers: 1,
+        },
+    );
+    tex
+}
+
+/// Validate the shape contract shared by `show_mesh_textured` and
+/// `set_mesh`. Pure; testable without a GPU.
+fn validate_entry_shape(entry: &crate::mesh_entry::MeshEntry) -> Result<(), String> {
+    let positions = &entry.positions;
+    let uvs = &entry.uvs;
+    let material_indices = &entry.material_indices;
+    let indices = &entry.indices;
+    let materials = &entry.materials;
+    let textures = &entry.textures;
+
+    if positions.len() != uvs.len() || positions.len() != material_indices.len() {
+        return Err(format!(
+            "mesh arrays disagree: {} positions, {} uvs, {} material indices",
+            positions.len(),
+            uvs.len(),
+            material_indices.len(),
+        ));
+    }
+    if materials.len() != textures.len() {
+        return Err(format!(
+            "materials/textures disagree: {} materials, {} textures",
+            materials.len(),
+            textures.len(),
+        ));
+    }
+    if indices.is_empty() || indices.len() % 3 != 0 {
+        return Err(format!(
+            "cannot show a mesh with {} indices (one triangle is 3 indices)",
+            indices.len()
+        ));
+    }
+    for (i, &mi) in material_indices.iter().enumerate() {
+        if (mi as usize) == 0 || (mi as usize) > materials.len() {
+            return Err(format!(
+                "vertex {i} references material index {mi} but only {} materials exist (indices are 1-based)",
+                materials.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct TexturedMeshState<'window> {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'window>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    pipeline: wgpu::RenderPipeline,
+    uniform_buffer: wgpu::Buffer,
+    uniform_bind_group: wgpu::BindGroup,
+    texture_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    depth_view: wgpu::TextureView,
+    start: std::time::Instant,
+    vertex_buffer: wgpu::Buffer,
+    index_buffers: Vec<(u32, wgpu::Buffer, u32)>,
+    texture_bind_groups: Vec<wgpu::BindGroup>,
+}
+
+impl<'window> TexturedMeshState<'window> {
+    fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("srm textured depth"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth24Plus,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        tex.create_view(&wgpu::TextureViewDescriptor::default())
+    }
+
+    async fn new(
+        window: Arc<Window>,
+        entry: &crate::mesh_entry::MeshEntry,
+    ) -> Result<Self, String> {
+        let core = open_core(window.clone(), "srm textured").await?;
+        let GpuCore { surface, device, queue, config } = core;
+
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("srm textured mvp"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let uniform_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("srm textured uniform layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("srm textured uniform"),
+            layout: &uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let texture_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("srm textured tex layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("srm textured sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("srm textured"),
+            source: wgpu::ShaderSource::Wgsl(MESH_TEXTURED_SHADER_SRC.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("srm textured pipeline layout"),
+            bind_group_layouts: &[Some(&uniform_layout), Some(&texture_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("srm textured"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<TVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                    ],
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let depth_view = Self::make_depth(&device, config.width, config.height);
+        let dummy = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dummy"),
+            size: 16,
+            usage: wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
+
+        let mut state = Self {
+            window,
+            surface,
+            device,
+            queue,
+            config,
+            pipeline,
+            uniform_buffer,
+            uniform_bind_group,
+            texture_layout,
+            sampler,
+            depth_view,
+            start: std::time::Instant::now(),
+            vertex_buffer: dummy,
+            index_buffers: Vec::new(),
+            texture_bind_groups: Vec::new(),
+        };
+        state.set_mesh(entry)?;
+        Ok(state)
+    }
+
+    fn set_mesh(&mut self, entry: &crate::mesh_entry::MeshEntry) -> Result<(), String> {
+        validate_entry_shape(entry)?;
+
+        let fitted = fit_positions(&entry.positions)?;
+        let vertices: Vec<TVertex> = fitted
+            .iter()
+            .zip(entry.uvs.iter())
+            .map(|(p, uv)| TVertex {
+                pos: *p,
+                uv: [uv[0] as f32 / 255.0, uv[1] as f32 / 255.0],
+                _pad: 0.0,
+            })
+            .collect();
+        let vbytes: &[u8] = bytemuck::cast_slice(&vertices);
+        let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("srm textured vertices"),
+            size: vbytes.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&vertex_buffer, 0, vbytes);
+
+        let mut ranges: Vec<(usize, Vec<u16>)> =
+            (0..entry.materials.len()).map(|i| (i + 1, Vec::new())).collect();
+        for tri in entry.indices.chunks_exact(3) {
+            let m = entry.material_indices[tri[0] as usize];
+            if let Some((_, v)) = ranges.iter_mut().find(|(idx, _)| *idx == m as usize) {
+                v.extend_from_slice(tri);
+            }
+        }
+        let mut index_buffers = Vec::with_capacity(ranges.len());
+        for (mat_idx, tri_indices) in &ranges {
+            if tri_indices.is_empty() {
+                continue;
+            }
+            let ibytes: Vec<u8> = tri_indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("srm textured indices"),
+                size: ibytes.len() as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.queue.write_buffer(&buf, 0, &ibytes);
+            index_buffers.push((*mat_idx as u32, buf, tri_indices.len() as u32));
+        }
+
+        let mut texture_bind_groups = Vec::with_capacity(entry.textures.len());
+        for (i, t) in entry.textures.iter().enumerate() {
+            let d = upload_rgba_texture(&self.device, &self.queue, &t.diffuse, "diffuse");
+            let n = upload_rgba_texture(&self.device, &self.queue, &t.normal, "normal");
+            let s = upload_rgba_texture(&self.device, &self.queue, &t.specular, "specular");
+            let dv = d.create_view(&wgpu::TextureViewDescriptor::default());
+            let nv = n.create_view(&wgpu::TextureViewDescriptor::default());
+            let sv = s.create_view(&wgpu::TextureViewDescriptor::default());
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(&format!("mat {i} textures")),
+                layout: &self.texture_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&dv) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&nv) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&sv) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                ],
+            });
+            texture_bind_groups.push(bg);
+        }
+
+        self.vertex_buffer = vertex_buffer;
+        self.index_buffers = index_buffers;
+        self.texture_bind_groups = texture_bind_groups;
+        Ok(())
+    }
+
+    fn resize(&mut self, size: PhysicalSize<u32>) {
+        if size.width > 0 && size.height > 0 {
+            self.config.width = size.width;
+            self.config.height = size.height;
+            self.surface.configure(&self.device, &self.config);
+            self.depth_view = Self::make_depth(&self.device, size.width, size.height);
+        }
+    }
+
+    fn render(&mut self) {
+        let aspect = self.config.width.max(1) as f32 / self.config.height.max(1) as f32;
+        let mvp = mvp_for(self.start.elapsed().as_secs_f32() * 0.6, aspect);
+        self.queue.write_buffer(&self.uniform_buffer, 0, &mat_bytes(&mvp));
+
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => return,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("srm textured"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("srm textured"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                multiview_mask: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
+            for (mat_idx, ibuf, count) in &self.index_buffers {
+                let bg_idx = (*mat_idx as usize) - 1;
+                if bg_idx < self.texture_bind_groups.len() {
+                    pass.set_bind_group(1, &self.texture_bind_groups[bg_idx], &[]);
+                    pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint16);
+                    pass.draw_indexed(0..*count, 0, 0..1);
+                }
+            }
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.queue.present(frame);
+    }
+}
+
+struct TexturedMeshApp {
+    entry: crate::mesh_entry::MeshEntry,
+    state: Option<TexturedMeshState<'static>>,
+    init_error: Option<String>,
+}
+
+impl ApplicationHandler for TexturedMeshApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(ControlFlow::Poll);
+        let window = match event_loop.create_window(
+            Window::default_attributes()
+                .with_title(&self.entry.title)
+                .with_inner_size(PhysicalSize::new(800, 600)),
+        ) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                self.init_error = Some(format!("cannot create window: {e}"));
+                event_loop.exit();
+                return;
+            }
+        };
+        match pollster::block_on(TexturedMeshState::new(window, &self.entry)) {
+            Ok(state) => self.state = Some(state),
+            Err(e) => {
+                self.init_error = Some(e);
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let Some(state) = &mut self.state else { return };
+        if window_id != state.window.id() { return; }
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                state.resize(size);
+                state.window.request_redraw();
+            }
+            WindowEvent::RedrawRequested => state.render(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state != ElementState::Pressed || event.repeat { return; }
+                if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+                    event_loop.exit();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = &self.state {
+            state.window.request_redraw();
+        }
+    }
+}
+
+pub fn show_mesh_textured(
+    positions: &[[f32; 3]],
+    uvs: &[[u8; 2]],
+    indices: &[u16],
+    material_indices: &[u8],
+    materials: &[crate::srm::Material],
+    textures: &[crate::textures_object::MaterialTextures],
+    title: &str,
+) -> Result<(), String> {
+    let entry = crate::mesh_entry::MeshEntry {
+        srm_path: std::path::PathBuf::from(title),
+        title: title.to_string(),
+        positions: positions.to_vec(),
+        uvs: uvs.to_vec(),
+        indices: indices.to_vec(),
+        material_indices: material_indices.to_vec(),
+        materials: materials.to_vec(),
+        textures: textures.to_vec(),
+    };
+    validate_entry_shape(&entry)?;
+    let event_loop =
+        EventLoop::new().map_err(|e| format!("cannot create window event loop: {e}"))?;
+    let mut app = TexturedMeshApp { entry, state: None, init_error: None };
+    event_loop
+        .run_app(&mut app)
+        .map_err(|e| format!("window event loop failed: {e}"))?;
+    match app.init_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+// --- `mesh-batch` gallery ---
+
+fn mesh_gallery_step(
+    entries: &[PathBuf],
+    tex_dir: &Path,
+    index: &mut usize,
+    current: &mut crate::mesh_entry::MeshEntry,
+    state: &mut TexturedMeshState<'_>,
+    dir: Direction,
+) {
+    let total = entries.len();
+    let mut next = *index;
+    loop {
+        let candidate = step_index(next, total, dir);
+        if candidate == next {
+            break;
+        }
+        next = candidate;
+        match crate::mesh_entry::load(&entries[next], tex_dir) {
+            Ok(entry) => match state.set_mesh(&entry) {
+                Ok(()) => {
+                    let label = format!("{}/{} {}", next + 1, total, entry.title);
+                    state.window.set_title(&label);
+                    println!("{label}");
+                    *current = entry;
+                    *index = next;
+                    state.window.request_redraw();
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("warning: skipping {}: {e}", entries[next].display());
+                }
+            },
+            Err(e) => {
+                eprintln!("warning: skipping {}: {e}", entries[next].display());
+            }
+        }
+    }
+}
+
+struct MeshGalleryApp<'a> {
+    entries: &'a [PathBuf],
+    tex_dir: &'a Path,
+    index: usize,
+    current: crate::mesh_entry::MeshEntry,
+    state: Option<TexturedMeshState<'static>>,
+    init_error: Option<String>,
+}
+
+impl<'a> ApplicationHandler for MeshGalleryApp<'a> {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(ControlFlow::Poll);
+        let total = self.entries.len();
+        let label = format!("{}/{} {}", self.index + 1, total, self.current.title);
+        let window = match event_loop.create_window(
+            Window::default_attributes()
+                .with_title(&label)
+                .with_inner_size(PhysicalSize::new(800, 600)),
+        ) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                self.init_error = Some(format!("cannot create window: {e}"));
+                event_loop.exit();
+                return;
+            }
+        };
+        match pollster::block_on(TexturedMeshState::new(window, &self.current)) {
+            Ok(state) => {
+                println!("{label}");
+                self.state = Some(state);
+            }
+            Err(e) => {
+                self.init_error = Some(e);
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let Some(state) = &mut self.state else { return };
+        if window_id != state.window.id() { return; }
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                state.resize(size);
+                state.window.request_redraw();
+            }
+            WindowEvent::RedrawRequested => state.render(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state != ElementState::Pressed || event.repeat { return; }
+                match event.logical_key {
+                    Key::Named(NamedKey::ArrowRight) => mesh_gallery_step(
+                        self.entries,
+                        self.tex_dir,
+                        &mut self.index,
+                        &mut self.current,
+                        state,
+                        Direction::Next,
+                    ),
+                    Key::Named(NamedKey::ArrowLeft) => mesh_gallery_step(
+                        self.entries,
+                        self.tex_dir,
+                        &mut self.index,
+                        &mut self.current,
+                        state,
+                        Direction::Prev,
+                    ),
+                    Key::Named(NamedKey::Escape) => event_loop.exit(),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(state) = &self.state {
+            state.window.request_redraw();
+        }
+    }
+}
+
+pub fn show_mesh_gallery(entries: &[PathBuf], tex_dir: &Path) -> Result<(), String> {
+    if entries.is_empty() {
+        return Err("no .SRM files to show".to_string());
+    }
+    let mut first: Option<(usize, crate::mesh_entry::MeshEntry)> = None;
+    for (index, path) in entries.iter().enumerate() {
+        match crate::mesh_entry::load(path, tex_dir) {
+            Ok(entry) => {
+                first = Some((index, entry));
+                break;
+            }
+            Err(e) => {
+                eprintln!("warning: skipping {}: {e}", path.display());
+            }
+        }
+    }
+    let Some((index, current)) = first else {
+        let dir = entries[0]
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        return Err(format!(
+            "no loadable .SRM in directory '{dir}' ({} entries, all skipped)",
+            entries.len()
+        ));
+    };
+    let event_loop =
+        EventLoop::new().map_err(|e| format!("cannot create window event loop: {e}"))?;
+    let mut app = MeshGalleryApp {
+        entries,
+        tex_dir,
+        index,
+        current,
+        state: None,
+        init_error: None,
+    };
+    event_loop
+        .run_app(&mut app)
+        .map_err(|e| format!("window event loop failed: {e}"))?;
+    match app.init_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod mesh_tests {
-    use super::fit_positions;
+    use super::{fit_positions, mvp_for, validate_entry_shape};
 
     #[test]
     fn autofit_centers_and_scales_to_unit_extent() {
@@ -1118,5 +1844,69 @@ mod mesh_tests {
         assert!(fit_positions(&[[1.0, 1.0, 1.0]; 3]).is_err());
         assert!(fit_positions(&[[f32::INFINITY, 0.0, 0.0], [0.0, 0.0, 0.0]]).is_err());
     }
-}
 
+    #[test]
+    fn origin_lands_in_front_of_camera() {
+        let m = mvp_for(0.0, 1.0);
+        let clip_z = m[3][2];
+        let clip_w = m[3][3];
+        assert!(
+            clip_w > 0.0,
+            "clip.w must be positive for a point in front of the camera, got {clip_w}"
+        );
+        let ndc_z = clip_z / clip_w;
+        assert!(
+            (0.0..=1.0).contains(&ndc_z),
+            "NDC z must lie in [0, 1] for WebGPU, got {ndc_z}"
+        );
+    }
+
+    #[test]
+    fn validate_entry_shape_rejects_mismatched_arrays() {
+        let entry = crate::mesh_entry::MeshEntry {
+            srm_path: std::path::PathBuf::from("x.srm"),
+            title: "x.srm".to_string(),
+            positions: vec![[0.0; 3]; 3],
+            uvs: vec![[0, 0]; 2], // wrong length
+            indices: vec![0, 1, 2],
+            material_indices: vec![1, 1, 1],
+            materials: Vec::new(),
+            textures: Vec::new(),
+        };
+        let e = validate_entry_shape(&entry).unwrap_err();
+        assert!(e.contains("mesh arrays disagree"));
+    }
+
+    #[test]
+    fn validate_entry_shape_rejects_out_of_range_material() {
+        let entry = crate::mesh_entry::MeshEntry {
+            srm_path: std::path::PathBuf::from("x.srm"),
+            title: "x.srm".to_string(),
+            positions: vec![[0.0; 3]; 3],
+            uvs: vec![[0, 0]; 3],
+            indices: vec![0, 1, 2],
+            material_indices: vec![2, 2, 2], // but only 1 material
+            materials: vec![crate::srm::Material { name: "M".into(), flags: 0x07 }],
+            textures: vec![],
+        };
+        let e = validate_entry_shape(&entry).unwrap_err();
+        // Fails first on the materials/textures length mismatch.
+        assert!(e.contains("materials/textures disagree") || e.contains("references material index"));
+    }
+
+    #[test]
+    fn validate_entry_shape_rejects_bad_indices() {
+        let entry = crate::mesh_entry::MeshEntry {
+            srm_path: std::path::PathBuf::from("x.srm"),
+            title: "x.srm".to_string(),
+            positions: vec![[0.0; 3]; 3],
+            uvs: vec![[0, 0]; 3],
+            indices: vec![0, 1], // not multiple of 3
+            material_indices: vec![1, 1, 1],
+            materials: Vec::new(),
+            textures: Vec::new(),
+        };
+        let e = validate_entry_shape(&entry).unwrap_err();
+        assert!(e.contains("indices") || e.contains("materials/textures"));
+    }
+}

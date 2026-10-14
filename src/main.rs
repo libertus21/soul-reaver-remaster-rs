@@ -1,5 +1,6 @@
 //! DDS texture viewer (`dds-texture-viewer` + `bc7-cpu-decode` +
-//! `texture-gallery` + `bigfile-index` + `models-3d`).
+//! `texture-gallery` + `bigfile-index` + `models-3d` + `mesh-textures`
+//! + `mesh-batch`).
 //!
 //! Usage: `cargo run -- <path-to-DDS | path-to-directory>` — a file opens
 //! a window showing that texture; a directory opens a gallery browsing
@@ -12,24 +13,35 @@
 //! layout summary (a custom layout, NOT the SR1PC bigfile layout).
 //! `cargo run -- --mesh <FILE.SRM>` parses one SR1-remaster mesh
 //! (positions + triangle indices only) and shows it as a flat-shaded
-//! auto-rotating solid (Esc or window close to exit). Game paths arrive via CLI
-//! arg at runtime only and are never committed. Gallery mode skips
-//! undecodable entries loud and continues; single-file and `--show`
-//! modes die loud on the first error (an archive index must be exact,
-//! not best-effort). Every [`dds::ViewerError`],
-//! [`bigfile::BigfileError`], [`textures::TexturesError`], and
-//! [`srm::SrmError`] maps to
-//! a clear stderr message + `ExitCode(1)`; closing the window exits `0`.
+//! auto-rotating solid (Esc or window close to exit).
+//! `cargo run -- --mesh-textured <FILE.SRM> --tex-dir <TEX>` parses the
+//! same mesh plus UVs, material indices, and material records, loads
+//! the three DDS textures per material from `<TEX>`, and shows it
+//! textured and lit (Esc or window close to exit).
+//! `cargo run -- --mesh-all <OBJECT_dir> --tex-dir <TEX>` browses every
+//! `.SRM` in a directory as a textured mesh gallery (ArrowLeft /
+//! ArrowRight step, Esc exits 0).
+//! Game paths arrive via CLI arg at runtime only and are never
+//! committed. Gallery mode skips undecodable entries loud and
+//! continues; single-file and `--show` modes die loud on the first
+//! error (an archive index must be exact, not best-effort). Every
+//! [`dds::ViewerError`], [`bigfile::BigfileError`],
+//! [`textures::TexturesError`], [`srm::SrmError`],
+//! [`textures_object::TextureError`], and [`mesh_entry::MeshEntryError`]
+//! maps to a clear stderr message + `ExitCode(1)`; closing the window
+//! exits `0`.
 
 mod bigfile;
 mod dds;
 mod gallery;
+mod mesh_entry;
 mod render;
 // Transitional: Task 2 wires the mesh arm; until then the parser is
 // test-only so dead-code warnings are allowed here, nowhere else.
 #[allow(dead_code)]
 mod srm;
 mod textures;
+mod textures_object;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -45,12 +57,20 @@ fn main() -> ExitCode {
     if args.first().is_some_and(|a| a == "--mesh") {
         return run_mesh(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--mesh-textured") {
+        return run_mesh_textured(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "--mesh-all") {
+        return run_mesh_all(&args[1..]);
+    }
     let Some(arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs <path-to-DDS | path-to-directory>");
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --list");
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --show <index|hash>");
         eprintln!("   or: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tlist");
         eprintln!("   or: soul-reaver-remaster-rs --mesh <FILE.SRM>");
+        eprintln!("   or: soul-reaver-remaster-rs --mesh-textured <FILE.SRM> --tex-dir <TEX>");
+        eprintln!("   or: soul-reaver-remaster-rs --mesh-all <OBJECT_dir> --tex-dir <TEX>");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
         eprintln!("directory of .DDS files as a gallery (ArrowRight/ArrowLeft to");
         eprintln!("step, Esc or window close to exit).");
@@ -79,7 +99,7 @@ fn main() -> ExitCode {
         eprintln!("error: no such file or directory: {arg}");
         return ExitCode::from(1);
     }
-    let texture = match dds::load_texture(&path) {
+    let texture = match dds::load_texture(path) {
         Ok(texture) => texture,
         Err(e) => {
             eprintln!("error: {e}");
@@ -214,9 +234,6 @@ fn run_textures(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // Task-2 hunt verdict: no table identified (specified no-go). `--tlist`
-    // carries the summary on stdout; `--tshow` reports the selector loud.
-    // Both name the file and the next candidate on stderr and exit 1.
     if tlist {
         println!("{}", layout.summary());
     } else {
@@ -273,9 +290,103 @@ fn run_mesh(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `--mesh-textured <FILE.SRM> --tex-dir <TEX>`: parse one SR1-remaster
+/// mesh (positions + UVs + material indices + material records +
+/// triangle indices), load the three DDS textures per material from
+/// `<TEX>`, and show it textured and lit. Any parse/load failure is a
+/// loud stderr error + exit 1 with no window; Esc/window close exits 0.
+fn run_mesh_textured(args: &[String]) -> ExitCode {
+    if args.len() != 3 || args[1] != "--tex-dir" {
+        eprintln!("usage: soul-reaver-remaster-rs --mesh-textured <FILE.SRM> --tex-dir <TEX>");
+        eprintln!(
+            "error: --mesh-textured expects exactly <SRM> --tex-dir <TEX>, got {} arg(s)",
+            args.len()
+        );
+        return ExitCode::from(1);
+    }
+    let srm_path = Path::new(&args[0]);
+    let tex_dir = Path::new(&args[2]);
+    if !srm_path.is_file() {
+        eprintln!("error: no such file: {}", srm_path.display());
+        return ExitCode::from(1);
+    }
+    if !tex_dir.is_dir() {
+        eprintln!("error: no such directory: {}", tex_dir.display());
+        return ExitCode::from(1);
+    }
+    let entry = match mesh_entry::load(srm_path, tex_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: {}: {e}", srm_path.display());
+            return ExitCode::from(1);
+        }
+    };
+    println!(
+        "{} vertices, {} triangles, {} materials",
+        entry.positions.len(),
+        entry.indices.len() / 3,
+        entry.materials.len()
+    );
+    if let Err(e) = render::show_mesh_textured(
+        &entry.positions,
+        &entry.uvs,
+        &entry.indices,
+        &entry.material_indices,
+        &entry.materials,
+        &entry.textures,
+        &entry.title,
+    ) {
+        eprintln!("error: {}: {e}", srm_path.display());
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `--mesh-all <OBJECT_dir> --tex-dir <TEX>`: browse every `.SRM` in a
+/// directory as a textured mesh gallery. ArrowLeft / ArrowRight step
+/// (clamped, no wrap), unloadable entries are skipped LOUD, Esc / close
+/// exits 0. Zero loadable entries exits 1 with no window.
+fn run_mesh_all(args: &[String]) -> ExitCode {
+    if args.len() != 3 || args[1] != "--tex-dir" {
+        eprintln!("usage: soul-reaver-remaster-rs --mesh-all <OBJECT_dir> --tex-dir <TEX>");
+        eprintln!(
+            "error: --mesh-all expects exactly <OBJECT_dir> --tex-dir <TEX>, got {} arg(s)",
+            args.len()
+        );
+        return ExitCode::from(1);
+    }
+    let obj_dir = Path::new(&args[0]);
+    let tex_dir = Path::new(&args[2]);
+    if !obj_dir.is_dir() {
+        eprintln!("error: no such directory: {}", obj_dir.display());
+        return ExitCode::from(1);
+    }
+    if !tex_dir.is_dir() {
+        eprintln!("error: no such directory: {}", tex_dir.display());
+        return ExitCode::from(1);
+    }
+    let entries = match srm::collect_srm_entries(obj_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: {}: {e}", obj_dir.display());
+            return ExitCode::from(1);
+        }
+    };
+    println!(
+        "{} .SRM files in {}",
+        entries.len(),
+        obj_dir.display()
+    );
+    if let Err(e) = render::show_mesh_gallery(&entries, tex_dir) {
+        eprintln!("error: {e}");
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
 #[cfg(test)]
 mod cli_tests {
-    use super::run_mesh;
+    use super::{run_mesh, run_mesh_all, run_mesh_textured};
     use std::process::ExitCode;
 
     fn write_tmp(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
@@ -302,5 +413,82 @@ mod cli_tests {
         short.extend_from_slice(&[0u8; 8]);
         let cut = write_tmp(&tmp, "cut.srm", &short);
         assert_eq!(run_mesh(&[cut]), ExitCode::from(1));
+    }
+
+    #[test]
+    fn mesh_textured_wrong_arg_count_or_order_exit_1() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let srm = write_tmp(&tmp, "x.srm", b"NOPE");
+        assert_eq!(run_mesh_textured(&[srm.clone()]), ExitCode::from(1));
+        assert_eq!(
+            run_mesh_textured(&[srm.clone(), "--wrong".to_string(), tmp.path().to_string_lossy().into_owned()]),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            run_mesh_textured(&[srm.clone(), "--tex-dir".to_string(), tmp.path().to_string_lossy().into_owned(), "extra".to_string()]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn mesh_textured_missing_files_exit_1() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let absent_srm = tmp.path().join("absent.srm").to_string_lossy().into_owned();
+        let tex_dir = tmp.path().to_string_lossy().into_owned();
+        assert_eq!(
+            run_mesh_textured(&[absent_srm, "--tex-dir".to_string(), tex_dir]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn mesh_textured_missing_tex_dir_exit_1() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let srm = write_tmp(&tmp, "x.srm", b"NOPE");
+        let absent_dir = tmp.path().join("no-such-dir").to_string_lossy().into_owned();
+        assert_eq!(
+            run_mesh_textured(&[srm, "--tex-dir".to_string(), absent_dir]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn mesh_all_wrong_args_exit_1() {
+        assert_eq!(run_mesh_all(&[]), ExitCode::from(1));
+        assert_eq!(run_mesh_all(&["dir".to_string()]), ExitCode::from(1));
+        assert_eq!(
+            run_mesh_all(&["dir".to_string(), "wrong".to_string(), "tex".to_string()]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn mesh_all_missing_dirs_exit_1() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().to_string_lossy().into_owned();
+        let absent = tmp
+            .path()
+            .join("no-such")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            run_mesh_all(&[absent.clone(), "--tex-dir".into(), real.clone()]),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            run_mesh_all(&[real, "--tex-dir".into(), absent]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn mesh_all_empty_srm_dir_exit_1() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("notes.txt"), b"x").unwrap();
+        let dir = tmp.path().to_string_lossy().into_owned();
+        assert_eq!(
+            run_mesh_all(&[dir.clone(), "--tex-dir".into(), dir]),
+            ExitCode::from(1)
+        );
     }
 }
