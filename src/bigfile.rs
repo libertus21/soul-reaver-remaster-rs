@@ -325,22 +325,23 @@ mod tests {
     fn count_above_sanity_limit_is_rejected() {
         let mut bytes = vec![0u8; 8];
         bytes[0..4].copy_from_slice(&(MAX_ENTRIES + 1).to_le_bytes());
-        assert!(matches!(
-            parse_index(&bytes, 8),
-            Err(BigfileError::NotBigfile(_))
-        ));
+        let err = parse_index(&bytes, 8).expect_err("insane count must fail loud");
+        assert!(
+            err.to_string().starts_with("not a BIGFILE index:"),
+            "S2 HELD row (no count-word reader edge): own text stays, got: {err}"
+        );
     }
 
     #[test]
     fn truncated_count_word_is_rejected() {
-        assert!(matches!(
-            parse_index(&[0x01, 0x02], 2),
-            Err(BigfileError::NotBigfile(_))
-        ));
-        assert!(matches!(
-            parse_index(&[], 0),
-            Err(BigfileError::NotBigfile(_))
-        ));
+        for short in [vec![0x01, 0x02], vec![]] {
+            let len = short.len() as u64;
+            let err = parse_index(&short, len).expect_err("short count must fail loud");
+            assert!(
+                err.to_string().starts_with("not a BIGFILE index:"),
+                "S2 HELD row (no count-word reader edge): own text stays, got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -410,7 +411,50 @@ mod tests {
             offset: 64,
             length: 8,
         };
-        assert!(matches!(read_entry(&path, &bad), Err(BigfileError::BadEntry(_))));
+        let err = read_entry(&path, &bad).expect_err("past-EOF read must fail loud");
+        assert!(
+            err.to_string().starts_with("bad bigfile entry:"),
+            "S2 HELD row (no bounds-check edge): own text stays, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_index_table_stage_messages_are_held() {
+        // Declares 2 entries but the file is physically shorter than the
+        // table: the on-disk table stage fails loud with our own prefix.
+        let full = synthetic_container(&[(1, 10, 100), (2, 10, 200)], 512);
+        let path = write_temp("index-table-short", &full[..10]);
+        let err = load_index(&path).expect_err("short table file must fail loud");
+        assert!(
+            err.to_string().starts_with("not a BIGFILE index:"),
+            "S2 HELD row (no table-reader edge): own text stays, got: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+        // Fewer than 4 bytes: not even the count word is present.
+        let tiny = write_temp("index-table-tiny", &[0x01, 0x02]);
+        let err = load_index(&tiny).expect_err("tiny file must fail loud");
+        assert!(
+            err.to_string().starts_with("not a BIGFILE index:"),
+            "S2 HELD row (no count-word reader edge): own text stays, got: {err}"
+        );
+        let _ = std::fs::remove_file(&tiny);
+    }
+
+    #[test]
+    fn short_read_maps_to_held_io_prefix() {
+        // A real OS short read (past EOF) surfaces through the held
+        // post-open IO variant — never as a silent short buffer.
+        let path = write_temp("short-read", b"ABCDEFGH");
+        let mut file = File::open(&path).expect("synthetic file must open");
+        file.seek(SeekFrom::Start(6)).expect("seek must succeed");
+        let mut buf = [0u8; 8];
+        let io_err = file.read_exact(&mut buf).expect_err("read past EOF must fail");
+        let held = BigfileError::Io(io_err);
+        assert!(
+            held.to_string().starts_with("cannot read bigfile:"),
+            "S2 HELD rows (no seek/read-cluster edge): own text stays, got: {held}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
