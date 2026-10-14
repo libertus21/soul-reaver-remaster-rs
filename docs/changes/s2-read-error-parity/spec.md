@@ -43,10 +43,10 @@ Rules: the adopted prefix is the original O2 format with the archive identity su
 ## Acceptance scenarios
 
 - [ ] **Proven row:** VACUOUS for this slice — no row resolved to PROVEN, so Task 3 makes zero production-line changes (box rule).
-- [ ] **Held row:** every row keeps its current prefix (to be pinned by test in Task 4); stderr still names the entry/detail; exit 1.
-- [ ] **Happy path unchanged:** valid synthetic index still lists / reads exact bytes; existing `cargo test` suite stays green.
-- [ ] **Unit level:** `cargo test` covers each parity-table row with message-prefix assertions on synthetic bytes (hold pins, Task 4).
-- [ ] **Legal:** `git status --short` shows only intended source/doc/test files; no listings, DBs, or game data committed.
+- [x] **Held row:** every row keeps its current prefix (pinned by test in Task 4); stderr still names the entry/detail; exit 1.
+- [x] **Happy path unchanged:** valid synthetic index still lists / reads exact bytes; existing `cargo test` suite stays green (88 passed).
+- [x] **Unit level:** `cargo test` covers each parity-table row with message-prefix assertions on synthetic bytes (hold pins, Task 4).
+- [x] **Legal:** `git status --short` shows only intended source/doc/test files; no listings, DBs, or game data committed.
 
 ## Next step
 

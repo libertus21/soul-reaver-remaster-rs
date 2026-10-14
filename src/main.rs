@@ -409,6 +409,12 @@ mod cli_tests {
             run_bigfile(&[trunc.to_string_lossy().into_owned(), "--list".to_string()]),
             ExitCode::from(1)
         );
+        // S2 HELD rows keep the loud-nonzero contract on the --show path too.
+        let absent_show = tmp.path().join("absent-show.big").to_string_lossy().into_owned();
+        assert_eq!(
+            run_bigfile(&[absent_show, "--show".to_string(), "0".to_string()]),
+            ExitCode::from(1)
+        );
     }
 
     #[test]
