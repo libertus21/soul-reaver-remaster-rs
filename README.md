@@ -100,9 +100,17 @@ extracted files, decompiled code, or database files.
   truncated headers, insane counts, and short vertex/face data fail
   loud (stderr + exit 1, no window). Mesh bytes stay in process memory
   (never written to disk or repo); tests use synthetic bytes only.
-  Playtest file: the 86-vertex / 56-triangle loose SRM named by relative
-  name in `docs/changes/models-3d/proposal.md`, resolved against the
-  user's own install at runtime.
+   Playtest file: the 86-vertex / 56-triangle loose SRM named by relative
+   name in `docs/changes/models-3d/proposal.md`, resolved against the
+   user's own install at runtime.
+- `s1-bigfile-loader` (playtest-accepted error parity, SR1 only):
+  open-stage failures (`--bigfile <absent> --list`) report the
+  original loader's load-failure prefix —
+  `Can't load big file named "<path>" (<OS detail>)`, exit 1. Five
+  post-open failure rows keep their existing messages (stage mapping
+  unconfirmed — no call-edge evidence, held by regression tests);
+  termination behavior unchanged. `cargo test` 86/86 green on
+  synthetic bytes (see `docs/changes/s1-bigfile-loader/archive.md`).
 
 ## What's missing
 
@@ -120,6 +128,10 @@ extracted files, decompiled code, or database files.
 - [ ] 3D models (NEXT slices): skeleton/animation, room meshes,
       multi-mesh browsing, textured meshes — scoping probe first, same
       slice discipline (proposal → spec → tasks → code → playtest).
+- [ ] Binary loader follow-ups (UNSCOPED, TBD by user): post-open
+      message parity needs call-edge tracing (S2 candidate);
+      launcher-to-`run` default-archive linkage (S3 candidate) — each
+      needs its own slice cycle, same slice discipline.
 - [ ] sRGB correctness pass, resize handling, full mipmap-chain UI —
       still deferred; `dxgiFormat` 99 (BC7 sRGB) still fails loud.
 - [ ] Visual playtest confirmation against a reference DDS viewer
