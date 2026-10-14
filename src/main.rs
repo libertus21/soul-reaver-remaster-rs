@@ -1,5 +1,5 @@
 //! DDS texture viewer (`dds-texture-viewer` + `bc7-cpu-decode` +
-//! `texture-gallery` + `bigfile-index`).
+//! `texture-gallery` + `bigfile-index` + `models-3d`).
 //!
 //! Usage: `cargo run -- <path-to-DDS | path-to-directory>` — a file opens
 //! a window showing that texture; a directory opens a gallery browsing
@@ -10,18 +10,25 @@
 //! the same window when it is a DDS texture. `cargo run -- --textures
 //! <TEXTURES.BIG> --tlist` prints the remaster textures-container
 //! layout summary (a custom layout, NOT the SR1PC bigfile layout).
-//! Game paths arrive via CLI
+//! `cargo run -- --mesh <FILE.SRM>` parses one SR1-remaster mesh
+//! (positions + triangle indices only) and shows it as a flat-shaded
+//! auto-rotating solid (Esc or window close to exit). Game paths arrive via CLI
 //! arg at runtime only and are never committed. Gallery mode skips
 //! undecodable entries loud and continues; single-file and `--show`
 //! modes die loud on the first error (an archive index must be exact,
 //! not best-effort). Every [`dds::ViewerError`],
-//! [`bigfile::BigfileError`], and [`textures::TexturesError`] maps to
+//! [`bigfile::BigfileError`], [`textures::TexturesError`], and
+//! [`srm::SrmError`] maps to
 //! a clear stderr message + `ExitCode(1)`; closing the window exits `0`.
 
 mod bigfile;
 mod dds;
 mod gallery;
 mod render;
+// Transitional: Task 2 wires the mesh arm; until then the parser is
+// test-only so dead-code warnings are allowed here, nowhere else.
+#[allow(dead_code)]
+mod srm;
 mod textures;
 
 use std::path::Path;
@@ -35,11 +42,15 @@ fn main() -> ExitCode {
     if args.first().is_some_and(|a| a == "--textures") {
         return run_textures(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--mesh") {
+        return run_mesh(&args[1..]);
+    }
     let Some(arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs <path-to-DDS | path-to-directory>");
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --list");
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --show <index|hash>");
         eprintln!("   or: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tlist");
+        eprintln!("   or: soul-reaver-remaster-rs --mesh <FILE.SRM>");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
         eprintln!("directory of .DDS files as a gallery (ArrowRight/ArrowLeft to");
         eprintln!("step, Esc or window close to exit).");
@@ -218,4 +229,78 @@ fn run_textures(args: &[String]) -> ExitCode {
         textures::NEXT_CANDIDATE
     );
     ExitCode::from(1)
+}
+
+/// `--mesh <FILE.SRM>`: parse one SR1-remaster mesh (positions +
+/// triangle indices only, bytes stay in process memory) and show it as
+/// a flat-shaded auto-rotating solid. Any parse failure is a loud
+/// stderr error + exit 1 with no window; Esc/window close exits 0.
+fn run_mesh(args: &[String]) -> ExitCode {
+    if args.len() != 1 {
+        eprintln!("usage: soul-reaver-remaster-rs --mesh <FILE.SRM>");
+        if args.is_empty() {
+            eprintln!("error: --mesh expects exactly one file argument, got 0");
+        } else {
+            eprintln!("error: --mesh expects exactly one file argument, got {}", args.len());
+        }
+        return ExitCode::from(1);
+    }
+    let path = Path::new(&args[0]);
+    if !path.is_file() {
+        eprintln!("error: no such file: {}", path.display());
+        return ExitCode::from(1);
+    }
+    let mesh = match srm::load(path) {
+        Ok(mesh) => mesh,
+        Err(e) => {
+            eprintln!("error: {}: {e}", path.display());
+            return ExitCode::from(1);
+        }
+    };
+    println!(
+        "{} vertices, {} triangles",
+        mesh.positions.len(),
+        mesh.indices.len() / 3
+    );
+    let title = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    if let Err(e) = render::show_mesh(&mesh.positions, &mesh.indices, &title) {
+        eprintln!("error: {}: {e}", path.display());
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::run_mesh;
+    use std::process::ExitCode;
+
+    fn write_tmp(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).expect("synthetic mesh file must be writable");
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn mesh_missing_and_extra_args_are_loud_exit_1() {
+        assert_eq!(run_mesh(&[]), ExitCode::from(1));
+        assert_eq!(run_mesh(&["a.srm".to_string(), "b.srm".to_string()]), ExitCode::from(1));
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let absent = tmp.path().join("absent.srm").to_string_lossy().into_owned();
+        assert_eq!(run_mesh(&[absent]), ExitCode::from(1));
+    }
+
+    #[test]
+    fn mesh_bad_magic_and_truncated_files_are_loud_exit_1() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let bad = write_tmp(&tmp, "bad.srm", b"NOPE-not-a-mesh-at-all-....");
+        assert_eq!(run_mesh(&[bad]), ExitCode::from(1));
+        let mut short = b"SRM\x01".to_vec();
+        short.extend_from_slice(&[0u8; 8]);
+        let cut = write_tmp(&tmp, "cut.srm", &short);
+        assert_eq!(run_mesh(&[cut]), ExitCode::from(1));
+    }
 }

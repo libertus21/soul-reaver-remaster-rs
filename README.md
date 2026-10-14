@@ -87,6 +87,22 @@ extracted files, decompiled code, or database files.
   nothing decoded). A tail + data-window hunt found no entry table, so
   this slice lands as docs + loud stubs + synthetic-only tests; next
   candidate: the SR2-side sibling named in the error.
+- `models-3d` (playtest-accepted on a real mesh): `cargo run -- --mesh
+  <FILE.SRM>` parses one SR1-remaster loose mesh (format verdict: magic
+  `SRM\x01`, 44-byte shader records, 32-byte material records, bone
+  block, 128 flag bytes, 32-byte vertex stride, `u16` triangles — both
+  planning probes land exactly on EOF) for positions + triangle indices
+  ONLY (normals, UVs, weights, materials, bones skipped as opaque byte
+  ranges) and shows it as a flat-shaded auto-rotating solid (fixed
+  perspective, derivative face normals, culling OFF, depth ON, CPU
+  auto-fit to a unit cube, ~0.6 rad/s; Esc or window close exits 0). It
+  prints `N vertices, M triangles` (counts only) to stdout; bad magic,
+  truncated headers, insane counts, and short vertex/face data fail
+  loud (stderr + exit 1, no window). Mesh bytes stay in process memory
+  (never written to disk or repo); tests use synthetic bytes only.
+  Playtest file: the 86-vertex / 56-triangle loose SRM named by relative
+  name in `docs/changes/models-3d/proposal.md`, resolved against the
+  user's own install at runtime.
 
 ## What's missing
 
@@ -97,9 +113,13 @@ extracted files, decompiled code, or database files.
       nothing listed, nothing decoded). Other SR1 `.BIG` files
       (`E3.BIG`, `BONUS.BIG`, `MOVIES.BIG`) remain unprobed — each
       needs its own probe before any claim.
-- [ ] 3D models (NEXT milestone): index and read the remaster's packed
-      models — scoping probe first, same slice discipline
-      (proposal → spec → tasks → code → playtest report).
+- [x] 3D models, slice 1 `models-3d` (parse-one + render-one, see
+      `docs/changes/models-3d/`): single loose SRM as a flat-shaded
+      auto-rotating solid. Still unscoped: skeleton/animation, room
+      meshes, multi-mesh browsing, textured meshes.
+- [ ] 3D models (NEXT slices): skeleton/animation, room meshes,
+      multi-mesh browsing, textured meshes — scoping probe first, same
+      slice discipline (proposal → spec → tasks → code → playtest).
 - [ ] sRGB correctness pass, resize handling, full mipmap-chain UI —
       still deferred; `dxgiFormat` 99 (BC7 sRGB) still fails loud.
 - [ ] Visual playtest confirmation against a reference DDS viewer
