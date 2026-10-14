@@ -348,10 +348,11 @@ mod tests {
         // Declares 2 entries but the buffer holds only 1.
         let full = synthetic_container(&[(1, 10, 100), (2, 10, 200)], 512);
         let cut = &full[..4 + ENTRY_BYTES];
-        assert!(matches!(
-            parse_index(cut, 512),
-            Err(BigfileError::NotBigfile(_))
-        ));
+        let err = parse_index(cut, 512).expect_err("cut table must fail loud");
+        assert!(
+            err.to_string().starts_with("not a BIGFILE index:"),
+            "UNKNOWN-mapping hold: own text stays (spec R3), got: {err}"
+        );
         // Table would overrun the real file size: loud, no guessing.
         assert!(matches!(
             parse_index(&full, 10),
@@ -364,7 +365,13 @@ mod tests {
         let bytes = synthetic_container(&[(0x1111_1111, 100, 900)], 1024);
         match parse_index(&bytes, 950) {
             Err(BigfileError::BadEntry(msg)) => {
-                assert!(msg.contains('0'), "message must name the entry, got: {msg}")
+                assert!(msg.contains('0'), "message must name the entry, got: {msg}");
+                assert!(
+                    BigfileError::BadEntry(msg)
+                        .to_string()
+                        .starts_with("bad bigfile entry:"),
+                    "UNKNOWN-mapping hold: own text stays (spec R3)"
+                );
             }
             other => panic!("expected BadEntry, got: {other:?}"),
         }
@@ -413,6 +420,38 @@ mod tests {
         p.push(format!("bigfile-test-no-such-file-{}", std::process::id()));
         let _ = std::fs::remove_file(&p);
         assert!(matches!(load_index(&p), Err(BigfileError::OpenFailed { .. })));
+    }
+
+    #[test]
+    fn open_failed_display_uses_load_prefix_naming_path() {
+        // Parity pin for the ONE confirmed row (spec O1): fails if the
+        // Task 3 prefix is reverted. Synthetic absence only — no game file.
+        let mut p = std::env::temp_dir();
+        p.push(format!("bigfile-test-no-such-file-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let err = load_index(&p).expect_err("missing file must fail loud");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("Can't load big file named \""),
+            "open failure must use the load-failure prefix, got: {msg}"
+        );
+        assert!(
+            msg.contains(&p.display().to_string()),
+            "open failure must name the path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn read_entry_on_missing_file_is_open_failed() {
+        let bad = BigfileEntry {
+            name_hash: 0x6666_6666,
+            offset: 64,
+            length: 8,
+        };
+        let mut p = std::env::temp_dir();
+        p.push(format!("bigfile-test-no-such-read-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        assert!(matches!(read_entry(&p, &bad), Err(BigfileError::OpenFailed { .. })));
     }
 
     #[test]
@@ -473,6 +512,16 @@ mod tests {
             BigfileError::NotDds("entry 0".to_string())
                 .to_string()
                 .contains("entry 0")
+        );
+        // UNKNOWN-mapping hold: post-open seek/read routing in the
+        // original is unconfirmed, so post-open IO keeps our own text.
+        let io = BigfileError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "failed to fill whole buffer",
+        ));
+        assert!(
+            io.to_string().starts_with("cannot read bigfile:"),
+            "hold prefix must survive, got: {io}"
         );
     }
 }

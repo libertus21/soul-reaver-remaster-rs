@@ -386,13 +386,29 @@ fn run_mesh_all(args: &[String]) -> ExitCode {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{run_mesh, run_mesh_all, run_mesh_textured};
+    use super::{run_bigfile, run_mesh, run_mesh_all, run_mesh_textured};
     use std::process::ExitCode;
 
     fn write_tmp(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
         let path = dir.path().join(name);
         std::fs::write(&path, bytes).expect("synthetic mesh file must be writable");
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn bigfile_list_missing_and_truncated_files_exit_1() {
+        // Failure paths only — no window opens. Synthetic bytes in a
+        // temp dir; the real archive is never touched.
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let absent = tmp.path().join("absent.big").to_string_lossy().into_owned();
+        assert_eq!(run_bigfile(&[absent, "--list".to_string()]), ExitCode::from(1));
+        let trunc = tmp.path().join("trunc.big");
+        std::fs::write(&trunc, [0x02u8, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04])
+            .expect("synthetic file must be writable");
+        assert_eq!(
+            run_bigfile(&[trunc.to_string_lossy().into_owned(), "--list".to_string()]),
+            ExitCode::from(1)
+        );
     }
 
     #[test]
