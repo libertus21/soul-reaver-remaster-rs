@@ -32,6 +32,9 @@
 //! exits `0`.
 
 mod bigfile;
+// Launcher CLI arg parser (pure). Viewer only strips three no-op flags.
+#[allow(dead_code)]
+mod launcher_cli;
 mod dds;
 mod gallery;
 mod mesh_entry;
@@ -47,7 +50,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    // Compatibility no-ops: stripped before dispatch, no output, no exit
+    // change. (Parser-only flags are never wired into the viewer.)
+    let args = strip_launcher_noops(raw);
     if args.first().is_some_and(|a| a == "--bigfile") {
         return run_bigfile(&args[1..]);
     }
@@ -384,9 +390,22 @@ fn run_mesh_all(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Strip launcher compatibility no-op flags before dispatch. Pure helper,
+/// testable without spawning a process or opening a window.
+fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
+    args.into_iter()
+        .filter(|a| {
+            !matches!(
+                a.as_str(),
+                "--nosteam" | "-nosteam" | "-nocheck" | "--nocheck" | "-skipintro" | "--skipintro"
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod cli_tests {
-    use super::{run_bigfile, run_mesh, run_mesh_all, run_mesh_textured};
+    use super::{run_bigfile, run_mesh, run_mesh_all, run_mesh_textured, strip_launcher_noops};
     use std::process::ExitCode;
 
     fn write_tmp(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
@@ -512,5 +531,26 @@ mod cli_tests {
             run_mesh_all(&[dir.clone(), "--tex-dir".into(), dir]),
             ExitCode::from(1)
         );
+    }
+
+    #[test]
+    fn strip_noops_removes_compat_flags() {
+        let input = vec![
+            "--nosteam".to_string(),
+            "-nocheck".to_string(),
+            "-skipintro".to_string(),
+            "--bigfile".to_string(),
+            "x.big".to_string(),
+        ];
+        assert_eq!(
+            strip_launcher_noops(input),
+            vec!["--bigfile".to_string(), "x.big".to_string()]
+        );
+    }
+
+    #[test]
+    fn strip_noops_preserves_unknown_and_paths() {
+        let input = vec!["foo.dds".to_string(), "-foo".to_string()];
+        assert_eq!(strip_launcher_noops(input.clone()), input);
     }
 }
