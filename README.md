@@ -111,6 +111,15 @@ extracted files, decompiled code, or database files.
   unconfirmed — no call-edge evidence, held by regression tests);
   termination behavior unchanged. `cargo test` 86/86 green on
   synthetic bytes (see `docs/changes/s1-bigfile-loader/archive.md`).
+- `s2-read-error-parity` (docs-only, SR1 only): the bounded call-edge
+   trace (2 of 2 probe passes) found zero caller-to-callee edges into
+   either error half, so no post-open row resolved to PROVEN and no
+   production message was aligned. All 5 post-open failure rows stay
+   HELD with their existing prefixes pinned by new regression tests
+   (truncated count/bad count, truncated index table, past-EOF,
+   seek-failure, short-read); termination unchanged; loud-stderr +
+   exit-1 contract untouched. `cargo test` 88/88 green on synthetic
+   bytes (see `docs/changes/s2-read-error-parity/archive.md`).
 
 ## What's missing
 
@@ -128,10 +137,12 @@ extracted files, decompiled code, or database files.
 - [ ] 3D models (NEXT slices): skeleton/animation, room meshes,
       multi-mesh browsing, textured meshes — scoping probe first, same
       slice discipline (proposal → spec → tasks → code → playtest).
-- [ ] Binary loader follow-ups (UNSCOPED, TBD by user): post-open
-      message parity needs call-edge tracing (S2 candidate);
-      launcher-to-`run` default-archive linkage (S3 candidate) — each
-      needs its own slice cycle, same slice discipline.
+- [ ] Binary loader follow-ups (UNSCOPED, TBD by user): S2 landed
+      docs-only — static call-edge tracing resolved zero post-open rows.
+      Next binary slice open: a DYNAMIC-trace candidate to resolve the
+      still-HELD post-open rows, or S3 launcher-to-`run`
+      default-archive linkage — each needs its own slice cycle, same
+      slice discipline.
 - [ ] sRGB correctness pass, resize handling, full mipmap-chain UI —
       still deferred; `dxgiFormat` 99 (BC7 sRGB) still fails loud.
 - [ ] Visual playtest confirmation against a reference DDS viewer
