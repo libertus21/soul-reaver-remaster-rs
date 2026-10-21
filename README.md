@@ -120,6 +120,17 @@ extracted files, decompiled code, or database files.
    seek-failure, short-read); termination unchanged; loud-stderr +
    exit-1 contract untouched. `cargo test` 88/88 green on synthetic
    bytes (see `docs/changes/s2-read-error-parity/archive.md`).
+- `s3-launcher-run` (docs-only, SR1 only): launcher-to-engine handshake
+   documented — SRX.exe has NO static import of `run` from `sr1.dll`
+   (L1 NOT CONFIRMED); it dynamically loads the engine library via
+   `LoadLibraryA` with the `1\sr1.dll` literal and resolves `run` via
+   `GetProcAddress` in the same function (L2 CONFIRMED, so linkage is
+   dynamic); `run` is the engine entry (also ordinal 1) and references
+   the default archive name `bigfile.dat` within its first bytes (L4
+   CONFIRMED). Engine startup contract beyond entry stays PARTIAL/UNKNOWN.
+   `cargo test` 88/88 green (no code touched; see
+   `docs/changes/s3-launcher-run/archive.md` and
+   `docs/notes/s3-launcher-run-behavior.md`).
 
 ## What's missing
 
@@ -137,12 +148,15 @@ extracted files, decompiled code, or database files.
 - [ ] 3D models (NEXT slices): skeleton/animation, room meshes,
       multi-mesh browsing, textured meshes — scoping probe first, same
       slice discipline (proposal → spec → tasks → code → playtest).
-- [ ] Binary loader follow-ups (UNSCOPED, TBD by user): S2 landed
-      docs-only — static call-edge tracing resolved zero post-open rows.
-      Next binary slice open: a DYNAMIC-trace candidate to resolve the
-      still-HELD post-open rows, or S3 launcher-to-`run`
-      default-archive linkage — each needs its own slice cycle, same
-      slice discipline.
+- [ ] Binary loader follow-ups (UNSCOPED, TBD by user): S2 and S3 both
+      landed docs-only — S2's static call-edge tracing resolved zero
+      post-open rows; S3 confirmed the launcher reaches `run`
+      dynamically but the engine startup contract beyond entry stays
+      UNKNOWN. Next binary slice open: a DYNAMIC-trace candidate to
+      resolve the still-HELD post-open rows and the still-UNKNOWN
+      contract rows, F4 launcher CLI (`-nosteam`, `SR1_*` IDs), or S4
+      `run` internals — each needs its own slice cycle, same slice
+      discipline.
 - [ ] sRGB correctness pass, resize handling, full mipmap-chain UI —
       still deferred; `dxgiFormat` 99 (BC7 sRGB) still fails loud.
 - [ ] Visual playtest confirmation against a reference DDS viewer
