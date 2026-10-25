@@ -131,6 +131,17 @@ extracted files, decompiled code, or database files.
    `cargo test` 88/88 green (no code touched; see
    `docs/changes/s3-launcher-run/archive.md` and
    `docs/notes/s3-launcher-run-behavior.md`).
+- `f4-launcher-cli` (playtest-accepted: no-op flags strip cleanly, unknown arg
+   still fails loud): the launcher flag surface found in `SRX.exe` strings is
+   replicated as a pure parser (`src/launcher_cli.rs`: `parse` +
+   `LauncherArgs` + `Game` + `EgsEnv` + `LauncherCliError`; no IO, env, or
+   process spawn) with unit tests on synthetic argv only. Every flag effect
+   stays UNKNOWN (static evidence only). The viewer strips
+   `--nosteam`/`-nocheck`/`-skipintro` (single- and double-dash forms) before
+   dispatch as compatibility no-ops — no output, no exit-code change; the
+   remaining flags are parser-only. `-nocheck`/`-skipintro` are absent from
+   this build, so they exist only as compatibility no-ops. `cargo test` 102/102
+   green (see `docs/changes/f4-launcher-cli/archive.md`).
 
 ## What's missing
 
@@ -154,9 +165,10 @@ extracted files, decompiled code, or database files.
       dynamically but the engine startup contract beyond entry stays
       UNKNOWN. Next binary slice open: a DYNAMIC-trace candidate to
       resolve the still-HELD post-open rows and the still-UNKNOWN
-      contract rows, F4 launcher CLI (`-nosteam`, `SR1_*` IDs), or S4
-      `run` internals — each needs its own slice cycle, same slice
-      discipline.
+      contract rows, or S4 `run` internals — each needs its own slice
+      cycle, same slice discipline. F4 launcher CLI is done (see
+      `docs/changes/f4-launcher-cli/archive.md`); its remaining
+      parser-only flags get wired only if a future slice needs them.
 - [ ] sRGB correctness pass, resize handling, full mipmap-chain UI —
       still deferred; `dxgiFormat` 99 (BC7 sRGB) still fails loud.
 - [ ] Visual playtest confirmation against a reference DDS viewer
