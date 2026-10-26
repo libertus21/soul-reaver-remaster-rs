@@ -1,4 +1,4 @@
-# Proposal: big-slots
+﻿# Proposal: big-slots
 
 ## Intent
 
@@ -50,10 +50,10 @@ Revert the `--tlist` / `--tshow` commits and the README bullet. `src/textures.rs
 
 ## Success Criteria
 
-- [ ] All four real containers pass geometry validation through one code path and list every slot with classes.
-- [ ] A one-byte length mismatch fails with the distinct geometry error, exit 1, and prints no listing.
-- [ ] `--tshow` rejects non-numeric and out-of-range indexes distinctly, and for a valid index names the class and the UNKNOWN decompressor, exit 1.
-- [ ] `cargo test` green on synthetic data only; `git status` shows only intended files.
+- [x] All four real containers pass geometry validation through one code path and list every slot with classes.
+- [x] A one-byte length mismatch fails with the distinct geometry error, exit 1, and prints no listing.
+- [x] `--tshow` rejects non-numeric and out-of-range indexes distinctly, and for a valid index names the class and the UNKNOWN decompressor, exit 1.
+- [x] `cargo test` green on synthetic data only; `git status` shows only intended files.
 
 ## Capabilities
 

@@ -1,4 +1,4 @@
-# Spec: big-slots
+﻿# Spec: big-slots
 
 `cargo run -- --textures <file> --tlist` validates the fixed-slot geometry, prints the existing header report plus one line per slot (index, byte offset, class), then a per-class footer, exit 0. `--tshow <i>` validates the index and fails loud with the slot class and the compression verdict (exit 1). Any geometry mismatch is a distinct loud error, never clamped. Header parsing, its messages, and every other CLI mode keep their prior behavior. No decompressor is implemented.
 
@@ -39,17 +39,17 @@
 
 ## Acceptance scenarios
 
-- [ ] **Geometry exact:** a synthetic container of exactly `4096 + count * 131072` bytes lists all slots and exits 0.
-- [ ] **Geometry mismatch:** the same container one byte shorter and one byte longer each exit 1 with the geometry message and print no listing or footer.
-- [ ] **Classes:** an 8-slot synthetic container with one all-`0xFF` slot, one all-`0x00` slot, and the rest invented data reports the exact class per index; the footer counts match the index lines.
-- [ ] **No sampling:** a slot that is `0xFF` in every byte except the last one is reported `data`.
-- [ ] **Offsets arithmetic:** every listed offset equals `4096 + i * 131072`; no table lookup is performed.
-- [ ] **Index range:** `--tshow <count>` exits 1 with the out-of-range message; `--tshow abc` exits 1 with the selector message; neither opens a window.
-- [ ] **Loud decode verdict:** `--tshow` on a `data` slot exits 1 naming `data`, `compressed`, and `UNKNOWN`; on `empty`/`zero` it exits 1 naming the class and no payload.
-- [ ] **Preserved contracts:** truncated header, wrong header size, and implausible count still produce their existing messages and exit 1; existing header summary content is unchanged.
-- [ ] **Regressions:** single-file DDS, directory gallery, `--bigfile --list/--show`, and mesh modes behave as before.
-- [ ] **Unit/CLI:** `cargo test` covers geometry pass/fail, all three classes, no-sampling, footer totals, selector/index errors, and CLI exit codes on synthetic bytes only.
-- [ ] **Legal:** `git status --short` shows only intended files; no game bytes or install paths in artifacts.
+- [x] **Geometry exact:** a synthetic container of exactly `4096 + count * 131072` bytes lists all slots and exits 0.
+- [x] **Geometry mismatch:** the same container one byte shorter and one byte longer each exit 1 with the geometry message and print no listing or footer.
+- [x] **Classes:** an 8-slot synthetic container with one all-`0xFF` slot, one all-`0x00` slot, and the rest invented data reports the exact class per index; the footer counts match the index lines.
+- [x] **No sampling:** a slot that is `0xFF` in every byte except the last one is reported `data`.
+- [x] **Offsets arithmetic:** every listed offset equals `4096 + i * 131072`; no table lookup is performed.
+- [x] **Index range:** `--tshow <count>` exits 1 with the out-of-range message; `--tshow abc` exits 1 with the selector message; neither opens a window.
+- [x] **Loud decode verdict:** `--tshow` on a `data` slot exits 1 naming `data`, `compressed`, and `UNKNOWN`; on `empty`/`zero` it exits 1 naming the class and no payload.
+- [x] **Preserved contracts:** truncated header, wrong header size, and implausible count still produce their existing messages and exit 1; existing header summary content is unchanged.
+- [x] **Regressions:** single-file DDS, directory gallery, `--bigfile --list/--show`, and mesh modes behave as before.
+- [x] **Unit/CLI:** `cargo test` covers geometry pass/fail, all three classes, no-sampling, footer totals, selector/index errors, and CLI exit codes on synthetic bytes only.
+- [x] **Legal:** `git status --short` shows only intended files; no game bytes or install paths in artifacts.
 
 ## Next step
 

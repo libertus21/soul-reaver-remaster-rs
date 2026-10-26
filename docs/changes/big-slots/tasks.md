@@ -1,4 +1,4 @@
-# Tasks: big-slots
+﻿# Tasks: big-slots
 
 Ordered work units. Each keeps its tests with its behavior and is independently reviewable. `test_command` for apply: `cargo test`.
 
@@ -31,38 +31,38 @@ Chain strategy: pending
 
 ## Task 1 - `src/textures.rs`: slot model, classification, geometry (<=150 authored lines, tests included)
 
-- [ ] 1.1 Add `SLOT_SIZE: u64 = 131072`, `SLOT_DATA_START: u64 = 4096`, `expected_len(count)`, `slot_offset(index)` (pure arithmetic).
-- [ ] 1.2 Add `SlotClass { Empty, Zero, Data }` with `Display` (`empty`/`zero`/`data`) and `classify_slot(&[u8])`: `all(0xFF)` -> `Empty`, else `all(0x00)` -> `Zero`, else `Data`; empty slice -> `Zero`.
-- [ ] 1.3 Add `validate_geometry(file_len, header)` rejecting anything except `4096 + count * 131072`; add `SlotGeometryMismatch { file_len, count, expected }` with the exact message from `spec.md`; call it in `describe` after `parse_header`.
-- [ ] 1.4 Clamp only the data probe offset to `min(DATA_PROBE_OFF, file_len - PROBE_LEN)` so a geometry-valid short container no longer fails on a probe; real containers keep 1 MiB.
-- [ ] 1.5 Add `SlotSelectorInvalid { selector, count }` and `SlotIndexOutOfRange { index, count }` variants with the exact messages; keep every existing variant and message.
-- [ ] 1.6 Unit tests (synthetic): offsets/expected lengths; classification of `0xFF`, `0x00`, mixed, `0xFF`-except-last-byte -> `Data`; geometry exact pass; one byte short and one byte long -> `SlotGeometryMismatch` with both lengths in the message.
-- [ ] 1.7 Verify: `cargo test` green; `cargo build` warning-free.
+- [x] 1.1 Add `SLOT_SIZE: u64 = 131072`, `SLOT_DATA_START: u64 = 4096`, `expected_len(count)`, `slot_offset(index)` (pure arithmetic).
+- [x] 1.2 Add `SlotClass { Empty, Zero, Data }` with `Display` (`empty`/`zero`/`data`) and `classify_slot(&[u8])`: `all(0xFF)` -> `Empty`, else `all(0x00)` -> `Zero`, else `Data`; empty slice -> `Zero`.
+- [x] 1.3 Add `validate_geometry(file_len, header)` rejecting anything except `4096 + count * 131072`; add `SlotGeometryMismatch { file_len, count, expected }` with the exact message from `spec.md`; call it in `describe` after `parse_header`.
+- [x] 1.4 Clamp only the data probe offset to `min(DATA_PROBE_OFF, file_len - PROBE_LEN)` so a geometry-valid short container no longer fails on a probe; real containers keep 1 MiB.
+- [x] 1.5 Add `SlotSelectorInvalid { selector, count }` and `SlotIndexOutOfRange { index, count }` variants with the exact messages; keep every existing variant and message.
+- [x] 1.6 Unit tests (synthetic): offsets/expected lengths; classification of `0xFF`, `0x00`, mixed, `0xFF`-except-last-byte -> `Data`; geometry exact pass; one byte short and one byte long -> `SlotGeometryMismatch` with both lengths in the message.
+- [x] 1.7 Verify: `cargo test` green; `cargo build` warning-free.
 
 ## Task 2 - `src/textures.rs`: whole-slot scan, report, single-slot lookup (<=150 authored lines, tests included)
 
-- [ ] 2.1 Add `SlotScan { classes }` with `count(class)` and `report()`: `addressing:` line, `slots (whole-slot scan; no sampling):`, `slot <i> offset <off> <class>` per index, footer `slots: <total> total, <empty> empty, <zero> zero, <data> data`.
-- [ ] 2.2 Add `scan_slots(path, header)`: one reusable 131072-byte buffer, seek to `SLOT_DATA_START`, read every slot whole, classify; short read -> existing `Io` error.
-- [ ] 2.3 Add `slot_class_at(path, header, index) -> (offset, class)`: seek to `slot_offset(index)`, read that slot only, classify.
-- [ ] 2.4 Add `SlotNotDecodable { index, offset, class }` with the three exact class-specific messages from `spec.md`.
-- [ ] 2.5 Unit tests (synthetic containers of exactly `4096 + count * 131072` bytes): one all-`0xFF`, one all-`0x00`, rest invented data; report line count, offsets arithmetic, footer totals; `slot_class_at` returns the same class; no-sampling test (last byte differs -> `Data`).
-- [ ] 2.6 Verify: `cargo test` green.
+- [x] 2.1 Add `SlotScan { classes }` with `count(class)` and `report()`: `addressing:` line, `slots (whole-slot scan; no sampling):`, `slot <i> offset <off> <class>` per index, footer `slots: <total> total, <empty> empty, <zero> zero, <data> data`.
+- [x] 2.2 Add `scan_slots(path, header)`: one reusable 131072-byte buffer, seek to `SLOT_DATA_START`, read every slot whole, classify; short read -> existing `Io` error.
+- [x] 2.3 Add `slot_class_at(path, header, index) -> (offset, class)`: seek to `slot_offset(index)`, read that slot only, classify.
+- [x] 2.4 Add `SlotNotDecodable { index, offset, class }` with the three exact class-specific messages from `spec.md`.
+- [x] 2.5 Unit tests (synthetic containers of exactly `4096 + count * 131072` bytes): one all-`0xFF`, one all-`0x00`, rest invented data; report line count, offsets arithmetic, footer totals; `slot_class_at` returns the same class; no-sampling test (last byte differs -> `Data`).
+- [x] 2.6 Verify: `cargo test` green.
 
 ## Task 3 - `src/main.rs`: CLI contract (<=150 authored lines, tests included)
 
-- [ ] 3.1 `run_textures` `--tlist`: after `describe`, print `layout.summary()`, then `scan_slots(...).report()`, return `ExitCode::SUCCESS`.
-- [ ] 3.2 `run_textures` `--tshow`: after `describe`, parse the selector as `usize`; non-integer -> `SlotSelectorInvalid`; `>= count` -> `SlotIndexOutOfRange`; else `slot_class_at` + `SlotNotDecodable`; all stderr `error: ...`, exit 1, no window. Header/geometry errors still win.
-- [ ] 3.3 Update existing synthetic fixtures (`synthetic_big`, `synthetic_textures`) to exact geometry lengths; keep every prior header/usage exit-code test and add geometry-mismatch, `--tlist` class listing, `--tshow` selector/range/class tests.
-- [ ] 3.4 Verify: `cargo test` green; `cargo run -- --textures <one real .BIG> --tlist` lists every slot with class + footer, exit 0 (user playtest, read-only); `--tshow 0` and `--tshow <count>` are loud, exit 1.
+- [x] 3.1 `run_textures` `--tlist`: after `describe`, print `layout.summary()`, then `scan_slots(...).report()`, return `ExitCode::SUCCESS`.
+- [x] 3.2 `run_textures` `--tshow`: after `describe`, parse the selector as `usize`; non-integer -> `SlotSelectorInvalid`; `>= count` -> `SlotIndexOutOfRange`; else `slot_class_at` + `SlotNotDecodable`; all stderr `error: ...`, exit 1, no window. Header/geometry errors still win.
+- [x] 3.3 Update existing synthetic fixtures (`synthetic_big`, `synthetic_textures`) to exact geometry lengths; keep every prior header/usage exit-code test and add geometry-mismatch, `--tlist` class listing, `--tshow` selector/range/class tests.
+- [x] 3.4 Verify: `cargo test` green; `cargo run -- --textures <one real .BIG> --tlist` lists every slot with class + footer, exit 0 (user playtest, read-only); `--tshow 0` and `--tshow <count>` are loud, exit 1.
 
 ## Task 4 - README + legal gate (docs only)
 
-- [ ] 4.1 Update the `.BIG` bullets in `README.md`: geometry validated, `--tlist` lists index/offset/class + footer, `--tshow` loud with class and UNKNOWN decompressor.
-- [ ] 4.2 Legal: `git status --short` shows only `src/*.rs` and `README.md`; no game bytes, install paths, or content dumps in the diff.
-- [ ] 4.3 Verify: `cargo test` green; whitelist clean.
+- [x] 4.1 Update the `.BIG` bullets in `README.md`: geometry validated, `--tlist` lists index/offset/class + footer, `--tshow` loud with class and UNKNOWN decompressor.
+- [x] 4.2 Legal: `git status --short` shows only `src/*.rs` and `README.md`; no game bytes, install paths, or content dumps in the diff.
+- [x] 4.3 Verify: `cargo test` green; whitelist clean.
 
 ## Apply gate
 
-- [ ] All four work units land as one PR from fresh `main`.
-- [ ] `cargo test` green; `--tlist` outcome recorded for at least one real container; `--tshow` loud behavior recorded.
-- [ ] Geometry mismatch is distinct and never clamped; classification is whole-slot (no sampling); `--tshow` still never decodes.
+- [x] All four work units land as one PR from fresh `main`.
+- [x] `cargo test` green; `--tlist` outcome recorded for at least one real container; `--tshow` loud behavior recorded.
+- [x] Geometry mismatch is distinct and never clamped; classification is whole-slot (no sampling); `--tshow` still never decodes.
