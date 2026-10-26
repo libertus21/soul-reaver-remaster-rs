@@ -44,6 +44,10 @@ mod gallery;
 mod mesh_entry;
 mod render;
 mod slot_texture;
+// Transitional: the following commit wires this module into `--map`;
+// until then nothing calls it, so dead-code warnings are allowed here only.
+#[allow(dead_code)]
+mod tex_hd_map;
 // Transitional: Task 2 wires the mesh arm; until then the parser is
 // test-only so dead-code warnings are allowed here, nowhere else.
 #[allow(dead_code)]
