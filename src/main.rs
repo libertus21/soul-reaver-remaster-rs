@@ -40,6 +40,10 @@ mod dds;
 mod gallery;
 mod mesh_entry;
 mod render;
+// Transitional: the `--tshow` arm wires this converter in a later commit;
+// until then it is test-only, so dead-code warnings are allowed here.
+#[allow(dead_code)]
+mod slot_texture;
 // Transitional: Task 2 wires the mesh arm; until then the parser is
 // test-only so dead-code warnings are allowed here, nowhere else.
 #[allow(dead_code)]
