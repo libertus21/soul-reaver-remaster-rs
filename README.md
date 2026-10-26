@@ -78,15 +78,19 @@ extracted files, decompiled code, or database files.
   (GPL-3.0-only, mirror `github.com/TheSerioliOfNosgoth/SoulSpiral-Official`;
   NO Soul Spiral code copied — facts only, so no THIRD-PARTY-NOTICES.md
    entry; see `docs/changes/bigfile-index/design.md`).
-- `textures-big` (documented no-go): `TEXTURES.BIG` is a CUSTOM layout,
-  not SR1PC (count-at-0 exceeds the sanity limit; `bigfile.rs` must not
-  parse it). `cargo run -- --textures <TEXTURES.BIG> --tlist` prints the
-  layout summary (size class + region classes + table status, shapes
-  only) to stdout and exits 1 loud naming the next candidate;
-  `--tshow <entry>` fails loud the same way (no table, nothing listed,
-  nothing decoded). A tail + data-window hunt found no entry table, so
-  this slice lands as docs + loud stubs + synthetic-only tests; next
-  candidate: the SR2-side sibling named in the error.
+- `big-header`: the four SR1 `.BIG` containers (`TEXTURES.BIG`,
+  `MOVIES.BIG`, `BONUS.BIG`, `E3.BIG`) share a verified 512-byte header
+  with a `u16` entry count — bytes `0..2` = header size (must be 512)
+  and `2..4` = entry count (must be `1..=32768`), little-endian.
+  `cargo run -- --textures <TEXTURES.BIG> --tlist` parses and validates
+  those four bytes, prints the header report (header size, entry count,
+  size class, window classes) to stdout, and exits 0. Truncated files,
+  wrong header sizes, and implausible counts each fail loud with a
+  distinct stderr message and exit 1. The entry table stays UNKNOWN —
+  index location and stride are not established, so nothing is listed,
+  and `--tshow <entry>` remains a loud exit 1. `bigfile.rs` is untouched
+  (this is not the SR1PC layout). Bytes `4..512` are observed but not
+  validated. Synthetic-bytes tests only.
 - `models-3d` (playtest-accepted on a real mesh): `cargo run -- --mesh
   <FILE.SRM>` parses one SR1-remaster loose mesh (format verdict: magic
   `SRM\x01`, 44-byte shader records, 32-byte material records, bone
@@ -145,13 +149,12 @@ extracted files, decompiled code, or database files.
 
 ## What's missing
 
-- [x] TEXTURES.BIG (documented no-go, see
-      `docs/changes/textures-big/archive.md`): custom layout, no entry
-      table found with bounded read-only probes; `--tlist`/`--tshow`
-      stay as loud playtest-accepted no-go arms (summary + exit 1,
-      nothing listed, nothing decoded). Other SR1 `.BIG` files
-      (`E3.BIG`, `BONUS.BIG`, `MOVIES.BIG`) remain unprobed — each
-      needs its own probe before any claim.
+- [x] `.BIG` headers, slice `big-header` (see
+      `docs/changes/big-header/`): the four containers share a verified
+      512-byte header plus entry count (1287 / 29 / 268 / 178
+      respectively); `--tlist` reports it and exits 0. The entry index
+      location and stride are still UNKNOWN — nothing is listed, nothing
+      is decoded, and `--tshow` stays loud. Next: locate the index.
 - [x] 3D models, slice 1 `models-3d` (parse-one + render-one, see
       `docs/changes/models-3d/`): single loose SRM as a flat-shaded
       auto-rotating solid. Still unscoped: skeleton/animation, room
