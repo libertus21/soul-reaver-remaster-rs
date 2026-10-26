@@ -11,7 +11,9 @@
 //! the same window when it is a DDS texture. `cargo run -- --textures
 //! <TEXTURES.BIG> --tlist` parses the remaster `.BIG` header (a custom
 //! layout, NOT the SR1PC bigfile layout), prints the header report, and
-//! exits 0 when it validates; the entry table stays UNKNOWN.
+//! exits 0 when it validates; the entry table stays UNKNOWN. `--tshow <i>`
+//! decodes one slot as its raw 256x256 A1R5G5B5 image (headerless, not
+//! compressed) and shows it; `empty`/`zero` slots stay loud.
 //! `cargo run -- --mesh <FILE.SRM>` parses one SR1-remaster mesh
 //! (positions + triangle indices only) and shows it as a flat-shaded
 //! auto-rotating solid (Esc or window close to exit).
@@ -40,6 +42,7 @@ mod dds;
 mod gallery;
 mod mesh_entry;
 mod render;
+mod slot_texture;
 // Transitional: Task 2 wires the mesh arm; until then the parser is
 // test-only so dead-code warnings are allowed here, nowhere else.
 #[allow(dead_code)]
@@ -75,9 +78,12 @@ fn main() -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --list");
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --show <index|hash>");
         eprintln!("   or: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tlist");
+        eprintln!("   or: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tshow <entry>");
         eprintln!("   or: soul-reaver-remaster-rs --mesh <FILE.SRM>");
         eprintln!("   or: soul-reaver-remaster-rs --mesh-textured <FILE.SRM> --tex-dir <TEX>");
         eprintln!("   or: soul-reaver-remaster-rs --mesh-all <OBJECT_dir> --tex-dir <TEX>");
+        eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
+        eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
         eprintln!("directory of .DDS files as a gallery (ArrowRight/ArrowLeft to");
         eprintln!("step, Esc or window close to exit).");
@@ -222,8 +228,9 @@ fn run_bigfile(args: &[String]) -> ExitCode {
 /// `--textures <path> --tlist`: a valid header and exact slot geometry
 /// print the preserved header report plus one class line per slot and a
 /// per-class footer (stdout, exit 0). `--tshow <i>` validates the selector,
-/// reads that one slot, and stays loud (exit 1): payload compression is
-/// UNKNOWN, so nothing is decoded and no window opens.
+/// reads exactly that one slot, and shows a `data` payload as raw 256x256
+/// A1R5G5B5 converted to RGBA8 through the existing window (close/Esc exits
+/// 0); `empty`/`zero` slots stay loud (exit 1) with no window.
 fn run_textures(args: &[String]) -> ExitCode {
     let Some(path_arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tlist");
@@ -281,17 +288,24 @@ fn run_textures(args: &[String]) -> ExitCode {
         );
         return ExitCode::from(1);
     }
-    match textures::slot_class_at(path, &layout.header, index as u16) {
-        Ok((offset, class)) => {
-            eprintln!(
-                "error: {}",
-                textures::TexturesError::SlotNotDecodable {
-                    index: index as u16,
-                    offset,
-                    class,
-                }
+    match textures::decode_slot_at(path, &layout.header, index as u16) {
+        Ok((offset, rgba)) => {
+            println!(
+                "slot {index} (offset {offset}) decoded: {}x{} A1R5G5B5 -> RGBA8; showing image",
+                slot_texture::WIDTH,
+                slot_texture::HEIGHT,
             );
-            ExitCode::from(1)
+            match render::show_rgba8(
+                slot_texture::WIDTH as u32,
+                slot_texture::HEIGHT as u32,
+                &rgba,
+            ) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::from(1)
+                }
+            }
         }
         Err(e) => {
             eprintln!("error: {e}");
@@ -548,7 +562,7 @@ mod cli_tests {
     }
 
     #[test]
-    fn textures_tshow_rejects_selector_range_and_decodes_nothing() {
+    fn textures_tshow_rejects_selector_and_range() {
         let tmp = tempfile::tempdir().expect("tempdir must succeed");
         let big = write_tmp(&tmp, "valid.big", &synthetic_big(512, 3));
         assert_eq!(
@@ -559,19 +573,25 @@ mod cli_tests {
             run_textures(&[big.clone(), "--tshow".to_string(), "3".to_string()]),
             ExitCode::from(1)
         );
-        // Valid index still fails loud: compression is UNKNOWN.
         assert_eq!(
-            run_textures(&[big, "--tshow".to_string(), "0".to_string()]),
+            run_textures(&[big, "--tshow".to_string(), "-1".to_string()]),
             ExitCode::from(1)
         );
     }
 
     #[test]
-    fn textures_tshow_stays_loud_exit_1() {
+    fn textures_tshow_no_payload_slots_stay_loud_exit_1() {
         let tmp = tempfile::tempdir().expect("tempdir must succeed");
-        let valid = write_tmp(&tmp, "valid.big", &synthetic_big(512, 3));
+        let zero = write_tmp(&tmp, "zero.big", &synthetic_big(512, 3));
         assert_eq!(
-            run_textures(&[valid, "--tshow".to_string(), "0".to_string()]),
+            run_textures(&[zero, "--tshow".to_string(), "0".to_string()]),
+            ExitCode::from(1)
+        );
+        let mut empty_bytes = synthetic_big(512, 3);
+        empty_bytes[4096..].fill(0xFF);
+        let empty = write_tmp(&tmp, "empty.big", &empty_bytes);
+        assert_eq!(
+            run_textures(&[empty, "--tshow".to_string(), "2".to_string()]),
             ExitCode::from(1)
         );
         let invalid = write_tmp(&tmp, "invalid.big", &synthetic_header(256, 3));
@@ -579,6 +599,23 @@ mod cli_tests {
             run_textures(&[invalid, "--tshow".to_string(), "0".to_string()]),
             ExitCode::from(1)
         );
+    }
+
+    #[test]
+    fn textures_tshow_data_slot_decodes_one_slot_without_a_window() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let mut bytes = synthetic_big(512, 2);
+        bytes[4096] = 0xFF; // one non-zero byte makes slot 0 `data`
+        let path = write_tmp(&tmp, "data.big", &bytes);
+        let header = crate::textures::BigHeader {
+            header_size: 512,
+            entry_count: 2,
+        };
+        let (offset, rgba) =
+            crate::textures::decode_slot_at(std::path::Path::new(&path), &header, 0)
+                .expect("data slot must decode");
+        assert_eq!(offset, 4096);
+        assert_eq!(rgba.len(), 256 * 256 * 4);
     }
 
     #[test]
