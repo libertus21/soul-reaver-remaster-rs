@@ -113,7 +113,17 @@ extracted files, decompiled code, or database files.
    `268 total, 1 empty, 0 zero, 267 data` (`BONUS.BIG`), and
    `178 total, 0 empty, 2 zero, 176 data` (`E3.BIG`); see
    `docs/changes/big-slots/archive.md` and the `big-header` slice
-   (`docs/changes/big-header/archive.md`).
+   (`docs/changes/big-header/archive.md`). `TEX_HD.MAP` names: the optional
+   trailing `--map <TEX_HD.MAP>` pair (exactly 384,000 bytes = 6,000 rows x
+   64 bytes, 16 little-endian `u32` alias codes per slot row, `0xFFFFFFFF` =
+   none) decodes the engine's own numeric asset names. `--tlist --map`
+   appends `; names <n1>,<n2>,...` (or `; names -`) to each slot line;
+   `--tshow <name> --map` accepts `<id>_<sub>`, `M\<id>_<sub>`, or
+   `B\<id>_<sub>` and refuses to guess when a name is shared by several
+   slots (loud error listing the candidates). Blocks: `TEXTURES` base 0,
+   `MOVIES` base 2,000, `BONUS` base 4,000; `E3.BIG` has no block and stays
+   index-only. Without `--map`, every prior line, message, and exit code is
+   unchanged. Format proof in `docs/notes/s8-big-slot-names.md`.
 - `models-3d` (playtest-accepted on a real mesh): `cargo run -- --mesh
   <FILE.SRM>` parses one SR1-remaster loose mesh (format verdict: magic
   `SRM\x01`, 44-byte shader records, 32-byte material records, bone
@@ -182,10 +192,13 @@ extracted files, decompiled code, or database files.
       little-endian A1R5G5B5 image and shows it, while `empty`/`zero` slots
       stay loud. Verdict: `data` slots are NOT compressed, so no decompressor
       is needed. Visual acceptance of decoded slots is a playtest, not a test.
-- [ ] Texture slot → name mapping: slots are addressed by index only; mapping
-      an index to a texture name (likely through `TEX_HD.MAP`) is the remaining
-      texture gap. Exhaustive validity of all 1287 `TEXTURES.BIG` slots is
-      sampled, not proven.
+- [x] Texture slot → name mapping, slice `slot-name` (see
+      `docs/changes/slot-name/`): `TEX_HD.MAP` is a fixed 6,000-row x 64-byte
+      alias matrix (16 codes per slot) and `--map` exposes those names on
+      `--tlist` and as `--tshow <name>` selectors, with loud errors for bad
+      lengths, unknown stems, and shared names (never a silent first match).
+      `E3.BIG` has no block and stays index-only. Exhaustive validity of all
+      1287 `TEXTURES.BIG` slots is sampled, not proven.
 - [x] 3D models, slice 1 `models-3d` (parse-one + render-one, see
       `docs/changes/models-3d/`): single loose SRM as a flat-shaded
       auto-rotating solid. Still unscoped: skeleton/animation, room
