@@ -90,7 +90,10 @@ extracted files, decompiled code, or database files.
   index location and stride are not established, so nothing is listed,
   and `--tshow <entry>` remains a loud exit 1. `bigfile.rs` is untouched
   (this is not the SR1PC layout). Bytes `4..512` are observed but not
-  validated. Synthetic-bytes tests only.
+  validated. Synthetic-bytes tests only. Playtest-accepted: `--tlist`
+  exits 0 reporting 1287 entries for `TEXTURES.BIG` and 29 for
+  `MOVIES.BIG`, 111/111 tests green (see
+  `docs/changes/big-header/archive.md`).
 - `models-3d` (playtest-accepted on a real mesh): `cargo run -- --mesh
   <FILE.SRM>` parses one SR1-remaster loose mesh (format verdict: magic
   `SRM\x01`, 44-byte shader records, 32-byte material records, bone
@@ -150,7 +153,7 @@ extracted files, decompiled code, or database files.
 ## What's missing
 
 - [x] `.BIG` headers, slice `big-header` (see
-      `docs/changes/big-header/`): the four containers share a verified
+      `docs/changes/big-header/archive.md`): the four containers share a verified
       512-byte header plus entry count (1287 / 29 / 268 / 178
       respectively); `--tlist` reports it and exits 0. The entry index
       location and stride are still UNKNOWN — nothing is listed, nothing
