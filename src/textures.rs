@@ -32,7 +32,6 @@ pub fn expected_len(count: u16) -> u64 {
 }
 
 /// Byte offset of slot `index` (pure arithmetic, no table).
-#[allow(dead_code)]
 pub fn slot_offset(index: u16) -> u64 {
     SLOT_DATA_START + u64::from(index) * SLOT_SIZE
 }
@@ -99,7 +98,6 @@ pub fn classify_window(bytes: &[u8]) -> RegionClass {
 }
 
 /// Whole-slot class (contract names exactly three classes).
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotClass {
     Empty,
@@ -119,7 +117,6 @@ impl fmt::Display for SlotClass {
 
 /// Classify a WHOLE slot slice: all-`0xFF` -> `Empty`, all-zero ->
 /// `Zero`, anything else -> `Data`. Empty slice is `Zero`.
-#[allow(dead_code)]
 pub fn classify_slot(bytes: &[u8]) -> SlotClass {
     if bytes.is_empty() {
         return SlotClass::Zero;
@@ -150,13 +147,11 @@ pub fn validate_geometry(file_len: u64, header: BigHeader) -> Result<(), Texture
 
 /// One class per slot, in index order. Built by a single sequential pass
 /// over whole slots with one reusable 128 KiB buffer (constant memory).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotScan {
     pub classes: Vec<SlotClass>,
 }
 
-#[allow(dead_code)]
 impl SlotScan {
     /// How many slots carry `class`.
     pub fn count(&self, class: SlotClass) -> usize {
@@ -185,7 +180,6 @@ impl SlotScan {
 
 /// Read every slot whole and classify it. Short read is a loud `Io`
 /// error (geometry validation already guaranteed the length).
-#[allow(dead_code)]
 pub fn scan_slots(path: &Path, header: &BigHeader) -> Result<SlotScan, TexturesError> {
     let mut file = File::open(path).map_err(TexturesError::Io)?;
     file.seek(SeekFrom::Start(SLOT_DATA_START))
@@ -200,7 +194,6 @@ pub fn scan_slots(path: &Path, header: &BigHeader) -> Result<SlotScan, TexturesE
 }
 
 /// Read exactly one slot and classify it. Returns `(offset, class)`.
-#[allow(dead_code)]
 pub fn slot_class_at(
     path: &Path,
     header: &BigHeader,

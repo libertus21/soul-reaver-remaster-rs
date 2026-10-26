@@ -219,9 +219,11 @@ fn run_bigfile(args: &[String]) -> ExitCode {
     }
 }
 
-/// `--textures <path> --tlist`: a valid header prints the report to
-/// stdout and exits 0. `--tshow` stays loud (exit 1): the entry table is
-/// still UNKNOWN, so no entry is read.
+/// `--textures <path> --tlist`: a valid header and exact slot geometry
+/// print the preserved header report plus one class line per slot and a
+/// per-class footer (stdout, exit 0). `--tshow <i>` validates the selector,
+/// reads that one slot, and stays loud (exit 1): payload compression is
+/// UNKNOWN, so nothing is decoded and no window opens.
 fn run_textures(args: &[String]) -> ExitCode {
     let Some(path_arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tlist");
@@ -244,10 +246,58 @@ fn run_textures(args: &[String]) -> ExitCode {
     };
     if tlist {
         println!("{}", layout.summary());
-        return ExitCode::SUCCESS;
+        return match textures::scan_slots(path, &layout.header) {
+            Ok(scan) => {
+                println!("{}", scan.report());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(1)
+            }
+        };
     }
-    eprintln!("error: {}", textures::TexturesError::BadSelector(args[2].clone()));
-    ExitCode::from(1)
+    let selector = &args[2];
+    let index = match selector.parse::<usize>() {
+        Ok(index) => index,
+        Err(_) => {
+            eprintln!(
+                "error: {}",
+                textures::TexturesError::SlotSelectorInvalid {
+                    selector: selector.clone(),
+                    count: layout.header.entry_count,
+                }
+            );
+            return ExitCode::from(1);
+        }
+    };
+    if index >= usize::from(layout.header.entry_count) {
+        eprintln!(
+            "error: {}",
+            textures::TexturesError::SlotIndexOutOfRange {
+                index,
+                count: layout.header.entry_count,
+            }
+        );
+        return ExitCode::from(1);
+    }
+    match textures::slot_class_at(path, &layout.header, index as u16) {
+        Ok((offset, class)) => {
+            eprintln!(
+                "error: {}",
+                textures::TexturesError::SlotNotDecodable {
+                    index: index as u16,
+                    offset,
+                    class,
+                }
+            );
+            ExitCode::from(1)
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// `--mesh <FILE.SRM>`: parse one SR1-remaster mesh (positions +
@@ -461,6 +511,57 @@ mod cli_tests {
         let huge = write_tmp(&tmp, "huge.big", &synthetic_header(512, 32769));
         assert_eq!(
             run_textures(&[huge, "--tlist".to_string()]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn textures_tlist_geometry_mismatch_exits_1() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let exact = synthetic_big(512, 2);
+        let mut short = exact.clone();
+        short.pop();
+        let mut long = exact;
+        long.push(0);
+        for (name, bytes) in [("short.big", short), ("long.big", long)] {
+            let path = write_tmp(&tmp, name, &bytes);
+            assert_eq!(
+                run_textures(&[path.clone(), "--tlist".to_string()]),
+                ExitCode::from(1)
+            );
+            // Header/geometry errors win over any selector problem.
+            assert_eq!(
+                run_textures(&[path, "--tshow".to_string(), "0".to_string()]),
+                ExitCode::from(1)
+            );
+        }
+    }
+
+    #[test]
+    fn textures_tlist_eight_slots_exits_0() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let big = write_tmp(&tmp, "eight.big", &synthetic_big(512, 8));
+        assert_eq!(
+            run_textures(&[big, "--tlist".to_string()]),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn textures_tshow_rejects_selector_range_and_decodes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let big = write_tmp(&tmp, "valid.big", &synthetic_big(512, 3));
+        assert_eq!(
+            run_textures(&[big.clone(), "--tshow".to_string(), "abc".to_string()]),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            run_textures(&[big.clone(), "--tshow".to_string(), "3".to_string()]),
+            ExitCode::from(1)
+        );
+        // Valid index still fails loud: compression is UNKNOWN.
+        assert_eq!(
+            run_textures(&[big, "--tshow".to_string(), "0".to_string()]),
             ExitCode::from(1)
         );
     }
