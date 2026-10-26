@@ -35,6 +35,7 @@
 //! exits `0`.
 
 mod bigfile;
+mod cli_out;
 // Launcher CLI arg parser (pure). Viewer only strips three no-op flags.
 #[allow(dead_code)]
 mod launcher_cli;
@@ -52,6 +53,8 @@ mod textures_object;
 
 use std::path::Path;
 use std::process::ExitCode;
+
+use cli_out::outln;
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -161,7 +164,7 @@ fn run_bigfile(args: &[String]) -> ExitCode {
                 }
             };
             for (index, entry) in entries.iter().enumerate() {
-                println!(
+                outln!(
                     "{index} {:08X} {} {}",
                     entry.name_hash, entry.offset, entry.length
                 );
@@ -252,10 +255,10 @@ fn run_textures(args: &[String]) -> ExitCode {
         }
     };
     if tlist {
-        println!("{}", layout.summary());
+        outln!("{}", layout.summary());
         return match textures::scan_slots(path, &layout.header) {
             Ok(scan) => {
-                println!("{}", scan.report());
+                outln!("{}", scan.report());
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -290,7 +293,7 @@ fn run_textures(args: &[String]) -> ExitCode {
     }
     match textures::decode_slot_at(path, &layout.header, index as u16) {
         Ok((offset, rgba)) => {
-            println!(
+            outln!(
                 "slot {index} (offset {offset}) decoded: {}x{} A1R5G5B5 -> RGBA8; showing image",
                 slot_texture::WIDTH,
                 slot_texture::HEIGHT,
@@ -340,7 +343,7 @@ fn run_mesh(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    println!(
+    outln!(
         "{} vertices, {} triangles",
         mesh.positions.len(),
         mesh.indices.len() / 3
@@ -387,7 +390,7 @@ fn run_mesh_textured(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    println!(
+    outln!(
         "{} vertices, {} triangles, {} materials",
         entry.positions.len(),
         entry.indices.len() / 3,
@@ -438,7 +441,7 @@ fn run_mesh_all(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    println!(
+    outln!(
         "{} .SRM files in {}",
         entries.len(),
         obj_dir.display()

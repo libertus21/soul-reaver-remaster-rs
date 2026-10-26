@@ -21,6 +21,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::cli_out::outln;
 use crate::dds::{self, DecodedImage, LoadedTexture};
 use crate::gallery::{Direction, step_index};
 
@@ -481,7 +482,7 @@ fn gallery_step(
                 let label = entry_label(next, total, &entries[next]);
                 state.set_image(image.width, image.height, &image.rgba8);
                 state.window.set_title(&label);
-                println!("{label}");
+                outln!("{label}");
                 *current = image;
                 *index = next;
                 state.window.request_redraw();
@@ -517,7 +518,7 @@ impl<'a> ApplicationHandler for GalleryApp<'a> {
             &self.current.rgba8,
         )) {
             Ok(state) => {
-                println!("{label}");
+                outln!("{label}");
                 self.state = Some(state);
             }
             Err(e) => {
@@ -1694,7 +1695,7 @@ fn mesh_gallery_step(
                 Ok(()) => {
                     let label = format!("{}/{} {}", next + 1, total, entry.title);
                     state.window.set_title(&label);
-                    println!("{label}");
+                    outln!("{label}");
                     *current = entry;
                     *index = next;
                     state.window.request_redraw();
@@ -1739,7 +1740,7 @@ impl<'a> ApplicationHandler for MeshGalleryApp<'a> {
         };
         match pollster::block_on(TexturedMeshState::new(window, &self.current)) {
             Ok(state) => {
-                println!("{label}");
+                outln!("{label}");
                 self.state = Some(state);
             }
             Err(e) => {
