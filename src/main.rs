@@ -413,10 +413,18 @@ mod cli_tests {
         path.to_string_lossy().into_owned()
     }
 
-    /// Synthetic `.BIG` bytes wide enough for the bounded probes: two
-    /// header words followed by zeros. Values are invented.
+    /// Synthetic `.BIG` with EXACT slot geometry: two header words then
+    /// zeros in `4096 + count * 131072` bytes. Values are invented.
     fn synthetic_big(header_size: u16, count: u16) -> Vec<u8> {
-        let mut bytes = vec![0u8; 1024 * 1024 + 64];
+        let mut bytes = vec![0u8; 4096 + usize::from(count) * 131072];
+        bytes[0..2].copy_from_slice(&header_size.to_le_bytes());
+        bytes[2..4].copy_from_slice(&count.to_le_bytes());
+        bytes
+    }
+
+    /// Header-only bytes for cases rejected before geometry validation.
+    fn synthetic_header(header_size: u16, count: u16) -> Vec<u8> {
+        let mut bytes = vec![0u8; 1024];
         bytes[0..2].copy_from_slice(&header_size.to_le_bytes());
         bytes[2..4].copy_from_slice(&count.to_le_bytes());
         bytes
@@ -440,17 +448,17 @@ mod cli_tests {
             run_textures(&[truncated, "--tlist".to_string()]),
             ExitCode::from(1)
         );
-        let wrong = write_tmp(&tmp, "wrong.big", &synthetic_big(256, 3));
+        let wrong = write_tmp(&tmp, "wrong.big", &synthetic_header(256, 3));
         assert_eq!(
             run_textures(&[wrong, "--tlist".to_string()]),
             ExitCode::from(1)
         );
-        let zero = write_tmp(&tmp, "zero.big", &synthetic_big(512, 0));
+        let zero = write_tmp(&tmp, "zero.big", &synthetic_header(512, 0));
         assert_eq!(
             run_textures(&[zero, "--tlist".to_string()]),
             ExitCode::from(1)
         );
-        let huge = write_tmp(&tmp, "huge.big", &synthetic_big(512, 32769));
+        let huge = write_tmp(&tmp, "huge.big", &synthetic_header(512, 32769));
         assert_eq!(
             run_textures(&[huge, "--tlist".to_string()]),
             ExitCode::from(1)
@@ -465,7 +473,7 @@ mod cli_tests {
             run_textures(&[valid, "--tshow".to_string(), "0".to_string()]),
             ExitCode::from(1)
         );
-        let invalid = write_tmp(&tmp, "invalid.big", &synthetic_big(256, 3));
+        let invalid = write_tmp(&tmp, "invalid.big", &synthetic_header(256, 3));
         assert_eq!(
             run_textures(&[invalid, "--tshow".to_string(), "0".to_string()]),
             ExitCode::from(1)
