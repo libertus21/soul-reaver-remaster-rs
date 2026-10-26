@@ -148,6 +148,78 @@ pub fn validate_geometry(file_len: u64, header: BigHeader) -> Result<(), Texture
     }
 }
 
+/// One class per slot, in index order. Built by a single sequential pass
+/// over whole slots with one reusable 128 KiB buffer (constant memory).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotScan {
+    pub classes: Vec<SlotClass>,
+}
+
+#[allow(dead_code)]
+impl SlotScan {
+    /// How many slots carry `class`.
+    pub fn count(&self, class: SlotClass) -> usize {
+        self.classes.iter().filter(|c| **c == class).count()
+    }
+
+    /// `--tlist` slot section: addressing line, one line per slot, and
+    /// the per-class footer. Classes only; never payload bytes.
+    pub fn report(&self) -> String {
+        let total = self.classes.len();
+        let mut out = format!(
+            "addressing: fixed {SLOT_SIZE}-byte slots (slot i at {SLOT_DATA_START} + i * {SLOT_SIZE})\nslots (whole-slot scan; no sampling):"
+        );
+        for (i, class) in self.classes.iter().enumerate() {
+            out.push_str(&format!("\nslot {i} offset {} {class}", slot_offset(i as u16)));
+        }
+        out.push_str(&format!(
+            "\nslots: {total} total, {} empty, {} zero, {} data",
+            self.count(SlotClass::Empty),
+            self.count(SlotClass::Zero),
+            self.count(SlotClass::Data),
+        ));
+        out
+    }
+}
+
+/// Read every slot whole and classify it. Short read is a loud `Io`
+/// error (geometry validation already guaranteed the length).
+#[allow(dead_code)]
+pub fn scan_slots(path: &Path, header: &BigHeader) -> Result<SlotScan, TexturesError> {
+    let mut file = File::open(path).map_err(TexturesError::Io)?;
+    file.seek(SeekFrom::Start(SLOT_DATA_START))
+        .map_err(TexturesError::Io)?;
+    let mut buf = vec![0u8; SLOT_SIZE as usize];
+    let mut classes = Vec::with_capacity(usize::from(header.entry_count));
+    for _ in 0..header.entry_count {
+        file.read_exact(&mut buf).map_err(TexturesError::Io)?;
+        classes.push(classify_slot(&buf));
+    }
+    Ok(SlotScan { classes })
+}
+
+/// Read exactly one slot and classify it. Returns `(offset, class)`.
+#[allow(dead_code)]
+pub fn slot_class_at(
+    path: &Path,
+    header: &BigHeader,
+    index: u16,
+) -> Result<(u64, SlotClass), TexturesError> {
+    debug_assert!(
+        index < header.entry_count,
+        "slot index must be range-checked by the caller"
+    );
+    let offset = slot_offset(index);
+    let mut file = File::open(path).map_err(TexturesError::Io)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(TexturesError::Io)?;
+    let mut buf = vec![0u8; SLOT_SIZE as usize];
+    file.read_exact(&mut buf).map_err(TexturesError::Io)?;
+    Ok((offset, classify_slot(&buf)))
+}
+
+
 /// Every textures failure maps to stderr + nonzero exit in `main`.
 /// `BadEntry`/`NotDds` await a future table parser (no-go: unset).
 #[allow(dead_code)]
@@ -165,6 +237,19 @@ pub enum TexturesError {
         file_len: u64,
         count: u16,
         expected: u64,
+    },
+    SlotSelectorInvalid {
+        selector: String,
+        count: u16,
+    },
+    SlotIndexOutOfRange {
+        index: usize,
+        count: u16,
+    },
+    SlotNotDecodable {
+        index: u16,
+        offset: u64,
+        class: SlotClass,
     },
 }
 
@@ -199,6 +284,32 @@ impl fmt::Display for TexturesError {
                 f,
                 "slot geometry mismatch: file holds {file_len} bytes, header count {count} implies {expected} (4096 + {count} * {SLOT_SIZE}); refusing to clamp"
             ),
+            TexturesError::SlotSelectorInvalid { selector, count } => write!(
+                f,
+                "invalid slot selector '{selector}': expected a slot index in 0..{count}"
+            ),
+            TexturesError::SlotIndexOutOfRange { index, count } => write!(
+                f,
+                "slot index {index} is out of range: container holds {count} slots (valid 0..{count})"
+            ),
+            TexturesError::SlotNotDecodable {
+                index,
+                offset,
+                class,
+            } => match class {
+                SlotClass::Data => write!(
+                    f,
+                    "slot {index} (offset {offset}) is data: payload is compressed, decompressor UNKNOWN (cannot decode)"
+                ),
+                SlotClass::Empty => write!(
+                    f,
+                    "slot {index} (offset {offset}) is empty (0xFF marker): no payload; decompressor UNKNOWN (nothing to decode)"
+                ),
+                SlotClass::Zero => write!(
+                    f,
+                    "slot {index} (offset {offset}) is zero (0x00 fill): no payload; decompressor UNKNOWN (nothing to decode)"
+                ),
+            },
         }
     }
 }
@@ -362,6 +473,28 @@ mod tests {
         b
     }
 
+    /// Synthetic container whose slots are exactly the requested classes.
+    /// Header prefix is zero; slot payloads are invented.
+    fn synthetic_slots(classes: &[SlotClass]) -> Vec<u8> {
+        let count = classes.len() as u16;
+        let mut b = vec![0u8; expected_len(count) as usize];
+        b[0..4].copy_from_slice(&prefix(512, count));
+        for (i, class) in classes.iter().enumerate() {
+            let start = slot_offset(i as u16) as usize;
+            let slot = &mut b[start..start + SLOT_SIZE as usize];
+            match class {
+                SlotClass::Empty => slot.fill(0xFF),
+                SlotClass::Zero => slot.fill(0x00),
+                SlotClass::Data => {
+                    for (j, byte) in slot.iter_mut().enumerate() {
+                        *byte = (j % 251) as u8 + 1;
+                    }
+                }
+            }
+        }
+        b
+    }
+
     fn write_temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
         p.push(format!("textures-test-{name}-{}", std::process::id()));
@@ -493,6 +626,112 @@ mod tests {
             Err(TexturesError::SlotGeometryMismatch { .. })
         ));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_slots_reports_every_slot_and_footer() {
+        let classes = [
+            SlotClass::Empty,
+            SlotClass::Zero,
+            SlotClass::Data,
+            SlotClass::Data,
+            SlotClass::Data,
+            SlotClass::Data,
+            SlotClass::Data,
+            SlotClass::Data,
+        ];
+        let path = write_temp("eight-slots", &synthetic_slots(&classes));
+        let header = BigHeader {
+            header_size: 512,
+            entry_count: 8,
+        };
+        let scan = scan_slots(&path, &header).expect("scan must succeed");
+        assert_eq!(scan.classes, classes);
+        assert_eq!(scan.count(SlotClass::Empty), 1);
+        assert_eq!(scan.count(SlotClass::Zero), 1);
+        assert_eq!(scan.count(SlotClass::Data), 6);
+        let report = scan.report();
+        assert!(
+            report.starts_with("addressing: fixed 131072-byte slots (slot i at 4096 + i * 131072)"),
+            "got: {report}"
+        );
+        assert!(report.contains("slots (whole-slot scan; no sampling):"));
+        assert!(report.contains("slot 0 offset 4096 empty"));
+        assert!(report.contains("slot 1 offset 135168 zero"));
+        assert!(report.contains("slot 7 offset 921600 data"));
+        assert!(report.contains("slots: 8 total, 1 empty, 1 zero, 6 data"));
+        assert_eq!(report.lines().count(), 11, "got: {report}");
+        let (offset, class) = slot_class_at(&path, &header, 1).expect("one slot must read");
+        assert_eq!(offset, slot_offset(1));
+        assert_eq!(class, SlotClass::Zero);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn no_sampling_last_byte_decides() {
+        // Slot 1 is 0xFF in every byte except its last one -> data.
+        let mut bytes = synthetic_slots(&[SlotClass::Empty, SlotClass::Data]);
+        let start = slot_offset(1) as usize;
+        bytes[start..start + SLOT_SIZE as usize].fill(0xFF);
+        bytes[start + SLOT_SIZE as usize - 1] = 0x00;
+        let path = write_temp("no-sampling", &bytes);
+        let header = BigHeader {
+            header_size: 512,
+            entry_count: 2,
+        };
+        let scan = scan_slots(&path, &header).expect("scan must succeed");
+        assert_eq!(scan.classes[1], SlotClass::Data);
+        let (_, class) = slot_class_at(&path, &header, 1).expect("one slot must read");
+        assert_eq!(class, SlotClass::Data);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn slot_not_decodable_messages_name_class_and_unknown_decompressor() {
+        let data = TexturesError::SlotNotDecodable {
+            index: 2,
+            offset: 266240,
+            class: SlotClass::Data,
+        }
+        .to_string();
+        assert!(
+            data.contains("is data") && data.contains("compressed") && data.contains("UNKNOWN"),
+            "got: {data}"
+        );
+        let empty = TexturesError::SlotNotDecodable {
+            index: 0,
+            offset: 4096,
+            class: SlotClass::Empty,
+        }
+        .to_string();
+        assert!(
+            empty.contains("is empty") && empty.contains("no payload") && empty.contains("UNKNOWN"),
+            "got: {empty}"
+        );
+        let zero = TexturesError::SlotNotDecodable {
+            index: 1,
+            offset: 135168,
+            class: SlotClass::Zero,
+        }
+        .to_string();
+        assert!(
+            zero.contains("is zero") && zero.contains("no payload") && zero.contains("UNKNOWN"),
+            "got: {zero}"
+        );
+        let selector = TexturesError::SlotSelectorInvalid {
+            selector: "abc".to_string(),
+            count: 8,
+        }
+        .to_string();
+        assert!(
+            selector.contains("'abc'") && selector.contains("0..8"),
+            "got: {selector}"
+        );
+        let range = TexturesError::SlotIndexOutOfRange { index: 8, count: 8 }.to_string();
+        assert!(
+            range.contains("slot index 8") && range.contains("valid 0..8"),
+            "got: {range}"
+        );
     }
 
     #[test]
