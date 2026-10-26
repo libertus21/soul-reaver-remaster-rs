@@ -78,22 +78,29 @@ extracted files, decompiled code, or database files.
   (GPL-3.0-only, mirror `github.com/TheSerioliOfNosgoth/SoulSpiral-Official`;
   NO Soul Spiral code copied — facts only, so no THIRD-PARTY-NOTICES.md
    entry; see `docs/changes/bigfile-index/design.md`).
-- `big-header`: the four SR1 `.BIG` containers (`TEXTURES.BIG`,
+- `big-slots`: the four SR1 `.BIG` containers (`TEXTURES.BIG`,
   `MOVIES.BIG`, `BONUS.BIG`, `E3.BIG`) share a verified 512-byte header
-  with a `u16` entry count — bytes `0..2` = header size (must be 512)
-  and `2..4` = entry count (must be `1..=32768`), little-endian.
-  `cargo run -- --textures <TEXTURES.BIG> --tlist` parses and validates
-  those four bytes, prints the header report (header size, entry count,
-  size class, window classes) to stdout, and exits 0. Truncated files,
-  wrong header sizes, and implausible counts each fail loud with a
-  distinct stderr message and exit 1. The entry table stays UNKNOWN —
-  index location and stride are not established, so nothing is listed,
-  and `--tshow <entry>` remains a loud exit 1. `bigfile.rs` is untouched
-  (this is not the SR1PC layout). Bytes `4..512` are observed but not
-  validated. Synthetic-bytes tests only. Playtest-accepted: `--tlist`
-  exits 0 reporting 1287 entries for `TEXTURES.BIG` and 29 for
-  `MOVIES.BIG`, 111/111 tests green (see
-  `docs/changes/big-header/archive.md`).
+  (`0..2` = header size, must be 512; `2..4` = entry count, must be
+  `1..=32768`, little-endian) and fixed 131072-byte slots:
+  `file_len == 4096 + count * 131072` exactly, slot `i` at
+  `4096 + i * 131072`. `cargo run -- --textures <TEXTURES.BIG> --tlist`
+  validates that geometry, prints the header report (header size, entry
+  count, size class, window classes) plus the addressing line, one
+  `slot <i> offset <off> <class>` line per slot (`empty` = all `0xFF`,
+  `zero` = all `0x00`, else `data`; whole-slot read, no sampling), and a
+  per-class footer, then exits 0. Any length mismatch is a DISTINCT loud
+  `slot geometry mismatch` error (exit 1, never clamped). Truncated
+  files, wrong header sizes, and implausible counts each fail loud with
+  their distinct stderr message. `--tshow <i>` rejects a non-integer or
+  out-of-range index distinctly and, for a valid index, reads that one
+  slot and exits 1 naming its class and `decompressor UNKNOWN` — no
+  decompressor is implemented and no window opens. `bigfile.rs` is
+  untouched (this is not the SR1PC layout). Bytes `4..512` are observed
+  but not validated. Synthetic-bytes tests only. Playtest-accepted:
+  `--tlist` exits 0 for all four containers (1287 entries in
+  `TEXTURES.BIG`, 29 in `MOVIES.BIG`); see
+  `docs/changes/big-slots/design.md` and the `big-header` slice
+  (`docs/changes/big-header/archive.md`).
 - `models-3d` (playtest-accepted on a real mesh): `cargo run -- --mesh
   <FILE.SRM>` parses one SR1-remaster loose mesh (format verdict: magic
   `SRM\x01`, 44-byte shader records, 32-byte material records, bone
@@ -152,12 +159,14 @@ extracted files, decompiled code, or database files.
 
 ## What's missing
 
-- [x] `.BIG` headers, slice `big-header` (see
-      `docs/changes/big-header/archive.md`): the four containers share a verified
-      512-byte header plus entry count (1287 / 29 / 268 / 178
-      respectively); `--tlist` reports it and exits 0. The entry index
-      location and stride are still UNKNOWN — nothing is listed, nothing
-      is decoded, and `--tshow` stays loud. Next: locate the index.
+- [x] `.BIG` fixed-slot layout, slice `big-slots` (see
+      `docs/changes/big-slots/design.md`): the four containers share a
+      verified 512-byte header plus entry count (1287 / 29 / 268 / 178
+      respectively) and `4096 + count * 131072`-byte fixed slots.
+      `--tlist` lists every slot with index/offset/class and a per-class
+      footer, exits 0; `--tshow` stays loud naming the class and the
+      UNKNOWN decompressor. Not yet decoded: `data` slots are compressed
+      with an unknown algorithm. Next: identify the decompressor.
 - [x] 3D models, slice 1 `models-3d` (parse-one + render-one, see
       `docs/changes/models-3d/`): single loose SRM as a flat-shaded
       auto-rotating solid. Still unscoped: skeleton/animation, room

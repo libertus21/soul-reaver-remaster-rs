@@ -1,10 +1,11 @@
-//! Remaster `.BIG` header parser (`big-header`): observed CUSTOM layout
-//! (NOT SR1PC — `bigfile.rs` must never parse it). Parses exactly bytes
-//! `0..2` (`u16` header size, must be 512) and `2..4` (`u16` entry
-//! count, must be `1..=32768`), then keeps bounded read-only probes.
-//! Only classes/verdicts leave, never content. The entry index stays
-//! UNKNOWN: no stride, no offset, no entry lines. `--tlist` prints the
-//! header report and exits 0; `--tshow` stays loud (exit 1).
+//! Remaster `.BIG` fixed-slot container (`big-slots`): verified 512-byte
+//! header (`0..2` size must be 512, `2..4` count must be `1..=32768`) plus
+//! fixed 131072-byte slots (`file_len == 4096 + count * 131072`, slot `i`
+//! at `4096 + i * 131072`). Geometry mismatches are loud, never clamped.
+//! Slots are classified over their WHOLE length: all-`0xFF` = empty,
+//! all-zero = zero, else data. No sampling. Decoding is UNKNOWN, so
+//! `--tshow` stays loud. This is NOT the SR1PC layout — `bigfile.rs` must
+//! never parse it. Only classes/verdicts leave, never content.
 //! Synthetic bytes in tests only.
 
 use std::fmt;
@@ -18,6 +19,22 @@ pub const MAX_ENTRIES: u32 = 32768;
 
 /// Verified `.BIG` header length: the size word must equal this value.
 pub const HEADER_SIZE: u16 = 512;
+
+/// Verified fixed slot size for the four SR1 remaster containers.
+pub const SLOT_SIZE: u64 = 131072;
+
+/// First slot starts here: the 4 KiB prefix after the 512-byte header.
+pub const SLOT_DATA_START: u64 = 4096;
+
+/// Exact file length implied by the header entry count.
+pub fn expected_len(count: u16) -> u64 {
+    SLOT_DATA_START + u64::from(count) * SLOT_SIZE
+}
+
+/// Byte offset of slot `index` (pure arithmetic, no table).
+pub fn slot_offset(index: u16) -> u64 {
+    SLOT_DATA_START + u64::from(index) * SLOT_SIZE
+}
 
 /// The only parsed header fields: a `u16` size word and a `u16` entry
 /// count. Bytes `4..16` are observed zero in all four real containers
@@ -80,6 +97,122 @@ pub fn classify_window(bytes: &[u8]) -> RegionClass {
     RegionClass::Data
 }
 
+/// Whole-slot class (contract names exactly three classes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotClass {
+    Empty,
+    Zero,
+    Data,
+}
+
+impl fmt::Display for SlotClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SlotClass::Empty => write!(f, "empty"),
+            SlotClass::Zero => write!(f, "zero"),
+            SlotClass::Data => write!(f, "data"),
+        }
+    }
+}
+
+/// Classify a WHOLE slot slice: all-`0xFF` -> `Empty`, all-zero ->
+/// `Zero`, anything else -> `Data`. Empty slice is `Zero`.
+pub fn classify_slot(bytes: &[u8]) -> SlotClass {
+    if bytes.is_empty() {
+        return SlotClass::Zero;
+    }
+    if bytes.iter().all(|b| *b == 0xFF) {
+        return SlotClass::Empty;
+    }
+    if bytes.iter().all(|b| *b == 0) {
+        return SlotClass::Zero;
+    }
+    SlotClass::Data
+}
+
+/// Reject any file length that is not `4096 + count * 131072` exactly.
+/// Never clamps: a mismatch is loud, not silently repaired.
+pub fn validate_geometry(file_len: u64, header: BigHeader) -> Result<(), TexturesError> {
+    let expected = expected_len(header.entry_count);
+    if file_len == expected {
+        Ok(())
+    } else {
+        Err(TexturesError::SlotGeometryMismatch {
+            file_len,
+            count: header.entry_count,
+            expected,
+        })
+    }
+}
+
+/// One class per slot, in index order. Built by a single sequential pass
+/// over whole slots with one reusable 128 KiB buffer (constant memory).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotScan {
+    pub classes: Vec<SlotClass>,
+}
+
+impl SlotScan {
+    /// How many slots carry `class`.
+    pub fn count(&self, class: SlotClass) -> usize {
+        self.classes.iter().filter(|c| **c == class).count()
+    }
+
+    /// `--tlist` slot section: addressing line, one line per slot, and
+    /// the per-class footer. Classes only; never payload bytes.
+    pub fn report(&self) -> String {
+        let total = self.classes.len();
+        let mut out = format!(
+            "addressing: fixed {SLOT_SIZE}-byte slots (slot i at {SLOT_DATA_START} + i * {SLOT_SIZE})\nslots (whole-slot scan; no sampling):"
+        );
+        for (i, class) in self.classes.iter().enumerate() {
+            out.push_str(&format!("\nslot {i} offset {} {class}", slot_offset(i as u16)));
+        }
+        out.push_str(&format!(
+            "\nslots: {total} total, {} empty, {} zero, {} data",
+            self.count(SlotClass::Empty),
+            self.count(SlotClass::Zero),
+            self.count(SlotClass::Data),
+        ));
+        out
+    }
+}
+
+/// Read every slot whole and classify it. Short read is a loud `Io`
+/// error (geometry validation already guaranteed the length).
+pub fn scan_slots(path: &Path, header: &BigHeader) -> Result<SlotScan, TexturesError> {
+    let mut file = File::open(path).map_err(TexturesError::Io)?;
+    file.seek(SeekFrom::Start(SLOT_DATA_START))
+        .map_err(TexturesError::Io)?;
+    let mut buf = vec![0u8; SLOT_SIZE as usize];
+    let mut classes = Vec::with_capacity(usize::from(header.entry_count));
+    for _ in 0..header.entry_count {
+        file.read_exact(&mut buf).map_err(TexturesError::Io)?;
+        classes.push(classify_slot(&buf));
+    }
+    Ok(SlotScan { classes })
+}
+
+/// Read exactly one slot and classify it. Returns `(offset, class)`.
+pub fn slot_class_at(
+    path: &Path,
+    header: &BigHeader,
+    index: u16,
+) -> Result<(u64, SlotClass), TexturesError> {
+    debug_assert!(
+        index < header.entry_count,
+        "slot index must be range-checked by the caller"
+    );
+    let offset = slot_offset(index);
+    let mut file = File::open(path).map_err(TexturesError::Io)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(TexturesError::Io)?;
+    let mut buf = vec![0u8; SLOT_SIZE as usize];
+    file.read_exact(&mut buf).map_err(TexturesError::Io)?;
+    Ok((offset, classify_slot(&buf)))
+}
+
+
 /// Every textures failure maps to stderr + nonzero exit in `main`.
 /// `BadEntry`/`NotDds` await a future table parser (no-go: unset).
 #[allow(dead_code)]
@@ -93,6 +226,24 @@ pub enum TexturesError {
     TruncatedHeader { len: u64 },
     WrongHeaderSize { found: u16 },
     ImplausibleCount { count: u16 },
+    SlotGeometryMismatch {
+        file_len: u64,
+        count: u16,
+        expected: u64,
+    },
+    SlotSelectorInvalid {
+        selector: String,
+        count: u16,
+    },
+    SlotIndexOutOfRange {
+        index: usize,
+        count: u16,
+    },
+    SlotNotDecodable {
+        index: u16,
+        offset: u64,
+        class: SlotClass,
+    },
 }
 
 impl fmt::Display for TexturesError {
@@ -118,6 +269,40 @@ impl fmt::Display for TexturesError {
                 f,
                 "implausible .BIG entry count: {count} (sanity range 1..={MAX_ENTRIES})"
             ),
+            TexturesError::SlotGeometryMismatch {
+                file_len,
+                count,
+                expected,
+            } => write!(
+                f,
+                "slot geometry mismatch: file holds {file_len} bytes, header count {count} implies {expected} (4096 + {count} * {SLOT_SIZE}); refusing to clamp"
+            ),
+            TexturesError::SlotSelectorInvalid { selector, count } => write!(
+                f,
+                "invalid slot selector '{selector}': expected a slot index in 0..{count}"
+            ),
+            TexturesError::SlotIndexOutOfRange { index, count } => write!(
+                f,
+                "slot index {index} is out of range: container holds {count} slots (valid 0..{count})"
+            ),
+            TexturesError::SlotNotDecodable {
+                index,
+                offset,
+                class,
+            } => match class {
+                SlotClass::Data => write!(
+                    f,
+                    "slot {index} (offset {offset}) is data: payload is compressed, decompressor UNKNOWN (cannot decode)"
+                ),
+                SlotClass::Empty => write!(
+                    f,
+                    "slot {index} (offset {offset}) is empty (0xFF marker): no payload; decompressor UNKNOWN (nothing to decode)"
+                ),
+                SlotClass::Zero => write!(
+                    f,
+                    "slot {index} (offset {offset}) is zero (0x00 fill): no payload; decompressor UNKNOWN (nothing to decode)"
+                ),
+            },
         }
     }
 }
@@ -175,6 +360,13 @@ const FILL_PROBE_OFF: u64 = 4096;
 const DATA_PROBE_OFF: u64 = 1024 * 1024;
 const PROBE_LEN: usize = 64;
 
+/// Data-probe offset clamped so a geometry-valid short container (as few
+/// as one slot) never fails with a misleading probed-EOF error. Real
+/// containers are all larger than 1 MiB, so their offset is unchanged.
+fn data_probe_offset(file_len: u64) -> u64 {
+    DATA_PROBE_OFF.min(file_len.saturating_sub(PROBE_LEN as u64))
+}
+
 /// Read exactly `PROBE_LEN` bytes at `offset` (bounded, read-only).
 fn probe_window(file: &mut File, offset: u64, file_len: u64) -> Result<[u8; PROBE_LEN], TexturesError> {
     if offset + PROBE_LEN as u64 > file_len {
@@ -212,7 +404,7 @@ pub fn hunt_table(path: &Path, file_len: u64) -> Result<bool, TexturesError> {
     // Observed, then deliberately unused: even a sane tail word cannot
     // anchor a parser without observed fields — refusing to guess.
     let _tail_signal = sane_at(0) || sane_at(tail.len().saturating_sub(4));
-    let _data_class = classify_window(&probe_window(&mut file, DATA_PROBE_OFF, file_len)?);
+    let _data_class = classify_window(&probe_window(&mut file, data_probe_offset(file_len), file_len)?);
     Ok(false)
 }
 
@@ -228,9 +420,10 @@ pub fn describe(path: &Path) -> Result<TexturesLayout, TexturesError> {
     file.read_exact(&mut prefix)
         .map_err(|_| TexturesError::TruncatedHeader { len: file_len })?;
     let header = parse_header(prefix, file_len)?;
+    validate_geometry(file_len, header)?;
     let header_class = classify_window(&probe_window(&mut file, HEADER_PROBE_OFF, file_len)?);
     let fill_class = classify_window(&probe_window(&mut file, FILL_PROBE_OFF, file_len)?);
-    let data_class = classify_window(&probe_window(&mut file, DATA_PROBE_OFF, file_len)?);
+    let data_class = classify_window(&probe_window(&mut file, data_probe_offset(file_len), file_len)?);
     drop(file);
     let table_found = hunt_table(path, file_len)?;
     Ok(TexturesLayout {
@@ -256,16 +449,41 @@ mod tests {
         p
     }
 
-    /// Synthetic container: header words + `0xFF` fill from 4K + nonzero
-    /// data from 1 MiB. All values invented — never game bytes.
+    /// Synthetic container with EXACT geometry: header words, `0xFF` fill
+    /// from 4K, nonzero bytes in the last probe window. All values
+    /// invented — never game bytes.
     fn synthetic_textures(header_size: u16, count: u16) -> Vec<u8> {
-        let mut b = vec![0u8; DATA_PROBE_OFF as usize + PROBE_LEN];
+        let len = expected_len(count) as usize;
+        let mut b = vec![0u8; len];
         b[0..4].copy_from_slice(&prefix(header_size, count));
-        for byte in b[4096..].iter_mut() {
+        for byte in b[SLOT_DATA_START as usize..].iter_mut() {
             *byte = 0xFF;
         }
-        for (i, byte) in b[DATA_PROBE_OFF as usize..].iter_mut().enumerate() {
+        let probe = data_probe_offset(len as u64) as usize;
+        for (i, byte) in b[probe..].iter_mut().enumerate() {
             *byte = (i % 251) as u8 + 1;
+        }
+        b
+    }
+
+    /// Synthetic container whose slots are exactly the requested classes.
+    /// Header prefix is zero; slot payloads are invented.
+    fn synthetic_slots(classes: &[SlotClass]) -> Vec<u8> {
+        let count = classes.len() as u16;
+        let mut b = vec![0u8; expected_len(count) as usize];
+        b[0..4].copy_from_slice(&prefix(512, count));
+        for (i, class) in classes.iter().enumerate() {
+            let start = slot_offset(i as u16) as usize;
+            let slot = &mut b[start..start + SLOT_SIZE as usize];
+            match class {
+                SlotClass::Empty => slot.fill(0xFF),
+                SlotClass::Zero => slot.fill(0x00),
+                SlotClass::Data => {
+                    for (j, byte) in slot.iter_mut().enumerate() {
+                        *byte = (j % 251) as u8 + 1;
+                    }
+                }
+            }
         }
         b
     }
@@ -332,6 +550,181 @@ mod tests {
         ));
         assert!(err.to_string().contains("32769"), "got: {err}");
         assert!(parse_header(prefix(512, 32768), 4096).is_ok());
+    }
+
+    #[test]
+    fn slot_arithmetic_matches_verified_layout() {
+        assert_eq!(expected_len(1), 135168);
+        assert_eq!(expected_len(1287), 4096 + 1287 * 131072);
+        assert_eq!(slot_offset(0), 4096);
+        assert_eq!(slot_offset(1), 135168);
+        for i in 0..16u16 {
+            assert_eq!(slot_offset(i), SLOT_DATA_START + u64::from(i) * SLOT_SIZE);
+        }
+    }
+
+    #[test]
+    fn classify_slot_uses_the_whole_slice() {
+        assert_eq!(classify_slot(&[0xFFu8; 131072]), SlotClass::Empty);
+        assert_eq!(classify_slot(&[0u8; 131072]), SlotClass::Zero);
+        assert_eq!(classify_slot(&[]), SlotClass::Zero);
+        let mut mixed = vec![0xFFu8; 131072];
+        mixed[131071] = 0x00;
+        assert_eq!(classify_slot(&mixed), SlotClass::Data);
+        assert_eq!(classify_slot(&[0u8, 1]), SlotClass::Data);
+        assert_eq!(SlotClass::Empty.to_string(), "empty");
+        assert_eq!(SlotClass::Zero.to_string(), "zero");
+        assert_eq!(SlotClass::Data.to_string(), "data");
+    }
+
+    #[test]
+    fn validate_geometry_accepts_exact_length_only() {
+        let header = BigHeader {
+            header_size: 512,
+            entry_count: 3,
+        };
+        let exact = expected_len(3);
+        validate_geometry(exact, header).expect("exact geometry must pass");
+        let short = validate_geometry(exact - 1, header).expect_err("one byte short must fail");
+        assert!(matches!(
+            short,
+            TexturesError::SlotGeometryMismatch { file_len, count: 3, expected }
+                if file_len == exact - 1 && expected == exact
+        ));
+        let long = validate_geometry(exact + 1, header).expect_err("one byte long must fail");
+        let msg = long.to_string();
+        assert!(
+            msg.contains(&(exact + 1).to_string())
+                && msg.contains(&exact.to_string())
+                && msg.contains("refusing to clamp"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn short_geometry_valid_container_passes_probes() {
+        let path = write_temp("one-slot", &synthetic_textures(512, 1));
+        let layout = describe(&path).expect("one-slot container must describe");
+        assert_eq!(layout.header.entry_count, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn describe_rejects_geometry_mismatch() {
+        let mut bytes = synthetic_textures(512, 2);
+        bytes.push(0);
+        let path = write_temp("one-byte-long", &bytes);
+        assert!(matches!(
+            describe(&path),
+            Err(TexturesError::SlotGeometryMismatch { .. })
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_slots_reports_every_slot_and_footer() {
+        let classes = [
+            SlotClass::Empty,
+            SlotClass::Zero,
+            SlotClass::Data,
+            SlotClass::Data,
+            SlotClass::Data,
+            SlotClass::Data,
+            SlotClass::Data,
+            SlotClass::Data,
+        ];
+        let path = write_temp("eight-slots", &synthetic_slots(&classes));
+        let header = BigHeader {
+            header_size: 512,
+            entry_count: 8,
+        };
+        let scan = scan_slots(&path, &header).expect("scan must succeed");
+        assert_eq!(scan.classes, classes);
+        assert_eq!(scan.count(SlotClass::Empty), 1);
+        assert_eq!(scan.count(SlotClass::Zero), 1);
+        assert_eq!(scan.count(SlotClass::Data), 6);
+        let report = scan.report();
+        assert!(
+            report.starts_with("addressing: fixed 131072-byte slots (slot i at 4096 + i * 131072)"),
+            "got: {report}"
+        );
+        assert!(report.contains("slots (whole-slot scan; no sampling):"));
+        assert!(report.contains("slot 0 offset 4096 empty"));
+        assert!(report.contains("slot 1 offset 135168 zero"));
+        assert!(report.contains("slot 7 offset 921600 data"));
+        assert!(report.contains("slots: 8 total, 1 empty, 1 zero, 6 data"));
+        assert_eq!(report.lines().count(), 11, "got: {report}");
+        let (offset, class) = slot_class_at(&path, &header, 1).expect("one slot must read");
+        assert_eq!(offset, slot_offset(1));
+        assert_eq!(class, SlotClass::Zero);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn no_sampling_last_byte_decides() {
+        // Slot 1 is 0xFF in every byte except its last one -> data.
+        let mut bytes = synthetic_slots(&[SlotClass::Empty, SlotClass::Data]);
+        let start = slot_offset(1) as usize;
+        bytes[start..start + SLOT_SIZE as usize].fill(0xFF);
+        bytes[start + SLOT_SIZE as usize - 1] = 0x00;
+        let path = write_temp("no-sampling", &bytes);
+        let header = BigHeader {
+            header_size: 512,
+            entry_count: 2,
+        };
+        let scan = scan_slots(&path, &header).expect("scan must succeed");
+        assert_eq!(scan.classes[1], SlotClass::Data);
+        let (_, class) = slot_class_at(&path, &header, 1).expect("one slot must read");
+        assert_eq!(class, SlotClass::Data);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn slot_not_decodable_messages_name_class_and_unknown_decompressor() {
+        let data = TexturesError::SlotNotDecodable {
+            index: 2,
+            offset: 266240,
+            class: SlotClass::Data,
+        }
+        .to_string();
+        assert!(
+            data.contains("is data") && data.contains("compressed") && data.contains("UNKNOWN"),
+            "got: {data}"
+        );
+        let empty = TexturesError::SlotNotDecodable {
+            index: 0,
+            offset: 4096,
+            class: SlotClass::Empty,
+        }
+        .to_string();
+        assert!(
+            empty.contains("is empty") && empty.contains("no payload") && empty.contains("UNKNOWN"),
+            "got: {empty}"
+        );
+        let zero = TexturesError::SlotNotDecodable {
+            index: 1,
+            offset: 135168,
+            class: SlotClass::Zero,
+        }
+        .to_string();
+        assert!(
+            zero.contains("is zero") && zero.contains("no payload") && zero.contains("UNKNOWN"),
+            "got: {zero}"
+        );
+        let selector = TexturesError::SlotSelectorInvalid {
+            selector: "abc".to_string(),
+            count: 8,
+        }
+        .to_string();
+        assert!(
+            selector.contains("'abc'") && selector.contains("0..8"),
+            "got: {selector}"
+        );
+        let range = TexturesError::SlotIndexOutOfRange { index: 8, count: 8 }.to_string();
+        assert!(
+            range.contains("slot index 8") && range.contains("valid 0..8"),
+            "got: {range}"
+        );
     }
 
     #[test]
