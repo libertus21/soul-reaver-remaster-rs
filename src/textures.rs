@@ -19,10 +19,6 @@ pub const MAX_ENTRIES: u32 = 32768;
 /// Verified `.BIG` header length: the size word must equal this value.
 pub const HEADER_SIZE: u16 = 512;
 
-/// Next candidate named by loud errors when no table is identified
-/// (relative name only — never an install path).
-pub const NEXT_CANDIDATE: &str = "2\\BIGFILE.DAT (2236-entry sibling, layout unverified)";
-
 /// The only parsed header fields: a `u16` size word and a `u16` entry
 /// count. Bytes `4..16` are observed zero in all four real containers
 /// but are NOT validated or interpreted.
@@ -107,7 +103,7 @@ impl fmt::Display for TexturesError {
             TexturesError::BadEntry(msg) => write!(f, "bad textures entry: {msg}"),
             TexturesError::BadSelector(sel) => write!(
                 f,
-                "no textures entry matches selector '{sel}' (no entry table identified; {NEXT_CANDIDATE})"
+                "no entry table identified for selector '{sel}': index location UNKNOWN (no stride inferred)"
             ),
             TexturesError::NotDds(msg) => write!(f, "not a DDS entry: {msg}"),
             TexturesError::TruncatedHeader { len } => write!(
@@ -426,7 +422,7 @@ mod tests {
     #[test]
     fn error_displays_carry_details() {
         let msg = TexturesError::BadSelector("3".to_string()).to_string();
-        assert!(msg.contains('3') && msg.contains("entry table"), "got: {msg}");
+        assert!(msg.contains('3') && msg.contains("UNKNOWN"), "got: {msg}");
         assert!(TexturesError::NotDds("entry 0".into()).to_string().contains("entry 0"));
     }
 }

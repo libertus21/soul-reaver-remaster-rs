@@ -9,8 +9,9 @@
 //! archive index (one line per entry); `--show <index|hash>` decodes
 //! that entry IN MEMORY (never written to disk) and shows it through
 //! the same window when it is a DDS texture. `cargo run -- --textures
-//! <TEXTURES.BIG> --tlist` prints the remaster textures-container
-//! layout summary (a custom layout, NOT the SR1PC bigfile layout).
+//! <TEXTURES.BIG> --tlist` parses the remaster `.BIG` header (a custom
+//! layout, NOT the SR1PC bigfile layout), prints the header report, and
+//! exits 0 when it validates; the entry table stays UNKNOWN.
 //! `cargo run -- --mesh <FILE.SRM>` parses one SR1-remaster mesh
 //! (positions + triangle indices only) and shows it as a flat-shaded
 //! auto-rotating solid (Esc or window close to exit).
@@ -218,8 +219,9 @@ fn run_bigfile(args: &[String]) -> ExitCode {
     }
 }
 
-/// `--textures <path> --tlist`: no table is identified, so print the
-/// layout summary (stdout) and exit 1 loud naming the next candidate.
+/// `--textures <path> --tlist`: a valid header prints the report to
+/// stdout and exits 0. `--tshow` stays loud (exit 1): the entry table is
+/// still UNKNOWN, so no entry is read.
 fn run_textures(args: &[String]) -> ExitCode {
     let Some(path_arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tlist");
@@ -242,15 +244,9 @@ fn run_textures(args: &[String]) -> ExitCode {
     };
     if tlist {
         println!("{}", layout.summary());
-    } else {
-        eprintln!("error: {}", textures::TexturesError::BadSelector(args[2].clone()));
+        return ExitCode::SUCCESS;
     }
-    eprintln!(
-        "error: no entry table identified in '{}' ({}; next candidate: {})",
-        path.display(),
-        layout.size_class(),
-        textures::NEXT_CANDIDATE
-    );
+    eprintln!("error: {}", textures::TexturesError::BadSelector(args[2].clone()));
     ExitCode::from(1)
 }
 
@@ -405,13 +401,91 @@ fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod cli_tests {
-    use super::{run_bigfile, run_mesh, run_mesh_all, run_mesh_textured, strip_launcher_noops};
+    use super::{
+        run_bigfile, run_mesh, run_mesh_all, run_mesh_textured, run_textures,
+        strip_launcher_noops,
+    };
     use std::process::ExitCode;
 
     fn write_tmp(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
         let path = dir.path().join(name);
         std::fs::write(&path, bytes).expect("synthetic mesh file must be writable");
         path.to_string_lossy().into_owned()
+    }
+
+    /// Synthetic `.BIG` bytes wide enough for the bounded probes: two
+    /// header words followed by zeros. Values are invented.
+    fn synthetic_big(header_size: u16, count: u16) -> Vec<u8> {
+        let mut bytes = vec![0u8; 1024 * 1024 + 64];
+        bytes[0..2].copy_from_slice(&header_size.to_le_bytes());
+        bytes[2..4].copy_from_slice(&count.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn textures_tlist_valid_header_exits_0() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let big = write_tmp(&tmp, "valid.big", &synthetic_big(512, 3));
+        assert_eq!(
+            run_textures(&[big, "--tlist".to_string()]),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn textures_tlist_each_invalid_header_class_exits_1() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let truncated = write_tmp(&tmp, "trunc.big", &[0u8; 100]);
+        assert_eq!(
+            run_textures(&[truncated, "--tlist".to_string()]),
+            ExitCode::from(1)
+        );
+        let wrong = write_tmp(&tmp, "wrong.big", &synthetic_big(256, 3));
+        assert_eq!(
+            run_textures(&[wrong, "--tlist".to_string()]),
+            ExitCode::from(1)
+        );
+        let zero = write_tmp(&tmp, "zero.big", &synthetic_big(512, 0));
+        assert_eq!(
+            run_textures(&[zero, "--tlist".to_string()]),
+            ExitCode::from(1)
+        );
+        let huge = write_tmp(&tmp, "huge.big", &synthetic_big(512, 32769));
+        assert_eq!(
+            run_textures(&[huge, "--tlist".to_string()]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn textures_tshow_stays_loud_exit_1() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let valid = write_tmp(&tmp, "valid.big", &synthetic_big(512, 3));
+        assert_eq!(
+            run_textures(&[valid, "--tshow".to_string(), "0".to_string()]),
+            ExitCode::from(1)
+        );
+        let invalid = write_tmp(&tmp, "invalid.big", &synthetic_big(256, 3));
+        assert_eq!(
+            run_textures(&[invalid, "--tshow".to_string(), "0".to_string()]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn textures_usage_errors_exit_1() {
+        assert_eq!(run_textures(&[]), ExitCode::from(1));
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let big = write_tmp(&tmp, "valid.big", &synthetic_big(512, 3));
+        assert_eq!(run_textures(&[big.clone()]), ExitCode::from(1));
+        assert_eq!(
+            run_textures(&[big.clone(), "--tlist".to_string(), "extra".to_string()]),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            run_textures(&[big, "--unknown".to_string()]),
+            ExitCode::from(1)
+        );
     }
 
     #[test]
