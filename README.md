@@ -100,11 +100,14 @@ extracted files, decompiled code, or database files.
   because the payload is not compressed (see
   `docs/notes/s7-big-slot-payload-format.md`). `bigfile.rs` is
   untouched (this is not the SR1PC layout). Bytes `4..512` are observed
-  but not validated. Synthetic-bytes tests only. Playtest-accepted:
-  `--tlist` exits 0 for all four containers (1287 entries in
-  `TEXTURES.BIG`, 29 in `MOVIES.BIG`); see
-  `docs/changes/big-slots/design.md` and the `big-header` slice
-  (`docs/changes/big-header/archive.md`).
+   but not validated. Synthetic-bytes tests only. Slot listing is
+   playtest-accepted: `--tlist` exits 0 for all four containers with the
+   footer `slots: 29 total, 1 empty, 0 zero, 28 data` (`MOVIES.BIG`),
+   `1287 total, 1 empty, 0 zero, 1286 data` (`TEXTURES.BIG`),
+   `268 total, 1 empty, 0 zero, 267 data` (`BONUS.BIG`), and
+   `178 total, 0 empty, 2 zero, 176 data` (`E3.BIG`); see
+   `docs/changes/big-slots/archive.md` and the `big-header` slice
+   (`docs/changes/big-header/archive.md`).
 - `models-3d` (playtest-accepted on a real mesh): `cargo run -- --mesh
   <FILE.SRM>` parses one SR1-remaster loose mesh (format verdict: magic
   `SRM\x01`, 44-byte shader records, 32-byte material records, bone
