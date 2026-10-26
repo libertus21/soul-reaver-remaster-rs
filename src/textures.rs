@@ -1,17 +1,20 @@
-//! Remaster `.BIG` fixed-slot container (`big-slots`): verified 512-byte
-//! header (`0..2` size must be 512, `2..4` count must be `1..=32768`) plus
-//! fixed 131072-byte slots (`file_len == 4096 + count * 131072`, slot `i`
-//! at `4096 + i * 131072`). Geometry mismatches are loud, never clamped.
-//! Slots are classified over their WHOLE length: all-`0xFF` = empty,
-//! all-zero = zero, else data. No sampling. Decoding is UNKNOWN, so
-//! `--tshow` stays loud. This is NOT the SR1PC layout — `bigfile.rs` must
-//! never parse it. Only classes/verdicts leave, never content.
+//! Remaster `.BIG` fixed-slot container (`big-slots` + `big-decompressor`):
+//! verified 512-byte header (`0..2` size must be 512, `2..4` count must be
+//! `1..=32768`) plus fixed 131072-byte slots (`file_len == 4096 + count *
+//! 131072`, slot `i` at `4096 + i * 131072`). Geometry mismatches are loud,
+//! never clamped. Slots are classified over their WHOLE length: all-`0xFF` =
+//! empty, all-zero = zero, else data. No sampling. A `data` payload is raw
+//! 256 x 256 little-endian A1R5G5B5 (`slot_texture`), NOT compressed, so
+//! `--tshow` decodes one slot. This is NOT the SR1PC layout — `bigfile.rs`
+//! must never parse it. Only classes/verdicts leave, never content.
 //! Synthetic bytes in tests only.
 
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+
+use crate::slot_texture;
 
 /// Sanity bound from the bigfile spec source (`MAX_ENTRIES = 32768`).
 /// Used here as a guard on the parsed entry count — not a format claim.
@@ -193,12 +196,14 @@ pub fn scan_slots(path: &Path, header: &BigHeader) -> Result<SlotScan, TexturesE
     Ok(SlotScan { classes })
 }
 
-/// Read exactly one slot and classify it. Returns `(offset, class)`.
-pub fn slot_class_at(
+/// Read exactly one slot, classify it, and decode it when it is `data`.
+/// `empty`/`zero` slots carry no payload and are loud; a payload whose
+/// length is not the slot size is loud too. A short read stays `Io`.
+pub fn decode_slot_at(
     path: &Path,
     header: &BigHeader,
     index: u16,
-) -> Result<(u64, SlotClass), TexturesError> {
+) -> Result<(u64, Vec<u8>), TexturesError> {
     debug_assert!(
         index < header.entry_count,
         "slot index must be range-checked by the caller"
@@ -209,7 +214,23 @@ pub fn slot_class_at(
         .map_err(TexturesError::Io)?;
     let mut buf = vec![0u8; SLOT_SIZE as usize];
     file.read_exact(&mut buf).map_err(TexturesError::Io)?;
-    Ok((offset, classify_slot(&buf)))
+    match classify_slot(&buf) {
+        SlotClass::Data => match slot_texture::decode_a1r5g5b5(&buf) {
+            Ok(rgba) => Ok((offset, rgba)),
+            Err(slot_texture::SlotDecodeError::WrongLength { found, expected }) => {
+                Err(TexturesError::SlotPayloadLength {
+                    index,
+                    found,
+                    expected,
+                })
+            }
+        },
+        class => Err(TexturesError::SlotNoPayload {
+            index,
+            offset,
+            class,
+        }),
+    }
 }
 
 
@@ -239,10 +260,15 @@ pub enum TexturesError {
         index: usize,
         count: u16,
     },
-    SlotNotDecodable {
+    SlotNoPayload {
         index: u16,
         offset: u64,
         class: SlotClass,
+    },
+    SlotPayloadLength {
+        index: u16,
+        found: usize,
+        expected: usize,
     },
 }
 
@@ -285,24 +311,34 @@ impl fmt::Display for TexturesError {
                 f,
                 "slot index {index} is out of range: container holds {count} slots (valid 0..{count})"
             ),
-            TexturesError::SlotNotDecodable {
+            TexturesError::SlotNoPayload {
                 index,
                 offset,
                 class,
             } => match class {
-                SlotClass::Data => write!(
-                    f,
-                    "slot {index} (offset {offset}) is data: payload is compressed, decompressor UNKNOWN (cannot decode)"
-                ),
                 SlotClass::Empty => write!(
                     f,
-                    "slot {index} (offset {offset}) is empty (0xFF marker): no payload; decompressor UNKNOWN (nothing to decode)"
+                    "slot {index} (offset {offset}) is empty (0xFF marker): no payload to decode"
                 ),
                 SlotClass::Zero => write!(
                     f,
-                    "slot {index} (offset {offset}) is zero (0x00 fill): no payload; decompressor UNKNOWN (nothing to decode)"
+                    "slot {index} (offset {offset}) is zero (0x00 fill): no payload to decode"
+                ),
+                SlotClass::Data => write!(
+                    f,
+                    "slot {index} (offset {offset}) is data: no payload to decode"
                 ),
             },
+            TexturesError::SlotPayloadLength {
+                index,
+                found,
+                expected,
+            } => write!(
+                f,
+                "slot {index} payload length {found} does not match {}x{} A1R5G5B5 ({expected} bytes)",
+                slot_texture::WIDTH,
+                slot_texture::HEIGHT,
+            ),
         }
     }
 }
@@ -654,9 +690,9 @@ mod tests {
         assert!(report.contains("slot 7 offset 921600 data"));
         assert!(report.contains("slots: 8 total, 1 empty, 1 zero, 6 data"));
         assert_eq!(report.lines().count(), 11, "got: {report}");
-        let (offset, class) = slot_class_at(&path, &header, 1).expect("one slot must read");
-        assert_eq!(offset, slot_offset(1));
-        assert_eq!(class, SlotClass::Zero);
+        let (offset, rgba) = decode_slot_at(&path, &header, 2).expect("data slot must decode");
+        assert_eq!(offset, slot_offset(2));
+        assert_eq!(rgba.len(), 262144);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -674,42 +710,53 @@ mod tests {
         };
         let scan = scan_slots(&path, &header).expect("scan must succeed");
         assert_eq!(scan.classes[1], SlotClass::Data);
-        let (_, class) = slot_class_at(&path, &header, 1).expect("one slot must read");
-        assert_eq!(class, SlotClass::Data);
+        decode_slot_at(&path, &header, 1).expect("single-slot read must see the last byte");
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn slot_not_decodable_messages_name_class_and_unknown_decompressor() {
-        let data = TexturesError::SlotNotDecodable {
-            index: 2,
-            offset: 266240,
-            class: SlotClass::Data,
-        }
-        .to_string();
-        assert!(
-            data.contains("is data") && data.contains("compressed") && data.contains("UNKNOWN"),
-            "got: {data}"
-        );
-        let empty = TexturesError::SlotNotDecodable {
+    fn slot_errors_name_class_length_selector_and_range() {
+        let empty = TexturesError::SlotNoPayload {
             index: 0,
             offset: 4096,
             class: SlotClass::Empty,
         }
         .to_string();
         assert!(
-            empty.contains("is empty") && empty.contains("no payload") && empty.contains("UNKNOWN"),
+            empty.contains("slot 0 (offset 4096)")
+                && empty.contains("is empty")
+                && empty.contains("0xFF marker")
+                && empty.contains("no payload to decode"),
             "got: {empty}"
         );
-        let zero = TexturesError::SlotNotDecodable {
+        let zero = TexturesError::SlotNoPayload {
             index: 1,
             offset: 135168,
             class: SlotClass::Zero,
         }
         .to_string();
         assert!(
-            zero.contains("is zero") && zero.contains("no payload") && zero.contains("UNKNOWN"),
+            zero.contains("is zero") && zero.contains("0x00 fill") && zero.contains("no payload"),
             "got: {zero}"
+        );
+        for msg in [&empty, &zero] {
+            assert!(
+                !msg.contains("compressed") && !msg.contains("UNKNOWN"),
+                "stale compression wording: {msg}"
+            );
+        }
+        let length = TexturesError::SlotPayloadLength {
+            index: 2,
+            found: 131071,
+            expected: 131072,
+        }
+        .to_string();
+        assert!(
+            length.contains("slot 2")
+                && length.contains("131071")
+                && length.contains("256x256")
+                && length.contains("131072"),
+            "got: {length}"
         );
         let selector = TexturesError::SlotSelectorInvalid {
             selector: "abc".to_string(),
@@ -725,6 +772,64 @@ mod tests {
             range.contains("slot index 8") && range.contains("valid 0..8"),
             "got: {range}"
         );
+    }
+
+    #[test]
+    fn decode_slot_at_reads_one_data_slot() {
+        assert_eq!(slot_texture::SLOT_BYTES as u64, SLOT_SIZE);
+        let path = write_temp(
+            "decode-data",
+            &synthetic_slots(&[SlotClass::Zero, SlotClass::Data]),
+        );
+        let header = BigHeader {
+            header_size: 512,
+            entry_count: 2,
+        };
+        let (offset, rgba) = decode_slot_at(&path, &header, 1).expect("data slot must decode");
+        assert_eq!(offset, slot_offset(1));
+        assert_eq!(rgba.len(), 262144);
+        assert_eq!(
+            rgba.len(),
+            slot_texture::WIDTH * slot_texture::HEIGHT * 4
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn decode_slot_at_rejects_empty_and_zero_slots() {
+        let path = write_temp(
+            "decode-classes",
+            &synthetic_slots(&[SlotClass::Empty, SlotClass::Zero, SlotClass::Data]),
+        );
+        let header = BigHeader {
+            header_size: 512,
+            entry_count: 3,
+        };
+        let empty = decode_slot_at(&path, &header, 0).expect_err("empty must not decode");
+        assert!(
+            matches!(
+                empty,
+                TexturesError::SlotNoPayload {
+                    index: 0,
+                    offset: 4096,
+                    class: SlotClass::Empty
+                }
+            ),
+            "got: {empty:?}"
+        );
+        let zero = decode_slot_at(&path, &header, 1).expect_err("zero must not decode");
+        assert!(
+            matches!(
+                zero,
+                TexturesError::SlotNoPayload {
+                    index: 1,
+                    class: SlotClass::Zero,
+                    ..
+                }
+            ),
+            "got: {zero:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
