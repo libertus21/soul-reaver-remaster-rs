@@ -34,6 +34,12 @@ extracted files, decompiled code, or database files.
 
 ## What works
 
+- `.BIG` textures (playtest-accepted): reads and renders textures from the
+  `.BIG` containers (256 × 256 A1R5G5B5). `--tshow` renders real content
+  (stone, faces, legible runes) from `TEXTURES.BIG`, `BONUS.BIG`, `E3.BIG`, and
+  `MOVIES.BIG` slots; large flat regions are atlas fill/padding, not a decode
+  error. Container contract in the `big-slots` bullet; format proof in
+  `docs/changes/big-decompressor/archive.md`.
 - `dds-texture-viewer`: `cargo run -- <path-to-a-DDS>` decodes one
   `.DDS` (DX10 extended header via the `image` crate, base mip to
   RGBA8) and shows it as a stretched fullscreen quad in a winit/wgpu
@@ -176,6 +182,10 @@ extracted files, decompiled code, or database files.
       little-endian A1R5G5B5 image and shows it, while `empty`/`zero` slots
       stay loud. Verdict: `data` slots are NOT compressed, so no decompressor
       is needed. Visual acceptance of decoded slots is a playtest, not a test.
+- [ ] Texture slot → name mapping: slots are addressed by index only; mapping
+      an index to a texture name (likely through `TEX_HD.MAP`) is the remaining
+      texture gap. Exhaustive validity of all 1287 `TEXTURES.BIG` slots is
+      sampled, not proven.
 - [x] 3D models, slice 1 `models-3d` (parse-one + render-one, see
       `docs/changes/models-3d/`): single loose SRM as a flat-shaded
       auto-rotating solid. Still unscoped: skeleton/animation, room

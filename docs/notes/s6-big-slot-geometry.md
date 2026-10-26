@@ -3,6 +3,11 @@
 Follow-up probe after the header slice. Bounded, read-only: header reads, slot-head
 reads, arithmetic checks. No extraction, no game content committed.
 
+> **Superseded in part by [`s7-big-slot-payload-format.md`](s7-big-slot-payload-format.md).**
+> The fixed-slot geometry below still holds. Two payload claims in this note do
+> not: slot payloads are **not compressed**, and slot 1 is **not** all-zero.
+> Those sections are annotated inline and left unrewritten on purpose.
+
 ## Result (CONFIRMED)
 
 The four `.BIG` containers are **arrays of fixed 131072-byte (128 KB) slots**, not
@@ -39,7 +44,19 @@ In both TEXTURES.BIG and MOVIES.BIG, slot 0 is **131072 bytes of `0xFF`** — th
 entire slot, exactly. Slot 1 in both files is zero-filled. Real payload starts
 around slot 2.
 
+> **Superseded by [`s7`](s7-big-slot-payload-format.md) — the slot-1 half is wrong.**
+> Slot 0 (`0xFF` marker) is confirmed. Slot 1 is **not** all-zero: it is about
+> 93% `0x00` plus a small non-zero patch, i.e. a near-black image, so it
+> classifies `data`, not `zero`.
+
 ## Slot payloads are compressed (CONFIRMED for the heads; algorithm UNKNOWN)
+
+> **Superseded by [`s7`](s7-big-slot-payload-format.md) — this section's verdict is wrong.**
+> `data` slots are **not compressed**. Each is a raw, headerless 256 × 256 image
+> of little-endian A1R5G5B5 pixels, exactly 131072 bytes. The repeating 16-bit
+> symbols read here as a dictionary/LZ stream are flat-coloured pixel runs
+> (atlas fill), which is what an uncompressed surface looks like. No
+> decompression algorithm exists to identify.
 
 - No slot begins with the `DDS ` four-character code; TEXTURES.BIG has 676 distinct
   4-byte slot-head patterns across 1287 slots, dominated by repeats such as
@@ -67,6 +84,10 @@ actual pixels.
   from the slot head (empty / zero / data). That is honest and verifiable now.
 - `--tshow` cannot render a texture until the decompressor is identified; it must
   stay loud instead of guessing.
+
+> **Superseded by [`s7`](s7-big-slot-payload-format.md).** `--tshow` can render
+> today: it needs an A1R5G5B5 → RGBA8 converter, not a decompressor. Delivered in
+> the `big-decompressor` slice (see `docs/changes/big-decompressor/archive.md`).
 - The `.BIG` geometry is now settled, so the container work reduces to two known
   problems: slot addressing (solved) and payload decompression (open).
 
