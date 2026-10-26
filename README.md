@@ -92,9 +92,13 @@ extracted files, decompiled code, or database files.
   `slot geometry mismatch` error (exit 1, never clamped). Truncated
   files, wrong header sizes, and implausible counts each fail loud with
   their distinct stderr message. `--tshow <i>` rejects a non-integer or
-  out-of-range index distinctly and, for a valid index, reads that one
-  slot and exits 1 naming its class and `decompressor UNKNOWN` — no
-  decompressor is implemented and no window opens. `bigfile.rs` is
+  out-of-range index distinctly and, for a valid `data` slot, reads exactly
+  that one slot, converts its raw 256 x 256 little-endian A1R5G5B5 pixels
+  to RGBA8 (bit 15 = alpha, each 5-bit channel expanded by bit replication)
+  and shows it through the existing window (close/Esc exits 0); `empty` and
+  `zero` slots stay loud (exit 1) with no window. There is no decompressor
+  because the payload is not compressed (see
+  `docs/notes/s7-big-slot-payload-format.md`). `bigfile.rs` is
   untouched (this is not the SR1PC layout). Bytes `4..512` are observed
   but not validated. Synthetic-bytes tests only. Playtest-accepted:
   `--tlist` exits 0 for all four containers (1287 entries in
@@ -159,14 +163,16 @@ extracted files, decompiled code, or database files.
 
 ## What's missing
 
-- [x] `.BIG` fixed-slot layout, slice `big-slots` (see
-      `docs/changes/big-slots/design.md`): the four containers share a
+- [x] `.BIG` fixed-slot layout and slot decoding, slices `big-slots` +
+      `big-decompressor` (see `docs/changes/big-slots/design.md` and
+      `docs/changes/big-decompressor/design.md`): the four containers share a
       verified 512-byte header plus entry count (1287 / 29 / 268 / 178
       respectively) and `4096 + count * 131072`-byte fixed slots.
       `--tlist` lists every slot with index/offset/class and a per-class
-      footer, exits 0; `--tshow` stays loud naming the class and the
-      UNKNOWN decompressor. Not yet decoded: `data` slots are compressed
-      with an unknown algorithm. Next: identify the decompressor.
+      footer, exits 0; `--tshow` decodes one `data` slot as a raw 256 x 256
+      little-endian A1R5G5B5 image and shows it, while `empty`/`zero` slots
+      stay loud. Verdict: `data` slots are NOT compressed, so no decompressor
+      is needed. Visual acceptance of decoded slots is a playtest, not a test.
 - [x] 3D models, slice 1 `models-3d` (parse-one + render-one, see
       `docs/changes/models-3d/`): single loose SRM as a flat-shaded
       auto-rotating solid. Still unscoped: skeleton/animation, room

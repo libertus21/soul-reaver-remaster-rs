@@ -196,29 +196,9 @@ pub fn scan_slots(path: &Path, header: &BigHeader) -> Result<SlotScan, TexturesE
     Ok(SlotScan { classes })
 }
 
-/// Read exactly one slot and classify it. Returns `(offset, class)`.
-pub fn slot_class_at(
-    path: &Path,
-    header: &BigHeader,
-    index: u16,
-) -> Result<(u64, SlotClass), TexturesError> {
-    debug_assert!(
-        index < header.entry_count,
-        "slot index must be range-checked by the caller"
-    );
-    let offset = slot_offset(index);
-    let mut file = File::open(path).map_err(TexturesError::Io)?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(TexturesError::Io)?;
-    let mut buf = vec![0u8; SLOT_SIZE as usize];
-    file.read_exact(&mut buf).map_err(TexturesError::Io)?;
-    Ok((offset, classify_slot(&buf)))
-}
-
 /// Read exactly one slot, classify it, and decode it when it is `data`.
 /// `empty`/`zero` slots carry no payload and are loud; a payload whose
 /// length is not the slot size is loud too. A short read stays `Io`.
-#[allow(dead_code)] // Transitional: the `--tshow` arm wires this in a later commit.
 pub fn decode_slot_at(
     path: &Path,
     header: &BigHeader,
@@ -710,9 +690,9 @@ mod tests {
         assert!(report.contains("slot 7 offset 921600 data"));
         assert!(report.contains("slots: 8 total, 1 empty, 1 zero, 6 data"));
         assert_eq!(report.lines().count(), 11, "got: {report}");
-        let (offset, class) = slot_class_at(&path, &header, 1).expect("one slot must read");
-        assert_eq!(offset, slot_offset(1));
-        assert_eq!(class, SlotClass::Zero);
+        let (offset, rgba) = decode_slot_at(&path, &header, 2).expect("data slot must decode");
+        assert_eq!(offset, slot_offset(2));
+        assert_eq!(rgba.len(), 262144);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -730,8 +710,7 @@ mod tests {
         };
         let scan = scan_slots(&path, &header).expect("scan must succeed");
         assert_eq!(scan.classes[1], SlotClass::Data);
-        let (_, class) = slot_class_at(&path, &header, 1).expect("one slot must read");
-        assert_eq!(class, SlotClass::Data);
+        decode_slot_at(&path, &header, 1).expect("single-slot read must see the last byte");
         let _ = std::fs::remove_file(&path);
     }
 
