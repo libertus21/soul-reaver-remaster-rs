@@ -96,11 +96,14 @@ extracted files, decompiled code, or database files.
   slot and exits 1 naming its class and `decompressor UNKNOWN` — no
   decompressor is implemented and no window opens. `bigfile.rs` is
   untouched (this is not the SR1PC layout). Bytes `4..512` are observed
-  but not validated. Synthetic-bytes tests only. Playtest-accepted:
-  `--tlist` exits 0 for all four containers (1287 entries in
-  `TEXTURES.BIG`, 29 in `MOVIES.BIG`); see
-  `docs/changes/big-slots/design.md` and the `big-header` slice
-  (`docs/changes/big-header/archive.md`).
+   but not validated. Synthetic-bytes tests only. Slot listing is
+   playtest-accepted: `--tlist` exits 0 for all four containers with the
+   footer `slots: 29 total, 1 empty, 0 zero, 28 data` (`MOVIES.BIG`),
+   `1287 total, 1 empty, 0 zero, 1286 data` (`TEXTURES.BIG`),
+   `268 total, 1 empty, 0 zero, 267 data` (`BONUS.BIG`), and
+   `178 total, 0 empty, 2 zero, 176 data` (`E3.BIG`); see
+   `docs/changes/big-slots/archive.md` and the `big-header` slice
+   (`docs/changes/big-header/archive.md`).
 - `models-3d` (playtest-accepted on a real mesh): `cargo run -- --mesh
   <FILE.SRM>` parses one SR1-remaster loose mesh (format verdict: magic
   `SRM\x01`, 44-byte shader records, 32-byte material records, bone
@@ -160,13 +163,16 @@ extracted files, decompiled code, or database files.
 ## What's missing
 
 - [x] `.BIG` fixed-slot layout, slice `big-slots` (see
-      `docs/changes/big-slots/design.md`): the four containers share a
+      `docs/changes/big-slots/archive.md`): the four containers share a
       verified 512-byte header plus entry count (1287 / 29 / 268 / 178
       respectively) and `4096 + count * 131072`-byte fixed slots.
       `--tlist` lists every slot with index/offset/class and a per-class
       footer, exits 0; `--tshow` stays loud naming the class and the
-      UNKNOWN decompressor. Not yet decoded: `data` slots are compressed
-      with an unknown algorithm. Next: identify the decompressor.
+      UNKNOWN decompressor. Slot listing is DONE and playtest-accepted.
+      The remaining blocker is the decompressor for `data` slots: the
+      payloads are compressed with an unknown algorithm, so nothing
+      renders until it is identified. `TEX_HD.MAP` name mapping (slot
+      index to texture name) is still open.
 - [x] 3D models, slice 1 `models-3d` (parse-one + render-one, see
       `docs/changes/models-3d/`): single loose SRM as a flat-shaded
       auto-rotating solid. Still unscoped: skeleton/animation, room
