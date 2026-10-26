@@ -113,6 +113,8 @@ impl TextureName {
 
     /// Parse the spec grammar: optional case-insensitive `B\` / `M\`,
     /// then ASCII digits `_` ASCII digits, nothing else.
+    // Transitional: the following commit wires `--tshow` name selectors.
+    #[allow(dead_code)]
     pub fn parse(s: &str) -> Option<TextureName> {
         let (bank, rest) = match s.get(0..2) {
             Some(prefix) if prefix.eq_ignore_ascii_case("B\\") => (Bank::B, &s[2..]),
@@ -129,6 +131,8 @@ impl TextureName {
 }
 
 /// Strict decimal digits: rejects `+`, signs, whitespace, and overflow.
+// Transitional: only the `--tshow` name selector (next commit) calls this.
+#[allow(dead_code)]
 fn parse_digits(s: &str) -> Option<u32> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -214,6 +218,8 @@ impl<'a> TextureMap<'a> {
 
     /// Slots in `0..slot_count` (capped at the block capacity) that own
     /// `name`, in ascending order. Never guesses: every match is returned.
+    // Transitional: the `--tshow <name>` arm (next commit) calls this.
+    #[allow(dead_code)]
     pub fn slots_for_name(
         &self,
         group: Group,

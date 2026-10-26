@@ -44,9 +44,6 @@ mod gallery;
 mod mesh_entry;
 mod render;
 mod slot_texture;
-// Transitional: the following commit wires this module into `--map`;
-// until then nothing calls it, so dead-code warnings are allowed here only.
-#[allow(dead_code)]
 mod tex_hd_map;
 // Transitional: Task 2 wires the mesh arm; until then the parser is
 // test-only so dead-code warnings are allowed here, nowhere else.
@@ -238,19 +235,28 @@ fn run_bigfile(args: &[String]) -> ExitCode {
 /// reads exactly that one slot, and shows a `data` payload as raw 256x256
 /// A1R5G5B5 converted to RGBA8 through the existing window (close/Esc exits
 /// 0); `empty`/`zero` slots stay loud (exit 1) with no window.
+/// The optional trailing `--map <TEX_HD.MAP>` pair adds the engine's slot
+/// names (`--tlist`) or a name selector (`--tshow`); everything without it
+/// stays byte-for-byte unchanged.
 fn run_textures(args: &[String]) -> ExitCode {
     let Some(path_arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tlist");
         return ExitCode::from(1);
     };
     let path = Path::new(path_arg);
-    let tlist = matches!(args.get(1).map(String::as_str), Some("--tlist") if args.len() == 2);
+    let tlist = matches!(args.get(1).map(String::as_str), Some("--tlist") if args.len() == 2 || (args.len() == 4 && args.get(2).map(String::as_str) == Some("--map")));
     let tshow = matches!(args.get(1).map(String::as_str), Some("--tshow") if args.len() == 3);
     if !tlist && !tshow {
         eprintln!("usage: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tlist");
+        eprintln!("   or: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tlist --map <TEX_HD.MAP>");
         eprintln!("   or: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tshow <entry>");
         return ExitCode::from(1);
     }
+    let map_arg = if tlist && args.len() == 4 {
+        Some(Path::new(&args[3]))
+    } else {
+        None
+    };
     let layout = match textures::describe(path) {
         Ok(layout) => layout,
         Err(e) => {
@@ -258,11 +264,33 @@ fn run_textures(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let map_context = match map_arg {
+        Some(map_path) => match load_map(map_path, path) {
+            Ok(context) => Some(context),
+            Err(message) => {
+                eprintln!("error: {message}");
+                return ExitCode::from(1);
+            }
+        },
+        None => None,
+    };
     if tlist {
         outln!("{}", layout.summary());
-        return match textures::scan_slots(path, &layout.header) {
-            Ok(scan) => {
-                outln!("{}", scan.report());
+        let scan = match textures::scan_slots(path, &layout.header) {
+            Ok(scan) => scan,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        let named = map_context.as_ref().map(|(bytes, group)| {
+            let map = tex_hd_map::TextureMap::parse(bytes)
+                .expect("map length was validated when the context was loaded");
+            (map, *group)
+        });
+        return match list_report(&scan, named.as_ref()) {
+            Ok(report) => {
+                outln!("{report}");
                 ExitCode::SUCCESS
             }
             Err(e) => {
@@ -319,6 +347,88 @@ fn run_textures(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Read and validate the explicit `--map` path, then select the block from
+/// the container stem. Wrong length, unreadable files, and unknown stems are
+/// loud; no implicit discovery happens anywhere.
+fn load_map(
+    map_path: &Path,
+    container: &Path,
+) -> Result<(Vec<u8>, tex_hd_map::Group), String> {
+    let bytes = std::fs::read(map_path)
+        .map_err(|e| format!("cannot read TEX_HD.MAP: {e}"))?;
+    tex_hd_map::TextureMap::parse(&bytes).map_err(|e| e.to_string())?;
+    let stem = container
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let group = tex_hd_map::Group::from_container_stem(&stem).ok_or_else(|| {
+        format!(
+            "cannot map names for '{}': expected TEXTURES.BIG, MOVIES.BIG, or BONUS.BIG",
+            file_label(container)
+        )
+    })?;
+    Ok((bytes, group))
+}
+
+/// Container name for messages (never an absolute install path).
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// `--tlist` body: the preserved report, with `; names ...` appended to
+/// each slot line when a map is present. Without a map this is exactly
+/// `scan.report()`.
+fn list_report(
+    scan: &textures::SlotScan,
+    named: Option<&(tex_hd_map::TextureMap<'_>, tex_hd_map::Group)>,
+) -> Result<String, tex_hd_map::MapError> {
+    let Some((map, group)) = named else {
+        return Ok(scan.report());
+    };
+    let mut suffixes = Vec::with_capacity(scan.classes.len());
+    for slot in 0..scan.classes.len() {
+        let slot16 = u16::try_from(slot).unwrap_or(u16::MAX);
+        let names = map.names(*group, slot16)?;
+        suffixes.push(join_names(&names));
+    }
+    Ok(append_name_suffixes(&scan.report(), &suffixes))
+}
+
+/// Display form of one slot's names: deduped comma list, or `-` when the
+/// row is all sentinel.
+fn join_names(names: &[tex_hd_map::TextureName]) -> String {
+    if names.is_empty() {
+        return "-".to_string();
+    }
+    names
+        .iter()
+        .map(tex_hd_map::TextureName::display)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Append `; names <suffix>` to every per-slot line, leaving the addressing
+/// line, summary, and footer untouched.
+fn append_name_suffixes(report: &str, suffixes: &[String]) -> String {
+    let mut out = String::with_capacity(report.len() + suffixes.len() * 16);
+    let mut slot = 0usize;
+    for (line_index, line) in report.lines().enumerate() {
+        if line_index > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+        if line.starts_with("slot ") {
+            let suffix = suffixes.get(slot).map(String::as_str).unwrap_or("-");
+            out.push_str("; names ");
+            out.push_str(suffix);
+            slot += 1;
+        }
+    }
+    out
 }
 
 /// `--mesh <FILE.SRM>`: parse one SR1-remaster mesh (positions +
@@ -473,7 +583,7 @@ fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod cli_tests {
     use super::{
-        run_bigfile, run_mesh, run_mesh_all, run_mesh_textured, run_textures,
+        list_report, run_bigfile, run_mesh, run_mesh_all, run_mesh_textured, run_textures,
         strip_launcher_noops,
     };
     use std::process::ExitCode;
@@ -499,6 +609,174 @@ mod cli_tests {
         bytes[0..2].copy_from_slice(&header_size.to_le_bytes());
         bytes[2..4].copy_from_slice(&count.to_le_bytes());
         bytes
+    }
+
+    /// All-sentinel `TEX_HD.MAP` (every slot "no reference" until overridden).
+    fn synthetic_map() -> Vec<u8> {
+        vec![0xFF; crate::tex_hd_map::MAP_BYTES]
+    }
+
+    /// Write one 16-code row of the synthetic map; missing codes stay sentinel.
+    fn put_map_row(map: &mut [u8], row: usize, codes: &[u32]) {
+        let start = row * crate::tex_hd_map::ROW_BYTES;
+        for i in 0..crate::tex_hd_map::ROW_CODES {
+            let code = codes
+                .get(i)
+                .copied()
+                .unwrap_or(crate::tex_hd_map::SENTINEL);
+            let at = start + i * 4;
+            map[at..at + 4].copy_from_slice(&code.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn list_report_with_map_appends_names_and_keeps_the_footer() {
+        use crate::tex_hd_map::{Group, TextureMap};
+        use crate::textures::{SlotClass, SlotScan};
+
+        let mut bytes = synthetic_map();
+        put_map_row(&mut bytes, 0, &[0, 32_000, 64_000, 0]);
+        let map = TextureMap::parse(&bytes).expect("synthetic map must parse");
+        let scan = SlotScan {
+            classes: vec![SlotClass::Data, SlotClass::Zero, SlotClass::Data],
+        };
+        let report = list_report(&scan, Some(&(map, Group::Textures)))
+            .expect("row reads must be in capacity");
+        assert!(
+            report.contains("slot 0 offset 4096 data; names 0_0,M\\0_0,B\\0_0"),
+            "got: {report}"
+        );
+        assert!(
+            report.contains("slot 1 offset 135168 zero; names -"),
+            "got: {report}"
+        );
+        assert!(
+            report.contains("slots: 3 total, 0 empty, 1 zero, 2 data"),
+            "got: {report}"
+        );
+        assert!(
+            report.starts_with("addressing: fixed 131072-byte slots"),
+            "got: {report}"
+        );
+        assert_eq!(
+            list_report(&scan, None).expect("no-map report is infallible"),
+            scan.report(),
+            "without a map the body must be byte-for-byte unchanged"
+        );
+    }
+
+    #[test]
+    fn list_report_with_map_never_writes_an_out_of_capacity_row() {
+        use crate::tex_hd_map::{Group, MapError, TextureMap};
+        use crate::textures::{SlotClass, SlotScan};
+
+        let bytes = synthetic_map();
+        let map = TextureMap::parse(&bytes).expect("synthetic map must parse");
+        let scan = SlotScan {
+            classes: vec![SlotClass::Data; crate::tex_hd_map::GROUP_ROWS + 1],
+        };
+        let err = list_report(&scan, Some(&(map, Group::Bonus)))
+            .expect_err("row 2000 must be rejected");
+        assert_eq!(
+            err,
+            MapError::SlotOutOfCapacity {
+                slot: 2_000,
+                group: Group::Bonus
+            }
+        );
+    }
+
+    #[test]
+    fn textures_tlist_with_map_names_a_valid_container() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let big = write_tmp(&tmp, "TEXTURES.BIG", &synthetic_big(512, 3));
+        let mut map_bytes = synthetic_map();
+        put_map_row(&mut map_bytes, 1, &[16]);
+        let map = write_tmp(&tmp, "TEX_HD.MAP", &map_bytes);
+        assert_eq!(
+            run_textures(&[big, "--tlist".to_string(), "--map".to_string(), map]),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn textures_tlist_with_bad_map_length_exits_1() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let big = write_tmp(&tmp, "TEXTURES.BIG", &synthetic_big(512, 2));
+        for len in [
+            crate::tex_hd_map::MAP_BYTES - 1,
+            crate::tex_hd_map::MAP_BYTES + 1,
+        ] {
+            let map = write_tmp(&tmp, "TEX_HD.MAP", &vec![0xFF; len]);
+            assert_eq!(
+                run_textures(&[big.clone(), "--tlist".to_string(), "--map".to_string(), map]),
+                ExitCode::from(1)
+            );
+        }
+    }
+
+    #[test]
+    fn textures_tlist_with_map_unknown_stem_exits_1() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let big = write_tmp(&tmp, "E3.BIG", &synthetic_big(512, 2));
+        let map = write_tmp(&tmp, "TEX_HD.MAP", &synthetic_map());
+        assert_eq!(
+            run_textures(&[big, "--tlist".to_string(), "--map".to_string(), map]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn textures_tlist_with_missing_map_exits_1() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let big = write_tmp(&tmp, "TEXTURES.BIG", &synthetic_big(512, 2));
+        let absent = tmp
+            .path()
+            .join("absent.map")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            run_textures(&[big, "--tlist".to_string(), "--map".to_string(), absent]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn textures_map_shape_errors_exit_1() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let big = write_tmp(&tmp, "TEXTURES.BIG", &synthetic_big(512, 2));
+        let map = write_tmp(&tmp, "TEX_HD.MAP", &synthetic_map());
+        // `--map` without a value.
+        assert_eq!(
+            run_textures(&[big.clone(), "--tlist".to_string(), "--map".to_string()]),
+            ExitCode::from(1)
+        );
+        // Trailing junk after the map pair.
+        assert_eq!(
+            run_textures(&[
+                big.clone(),
+                "--tlist".to_string(),
+                "--map".to_string(),
+                map.clone(),
+                "extra".to_string()
+            ]),
+            ExitCode::from(1)
+        );
+        // `--map` in any other position.
+        assert_eq!(
+            run_textures(&[
+                big.clone(),
+                "--map".to_string(),
+                map.clone(),
+                "--tlist".to_string()
+            ]),
+            ExitCode::from(1)
+        );
+        // Unsupported shape stays loud even with a valid map.
+        assert_eq!(
+            run_textures(&[big, "--tshow".to_string(), "0".to_string(), "--map".to_string(), map]),
+            ExitCode::from(1)
+        );
     }
 
     #[test]
