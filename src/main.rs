@@ -52,6 +52,10 @@ mod tex_hd_map;
 // test-only so dead-code warnings are allowed here, nowhere else.
 #[allow(dead_code)]
 mod srm;
+// Transitional: the `--audio` arm lands next; until then the parser is
+// test-only so dead-code warnings are allowed here, nowhere else.
+#[allow(dead_code)]
+mod snd;
 mod textures;
 mod textures_object;
 
