@@ -222,3 +222,14 @@ Still UNKNOWN after this observation:
 3. What the 4 tail bytes of a 40-byte block are.
 4. Whether these groups describe placement, transforms, or something else.
 5. Whether the group layout generalises beyond the 40/48-byte sizes.
+
+## Correction — corpus-wide placement probe (2026-10-27)
+
+The later observation above stays as written: it was true for `LAIR14`. A
+follow-up probe over all 89 units found that the 12-byte
+`[u32 id-ish][f32 value][u32 flags]` reading is **unit-local**, not a general
+`.PCM` layout. The settled unit is a **4-byte word grid** (0 of 42,346 non-zero
+blocks violate `size % 4 == 0`; 40 B = 10 words, 48 B = 12 words). The `0x34`
+high byte is a rare marker (0.39% of words, present in 40/89 units), not a
+constant tag. Even in `LAIR14` the full triple co-occurs in 4.9% of groups.
+Placement and transforms remain **NO-GO**. See `docs/notes/placement.md`.
