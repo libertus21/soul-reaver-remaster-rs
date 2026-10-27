@@ -172,3 +172,25 @@ could be a 6-column record, repeated values, or a shared constant pattern.
   added pointing to this note. Its size-class census (`fixed48 = fixed40 + 1`)
   is base-invariant and stands.
 - Stride and integer findings are plausibility-level, not proofs.
+
+## Correction (2026-10-27, `level-builder` pass)
+
+The size classes in this note are **pointer spacings**, not record sizes. The
+leading offset table is a relocation directory (entry = position of a dword
+holding a non-zero base-relative offset), and the loader discards it after
+reading `N`; the level builder walks a fixed header schema. Consequences:
+
+- "40-byte" and "48-byte" blocks are spans between consecutive pointer fields.
+  A 48-byte span can be a record, a 16-byte struct plus 32 zero bytes, or an
+  array element. The class is heterogeneous and carries no type.
+- The 48-strided run with monotone column 0 is an array whose elements begin
+  with a base-relative pointer; the targets are laid out in order. The lag-6
+  u16 period is in the 44-byte payload, not in a type tag.
+- The first word measured as a "small-to-medium integer" is a base-relative
+  pointer. All 46,124 directory entries across 89 area units hold in-range
+  offsets.
+- The falsifiable probes above are superseded by this structural explanation;
+  they may still be run, but they no longer decide block semantics.
+
+Evidence: `docs/notes/level-builder.md` (ledger B1-B13). No prior text is
+deleted; this block only reinterprets it.
