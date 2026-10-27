@@ -14,6 +14,9 @@ runtime, writing, or any other format.
 - Headless Ghidra 12.1.4 on the SR1 binary, project under `%TEMP%`.
 - Entry points are string literals and their xrefs. Function names are
   re-pinned by those anchors every run, never hardcoded.
+- Arithmetic is confirmed against real units read-only: file size, `4 + 4N`
+  and the drain's rounded value are reported side by side, and the corpus
+  check is recorded (counts and offsets only).
 - Budget: about two passes. Anything past the budget is recorded as UNKNOWN,
   not guessed.
 
@@ -37,13 +40,25 @@ The note must establish, with classes:
 4. The level struct, the header tables, and the 36-to-40-byte record relation
    (L7-L9).
 5. The meaning of the 48 in the object tracker (L10).
-6. The first-dword conflict (L13), stated as UNRESOLVED.
+6. The first-dword rule and the data base (L13), stated as CONFIRMED: the
+   first dword is N; the drain strips `4 * roundup512(N)` bytes; directory
+   and header offsets are relative to that data base.
+7. The name resolver's behavior on the 36-byte record's first field (L15),
+   stated as CONFIRMED behavior with UNKNOWN interior.
 
 ## R5 - No-go bar
 
-The verdict may be "documented" only if L13, L15 and L16 are CONFIRMED. The
-current verdict is PARTIAL because they are not. A "no-go" wording is reserved
-for the case where the pipeline itself is disproved.
+The verdict may be "documented" only if L13, L15 and L16 are CONFIRMED. L13
+and L15 (behavior) are now CONFIRMED; L16 and the tagged-record interior are
+not, so the verdict stays PARTIAL. A "no-go" wording is reserved for the case
+where the pipeline itself is disproved.
+
+## R5a - Reader safety
+
+A reader may implement the container and the level-header shape (count,
+directory offsets, data base, tag dispatch) because L13 is CONFIRMED. It must
+not name the 36-byte record's fields or treat the first field as a string.
+Any note that still uses the `4 + 4N` base is wrong by the padding amount.
 
 ## R6 - Legal
 
