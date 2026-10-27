@@ -124,6 +124,19 @@ docs-only and ships on its own branch without applying anything.
   `.wav`, no game bytes, no install path in the diff.
 - [ ] 4.5 Verify: `cargo test` green.
 
+## Forecast lesson (post-apply)
+
+The forecast above (~380 authored lines) landed at ~1,491 authored code lines,
+the second consecutive large miss, against an 800-line review budget. Two
+changes to future forecasts:
+
+- Budget tests as their own line. Tests were folded into each unit's estimate
+  and then grew with the error surface (one case per invariant and per refusal
+  path), which is where most of the overrun came from.
+- If the honest total exceeds the review budget, chain the PRs from the start.
+  This slice discovered the overrun at the end, when splitting was no longer
+  cheap, so it shipped as one large PR.
+
 ## Apply gate
 
 - [ ] All work units land as one PR from fresh `main`.
