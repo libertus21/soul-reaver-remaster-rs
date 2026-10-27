@@ -1,5 +1,12 @@
 # room-geometry — what lives inside the `.PCM` records
 
+> **INVALIDATED (content claims).** The P14-P16 content conclusions below
+> (12-byte `[u32][f32][u32]` groups, the f32 field, the leading tag, and the
+> placement lead) were computed on the superseded `4+4N` base. See
+> `docs/notes/pcm-content-census.md`: f32 is at chance on the correct base, and
+> the group reading is refuted. The 12-byte lag-6 period survives as an
+> unexplained observation. The size-class census remains valid.
+
 Read-only probe of the SR1 remaster `<install>/1/AREA` tree. No game bytes,
 absolute install paths, coordinates, or decompiled code are recorded here.
 Date: 2026-10-27. Box: 3 passes, ~120 minutes.
