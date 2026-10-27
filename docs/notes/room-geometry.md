@@ -25,9 +25,11 @@ one (~553), and a large one (~1,655). All scratch work stayed outside the repo.
 - Record 1 is **all zero in 89/89**: 8 bytes in 21 units, 80 bytes in 67, and
   120 bytes in 1.
 
-That **refutes** the earlier hint that records 0 and 1 form a directory. They
-are constant zero padding. The only directory in a `.PCM` is the offset table
-itself, and **no block carries a type tag**.
+**Correction (recorded during this change):** the previous probe's reading that
+records 0 and 1 form a directory is **WRONG**. Record 0 is 4 zero bytes and
+record 1 is all zero across 89/89 units, so both are constant zero padding, not
+a directory. The only directory in a `.PCM` is the offset table itself, and **no
+block carries a type tag**.
 
 ## Classification by size clique
 
@@ -158,8 +160,10 @@ coordinates.
    for a shared prologue or a count word.
 3. Search for a face/index array by testing u16 values against a plausible
    vertex ceiling per unit.
-4. Check whether the 48-byte blocks are a parallel array to the 40-byte blocks
-   (same count, same order) before assigning either a role.
+4. ~~Check whether the 48-byte blocks are a parallel array to the 40-byte
+   blocks.~~ **Answered NO** by the later observation below: the
+   `fixed48 = fixed40 + 1` count correlation holds in 26/31 `LAIR` units, but the
+   block content disproves the parallel-array reading.
 5. If a real PS1 `.drm` set becomes available, compare section counts against
    the block census.
 
@@ -187,3 +191,34 @@ Wording contract: these are SIZE classes, not types. No block carries a type
 tag, and no vertex or face count is claimed. Nothing here decodes geometry,
 placement, transforms, or rendering. The 12-byte stride signal stays a
 statistical observation, not a proven record layout.
+
+## Later observation — 40/48-byte block internals (AFTER the playtest)
+
+Recorded on 2026-10-27 from a follow-up inline probe that ran **after** the
+accepted playtest. Evidence class: **CONFIRMED-observed**. Semantics: **UNKNOWN**.
+Nothing here changes the shipped `--level-records` census, and nothing here is a
+geometry, placement, or transform claim.
+
+| # | Probe | Result | Class |
+|---|---|---|---|
+| P12 | 40/48 count correlation | `fixed48 = fixed40 + 1` holds in 26/31 `LAIR` units | Observed |
+| P13 | Parallel-array reading | Refuted by content: the two sizes are NOT three parallel per-object arrays | Observed / Derived |
+| P14 | 12-byte group stride | `[u32 id-ish][f32 value][u32 flags]`; a 48-byte block is exactly 4 groups, a 40-byte block is 3 groups plus 4 unexplained tail bytes | Observed shape |
+| P15 | f32 field | 106 non-zero values; 44 with an absolute value below 5000 (e.g. -0.45, -460.35, -14.39, -14730.5, -471377.1); values repeat in runs of the same value | Observed values |
+| P16 | Leading u32 | High byte `0x34`; readable low bytes (`HHD`, `CCC`) suggest an id/tag family | Observed bytes / Inferred tag |
+
+Reading: a 12-byte `[u32 id-ish][f32 value][u32 flags]` group is a plausible
+**placement/transform** shape, which is why the next slice targets placement and
+transforms rather than geometry. The f32 magnitude spread and the repeated runs
+are consistent with a scalar field (angle, scale, or distance), but **no field
+role is proven**.
+
+Still UNKNOWN after this observation:
+
+1. What the id-ish u32 means, and whether the `0x34` high byte is a type/tag or
+   part of a larger identifier.
+2. What the f32 represents (angle, scale, a position component, or other), and
+   its units.
+3. What the 4 tail bytes of a 40-byte block are.
+4. Whether these groups describe placement, transforms, or something else.
+5. Whether the group layout generalises beyond the 40/48-byte sizes.

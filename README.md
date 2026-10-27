@@ -240,24 +240,32 @@ extracted files, decompiled code, or database files.
   exits 3, a bad invocation exits 1. Synthetic-byte tests only; `cargo test`
   226/226 green.
 
-- `room-geometry` (slice `level-records`; no window): `cargo run --
-  --level-records <.PCM file | room directory>` counts each unit's blocks by
-  **shape class** from the offset table alone (`zero`, `small4`, `fixed40`,
-  `fixed48`, `other:<size>`) and prints the largest block's ordinal and size.
-  These are SIZE classes, not types: no block carries a type tag. Acceptance on
-  a small, a median, and the largest unit (`LAIR5` 62 blocks, `CATHY44` 326,
-  `MOVIE3` 2256) and one room directory (`LAIR`: 31 units, 12641 blocks); every
-  unit's class counts sum to its header count. No vertex, face, placement,
-  transform, or render claim; `--level-info` is unchanged (see
-  `docs/notes/room-geometry.md`).
+- `room-geometry` (playtest-accepted: `LAIR5`, `MOVIE3`, and the `LAIR` room
+  directory; no window): `cargo run -- --level-records <.PCM file | room
+  directory>` counts each unit's blocks by **shape class** from the offset table
+  alone (`zero`, `small4`, `fixed40`, `fixed48`, `other:<size>`) and prints the
+  largest block's ordinal and size. These are SIZE classes, not types: no block
+  carries a type tag. Census (89 units): 46,124 blocks, median 281 per unit; the
+  4/48/40-byte classes are ~92.7% of all blocks and 8.2% are all zero. Accepted
+  runs: `LAIR5` 62 blocks (zero 23, small4 14, fixed40 10, fixed48 11, other 4;
+  largest 61/3616), `MOVIE3` 2256 blocks (largest 549/143872), and the `LAIR`
+  room directory (31 units, exit 0); every unit's class counts sum to its header
+  count. Records 0 and 1 are all-zero padding, so the offset table is the only
+  directory. No vertex, face, placement, transform, or render claim;
+  `--level-info` is unchanged (see `docs/notes/room-geometry.md` and
+  `docs/changes/room-geometry/archive.md`).
 
 ## What's missing
 
-- [ ] Room geometry inside the `.PCM` records stays **NO-GO**:
-      `--level-records` counts blocks by shape class only, because the offset
-      table is the only directory and no block carries a type tag. Collision,
-      object placement, transforms, room rendering, and PMF playback stay
-      NO-GO; no vertex, face, transform, or playback claim.
+- [ ] Room geometry inside the `.PCM` records stays **UNPROVEN**, and the next
+      slice targets **placement and transforms**, not geometry: a later probe
+      read the 40/48-byte blocks as 12-byte `[u32 id-ish][f32 value][u32 flags]`
+      groups (48 B = 4 groups; 40 B = 3 groups + 4 unexplained tail bytes;
+      semantics UNKNOWN), which is not a geometry decode. `--level-records`
+      counts blocks by shape class only, because the offset table is the only
+      directory (records 0 and 1 are all-zero padding) and no block carries a
+      type tag. Collision, object placement, transforms, room rendering, and PMF
+      playback stay NO-GO; no vertex, face, transform, or playback claim.
 - [x] `.BIG` fixed-slot layout and slot decoding, slices `big-slots` +
       `big-decompressor` (see `docs/changes/big-slots/design.md` and
       `docs/changes/big-decompressor/design.md`): the four containers share a
@@ -313,7 +321,8 @@ Read `AGENTS.md`, then `docs/notes/` (survey + community tools + format
 notes). The `.SND`+`.SMP` audio probe and its one-wave slice are done, and
 the `animation` slice is archived as PARTIAL: bone decode and one-bone pose
 are in, but full-body pose is blocked by the absent hierarchy. The
-`room-geometry` census slice (`level-records`) is in and counts blocks by
-shape class only; object placement and transforms follow, and the PMF codec is
-a separate audio slice. `.SRA` scoping (227 sibling files) stays open under
-animation.
+`room-geometry` is archived: `--level-records` is in and counts blocks by shape
+class only, records 0 and 1 are all-zero padding, and geometry stays unproven.
+A placement/transform probe (12-byte `[u32 id-ish][f32 value][u32 flags]`
+groups) is next; the PMF codec is a separate audio slice. `.SRA` scoping (227
+sibling files) stays open under animation.
