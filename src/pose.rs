@@ -115,6 +115,9 @@ pub fn axis_angle_matrix(axis: [f32; 3], degrees: f32) -> Result<Mat3, String> {
 }
 
 /// Take the upper-left 3x3 of a caller-supplied row-major 4x4 matrix.
+/// Only the tests exercise this today; the CLI pose path builds rotations
+/// directly through [`axis_angle_matrix`].
+#[cfg(test)]
 pub fn mat3_from_mat4(m: &[[f32; 4]; 4]) -> Mat3 {
     [[m[0][0], m[0][1], m[0][2]], [m[1][0], m[1][1], m[1][2]], [m[2][0], m[2][1], m[2][2]]]
 }
@@ -172,8 +175,14 @@ pub fn apply_transforms(positions: &[[f32; 3]], bone_indices: &[[u8; 3]], bone_w
         if !finite(posed) {
             return Err(format!("vertex {v} produced a non-finite position"));
         }
+        // The renormalised blend can differ from the rest position by a few
+        // f32 ulp even when every contributing transform is the identity.
+        // Compare against a magnitude-relative epsilon so a zero-angle pose
+        // (control run) reports zero moved vertices and keeps exact rest
+        // positions instead of counting rounding noise.
+        let scale = p.iter().fold(1.0f32, |m, v| m.max(v.abs()));
         let d = sub(posed, *p);
-        if dot(d, d).sqrt() > EPS {
+        if dot(d, d).sqrt() > EPS * scale {
             moved += 1;
             out.push(posed);
         } else {
@@ -241,6 +250,14 @@ mod tests {
         let positions = vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
         let out = apply(&positions, &[[0, 0, 0]; 2], &[[255, 0, 0]; 2], &joints(), PoseSpec { bone: 0, degrees: 0.0 }).expect("zero-angle pose");
         assert_eq!(out.positions, positions);
+        assert_eq!(out.moved_vertices, 0);
+    }
+
+    #[test]
+    fn zero_angle_keeps_large_rest_coordinates_exact() {
+        let positions = vec![[12345.0, -9876.0, 5432.0], [20000.0, 10000.0, -30000.0]];
+        let out = apply(&positions, &[[0, 1, 2]; 2], &[[85, 85, 85]; 2], &joints(), PoseSpec { bone: 0, degrees: 0.0 }).expect("zero-angle pose");
+        assert_eq!(out.positions, positions, "rounding noise must never displace the rest mesh");
         assert_eq!(out.moved_vertices, 0);
     }
 

@@ -20,6 +20,9 @@
 //! `cargo run -- --mesh <FILE.SRM>` parses one SR1-remaster mesh
 //! (positions + triangle indices only) and shows it as a flat-shaded
 //! auto-rotating solid (Esc or window close to exit).
+//! `cargo run -- --mesh <FILE.SRM> --pose <bone>:<degrees>` additionally
+//! rotates exactly one decoded `extra = 0` bone's weighted vertices in
+//! mesh space and shows the deformed mesh through the same path.
 //! `cargo run -- --mesh-textured <FILE.SRM> --tex-dir <TEX>` parses the
 //! same mesh plus UVs, material indices, and material records, loads
 //! the three DDS textures per material from `<TEX>`, and shows it
@@ -45,9 +48,7 @@ mod launcher_cli;
 mod dds;
 mod gallery;
 mod mesh_entry;
-// Pure one-bone pose math. The `--pose` CLI slice wires it; keep it
-// warning-free until then, nowhere else.
-#[allow(dead_code)]
+// Pure one-bone pose math, wired into the `--mesh --pose` arm below.
 mod pose;
 mod render;
 mod slot_texture;
@@ -71,6 +72,10 @@ fn main() -> ExitCode {
     // Compatibility no-ops: stripped before dispatch, no output, no exit
     // change. (Parser-only flags are never wired into the viewer.)
     let args = strip_launcher_noops(raw);
+    if let Some(message) = pose_mode_conflict(&args) {
+        eprintln!("{message}");
+        return ExitCode::from(1);
+    }
     if args.first().is_some_and(|a| a == "--bigfile") {
         return run_bigfile(&args[1..]);
     }
@@ -98,6 +103,7 @@ fn main() -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tshow <entry|name>");
         eprintln!("   or: soul-reaver-remaster-rs --textures <TEXTURES.BIG> --tshow <entry|name> --map <TEX_HD.MAP>");
         eprintln!("   or: soul-reaver-remaster-rs --mesh <FILE.SRM>");
+        eprintln!("   or: soul-reaver-remaster-rs --mesh <FILE.SRM> --pose <bone>:<degrees>");
         eprintln!("   or: soul-reaver-remaster-rs --mesh-textured <FILE.SRM> --tex-dir <TEX>");
         eprintln!("   or: soul-reaver-remaster-rs --mesh-all <OBJECT_dir> --tex-dir <TEX>");
         eprintln!("   or: soul-reaver-remaster-rs --audio <FILE.SND> --alist");
@@ -545,21 +551,115 @@ fn tshow_suffix(
     Ok(format!("; names {}", join_names(&names)))
 }
 
-/// `--mesh <FILE.SRM>`: parse one SR1-remaster mesh (positions +
-/// triangle indices only, bytes stay in process memory) and show it as
-/// a flat-shaded auto-rotating solid. Any parse failure is a loud
-/// stderr error + exit 1 with no window; Esc/window close exits 0.
-fn run_mesh(args: &[String]) -> ExitCode {
-    if args.len() != 1 {
-        eprintln!("usage: soul-reaver-remaster-rs --mesh <FILE.SRM>");
-        if args.is_empty() {
-            eprintln!("error: --mesh expects exactly one file argument, got 0");
-        } else {
-            eprintln!("error: --mesh expects exactly one file argument, got {}", args.len());
-        }
-        return ExitCode::from(1);
+/// Distinguish a pose argument-shape error from the generic mesh usage
+/// error. `--pose` is only valid directly after `--mesh <FILE.SRM>`.
+fn parse_mesh_args(args: &[String]) -> Result<(&Path, Option<&str>), String> {
+    match args {
+        [path] => Ok((Path::new(path), None)),
+        [path, flag, spec] if flag == "--pose" => Ok((Path::new(path), Some(spec.as_str()))),
+        _ => Err(mesh_usage_error(args)),
     }
-    let path = Path::new(&args[0]);
+}
+
+fn mesh_usage_error(args: &[String]) -> String {
+    let usage = "usage: soul-reaver-remaster-rs --mesh <FILE.SRM> [--pose <bone>:<degrees>]";
+    if args.iter().any(|a| a == "--pose") {
+        if let Some(flag) = args
+            .iter()
+            .skip(1)
+            .find(|a| is_mode_flag(a) && a.as_str() != "--pose")
+        {
+            return format!(
+                "{usage}\nerror: --pose cannot be combined with {flag}; run one mode at a time"
+            );
+        }
+    }
+    format!(
+        "{usage}\nerror: --mesh expects <FILE.SRM> or <FILE.SRM> --pose <bone>:<degrees>, got {} arg(s)",
+        args.len()
+    )
+}
+
+/// Refuse `--pose` anywhere except as the second word of the mesh mode,
+/// before any file is opened or any window is created.
+fn pose_mode_conflict(args: &[String]) -> Option<String> {
+    if args.first().is_some_and(|a| a == "--mesh") || !args.iter().any(|a| a == "--pose") {
+        return None;
+    }
+    let other = args
+        .iter()
+        .skip(1)
+        .find(|a| is_mode_flag(a))
+        .or_else(|| args.first().filter(|a| is_mode_flag(a)));
+    Some(match other {
+        Some(flag) => format!(
+            "error: --pose cannot be combined with {flag}; --pose is only valid as `--mesh <FILE.SRM> --pose <bone>:<degrees>`"
+        ),
+        None => "error: --pose is only valid as `--mesh <FILE.SRM> --pose <bone>:<degrees>`".to_string(),
+    })
+}
+
+fn is_mode_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--bigfile"
+            | "--textures"
+            | "--tlist"
+            | "--tshow"
+            | "--show"
+            | "--list"
+            | "--mesh-textured"
+            | "--mesh-all"
+            | "--tex-dir"
+            | "--map"
+            | "--audio"
+            | "--alist"
+            | "--wave"
+            | "--out"
+    )
+}
+
+/// Prepare the pose path shared by the CLI and its tests: refuse the
+/// `extra > 0` class, parse the spec, map joints to mesh space, and apply
+/// the one-bone blend. Returns the parsed spec for the stdout line.
+fn prepare_pose(
+    mesh: &srm::Mesh,
+    spec: &str,
+) -> Result<(pose::PoseSpec, pose::PoseOutcome), String> {
+    mesh.poseable_bones().map_err(|e| e.to_string())?;
+    let spec = pose::parse_spec(spec)?;
+    let joints = pose::mesh_space_joints(&mesh.bones.joints);
+    let outcome = pose::apply(
+        &mesh.positions,
+        &mesh.bone_indices,
+        &mesh.bone_weights,
+        &joints,
+        spec,
+    )?;
+    Ok((spec, outcome))
+}
+
+/// `--mesh <FILE.SRM> [--pose <bone>:<degrees>]`: parse one SR1-remaster
+/// mesh and show it as a flat-shaded auto-rotating solid. With `--pose`,
+/// exactly one decoded `extra = 0` bone's weighted vertices are rotated
+/// in mesh space before the existing render path. Any parse, class, or
+/// pose failure is a loud stderr error + exit 1 with no window; Esc/window
+/// close exits 0.
+fn run_mesh(args: &[String]) -> ExitCode {
+    run_mesh_with(args, render::show_mesh)
+}
+
+fn run_mesh_with(
+    args: &[String],
+    show: impl FnOnce(&[[f32; 3]], &[u16], &str) -> Result<(), String>,
+) -> ExitCode {
+    let (path, pose_spec) = match parse_mesh_args(args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(1);
+        }
+    };
     if !path.is_file() {
         eprintln!("error: no such file: {}", path.display());
         return ExitCode::from(1);
@@ -571,6 +671,22 @@ fn run_mesh(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let (positions, pose_line) = match pose_spec {
+        Some(spec) => match prepare_pose(&mesh, spec) {
+            Ok((parsed, outcome)) => (
+                outcome.positions,
+                Some(format!(
+                    "pose bone {}, {} deg, {} vertices moved",
+                    parsed.bone, parsed.degrees, outcome.moved_vertices
+                )),
+            ),
+            Err(e) => {
+                eprintln!("error: {}: {e}", path.display());
+                return ExitCode::from(1);
+            }
+        },
+        None => (mesh.positions.clone(), None),
+    };
     outln!(
         "{} vertices, {} triangles, skeleton: {} matrices, {} joints",
         mesh.positions.len(),
@@ -578,11 +694,14 @@ fn run_mesh(args: &[String]) -> ExitCode {
         mesh.bones.matrices.len(),
         mesh.bones.joints.len()
     );
+    if let Some(line) = pose_line {
+        outln!("{line}");
+    }
     let title = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
-    if let Err(e) = render::show_mesh(&mesh.positions, &mesh.indices, &title) {
+    if let Err(e) = show(&positions, &mesh.indices, &title) {
         eprintln!("error: {}: {e}", path.display());
         return ExitCode::from(1);
     }
@@ -874,10 +993,12 @@ fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod cli_tests {
     use super::{
-        list_report, resolve_texture_name, run_audio, run_bigfile, run_mesh, run_mesh_all,
-        run_mesh_textured, run_textures, strip_launcher_noops, tshow_suffix,
+        list_report, pose_mode_conflict, resolve_texture_name, run_audio, run_bigfile, run_mesh,
+        run_mesh_all, run_mesh_textured, run_mesh_with, run_textures, strip_launcher_noops,
+        tshow_suffix,
     };
     use std::process::ExitCode;
+    use std::rc::Rc;
 
     fn write_tmp(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
         let path = dir.path().join(name);
@@ -1413,6 +1534,163 @@ mod cli_tests {
         short.extend_from_slice(&[0u8; 8]);
         let cut = write_tmp(&tmp, "cut.srm", &short);
         assert_eq!(run_mesh(&[cut]), ExitCode::from(1));
+    }
+
+    /// Identity 3x4 affine that passes the `extra > 0` orthonormality check.
+    const IDENTITY_AFFINE: [f32; 12] = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+    ];
+
+    /// Minimal synthetic `.SRM` (no shaders, no materials, sentinel arm)
+    /// with a caller-chosen matrix pool, joint prefix, and weighted vertices.
+    fn synthetic_srm(
+        extra: &[[f32; 12]],
+        joints: &[[f32; 3]],
+        verts: &[([f32; 3], [u8; 3], [u8; 3])],
+    ) -> Vec<u8> {
+        use crate::srm::{
+            FLAG_BYTES, JOINT_SLOTS, MAGIC, OFF_MATERIAL, OFF_V, SENTINEL, VERTEX_STRIDE,
+        };
+        let mut b = Vec::new();
+        b.extend_from_slice(MAGIC);
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&(extra.len() as u32).to_le_bytes());
+        for m in extra {
+            for v in m {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        let mut pool = [[0.0f32; 3]; JOINT_SLOTS];
+        pool[..joints.len()].copy_from_slice(joints);
+        for j in pool.iter().flatten() {
+            b.extend_from_slice(&j.to_le_bytes());
+        }
+        b.extend_from_slice(&SENTINEL.to_le_bytes());
+        b.extend(std::iter::repeat_n(0u8, FLAG_BYTES as usize));
+        b.extend_from_slice(&(verts.len() as u32).to_le_bytes());
+        b.extend_from_slice(&3u32.to_le_bytes());
+        for (pos, idx, weights) in verts {
+            for x in pos {
+                b.extend_from_slice(&x.to_le_bytes());
+            }
+            b.extend(std::iter::repeat_n(0u8, OFF_MATERIAL - 12));
+            b.push(0);
+            b.extend_from_slice(idx);
+            b.push(0);
+            b.extend_from_slice(weights);
+            b.push(0);
+            b.extend(std::iter::repeat_n(
+                0u8,
+                VERTEX_STRIDE as usize - OFF_V - 1,
+            ));
+        }
+        for f in [0u16, 1, 2] {
+            b.extend_from_slice(&f.to_le_bytes());
+        }
+        b
+    }
+
+    /// Joint 0 at the origin with its tail at `+Y`, so the derived swing
+    /// axis is `+X` and 45 degrees maps `[0, 0, 1]` to `[0, -s, c]`.
+    fn pose_joints() -> [[f32; 3]; 2] {
+        [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    }
+
+    fn weighted_verts() -> [([f32; 3], [u8; 3], [u8; 3]); 3] {
+        [
+            ([0.0, 0.0, 1.0], [0, 0, 0], [255, 0, 0]),
+            ([2.0, 0.0, 0.0], [0, 0, 0], [255, 0, 0]),
+            ([0.0, 0.0, 0.0], [0, 0, 0], [255, 0, 0]),
+        ]
+    }
+
+    fn rest_positions() -> Vec<[f32; 3]> {
+        weighted_verts().iter().map(|(pos, _, _)| *pos).collect()
+    }
+
+    fn pose_args(path: &str, spec: &str) -> Vec<String> {
+        vec![path.to_string(), "--pose".to_string(), spec.to_string()]
+    }
+
+    /// Run the mesh CLI with a capturing renderer, so tests prove whether
+    /// the render call was reached without ever opening a window.
+    fn run_mesh_capture(args: &[String]) -> (ExitCode, bool, Option<Vec<[f32; 3]>>) {
+        let reached = Rc::new(std::cell::Cell::new(false));
+        let captured = Rc::new(std::cell::RefCell::new(None));
+        let (seen, sink) = (Rc::clone(&reached), Rc::clone(&captured));
+        let code = run_mesh_with(args, move |positions, _, _| {
+            seen.set(true);
+            *sink.borrow_mut() = Some(positions.to_vec());
+            Ok(())
+        });
+        let rendered = reached.get().then(|| captured.borrow_mut().take()).flatten();
+        (code, reached.get(), rendered)
+    }
+
+    fn assert_mesh_refused(args: &[String], why: &str) {
+        let (code, reached, positions) = run_mesh_capture(args);
+        assert_eq!(code, ExitCode::from(1), "{why}: must exit 1");
+        assert!(!reached, "{why}: must not reach the render call");
+        assert!(positions.is_none(), "{why}: must not render positions");
+    }
+
+    #[test]
+    fn mesh_rest_path_reaches_render_unchanged() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let path = write_tmp(&tmp, "rest.srm", &synthetic_srm(&[], &pose_joints(), &weighted_verts()));
+        let (code, reached, positions) = run_mesh_capture(&[path]);
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(reached, "rest --mesh must still reach the render call");
+        assert_eq!(positions.expect("render positions"), rest_positions());
+    }
+
+    #[test]
+    fn mesh_pose_valid_spec_reaches_render_with_deformed_positions() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let path = write_tmp(&tmp, "pose.srm", &synthetic_srm(&[], &pose_joints(), &weighted_verts()));
+        let (code, reached, positions) = run_mesh_capture(&pose_args(&path, "0:45"));
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(reached, "a valid --pose spec must reach the render call");
+        let rendered = positions.expect("render must receive posed positions");
+        let moved = rendered[0];
+        let diag = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((moved[1] + diag).abs() < 1e-4, "expected a -45-degree X swing, got {moved:?}");
+        assert!((moved[2] - diag).abs() < 1e-4);
+        assert_eq!(rendered[1], [2.0, 0.0, 0.0], "pivot vertices stay put");
+        let (code, reached, positions) = run_mesh_capture(&pose_args(&path, "0:0"));
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert!(reached, "zero angle still reaches the render call");
+        assert_eq!(positions.expect("render positions"), rest_positions());
+    }
+
+    #[test]
+    fn mesh_pose_refusals_exit_1_without_a_window() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let rest = write_tmp(&tmp, "rest.srm", &synthetic_srm(&[], &pose_joints(), &weighted_verts()));
+        let hd = write_tmp(&tmp, "hd.srm", &synthetic_srm(&[IDENTITY_AFFINE], &pose_joints(), &weighted_verts()));
+        assert_mesh_refused(&pose_args(&hd, "0:45"), "extra > 0 model");
+        for spec in ["7", ":45", "7:", "7:45:0", "x:45", "7:nan", "7:361", "128:45"] {
+            assert_mesh_refused(&pose_args(&rest, spec), &format!("bad spec {spec:?}"));
+        }
+        assert_mesh_refused(&pose_args(&rest, "5:45"), "bone with no weighted vertex");
+        let mut mixed = pose_args(&rest, "0:45");
+        mixed.push("--tshow".to_string());
+        assert_mesh_refused(&mixed, "--pose with an incompatible mode");
+        let mut cut = synthetic_srm(&[], &pose_joints(), &weighted_verts());
+        cut.truncate(20);
+        let cut = write_tmp(&tmp, "cut.srm", &cut);
+        assert_mesh_refused(&pose_args(&cut, "0:45"), "truncated bone block");
+    }
+
+    #[test]
+    fn pose_outside_the_mesh_mode_is_refused() {
+        let args = ["--textures", "TEXTURES.BIG", "--tshow", "0", "--pose", "7:45"].map(String::from);
+        let err = pose_mode_conflict(&args).expect("--pose in another mode must be refused");
+        assert!(err.contains("--tshow"), "{err}");
+        assert!(pose_mode_conflict(&["--mesh", "a.srm", "--pose", "7:45"].map(String::from)).is_none());
+        let bare = pose_mode_conflict(&["--pose", "7:45"].map(String::from));
+        assert!(bare.expect("bare --pose must be refused").contains("--pose"));
     }
 
     #[test]

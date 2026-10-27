@@ -143,14 +143,24 @@ extracted files, decompiled code, or database files.
    Playtest file: the 86-vertex / 56-triangle loose SRM named by relative
    name in `docs/changes/models-3d/proposal.md`, resolved against the
    user's own install at runtime.
-- `animation` decode (PR 1 of 3): `--mesh` now decodes the `.SRM` bone
-  block — `extra` HD 3x4 matrices, 128 joint slots, per-vertex bone
-  indices and weights — validates orthonormal matrices, 255-weight
+- `animation` decode + one-bone pose (PRs 1-3 of 3): `--mesh` decodes the
+  `.SRM` bone block — `extra` HD 3x4 matrices, 128 joint slots, per-vertex
+  bone indices and weights — validates orthonormal matrices, 255-weight
   triples, and indices below 128, and prints
-  `skeleton: K matrices, 128 joints`. `extra > 0` models decode but are
-  refused for posing because the matrix/joint relation is UNKNOWN. Pose
-  math and `--pose` are the next PRs. Supersedes the "bones skipped"
-  note in the `models-3d` bullet.
+  `skeleton: K matrices, 128 joints`. `cargo run -- --mesh <FILE.SRM>
+  --pose <bone>:<degrees>` rotates exactly one decoded bone's weighted
+  vertices (integer bone `0..=127`, finite `|degrees| <= 360`), prints
+  `pose bone B, D deg, V vertices moved`, and shows the deformed mesh
+  through the unchanged auto-rotating flat-shaded path. The blend is
+  one-bone linear blend skinning in mesh space (joint Z negated per design
+  P5); a vertex moves by `p + (w/255) * (R(p - head) - (p - head))`, so
+  seams stay continuous and zero-weight vertices are untouched. Without
+  `--pose`, the `--mesh` path is byte-for-byte unchanged. `extra > 0` models
+  still decode but `--pose` refuses them because the matrix/joint relation
+  is UNKNOWN; malformed specs, out-of-range or unweighted bones, and
+  `--pose` in any other mode all fail loud (stderr + exit 1, no window).
+  Bone hierarchy, parenting, and `.SRA` clip playback remain missing.
+  Supersedes the "bones skipped" note in the `models-3d` bullet.
 - `s1-bigfile-loader` (playtest-accepted error parity, SR1 only):
   open-stage failures (`--bigfile <absent> --list`) report the
   original loader's load-failure prefix —
@@ -227,10 +237,13 @@ extracted files, decompiled code, or database files.
       `docs/changes/models-3d/`): single loose SRM as a flat-shaded
       auto-rotating solid. Still unscoped: skeleton/animation, room
       meshes, multi-mesh browsing, textured meshes.
-- [ ] Animation (NEXT slice, unscoped): skeleton/animation for the existing
-      mesh path — scoping probe first, same slice discipline (proposal →
-      spec → tasks → code → playtest), then room meshes, multi-mesh
-      browsing and textured meshes.
+- [x] Animation, slice `animation` (one-bone pose only): `--mesh --pose
+      <bone>:<degrees>` deforms one `extra = 0` model for the playtest.
+      Still missing: skeleton point/chain overlay, bone hierarchy and
+      parenting, animation clips (`.SRA`/`.SRL`), `extra > 0` HD matrix
+      interpretation, and bone names. Next candidates are the joint
+      overlay and `.SRA` + Ghidra; room meshes, multi-mesh browsing and
+      textured meshes stay separate scopes.
 - [ ] Audio follow-ups (unscoped, after animation): 322 of 841 waves are looped
       but rendering is one-shot (the loop span is reported only); the 155
       `QSMa` sequences are still unread and need a MIDI-like interpreter, SPU
