@@ -84,6 +84,23 @@ mapping. The mapping is playtest-gated in the `animation` change.
   affine matrices whose relationship to the 128 joints is UNKNOWN. The
   `animation` slice refuses `--pose` on that class rather than guessing.
 
+## Decode landed (PR 1, `animation`)
+
+`src/srm.rs` now decodes the block instead of skipping it:
+
+| Check | Rule |
+|---|---|
+| Matrix class | `extra` 48-byte records, 12 f32 LE; each upper 3x3 must be unit-row orthonormal within `1e-3` (worst real file `2.2e-5`) |
+| Joint pool | Always 128 slots, four `vec3` per record, stored in file order |
+| Bone indices | Every vertex index below 128 (real range 0..67) |
+| Weights | Every triple sums to 255 (all real vertices) |
+| Extra ceiling | `extra > 4096` is `InvalidSrm` before allocation |
+| Pose refusal | `Mesh::poseable_bones` returns a distinct loud `extra > 0` UNKNOWN error; decode still succeeds |
+
+Headless replay of this parser over the loose `.SRM` files: 349/349 exact
+EOF, unchanged `extra` distribution, 128 matrices, 128 joints per file,
+and 7/7 `extra > 0` pose refusals. Counts only.
+
 ## Community tools (exact URLs + licenses)
 
 | Tool | URL | License | Relevance |
