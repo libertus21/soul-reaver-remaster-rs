@@ -568,9 +568,11 @@ fn run_mesh(args: &[String]) -> ExitCode {
         }
     };
     outln!(
-        "{} vertices, {} triangles",
+        "{} vertices, {} triangles, skeleton: {} matrices, {} joints",
         mesh.positions.len(),
-        mesh.indices.len() / 3
+        mesh.indices.len() / 3,
+        mesh.bones.matrices.len(),
+        mesh.bones.joints.len()
     );
     let title = path
         .file_name()

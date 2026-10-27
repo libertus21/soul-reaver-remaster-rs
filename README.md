@@ -143,6 +143,14 @@ extracted files, decompiled code, or database files.
    Playtest file: the 86-vertex / 56-triangle loose SRM named by relative
    name in `docs/changes/models-3d/proposal.md`, resolved against the
    user's own install at runtime.
+- `animation` decode (PR 1 of 3): `--mesh` now decodes the `.SRM` bone
+  block — `extra` HD 3x4 matrices, 128 joint slots, per-vertex bone
+  indices and weights — validates orthonormal matrices, 255-weight
+  triples, and indices below 128, and prints
+  `skeleton: K matrices, 128 joints`. `extra > 0` models decode but are
+  refused for posing because the matrix/joint relation is UNKNOWN. Pose
+  math and `--pose` are the next PRs. Supersedes the "bones skipped"
+  note in the `models-3d` bullet.
 - `s1-bigfile-loader` (playtest-accepted error parity, SR1 only):
   open-stage failures (`--bigfile <absent> --list`) report the
   original loader's load-failure prefix —

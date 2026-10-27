@@ -149,7 +149,7 @@ mod tests {
             b.push(1);
             b.extend(std::iter::repeat_n(0u8, 23 - 20));
             b.push(i * 80);
-            b.extend(std::iter::repeat_n(0u8, 27 - 24));
+            b.extend_from_slice(&[255, 0, 0]);
             b.push(i * 90);
             b.extend(std::iter::repeat_n(0u8, 32 - 28));
         }
@@ -198,7 +198,9 @@ mod tests {
         b.extend_from_slice(&3u32.to_le_bytes());
         b.extend_from_slice(&3u32.to_le_bytes());
         for _ in 0..3 {
-            b.extend(std::iter::repeat_n(0u8, 32));
+            b.extend(std::iter::repeat_n(0u8, 24));
+            b.extend_from_slice(&[255, 0, 0]);
+            b.extend(std::iter::repeat_n(0u8, 5));
         }
         for f in [0u16, 1, 2] {
             b.extend_from_slice(&f.to_le_bytes());
