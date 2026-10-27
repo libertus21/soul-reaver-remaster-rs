@@ -143,24 +143,30 @@ extracted files, decompiled code, or database files.
    Playtest file: the 86-vertex / 56-triangle loose SRM named by relative
    name in `docs/changes/models-3d/proposal.md`, resolved against the
    user's own install at runtime.
-- `animation` decode + one-bone pose (PRs 1-3 of 3): `--mesh` decodes the
-  `.SRM` bone block — `extra` HD 3x4 matrices, 128 joint slots, per-vertex
-  bone indices and weights — validates orthonormal matrices, 255-weight
-  triples, and indices below 128, and prints
-  `skeleton: K matrices, 128 joints`. `cargo run -- --mesh <FILE.SRM>
-  --pose <bone>:<degrees>` rotates exactly one decoded bone's weighted
-  vertices (integer bone `0..=127`, finite `|degrees| <= 360`), prints
-  `pose bone B, D deg, V vertices moved`, and shows the deformed mesh
-  through the unchanged auto-rotating flat-shaded path. The blend is
-  one-bone linear blend skinning in mesh space (joint Z negated per design
-  P5); a vertex moves by `p + (w/255) * (R(p - head) - (p - head))`, so
-  seams stay continuous and zero-weight vertices are untouched. Without
-  `--pose`, the `--mesh` path is byte-for-byte unchanged. `extra > 0` models
-  still decode but `--pose` refuses them because the matrix/joint relation
-  is UNKNOWN; malformed specs, out-of-range or unweighted bones, and
-  `--pose` in any other mode all fail loud (stderr + exit 1, no window).
-  Bone hierarchy, parenting, and `.SRA` clip playback remain missing.
-  Supersedes the "bones skipped" note in the `models-3d` bullet.
+- `animation` decode + one-bone pose — PARTIAL (PRs 1-3 of 3, all merged):
+  `--mesh` decodes the `.SRM` bone block — `extra` HD 3x4 matrices, 128
+  joint slots, per-vertex bone indices and weights — validates orthonormal
+  matrices, 255-weight triples, and indices below 128, and prints
+  `skeleton: K matrices, 128 joints` (349/349 loose `.SRM` files decode to
+  exact EOF). `cargo run -- --mesh <FILE.SRM> --pose <bone>:<degrees>`
+  rotates exactly one decoded slot's weighted vertices (integer bone
+  `0..=127`, finite `|degrees| <= 360`), prints `pose bone B, D deg, V
+  vertices moved`, and shows the deformed mesh through the unchanged
+  auto-rotating flat-shaded path. The math is one-bone linear blend
+  skinning in mesh space (joint Z negated per design P5):
+  `p' = sum(w_i * (M_i * p)) / sum(w_i)`; zero-weight vertices are
+  untouched. CAVEAT: this is a LOCAL CLUSTER rotation, not a pose. The
+  `.SRM` has NO hierarchy (128 independent slots, no parent/child, no
+  keyframes, no clips), so the other 127 slots never follow; rotating a
+  slot that reads as a parent leaves its children fixed and the mesh tears
+  at the boundary. Full-body posing is NOT delivered. Without `--pose`, the
+  `--mesh` path is byte-for-byte unchanged. `extra > 0` models still decode
+  but `--pose` refuses them because the matrix/joint relation is UNKNOWN;
+  malformed specs, out-of-range or unweighted bones, and `--pose` in any
+  other mode all fail loud (stderr + exit 1, no window). Playtest: `7:0`
+  rest, `7:45` mostly coherent with one odd leg edge, `12:45` scattered —
+  see `docs/changes/animation/archive.md`. Supersedes the "bones skipped"
+  note in the `models-3d` bullet.
 - `s1-bigfile-loader` (playtest-accepted error parity, SR1 only):
   open-stage failures (`--bigfile <absent> --list`) report the
   original loader's load-failure prefix —
@@ -237,13 +243,19 @@ extracted files, decompiled code, or database files.
       `docs/changes/models-3d/`): single loose SRM as a flat-shaded
       auto-rotating solid. Still unscoped: skeleton/animation, room
       meshes, multi-mesh browsing, textured meshes.
-- [x] Animation, slice `animation` (one-bone pose only): `--mesh --pose
-      <bone>:<degrees>` deforms one `extra = 0` model for the playtest.
-      Still missing: skeleton point/chain overlay, bone hierarchy and
-      parenting, animation clips (`.SRA`/`.SRL`), `extra > 0` HD matrix
-      interpretation, and bone names. Next candidates are the joint
-      overlay and `.SRA` + Ghidra; room meshes, multi-mesh browsing and
-      textured meshes stay separate scopes.
+- [ ] Animation — **NOT solved** by the `animation` slice. What landed is
+      the `.SRM` bone-block decode plus one-bone deformation (`--mesh
+      --pose`), and it works only as a LOCAL CLUSTER rotation: a rotated
+      slot moves its own weighted vertices and nothing else. `.SRM` carries
+      no hierarchy (128 independent slots, no parent/child, no keyframes, no
+      clips), so posing a "parent" leaves children fixed and the mesh tears
+      — confirmed by playtest (`7:45` mostly coherent with one odd leg edge;
+      `12:45` scattered). The limb/body still cannot be animated. Next
+      candidate: scope the `.SRA` siblings (227 files, still undecoded) for
+      clips and hierarchy. Also open: joint/chain overlay, `extra > 0` HD
+      matrix interpretation, and bone names. See
+      `docs/changes/animation/archive.md`. Room meshes, multi-mesh browsing
+      and textured meshes stay separate scopes.
 - [ ] Audio follow-ups (unscoped, after animation): 322 of 841 waves are looped
       but rendering is one-shot (the loop span is reported only); the 155
       `QSMa` sequences are still unread and need a MIDI-like interpreter, SPU
@@ -269,5 +281,8 @@ extracted files, decompiled code, or database files.
 ## Next step
 
 Read `AGENTS.md`, then `docs/notes/` (survey + community tools + format
-notes). The `.SND`+`.SMP` audio probe and its one-wave slice are done; the
-next change is the animation scoping probe for the mesh path.
+notes). The `.SND`+`.SMP` audio probe and its one-wave slice are done, and
+the `animation` slice is archived as PARTIAL: bone decode and one-bone pose
+are in, but full-body pose is blocked by the absent hierarchy. The next
+change is the `.SRA` scoping probe (227 sibling files) to look for clips and
+hierarchy.
