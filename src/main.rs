@@ -47,6 +47,7 @@ mod cli_out;
 mod launcher_cli;
 mod dds;
 mod gallery;
+mod level;
 mod mesh_entry;
 // Pure one-bone pose math, wired into the `--mesh --pose` arm below.
 mod pose;
@@ -94,6 +95,9 @@ fn main() -> ExitCode {
     if args.first().is_some_and(|a| a == "--audio") {
         return run_audio(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--level-info") {
+        return run_level_info(&args[1..]);
+    }
     let Some(arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs <path-to-DDS | path-to-directory>");
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --list");
@@ -108,6 +112,7 @@ fn main() -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --mesh-all <OBJECT_dir> --tex-dir <TEX>");
         eprintln!("   or: soul-reaver-remaster-rs --audio <FILE.SND> --alist");
         eprintln!("   or: soul-reaver-remaster-rs --audio <FILE.SND> --wave <n> --out <FILE.wav>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-info <.PCM file | room directory>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
@@ -970,6 +975,25 @@ fn run_audio(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Read-only `--level-info` arm: one line per unit, then one per link.
+fn run_level_info(args: &[String]) -> ExitCode {
+    let result = match args {
+        [path] if !path.starts_with('-') => level::read_path(Path::new(path)),
+        _ => Err(level::LevelError::Usage("expected --level-info <path>")),
+    };
+    let units = match result {
+        Ok(units) => units,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    for line in units.iter().flat_map(level::report_lines) {
+        outln!("{line}");
+    }
+    ExitCode::SUCCESS
+}
+
 /// Track label for messages: the file stem, never an install path.
 fn track_name(path: &Path) -> String {
     path.file_stem()
@@ -992,6 +1016,7 @@ fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod cli_tests {
+    use super::run_level_info;
     use super::{
         list_report, pose_mode_conflict, resolve_texture_name, run_audio, run_bigfile, run_mesh,
         run_mesh_all, run_mesh_textured, run_mesh_with, run_textures, strip_launcher_noops,
@@ -1039,6 +1064,26 @@ mod cli_tests {
             let at = start + i * 4;
             map[at..at + 4].copy_from_slice(&code.to_le_bytes());
         }
+    }
+
+    #[test]
+    fn level_info_maps_the_exit_matrix() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let mut pcm = 2u32.to_le_bytes().to_vec();
+        pcm.extend_from_slice(&0u32.to_le_bytes());
+        pcm.extend_from_slice(&4u32.to_le_bytes());
+        pcm.extend_from_slice(b"lair5\0\0\0\0\0\0\0\0\0");
+        let pcm_path = write_tmp(&tmp, "lair5.PCM", &pcm);
+        let pmf_path = write_tmp(&tmp, "notes.PMF", &[0u8; 44]);
+        let empty = tmp.path().join("EMPTY");
+        std::fs::create_dir(&empty).expect("EMPTY must be creatable");
+        let empty = empty.to_string_lossy().into_owned();
+        assert_eq!(run_level_info(&[]), ExitCode::from(1));
+        assert_eq!(run_level_info(&["--other".to_string()]), ExitCode::from(1));
+        assert_eq!(run_level_info(&[pcm_path.clone(), pcm_path.clone()]), ExitCode::from(1));
+        assert_eq!(run_level_info(&[pmf_path]), ExitCode::from(3));
+        assert_eq!(run_level_info(&[empty]), ExitCode::from(2));
+        assert_eq!(run_level_info(&[pcm_path]), ExitCode::SUCCESS);
     }
 
     #[test]
