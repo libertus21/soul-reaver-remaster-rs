@@ -84,6 +84,30 @@ mapping. The mapping is playtest-gated in the `animation` change.
   affine matrices whose relationship to the 128 joints is UNKNOWN. The
   `animation` slice refuses `--pose` on that class rather than guessing.
 
+## Limitation: no hierarchy (why full-body posing is blocked)
+
+The block is a flat pool of 128 independent joint slots. There are no parent
+indices, child lists, per-slot bind matrices, keyframes, or clip counts
+anywhere in the `.SRM`. A one-bone transform can therefore rotate only the
+vertices weighted to the target slot; every other slot - including the ones a
+viewer would read as its children - stays exactly where it was.
+
+The playtest on the extra=0 humanoid shows the consequence directly:
+
+| Run | Weighted vertices | Observation |
+|---|---|---|
+| `--pose 7:0` | 0 moved | normal rest mesh (control) |
+| `--pose 7:45` | 940 | mostly plausible; one leg edge looks odd |
+| `--pose 12:45` | 5,215 | clearly broken/scattered |
+
+On a small cluster the rotation is internally coherent, so the only visible
+artifact is the seam where it meets unrotated neighbours (the odd leg edge).
+On a large cluster the rotated region separates from adjacent regions that
+cannot follow, so the silhouette scatters. This is structural, not a math
+defect: one-bone linear blend skinning does exactly what the data supports.
+Coherent full-body posing needs hierarchy and/or clips; the 227 `.SRA`
+siblings are the next candidate, not a larger one-bone angle.
+
 ## Decode landed (PR 1, `animation`)
 
 `src/srm.rs` now decodes the block instead of skipping it:
