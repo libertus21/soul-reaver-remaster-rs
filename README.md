@@ -182,9 +182,10 @@ extracted files, decompiled code, or database files.
    remaining flags are parser-only. `-nocheck`/`-skipintro` are absent from
    this build, so they exist only as compatibility no-ops. `cargo test` 102/102
    green (see `docs/changes/f4-launcher-cli/archive.md`).
-- `audio-snd` (playtest pending: one wave decoded read-only, scratch WAV in
-  `%TEMP%`): the paired `.SND`+`.SMP` instrument banks under `MUSIC/<track>/`
-  are readable. `cargo run -- --audio <FILE.SND> --alist` parses the 40-byte
+- `audio-snd` (playtest-accepted: one wave decoded and heard — the tone sounded
+  natural, and 44100 Hz is confirmed by ear; the scratch WAV stays in `%TEMP%`):
+  the paired `.SND`+`.SMP` instrument banks under `MUSIC/<track>/` are
+  readable. `cargo run -- --audio <FILE.SND> --alist` parses the 40-byte
   `DNSa` header, the program (8 B) and zone (16 B) tables and the `u32`
   wave/sequence/label offset tables, validates every structural invariant,
   and lists each wave's offset, bytes, frames, decoded samples, duration and
@@ -193,11 +194,14 @@ extracted files, decompiled code, or database files.
   frame, 28 samples, filters 0-4, flag 7 stops before its samples) and writes
   a canonical 44-byte RIFF/WAVE PCM16 mono file. The container stores no
   sample rate: 44100 Hz is the community convention and every message prints
-  it as `(chosen)`. The writer refuses a missing parent and any path inside a
-  git working tree, so game audio cannot enter this repository; the WAV is a
-  scratch playtest artifact, never an export path. No sequence playback, no
-  mixing, no new dependency; tests use synthetic bytes only (see
-  `docs/notes/s9-audio-snd.md`).
+  it as `(chosen)`; the audible playtest accepted 44100, so the 22050
+  alternative was not needed. The writer refuses a missing parent and any path
+  inside a git working tree, so game audio cannot enter this repository; the WAV
+  is a scratch playtest artifact, never an export path. Waves decode one-shot
+  even when the bank marks them looped (the loop span is reported only). No
+  sequence playback, no mixing, no new dependency; tests use synthetic bytes
+  only (see `docs/notes/s9-audio-snd.md` and
+  `docs/changes/audio-snd/archive.md`).
 
 ## What's missing
 
@@ -211,19 +215,20 @@ extracted files, decompiled code, or database files.
       little-endian A1R5G5B5 image and shows it, while `empty`/`zero` slots
       stay loud. Verdict: `data` slots are NOT compressed, so no decompressor
       is needed. Visual acceptance of decoded slots is a playtest, not a test.
-- [ ] Audio sequences (NEXT slice, unscoped): the sample bank is readable
-      (`audio-snd`: `--alist` plus one wave to a scratch WAV), but the 155
-      `QSMa` sequences under the same `.SND` files are still unread. Rendering
-      a sequence needs a MIDI-like interpreter, SPU ADSR envelopes and pitch
-      resampling; the wave slice stops at the sample bank. See
-      `docs/notes/s9-audio-snd.md`.
 - [x] 3D models, slice 1 `models-3d` (parse-one + render-one, see
       `docs/changes/models-3d/`): single loose SRM as a flat-shaded
       auto-rotating solid. Still unscoped: skeleton/animation, room
       meshes, multi-mesh browsing, textured meshes.
-- [ ] 3D models (NEXT slices): skeleton/animation, room meshes,
-      multi-mesh browsing, textured meshes — scoping probe first, same
-      slice discipline (proposal → spec → tasks → code → playtest).
+- [ ] Animation (NEXT slice, unscoped): skeleton/animation for the existing
+      mesh path — scoping probe first, same slice discipline (proposal →
+      spec → tasks → code → playtest), then room meshes, multi-mesh
+      browsing and textured meshes.
+- [ ] Audio follow-ups (unscoped, after animation): 322 of 841 waves are looped
+      but rendering is one-shot (the loop span is reported only); the 155
+      `QSMa` sequences are still unread and need a MIDI-like interpreter, SPU
+      ADSR envelopes and pitch resampling. Multi-track playback and the other
+      audio banks are separate scopes. See
+      `docs/changes/audio-snd/archive.md` and `docs/notes/s9-audio-snd.md`.
 - [ ] Binary loader follow-ups (UNSCOPED, TBD by user): S2 and S3 both
       landed docs-only — S2's static call-edge tracing resolved zero
       post-open rows; S3 confirmed the launcher reaches `run`
