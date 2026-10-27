@@ -72,6 +72,7 @@ pub enum LevelError {
     CountCeiling,
     TableNotAscending,
     TablePastEof,
+    PaddingTruncated,
     MissingUnitName,
     SidecarIncomplete,
     BadSidecarMagic,
@@ -98,6 +99,9 @@ impl fmt::Display for LevelError {
             LevelError::CountCeiling => "record count out of range",
             LevelError::TableNotAscending => "offset table must start 0, 4 and strictly ascend",
             LevelError::TablePastEof => "offset table or last record runs past the file",
+            LevelError::PaddingTruncated => {
+                "offset table padding is missing: file ends before the level-data base"
+            }
             LevelError::MissingUnitName => "name table does not contain the unit's own name",
             LevelError::SidecarIncomplete => "PMF and PNF must be present together",
             LevelError::BadSidecarMagic => "sidecar magic or header length is invalid",
@@ -114,15 +118,37 @@ fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.get(at..at.checked_add(4)?)?.try_into().ok()?))
 }
 
-/// `u32 N` + `N` ascending relative offsets, data base `4 + 4N`, name table.
+/// Word count the offset table is padded to: 512 words, i.e. a 2048-byte
+/// level-data base.
+pub(crate) const OFFSET_ALIGN: usize = 512;
+
+/// Level-data base: the `4 + 4N` table padded up to a 2048-byte boundary,
+/// i.e. `4 * roundup512(N)`. Equal to that form for every `N < 512`; the
+/// count word is included so the base can never land inside the table when
+/// `N` is an exact multiple of 512. Saturates instead of panicking.
+pub(crate) fn data_base(records: u32) -> usize {
+    let words = (records as usize).saturating_add(1);
+    let rounded = words.saturating_add(OFFSET_ALIGN - 1) & !(OFFSET_ALIGN - 1);
+    rounded.saturating_mul(4)
+}
+
+/// `u32 N` + `N` ascending relative offsets + zero padding up to
+/// `4 * roundup512(N)`, which is the level-data base, then the level data and
+/// the name table. Blocks are addressed relative to that padded base.
 pub fn parse_pcm(bytes: &[u8], expected_name: &str) -> Result<LevelUnit, LevelError> {
     let records = read_u32(bytes, 0).ok_or(LevelError::TablePastEof)?;
     if !(2..=MAX_RECORDS).contains(&records) {
         return Err(LevelError::CountCeiling);
     }
-    let table_end = 4 + 4 * records as usize;
+    let table_end = 4usize
+        .checked_add(4 * records as usize)
+        .ok_or(LevelError::TablePastEof)?;
     if table_end > bytes.len() {
         return Err(LevelError::TablePastEof);
+    }
+    let data_base = data_base(records);
+    if data_base > bytes.len() {
+        return Err(LevelError::PaddingTruncated);
     }
     let mut last = 0u32;
     let mut offsets = Vec::with_capacity(records as usize);
@@ -135,15 +161,15 @@ pub fn parse_pcm(bytes: &[u8], expected_name: &str) -> Result<LevelUnit, LevelEr
         last = offset;
         offsets.push(offset);
     }
-    if table_end + last as usize > bytes.len() {
+    if data_base.saturating_add(last as usize) > bytes.len() {
         return Err(LevelError::TablePastEof);
     }
     let mut block_sizes = Vec::with_capacity(records as usize);
     let mut block_all_zero = Vec::with_capacity(records as usize);
     for (index, offset) in offsets.iter().enumerate() {
-        let start = table_end + *offset as usize;
+        let start = data_base + *offset as usize;
         let end = match offsets.get(index + 1) {
-            Some(next) => table_end + *next as usize,
+            Some(next) => data_base + *next as usize,
             None => bytes.len(),
         };
         let block = &bytes[start..end];
@@ -429,6 +455,7 @@ mod tests {
         for offset in offsets {
             bytes.extend_from_slice(&offset.to_le_bytes());
         }
+        bytes.resize(data_base(offsets.len() as u32), 0);
         bytes.extend_from_slice(body);
         bytes
     }
@@ -517,6 +544,44 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 3]);
         assert_eq!(
             parse_pcm(&bytes, "lair5").err(),
+            Some(LevelError::PaddingTruncated)
+        );
+        assert_eq!(
+            parse_pcm(&pcm_bytes(&[0, 4, 5000], &[0u8; 8]), "lair5").err(),
+            Some(LevelError::TablePastEof)
+        );
+    }
+
+    #[test]
+    fn data_base_rounds_the_record_count_up_to_512() {
+        for (records, expected) in [(2, 2048), (62, 2048), (74, 2048), (512, 4096), (513, 4096)] {
+            assert_eq!(data_base(records), expected, "records={records}");
+            assert_eq!(data_base(records) % 2048, 0);
+        }
+        assert!(data_base(MAX_RECORDS) > 4 + 4 * MAX_RECORDS as usize);
+    }
+
+    #[test]
+    fn pcm_reads_blocks_from_the_aligned_data_base() {
+        let blocks = vec![block_of(4, 0x01), block_of(40, 0x00), named_block(48, 0x03)];
+        let (bytes, body_len) = blocks_pcm(&blocks);
+        assert_eq!(data_base(3), 2048);
+        assert_eq!(bytes.len(), 2048 + body_len);
+        let unit = parse_pcm(&bytes, "lair5").expect("must parse");
+        assert_eq!(unit.block_sizes, vec![4, 40, 48]);
+        assert_eq!(unit.block_all_zero, vec![false, true, false]);
+    }
+
+    #[test]
+    fn pcm_rejects_a_file_truncated_inside_the_offset_padding() {
+        let (bytes, _) = blocks_pcm(&[block_of(4, 0x01), block_of(40, 0x02)]);
+        assert_eq!(data_base(2), 2048);
+        assert_eq!(
+            parse_pcm(&bytes[..data_base(2) - 1], "lair5").err(),
+            Some(LevelError::PaddingTruncated)
+        );
+        assert_eq!(
+            parse_pcm(&bytes[..11], "lair5").err(),
             Some(LevelError::TablePastEof)
         );
     }
@@ -797,6 +862,7 @@ mod tests {
             LevelError::CountCeiling,
             LevelError::TableNotAscending,
             LevelError::TablePastEof,
+            LevelError::PaddingTruncated,
             LevelError::MissingUnitName,
             LevelError::SidecarIncomplete,
             LevelError::BadSidecarMagic,

@@ -1097,6 +1097,7 @@ mod cli_tests {
         let mut pcm = 2u32.to_le_bytes().to_vec();
         pcm.extend_from_slice(&0u32.to_le_bytes());
         pcm.extend_from_slice(&4u32.to_le_bytes());
+        pcm.resize(crate::level::data_base(2), 0);
         pcm.extend_from_slice(b"lair5\0\0\0\0\0\0\0\0\0");
         let pcm_path = write_tmp(&tmp, "lair5.PCM", &pcm);
         let pmf_path = write_tmp(&tmp, "notes.PMF", &[0u8; 44]);
@@ -1124,6 +1125,7 @@ mod cli_tests {
         for offset in offsets {
             bytes.extend_from_slice(&offset.to_le_bytes());
         }
+        bytes.resize(crate::level::data_base(blocks.len() as u32), 0);
         bytes.extend_from_slice(&body);
         bytes
     }
