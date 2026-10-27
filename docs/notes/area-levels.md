@@ -158,3 +158,25 @@ geometry.
 5. Compare same-size PMFs across the whole install to see whether the
    identity is a global duplication or a local one.
 6. If the original PS1 data is available, compare unit names and counts.
+
+## Apply result (2026-10-27)
+
+`--level-info` landed as `src/level.rs` plus one `main.rs` arm. Headless
+census (relative counts only; no bytes, coordinates, hashes, or install
+paths):
+
+- 89 `.PCM` units across 11 room directories; the 12th room holds no `.PCM`
+  and is refused with exit 2.
+- 89/89 pass the header model and the own-name guard.
+- 2,106 accepted names and 368 link names; 346 (94.0%) targets resolve to a
+  unit in this install, 22 do not (the warp-gate marker and units absent
+  here); 11 units have no links.
+- 23 units carry a PMF/PNF pair: segment counts 1x11, 2x2, 3x7, 4x2, 5x1;
+  the rate field is 22,050 in 18 and 11,025 in 5; PNF entries equal the PMF
+  segment count in all 23. 66 units have neither sidecar.
+- A single-file path, a `.PMF` path (exit 3), an empty room (exit 2), and a
+  missing argument (exit 1) behave as specified.
+
+Still UNKNOWN and not claimed: PCM geometry and collision, object placement
+and transforms, PMF codec and loop points, and the meaning of the id and PNF
+entries.

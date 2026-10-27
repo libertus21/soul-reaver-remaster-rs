@@ -220,9 +220,23 @@ extracted files, decompiled code, or database files.
   sequence playback, no mixing, no new dependency; tests use synthetic bytes
   only (see `docs/notes/s9-audio-snd.md` and
   `docs/changes/audio-snd/archive.md`).
+- `area-levels` (read-only probe; opens no window): `cargo run -- --level-info
+  <.PCM file | room directory>` prints one `level` line per unit
+  (`pcm_records`, accepted `names`, `links`, and the `PMF`/`PNF` sidecar
+  `segments`/`rate_field`/`pnf` counts) plus one `  link <target> <index>`
+  line per `<target>,<index>` name. A room directory resolves its `BIN` when
+  present (else itself) and units print sorted by name; a lone `.PCM` path
+  prints that one unit. Header and name table only: geometry, object
+  placement, transforms, and audio playback stay NOT decoded. Malformed input
+  exits 2, a refused path exits 3, a bad invocation exits 1. Synthetic-byte
+  tests only; `cargo test` 226/226 green.
 
 ## What's missing
 
+- [ ] Room geometry, collision, object placement, transforms and room
+      rendering stay NO-GO after `area-levels`: `--level-info` proves the
+      `.PCM` record table and the object-name/portal-link list only; no
+      vertex, face, transform, or playback claim.
 - [x] `.BIG` fixed-slot layout and slot decoding, slices `big-slots` +
       `big-decompressor` (see `docs/changes/big-slots/design.md` and
       `docs/changes/big-decompressor/design.md`): the four containers share a
