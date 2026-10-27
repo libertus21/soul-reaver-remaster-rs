@@ -98,6 +98,9 @@ fn main() -> ExitCode {
     if args.first().is_some_and(|a| a == "--level-info") {
         return run_level_info(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--level-records") {
+        return run_level_records(&args[1..]);
+    }
     let Some(arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs <path-to-DDS | path-to-directory>");
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --list");
@@ -113,6 +116,7 @@ fn main() -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --audio <FILE.SND> --alist");
         eprintln!("   or: soul-reaver-remaster-rs --audio <FILE.SND> --wave <n> --out <FILE.wav>");
         eprintln!("   or: soul-reaver-remaster-rs --level-info <.PCM file | room directory>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-records <.PCM file | room directory>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
@@ -994,6 +998,27 @@ fn run_level_info(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Read-only `--level-records` arm: per-unit block shape-class census.
+/// Every unit is read before the first line is printed, so a failure on any
+/// unit exits without partial output.
+fn run_level_records(args: &[String]) -> ExitCode {
+    let result = match args {
+        [path] if !path.starts_with('-') => level::read_path(Path::new(path)),
+        _ => Err(level::LevelError::Usage("expected --level-records <path>")),
+    };
+    let units = match result {
+        Ok(units) => units,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    for line in units.iter().flat_map(level::record_lines) {
+        outln!("{line}");
+    }
+    ExitCode::SUCCESS
+}
+
 /// Track label for messages: the file stem, never an install path.
 fn track_name(path: &Path) -> String {
     path.file_stem()
@@ -1018,9 +1043,9 @@ fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
 mod cli_tests {
     use super::run_level_info;
     use super::{
-        list_report, pose_mode_conflict, resolve_texture_name, run_audio, run_bigfile, run_mesh,
-        run_mesh_all, run_mesh_textured, run_mesh_with, run_textures, strip_launcher_noops,
-        tshow_suffix,
+        list_report, pose_mode_conflict, resolve_texture_name, run_audio, run_bigfile,
+        run_level_records, run_mesh, run_mesh_all, run_mesh_textured, run_mesh_with, run_textures,
+        strip_launcher_noops, tshow_suffix,
     };
     use std::process::ExitCode;
     use std::rc::Rc;
@@ -1084,6 +1109,47 @@ mod cli_tests {
         assert_eq!(run_level_info(&[pmf_path]), ExitCode::from(3));
         assert_eq!(run_level_info(&[empty]), ExitCode::from(2));
         assert_eq!(run_level_info(&[pcm_path]), ExitCode::SUCCESS);
+    }
+
+    /// Minimal ascending `.PCM` whose block 0 is 4 bytes and whose name
+    /// lives inside the last block, so the shape classes stay deterministic.
+    fn level_pcm(blocks: &[Vec<u8>]) -> Vec<u8> {
+        let mut offsets = Vec::with_capacity(blocks.len());
+        let mut body = Vec::new();
+        for block in blocks {
+            offsets.push(body.len() as u32);
+            body.extend_from_slice(block);
+        }
+        let mut bytes = (blocks.len() as u32).to_le_bytes().to_vec();
+        for offset in offsets {
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    #[test]
+    fn level_records_census_maps_the_exit_matrix() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let mut last = vec![0x01u8; 72];
+        last[..5].copy_from_slice(b"lair5");
+        let pcm = level_pcm(&[vec![0u8; 4], vec![0x02u8; 40], last]);
+        let pcm_path = write_tmp(&tmp, "lair5.PCM", &pcm);
+        let pmf_path = write_tmp(&tmp, "notes.PMF", &[0u8; 44]);
+        let empty = tmp.path().join("EMPTY");
+        std::fs::create_dir(&empty).expect("EMPTY must be creatable");
+        let empty = empty.to_string_lossy().into_owned();
+        assert_eq!(run_level_records(&[]), ExitCode::from(1));
+        assert_eq!(run_level_records(&["--other".to_string()]), ExitCode::from(1));
+        assert_eq!(
+            run_level_records(&[pcm_path.clone(), pcm_path.clone()]),
+            ExitCode::from(1)
+        );
+        assert_eq!(run_level_records(&[pmf_path]), ExitCode::from(3));
+        assert_eq!(run_level_records(&[empty]), ExitCode::from(2));
+        assert_eq!(run_level_records(&[pcm_path]), ExitCode::SUCCESS);
+        let dir = tmp.path().to_string_lossy().into_owned();
+        assert_eq!(run_level_records(&[dir]), ExitCode::SUCCESS);
     }
 
     #[test]
