@@ -145,6 +145,26 @@ area / object name
 3. **Object `.PCM` decompressor (L14).** Only if object containers are in
    scope; otherwise defer.
 
+## Correction (2026-10-27, `level-builder` pass)
+
+The L9 copy shape stands. Two refinements, with evidence in
+`docs/notes/level-builder.md`:
+
+- **L10 refined.** There is no 48-byte record type. The file's leading offset
+  table is a **relocation directory**: each entry is the position of a dword
+  that holds a non-zero base-relative offset. A "48-byte block" is the distance
+  from one pointer field to the next, so it can be a record, a struct plus
+  padding, or an array element. The drain uses only `N`; the individual offsets
+  are not read on the tag-2 path.
+- **L16 refined.** The first field of the 36-byte record is a base-relative
+  pointer to a `0xBE 0xEF` tagged blob (count byte, typed variable-length
+  entries) that is copied whole; with no magic the runtime field is null. It is
+  not a name offset. Object names come from a separate 16-byte table at header
+  slot 0x23, terminated by `0xFF`.
+
+The level builder was also read end to end: it walks a fixed header schema and
+has no loop over the offset directory. Type is decided by the header slot.
+
 ## Legal
 
 Behavior notes only. Role names, string text and field-level structure. No

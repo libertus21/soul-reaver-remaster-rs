@@ -245,7 +245,11 @@ extracted files, decompiled code, or database files.
   directory>` counts each unit's blocks by **shape class** from the offset table
   alone (`zero`, `small4`, `fixed40`, `fixed48`, `other:<size>`) and prints the
   largest block's ordinal and size. These are SIZE classes, not types: no block
-  carries a type tag. Census (89 units): 46,124 blocks, median 281 per unit; the
+  carries a type tag. The `level-builder` pass shows the offset table is a
+  relocation directory (each entry is the position of a dword holding a
+  non-zero base-relative offset), so these sizes are spacings between pointers,
+  not record types (`docs/notes/level-builder.md`). Census (89 units): 46,124
+  blocks, median 281 per unit; the
   4/48/40-byte classes are ~92.7% of all blocks and 8.2% are all zero. Accepted
   runs: `LAIR5` 62 blocks (zero 23, small4 14, fixed40 10, fixed48 11, other 4;
   largest 61/3616), `MOVIE3` 2256 blocks (largest 549/143872), and the `LAIR`
@@ -258,14 +262,14 @@ extracted files, decompiled code, or database files.
 ## What's missing
 
 - [ ] Room geometry inside the `.PCM` records stays **UNPROVEN**, and the next
-      slice targets **placement and transforms**, not geometry: a later probe
-      read the 40/48-byte blocks as 12-byte `[u32 id-ish][f32 value][u32 flags]`
-      groups (48 B = 4 groups; 40 B = 3 groups + 4 unexplained tail bytes;
-      semantics UNKNOWN), which is not a geometry decode. `--level-records`
-      counts blocks by shape class only, because the offset table is the only
-      directory (records 0 and 1 are all-zero padding) and no block carries a
-      type tag. Collision, object placement, transforms, room rendering, and PMF
-      playback stay NO-GO; no vertex, face, transform, or playback claim.
+      slice targets **placement and transforms**, not geometry. The
+      `level-builder` pass shows the offset table is a relocation directory,
+      not a block table: its sizes are pointer spacings, the level builder
+      walks a fixed header schema, and it composes no transform. The earlier
+      12-byte `[u32][f32][u32]` reading is refuted. `--level-records` still
+      counts spans by shape only. Collision, object placement, transforms, room
+      rendering, and PMF playback stay NO-GO; no vertex, face, transform, or
+      playback claim.
 - [x] `.BIG` fixed-slot layout and slot decoding, slices `big-slots` +
       `big-decompressor` (see `docs/changes/big-slots/design.md` and
       `docs/changes/big-decompressor/design.md`): the four containers share a
