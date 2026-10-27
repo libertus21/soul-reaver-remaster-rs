@@ -52,8 +52,10 @@ mod tex_hd_map;
 // test-only so dead-code warnings are allowed here, nowhere else.
 #[allow(dead_code)]
 mod srm;
+mod snd;
 mod textures;
 mod textures_object;
+mod wav;
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -80,6 +82,9 @@ fn main() -> ExitCode {
     if args.first().is_some_and(|a| a == "--mesh-all") {
         return run_mesh_all(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--audio") {
+        return run_audio(&args[1..]);
+    }
     let Some(arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs <path-to-DDS | path-to-directory>");
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --list");
@@ -91,6 +96,8 @@ fn main() -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --mesh <FILE.SRM>");
         eprintln!("   or: soul-reaver-remaster-rs --mesh-textured <FILE.SRM> --tex-dir <TEX>");
         eprintln!("   or: soul-reaver-remaster-rs --mesh-all <OBJECT_dir> --tex-dir <TEX>");
+        eprintln!("   or: soul-reaver-remaster-rs --audio <FILE.SND> --alist");
+        eprintln!("   or: soul-reaver-remaster-rs --audio <FILE.SND> --wave <n> --out <FILE.wav>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
@@ -670,6 +677,181 @@ fn run_mesh_all(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `--audio <FILE.SND> --alist` lists every wave; `--audio <FILE.SND>
+/// --wave <n> --out <FILE.wav>` decodes exactly one wave to a scratch
+/// WAV outside any git working tree. Anything else is a usage error.
+fn run_audio(args: &[String]) -> ExitCode {
+    let usage = || {
+        eprintln!("usage: soul-reaver-remaster-rs --audio <FILE.SND> --alist");
+        eprintln!(
+            "   or: soul-reaver-remaster-rs --audio <FILE.SND> --wave <n> --out <FILE.wav>"
+        );
+    };
+    let Some(snd_arg) = args.first() else {
+        usage();
+        return ExitCode::from(1);
+    };
+    let list = args.len() == 2 && args[1] == "--alist";
+    let decode = args.len() == 5 && args[1] == "--wave" && args[3] == "--out";
+    if !list && !decode {
+        usage();
+        return ExitCode::from(1);
+    }
+    let wave_index = if decode {
+        match args[2].parse::<usize>() {
+            Ok(index) => Some(index),
+            Err(_) => {
+                usage();
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    let snd_path = Path::new(snd_arg);
+    let track = track_name(snd_path);
+    let snd_bytes = match std::fs::read(snd_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("audio: cannot read {}: {error}", snd_path.display());
+            return ExitCode::from(1);
+        }
+    };
+    let bank = match snd::Bank::parse(&snd_bytes) {
+        Ok(bank) => bank,
+        Err(error) => {
+            eprintln!("audio: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let smp_path = snd_path.with_extension("SMP");
+    let smp_bytes = match std::fs::read(&smp_path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            eprintln!(
+                "audio: sibling sample bank not found: expected {}",
+                smp_path.display()
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let body = match snd::bank_body(&smp_bytes) {
+        Ok(body) => body,
+        Err(error) => {
+            eprintln!("audio: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let spans = match bank.spans(body.len()) {
+        Ok(spans) => spans,
+        Err(error) => {
+            eprintln!("audio: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if list {
+        outln!(
+            "track {track} programs {} zones {} waves {} sequences {} bank {} sample-rate {} (chosen)",
+            bank.programs(),
+            bank.zones(),
+            bank.waves(),
+            bank.sequences(),
+            bank.bank_version(),
+            snd::PLAYBACK_RATE
+        );
+        for span in &spans {
+            let info = match bank.info(body, span.index) {
+                Ok(info) => info,
+                Err(error) => {
+                    eprintln!("audio: {error}");
+                    return ExitCode::from(1);
+                }
+            };
+            let loop_text = match (info.loop_start, info.loop_end) {
+                (Some(start), Some(end)) => format!("{start}..{end}"),
+                _ => "-".to_string(),
+            };
+            let duration = info.samples as f64 / f64::from(snd::PLAYBACK_RATE);
+            outln!(
+                "wave {} offset {} bytes {} frames {} samples {} duration {duration:.3}s loop {loop_text}",
+                info.span.index,
+                info.span.offset,
+                info.span.len,
+                info.frames,
+                info.samples
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let index = wave_index.expect("decode shape parsed the index");
+    if index >= bank.waves() {
+        eprintln!("audio: wave {index} out of range (0..{})", bank.waves());
+        return ExitCode::from(1);
+    }
+    let pcm = match bank.decode(body, index) {
+        Ok(pcm) => pcm,
+        Err(error) => {
+            eprintln!("audio: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let out_path = Path::new(&args[4]);
+    let parent = out_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        eprintln!(
+            "audio: output directory does not exist: {}",
+            parent.display()
+        );
+        return ExitCode::from(1);
+    }
+    if let Err(message) = wav::ensure_outside_git_tree(out_path) {
+        eprintln!("audio: {message}");
+        return ExitCode::from(1);
+    }
+    if let Err(error) = wav::write_mono_pcm16(out_path, &pcm, snd::PLAYBACK_RATE) {
+        eprintln!("audio: cannot write {}: {error}", out_path.display());
+        return ExitCode::from(1);
+    }
+
+    let peak = pcm.iter().map(|sample| sample.unsigned_abs()).max().unwrap_or(0);
+    let sum_squares: f64 = pcm
+        .iter()
+        .map(|&sample| f64::from(sample) * f64::from(sample))
+        .sum();
+    let rms = if pcm.is_empty() {
+        0.0
+    } else {
+        (sum_squares / pcm.len() as f64).sqrt()
+    };
+    let nonzero = pcm.iter().filter(|&&sample| sample != 0).count();
+    let nonzero_pct = if pcm.is_empty() {
+        0.0
+    } else {
+        nonzero as f64 * 100.0 / pcm.len() as f64
+    };
+    let duration = pcm.len() as f64 / f64::from(snd::PLAYBACK_RATE);
+    outln!(
+        "wrote {}: {track} wave {index}, {} samples @ {} Hz (chosen), {duration:.3}s, peak {peak}, rms {rms:.0}, nonzero {nonzero_pct:.1}%",
+        out_path.display(),
+        pcm.len(),
+        snd::PLAYBACK_RATE
+    );
+    ExitCode::SUCCESS
+}
+
+/// Track label for messages: the file stem, never an install path.
+fn track_name(path: &Path) -> String {
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<unknown>".to_string())
+}
+
 /// Strip launcher compatibility no-op flags before dispatch. Pure helper,
 /// testable without spawning a process or opening a window.
 fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
@@ -686,7 +868,7 @@ fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod cli_tests {
     use super::{
-        list_report, resolve_texture_name, run_bigfile, run_mesh, run_mesh_all,
+        list_report, resolve_texture_name, run_audio, run_bigfile, run_mesh, run_mesh_all,
         run_mesh_textured, run_textures, strip_launcher_noops, tshow_suffix,
     };
     use std::process::ExitCode;
@@ -1323,5 +1505,203 @@ mod cli_tests {
     fn strip_noops_preserves_unknown_and_paths() {
         let input = vec!["foo.dds".to_string(), "-foo".to_string()];
         assert_eq!(strip_launcher_noops(input.clone()), input);
+    }
+
+    /// Synthetic 16-byte frame with all nibbles 7 (filter 0, shift 0).
+    fn audio_frame(flag: u8) -> Vec<u8> {
+        let mut frame = vec![0u8; crate::snd::FRAME_BYTES];
+        frame[1] = flag;
+        for byte in &mut frame[2..] {
+            *byte = 0x77;
+        }
+        frame
+    }
+
+    /// Synthetic `.SND`: one program, one zone (wave 0), given offsets.
+    fn audio_snd(waves: &[u32]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"DNSa");
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(&0x0106u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(waves.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&[0u8; 4]);
+        let mut zone = [0u8; crate::snd::ZONE_BYTES];
+        zone[7] = 127;
+        bytes.extend_from_slice(&zone);
+        for &offset in waves {
+            bytes.extend_from_slice(&offset.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn audio_smp(body: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"PMSa");
+        bytes.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    fn write_audio_pair(dir: &tempfile::TempDir, waves: &[u32], body: &[u8]) -> String {
+        let snd = write_tmp(dir, "TRACK.SND", &audio_snd(waves));
+        write_tmp(dir, "TRACK.SMP", &audio_smp(body));
+        snd
+    }
+
+    #[test]
+    fn audio_alist_lists_every_wave_and_exits_0() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let body = [audio_frame(0), audio_frame(0)].concat();
+        let snd = write_audio_pair(&tmp, &[0, 16], &body);
+        assert_eq!(
+            run_audio(&[snd, "--alist".to_string()]),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn audio_wave_decode_writes_a_canonical_wav() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let body = [audio_frame(0), audio_frame(7)].concat();
+        let snd = write_audio_pair(&tmp, &[0], &body);
+        let out = tmp.path().join("one.wav");
+        assert_eq!(
+            run_audio(&[
+                snd,
+                "--wave".to_string(),
+                "0".to_string(),
+                "--out".to_string(),
+                out.to_string_lossy().into_owned(),
+            ]),
+            ExitCode::SUCCESS
+        );
+        let bytes = std::fs::read(&out).expect("wav must exist");
+        assert_eq!(bytes.len(), crate::wav::WAV_HEADER_BYTES + 28 * 2);
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(
+            u32::from_le_bytes(bytes[24..28].try_into().expect("rate field")),
+            44_100
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[40..44].try_into().expect("data size")),
+            28 * 2
+        );
+    }
+
+    #[test]
+    fn audio_decode_refuses_an_out_of_range_wave() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let snd = write_audio_pair(&tmp, &[0], &audio_frame(0));
+        let out = tmp.path().join("one.wav");
+        assert_eq!(
+            run_audio(&[
+                snd,
+                "--wave".to_string(),
+                "999".to_string(),
+                "--out".to_string(),
+                out.to_string_lossy().into_owned(),
+            ]),
+            ExitCode::from(1)
+        );
+        assert!(!out.exists(), "a refused run must leave no WAV behind");
+    }
+
+    #[test]
+    fn audio_refuses_a_bad_magic_and_a_foreign_header_size() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let body = audio_frame(0);
+        write_tmp(&tmp, "TRACK.SMP", &audio_smp(&body));
+
+        let mut bad_magic = audio_snd(&[0]);
+        bad_magic[0..4].copy_from_slice(b"DNSb");
+        let snd = write_tmp(&tmp, "TRACK.SND", &bad_magic);
+        assert_eq!(
+            run_audio(&[snd, "--alist".to_string()]),
+            ExitCode::from(1)
+        );
+
+        let mut bad_size = audio_snd(&[0]);
+        bad_size[4..8].copy_from_slice(&28u32.to_le_bytes());
+        let snd = write_tmp(&tmp, "TRACK.SND", &bad_size);
+        assert_eq!(
+            run_audio(&[snd, "--alist".to_string()]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn audio_refuses_a_missing_bank_and_a_size_mismatch() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let snd = write_tmp(&tmp, "TRACK.SND", &audio_snd(&[0]));
+        assert_eq!(
+            run_audio(&[snd.clone(), "--alist".to_string()]),
+            ExitCode::from(1)
+        );
+
+        let mut smp = audio_smp(&audio_frame(0));
+        smp[4..8].copy_from_slice(&15u32.to_le_bytes());
+        write_tmp(&tmp, "TRACK.SMP", &smp);
+        assert_eq!(
+            run_audio(&[snd, "--alist".to_string()]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn audio_refuses_an_output_inside_a_git_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let snd = write_audio_pair(&tmp, &[0], &audio_frame(0));
+        std::fs::create_dir(tmp.path().join(".git")).expect("synthetic .git dir");
+        let out = tmp.path().join("refused.wav");
+        assert_eq!(
+            run_audio(&[
+                snd,
+                "--wave".to_string(),
+                "0".to_string(),
+                "--out".to_string(),
+                out.to_string_lossy().into_owned(),
+            ]),
+            ExitCode::from(1)
+        );
+        assert!(!out.exists(), "the git guard must refuse before writing");
+    }
+
+    #[test]
+    fn audio_refuses_a_missing_output_parent() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let snd = write_audio_pair(&tmp, &[0], &audio_frame(0));
+        let out = tmp.path().join("absent").join("one.wav");
+        assert_eq!(
+            run_audio(&[
+                snd,
+                "--wave".to_string(),
+                "0".to_string(),
+                "--out".to_string(),
+                out.to_string_lossy().into_owned(),
+            ]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn audio_usage_shapes_exit_1() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let snd = write_audio_pair(&tmp, &[0], &audio_frame(0));
+        assert_eq!(
+            run_audio(&[snd.clone(), "--wave".to_string(), "1".to_string()]),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            run_audio(&[snd, "--alist".to_string(), "extra".to_string()]),
+            ExitCode::from(1)
+        );
     }
 }

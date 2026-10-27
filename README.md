@@ -182,6 +182,22 @@ extracted files, decompiled code, or database files.
    remaining flags are parser-only. `-nocheck`/`-skipintro` are absent from
    this build, so they exist only as compatibility no-ops. `cargo test` 102/102
    green (see `docs/changes/f4-launcher-cli/archive.md`).
+- `audio-snd` (playtest pending: one wave decoded read-only, scratch WAV in
+  `%TEMP%`): the paired `.SND`+`.SMP` instrument banks under `MUSIC/<track>/`
+  are readable. `cargo run -- --audio <FILE.SND> --alist` parses the 40-byte
+  `DNSa` header, the program (8 B) and zone (16 B) tables and the `u32`
+  wave/sequence/label offset tables, validates every structural invariant,
+  and lists each wave's offset, bytes, frames, decoded samples, duration and
+  loop span. `--audio <FILE.SND> --wave <n> --out <FILE.wav>` decodes exactly
+  one wave from the paired `PMSa` sample bank as Sony 4-bit ADPCM (16-byte
+  frame, 28 samples, filters 0-4, flag 7 stops before its samples) and writes
+  a canonical 44-byte RIFF/WAVE PCM16 mono file. The container stores no
+  sample rate: 44100 Hz is the community convention and every message prints
+  it as `(chosen)`. The writer refuses a missing parent and any path inside a
+  git working tree, so game audio cannot enter this repository; the WAV is a
+  scratch playtest artifact, never an export path. No sequence playback, no
+  mixing, no new dependency; tests use synthetic bytes only (see
+  `docs/notes/s9-audio-snd.md`).
 
 ## What's missing
 
@@ -195,11 +211,12 @@ extracted files, decompiled code, or database files.
       little-endian A1R5G5B5 image and shows it, while `empty`/`zero` slots
       stay loud. Verdict: `data` slots are NOT compressed, so no decompressor
       is needed. Visual acceptance of decoded slots is a playtest, not a test.
-- [ ] Audio (NEXT slice, unscoped): the paired `.SND`+`.SMP` tracks under
-      `MUSIC/<track>/` (31 pairs in the observed install) are still unread.
-      A read-only format probe comes first (pair contract, VH/VB feasibility,
-      community facts only), then proposal → spec → tasks → code → playtest.
-      Texture work has no open blocker at this level.
+- [ ] Audio sequences (NEXT slice, unscoped): the sample bank is readable
+      (`audio-snd`: `--alist` plus one wave to a scratch WAV), but the 155
+      `QSMa` sequences under the same `.SND` files are still unread. Rendering
+      a sequence needs a MIDI-like interpreter, SPU ADSR envelopes and pitch
+      resampling; the wave slice stops at the sample bank. See
+      `docs/notes/s9-audio-snd.md`.
 - [x] 3D models, slice 1 `models-3d` (parse-one + render-one, see
       `docs/changes/models-3d/`): single loose SRM as a flat-shaded
       auto-rotating solid. Still unscoped: skeleton/animation, room
@@ -226,5 +243,5 @@ extracted files, decompiled code, or database files.
 ## Next step
 
 Read `AGENTS.md`, then `docs/notes/` (survey + community tools + format
-notes). The next change is a read-only probe of the paired `.SND`+`.SMP`
-audio tracks, followed by the animation scoping probe for the mesh path.
+notes). The `.SND`+`.SMP` audio probe and its one-wave slice are done; the
+next change is the animation scoping probe for the mesh path.
