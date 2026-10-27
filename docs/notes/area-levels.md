@@ -29,6 +29,15 @@ repo. No file under the game tree was modified.
   `offset[1] = 4`, and the list is strictly ascending. The data base is
   `4 + 4N`; record `i` starts at `base + offset[i]`.
 - The model holds on **89/89** files.
+
+> **Correction 2026-10-27 (`pcm-loader` L13): the base is wrong.** The
+> directory is right, but the engine's data base is `4 * roundup512(N)`
+> where `roundup512(N) = ((N + 512) & ~511)`, i.e. the next 512-**dword**
+> boundary, zero-padded from `4 + 4N`. The original text is left above
+> unchanged on purpose. Consequence: every record position derived from
+> `4 + 4N` is short by `4 * roundup512(N) - 4 - 4N` bytes (1,796 for a
+> 62-entry unit, 2,000+ for large units). See
+> [`pcm-loader.md`](pcm-loader.md) for the code and corpus evidence.
 - The first two records are small (4 and 80 bytes in the samples) and look
   like a directory; their meaning is not proven.
 - A lexical scan of printable runs finds an object-name table interleaved
