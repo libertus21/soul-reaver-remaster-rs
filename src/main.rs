@@ -45,6 +45,10 @@ mod launcher_cli;
 mod dds;
 mod gallery;
 mod mesh_entry;
+// Pure one-bone pose math. The `--pose` CLI slice wires it; keep it
+// warning-free until then, nowhere else.
+#[allow(dead_code)]
+mod pose;
 mod render;
 mod slot_texture;
 mod tex_hd_map;
