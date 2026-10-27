@@ -240,12 +240,24 @@ extracted files, decompiled code, or database files.
   exits 3, a bad invocation exits 1. Synthetic-byte tests only; `cargo test`
   226/226 green.
 
+- `room-geometry` (slice `level-records`; no window): `cargo run --
+  --level-records <.PCM file | room directory>` counts each unit's blocks by
+  **shape class** from the offset table alone (`zero`, `small4`, `fixed40`,
+  `fixed48`, `other:<size>`) and prints the largest block's ordinal and size.
+  These are SIZE classes, not types: no block carries a type tag. Acceptance on
+  a small, a median, and the largest unit (`LAIR5` 62 blocks, `CATHY44` 326,
+  `MOVIE3` 2256) and one room directory (`LAIR`: 31 units, 12641 blocks); every
+  unit's class counts sum to its header count. No vertex, face, placement,
+  transform, or render claim; `--level-info` is unchanged (see
+  `docs/notes/room-geometry.md`).
+
 ## What's missing
 
-- [ ] Room geometry inside the `.PCM` records is the **next area**:
-      `--level-info` proves the record table and the object-name/cross-link
-      list only. Collision, object placement, transforms, room rendering, and
-      PMF playback stay NO-GO; no vertex, face, transform, or playback claim.
+- [ ] Room geometry inside the `.PCM` records stays **NO-GO**:
+      `--level-records` counts blocks by shape class only, because the offset
+      table is the only directory and no block carries a type tag. Collision,
+      object placement, transforms, room rendering, and PMF playback stay
+      NO-GO; no vertex, face, transform, or playback claim.
 - [x] `.BIG` fixed-slot layout and slot decoding, slices `big-slots` +
       `big-decompressor` (see `docs/changes/big-slots/design.md` and
       `docs/changes/big-decompressor/design.md`): the four containers share a
@@ -300,7 +312,8 @@ extracted files, decompiled code, or database files.
 Read `AGENTS.md`, then `docs/notes/` (survey + community tools + format
 notes). The `.SND`+`.SMP` audio probe and its one-wave slice are done, and
 the `animation` slice is archived as PARTIAL: bone decode and one-bone pose
-are in, but full-body pose is blocked by the absent hierarchy. The next
-change is the room-geometry probe inside the `.PCM` records; object placement
-and transforms follow, and the PMF codec is a separate audio slice. `.SRA`
-scoping (227 sibling files) stays open under animation.
+are in, but full-body pose is blocked by the absent hierarchy. The
+`room-geometry` census slice (`level-records`) is in and counts blocks by
+shape class only; object placement and transforms follow, and the PMF codec is
+a separate audio slice. `.SRA` scoping (227 sibling files) stays open under
+animation.

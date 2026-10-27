@@ -162,3 +162,28 @@ coordinates.
    (same count, same order) before assigning either a role.
 5. If a real PS1 `.drm` set becomes available, compare section counts against
    the block census.
+
+## Apply result — slice `level-records` (2026-10-27)
+
+Shipped `--level-records <path>`: a read-only per-unit block census. Accepted
+on one small, one median, and the largest unit under `1/AREA`, plus one room
+directory. Only counts and sizes are recorded: no game bytes, file offsets,
+coordinates, or absolute install paths.
+
+| Unit | Blocks | zero | small4 | fixed40 | fixed48 | largest |
+|---|---:|---:|---:|---:|---:|---|
+| `LAIR5` | 62 | 23 | 14 | 10 | 11 | 3616 B at 61 |
+| `CATHY44` | 326 | 24 | 107 | 90 | 91 | 19920 B at 50 |
+| `MOVIE3` | 2256 | 190 | 501 | 552 | 696 | 143872 B at 549 |
+| `LAIR` room (31 units) | 12641 | — | — | — | — | — |
+
+Every unit's class counts sum to its header block count. `other:<size>` rows
+stay ascending by size, so `MOVIE3` also exposes 44-, 60-, 72-, 76-, and
+104-byte shapes. On `LAIR5` the largest block is the last block (ordinal 61);
+on `CATHY44` and `MOVIE3` it sits mid-stream, which matches the earlier "last
+in 1/89" observation.
+
+Wording contract: these are SIZE classes, not types. No block carries a type
+tag, and no vertex or face count is claimed. Nothing here decodes geometry,
+placement, transforms, or rendering. The 12-byte stride signal stays a
+statistical observation, not a proven record layout.
