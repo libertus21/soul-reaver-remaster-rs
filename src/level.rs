@@ -15,6 +15,34 @@ pub struct LevelUnit {
     pub names: Vec<String>,
     pub links: Vec<Link>,
     pub sidecar: Sidecar,
+    /// One entry per offset-table record, in table order.
+    pub block_sizes: Vec<u32>,
+    /// Parallel to `block_sizes`: whether every byte of that block is zero.
+    pub block_all_zero: Vec<bool>,
+}
+
+/// Shape class of one block. Labels describe a size (and zero-ness) only;
+/// no block carries a type tag, so no semantic name is claimed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockClass {
+    Zero,
+    Small4,
+    Fixed40,
+    Fixed48,
+    Other(u32),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct BlockCensus {
+    pub total: u32,
+    pub zero: u32,
+    pub small4: u32,
+    pub fixed40: u32,
+    pub fixed48: u32,
+    /// `(size, count)` for every other size, ascending by size.
+    pub other: Vec<(u32, u32)>,
+    /// `(ordinal, size)`; ties go to the lowest ordinal.
+    pub largest: (u32, u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +125,7 @@ pub fn parse_pcm(bytes: &[u8], expected_name: &str) -> Result<LevelUnit, LevelEr
         return Err(LevelError::TablePastEof);
     }
     let mut last = 0u32;
+    let mut offsets = Vec::with_capacity(records as usize);
     for index in 0..records as usize {
         let offset = read_u32(bytes, 4 + 4 * index).ok_or(LevelError::TablePastEof)?;
         let bad_prefix = index < 2 && offset != 4 * index as u32;
@@ -104,9 +133,22 @@ pub fn parse_pcm(bytes: &[u8], expected_name: &str) -> Result<LevelUnit, LevelEr
             return Err(LevelError::TableNotAscending);
         }
         last = offset;
+        offsets.push(offset);
     }
     if table_end + last as usize > bytes.len() {
         return Err(LevelError::TablePastEof);
+    }
+    let mut block_sizes = Vec::with_capacity(records as usize);
+    let mut block_all_zero = Vec::with_capacity(records as usize);
+    for (index, offset) in offsets.iter().enumerate() {
+        let start = table_end + *offset as usize;
+        let end = match offsets.get(index + 1) {
+            Some(next) => table_end + *next as usize,
+            None => bytes.len(),
+        };
+        let block = &bytes[start..end];
+        block_sizes.push((end - start) as u32);
+        block_all_zero.push(block.iter().all(|&byte| byte == 0));
     }
     let names = extract_names(bytes);
     let name = names
@@ -115,7 +157,88 @@ pub fn parse_pcm(bytes: &[u8], expected_name: &str) -> Result<LevelUnit, LevelEr
         .ok_or(LevelError::MissingUnitName)?
         .clone();
     let links = names.iter().filter_map(|entry| split_link(entry)).collect();
-    Ok(LevelUnit { name, records, names, links, sidecar: Sidecar::Absent })
+    Ok(LevelUnit {
+        name,
+        records,
+        names,
+        links,
+        sidecar: Sidecar::Absent,
+        block_sizes,
+        block_all_zero,
+    })
+}
+
+/// Shape-only classifier: all-zero wins, then the three frequent sizes,
+/// then the block's own size.
+pub fn classify(size: u32, all_zero: bool) -> BlockClass {
+    if all_zero {
+        return BlockClass::Zero;
+    }
+    match size {
+        4 => BlockClass::Small4,
+        40 => BlockClass::Fixed40,
+        48 => BlockClass::Fixed48,
+        other => BlockClass::Other(other),
+    }
+}
+
+/// Counts every block exactly once; the class counts sum to `records`.
+pub fn census(unit: &LevelUnit) -> BlockCensus {
+    debug_assert_eq!(unit.block_sizes.len(), unit.block_all_zero.len());
+    let mut counts = BlockCensus {
+        total: unit.records,
+        zero: 0,
+        small4: 0,
+        fixed40: 0,
+        fixed48: 0,
+        other: Vec::new(),
+        largest: (0, 0),
+    };
+    for (ordinal, &size) in unit.block_sizes.iter().enumerate() {
+        match classify(size, unit.block_all_zero[ordinal]) {
+            BlockClass::Zero => counts.zero += 1,
+            BlockClass::Small4 => counts.small4 += 1,
+            BlockClass::Fixed40 => counts.fixed40 += 1,
+            BlockClass::Fixed48 => counts.fixed48 += 1,
+            BlockClass::Other(size) => {
+                match counts.other.iter_mut().find(|(known, _)| *known == size) {
+                    Some((_, count)) => *count += 1,
+                    None => counts.other.push((size, 1)),
+                }
+            }
+        }
+        if size > counts.largest.1 {
+            counts.largest = (ordinal as u32, size);
+        }
+    }
+    counts.other.sort_unstable_by_key(|(size, _)| *size);
+    counts
+}
+
+/// One `blocks` header line, one line per present shape class in fixed
+/// order, and one `largest` line. Counts and sizes only: no payload, file
+/// offset, coordinate, or transform.
+pub fn record_lines(unit: &LevelUnit) -> Vec<String> {
+    let counts = census(unit);
+    let mut lines = vec![format!("blocks {} total={}", unit.name, counts.total)];
+    for (label, count) in [
+        ("zero", counts.zero),
+        ("small4", counts.small4),
+        ("fixed40", counts.fixed40),
+        ("fixed48", counts.fixed48),
+    ] {
+        if count > 0 {
+            lines.push(format!("  shape {label} {count}"));
+        }
+    }
+    lines.extend(
+        counts
+            .other
+            .iter()
+            .map(|(size, count)| format!("  shape other:{size} {count}")),
+    );
+    lines.push(format!("largest {} {}", counts.largest.0, counts.largest.1));
+    lines
 }
 
 /// `FMPa` magic, 16-bit id, segment count, and the rate field at `0x28`.
@@ -567,6 +690,100 @@ mod tests {
         assert_eq!(
             report_lines(&unit)[0],
             "level lair5 pcm_records=2 names=2 links=1 pmf=present segments=3 rate_field=22050 pnf=3"
+        );
+    }
+
+    fn block_of(size: usize, byte: u8) -> Vec<u8> {
+        vec![byte; size]
+    }
+
+    fn named_block(size: usize, byte: u8) -> Vec<u8> {
+        let mut block = vec![byte; size];
+        block[..5].copy_from_slice(b"lair5");
+        block
+    }
+
+    /// `N` blocks whose ascending table starts at 0, 4, so block 0 must be
+    /// 4 bytes. Returns the file bytes and the data-region length.
+    fn blocks_pcm(blocks: &[Vec<u8>]) -> (Vec<u8>, usize) {
+        let mut offsets = Vec::with_capacity(blocks.len());
+        let mut body = Vec::new();
+        for block in blocks {
+            offsets.push(body.len() as u32);
+            body.extend_from_slice(block);
+        }
+        let bytes = pcm_bytes(&offsets, &body);
+        let data_len = body.len();
+        (bytes, data_len)
+    }
+
+    #[test]
+    fn classify_is_zero_first_then_size() {
+        for size in [0, 4, 40, 48, 72] {
+            assert_eq!(classify(size, true), BlockClass::Zero);
+        }
+        assert_eq!(classify(4, false), BlockClass::Small4);
+        assert_eq!(classify(40, false), BlockClass::Fixed40);
+        assert_eq!(classify(48, false), BlockClass::Fixed48);
+        assert_eq!(classify(72, false), BlockClass::Other(72));
+    }
+
+    #[test]
+    fn census_counts_shape_classes_and_the_largest_block() {
+        let blocks = vec![
+            block_of(4, 0),
+            block_of(4, 0x01),
+            block_of(40, 0),
+            block_of(40, 0x02),
+            block_of(48, 0x03),
+            named_block(72, 0x04),
+        ];
+        let (bytes, data_len) = blocks_pcm(&blocks);
+        let unit = parse_pcm(&bytes, "lair5").expect("must parse");
+        let counts = census(&unit);
+        assert_eq!(counts.total, 6);
+        assert_eq!(
+            (counts.zero, counts.small4, counts.fixed40, counts.fixed48),
+            (2, 1, 1, 1)
+        );
+        assert_eq!(counts.other, vec![(72, 1)]);
+        assert_eq!(counts.largest, (5, 72));
+        let classified: u32 = counts.zero
+            + counts.small4
+            + counts.fixed40
+            + counts.fixed48
+            + counts.other.iter().map(|(_, count)| count).sum::<u32>();
+        assert_eq!(classified, unit.records);
+        assert_eq!(unit.block_sizes.iter().sum::<u32>() as usize, data_len);
+    }
+
+    #[test]
+    fn largest_tie_keeps_the_lowest_ordinal_and_its_class() {
+        let blocks = vec![block_of(4, 0), named_block(40, 0x02), block_of(40, 0x02)];
+        let (bytes, _) = blocks_pcm(&blocks);
+        let unit = parse_pcm(&bytes, "lair5").expect("must parse");
+        let counts = census(&unit);
+        assert_eq!(counts.fixed40, 2, "the largest keeps its shape class");
+        assert_eq!(counts.largest, (1, 40), "ties go to the lowest ordinal");
+    }
+
+    #[test]
+    fn other_rows_ascend_by_size_and_lines_keep_fixed_order() {
+        let blocks = vec![block_of(4, 0), block_of(72, 0x02), named_block(28, 0x04)];
+        let (bytes, _) = blocks_pcm(&blocks);
+        let unit = parse_pcm(&bytes, "lair5").expect("must parse");
+        let counts = census(&unit);
+        assert_eq!(counts.other, vec![(28, 1), (72, 1)]);
+        assert_eq!(counts.largest, (1, 72));
+        assert_eq!(
+            record_lines(&unit),
+            vec![
+                "blocks lair5 total=3",
+                "  shape zero 1",
+                "  shape other:28 1",
+                "  shape other:72 1",
+                "largest 1 72",
+            ]
         );
     }
 
