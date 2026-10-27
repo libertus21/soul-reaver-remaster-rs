@@ -226,23 +226,26 @@ extracted files, decompiled code, or database files.
   sequence playback, no mixing, no new dependency; tests use synthetic bytes
   only (see `docs/notes/s9-audio-snd.md` and
   `docs/changes/audio-snd/archive.md`).
-- `area-levels` (read-only probe; opens no window): `cargo run -- --level-info
+- `area-levels` (playtest-accepted: level graph on a linked room and a
+  single-unit room; opens no window): `cargo run -- --level-info
   <.PCM file | room directory>` prints one `level` line per unit
   (`pcm_records`, accepted `names`, `links`, and the `PMF`/`PNF` sidecar
   `segments`/`rate_field`/`pnf` counts) plus one `  link <target> <index>`
-  line per `<target>,<index>` name. A room directory resolves its `BIN` when
-  present (else itself) and units print sorted by name; a lone `.PCM` path
-  prints that one unit. Header and name table only: geometry, object
-  placement, transforms, and audio playback stay NOT decoded. Malformed input
-  exits 2, a refused path exits 3, a bad invocation exits 1. Synthetic-byte
-  tests only; `cargo test` 226/226 green.
+  line per `<target>,<index>` cross-link name. A room directory resolves its
+  `BIN` when present (else itself) and units print sorted by name; a lone
+  `.PCM` path prints that one unit. Census: 89 `.PCM` units across 11 rooms;
+  368 cross-links, 346 (94.0%) resolve; 23 units carry a PMF/PNF pair.
+  Header and name table only: geometry, object placement, transforms, and
+  audio playback stay NOT decoded. Malformed input exits 2, a refused path
+  exits 3, a bad invocation exits 1. Synthetic-byte tests only; `cargo test`
+  226/226 green.
 
 ## What's missing
 
-- [ ] Room geometry, collision, object placement, transforms and room
-      rendering stay NO-GO after `area-levels`: `--level-info` proves the
-      `.PCM` record table and the object-name/portal-link list only; no
-      vertex, face, transform, or playback claim.
+- [ ] Room geometry inside the `.PCM` records is the **next area**:
+      `--level-info` proves the record table and the object-name/cross-link
+      list only. Collision, object placement, transforms, room rendering, and
+      PMF playback stay NO-GO; no vertex, face, transform, or playback claim.
 - [x] `.BIG` fixed-slot layout and slot decoding, slices `big-slots` +
       `big-decompressor` (see `docs/changes/big-slots/design.md` and
       `docs/changes/big-decompressor/design.md`): the four containers share a
@@ -298,5 +301,6 @@ Read `AGENTS.md`, then `docs/notes/` (survey + community tools + format
 notes). The `.SND`+`.SMP` audio probe and its one-wave slice are done, and
 the `animation` slice is archived as PARTIAL: bone decode and one-bone pose
 are in, but full-body pose is blocked by the absent hierarchy. The next
-change is the `.SRA` scoping probe (227 sibling files) to look for clips and
-hierarchy.
+change is the room-geometry probe inside the `.PCM` records; object placement
+and transforms follow, and the PMF codec is a separate audio slice. `.SRA`
+scoping (227 sibling files) stays open under animation.
