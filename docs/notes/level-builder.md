@@ -14,10 +14,10 @@ focused re-reads), inside the ~3 h budget. Evidence class per claim:
 ## Verdict
 
 **The `.PCM` offset table is not a block table.** It is a **relocation
-directory**: entry `i` is the file position of a dword that holds a non-zero
-base-relative offset. Consecutive entries therefore bracket pointer fields, and
-the "block sizes" used by earlier notes (4/40/48) are *spacings between
-pointers*, not record sizes and not types.
+directory**: entry `i` is the **data-base-relative position** of a dword that
+holds a non-zero data-base-relative offset. Consecutive entries therefore
+bracket pointer fields, and the "block sizes" used by earlier notes (4/40/48)
+are *spacings between pointers*, not record sizes and not types.
 
 The level builder never reads that table. Before it runs, the loader reads only
 `N`, rounds it up to the next 512-dword boundary, and shifts the payload down to
@@ -29,8 +29,62 @@ rule.
 
 This closes the long-standing unknown: **the first word of a "48-byte block" is
 a base-relative pointer**, not a small integer of unknown meaning. Across the
-89 SR1 area units all 46,124 directory entries hold an in-range offset; none is
-zero or out of range.
+89 SR1 area units all 46,124 directory entries resolve this way; the dword at
+`data_base + entry` is in `1..data_len`.
+
+## Update 2026-10-27 - how many entries the engine reads, and the origin bug
+
+**Answer.** In the tag-2 path the engine reads **zero table entries**. It reads
+only the first dword, `N`. The drain rounds `N` up to the next 512 dwords, shifts
+the payload down by that many dwords, and dispatches on the allocation tag. The
+tag-2 builder receives only the level struct and the data base; it has no
+pointer to the directory and never indexes it. Relocation is structural: each
+header offset slot and each 36-byte record's first dword is used as
+`data_base + value` at the point of use (the record field is then passed to the
+tagged-blob copier). There is no per-entry loop, no condition and no count other
+than the header counts.
+
+**The ~13% anomaly was an origin error.** Table entries are offsets from the
+**data base**, not file positions. Probing `u32(file + entry)` lands inside the
+directory or its padding; probing `u32(data_base + entry)` lands on the pointer
+field the writer recorded. Read-only parse of three real units:
+
+| Unit | `N` | `u32(file + entry)` in `1..data_len` | `u32(data_base + entry)` in `1..data_len` |
+|---|---|---|---|
+| `LAIR14` | 74 | 10 (17 zero, 47 out) | **74 / 74** (0 zero) |
+| `LAIR5` | 62 | 10 (17 zero, 35 out) | **62 / 62** (0 zero) |
+| `MOVIE3` | 2256 | 463 (248 zero, 1545 out) | **2256 / 2256** (0 zero) |
+
+In all three the resolved dwords span `392..data_len-4` and never leave the
+data region. That is the relocation-directory signature, not a 13% subset.
+
+**Hypotheses.**
+
+- **H1** (`dword[entry] += base`, count `N`): **data CONFIRMED, engine
+  REFUTED.** The bytes fit H1 exactly at the corrected origin, but the engine
+  does not execute this loop.
+- **H2** (selective relocation behind a test): **REFUTED.** No gating condition
+  exists; the 10-in-74 subset is the file-origin artifact, not a qualifier.
+- **H3** (table not consumed as a pointer list): **CONFIRMED for the tag-2
+  engine path.** Only `N` is consumed; entries are never read.
+- **H4**: the table is the **writer's relocation map**. The builder reproduces
+  it from the header schema. This is the operative description.
+
+**Reader rule (next slice).** Read `N` at file offset 0; set
+`data_base = 4 * (((N + 512) & ~511))`; treat the level header as starting at
+`data_base`. Every offset field is `data_base + value`, with `value == 0`
+meaning null. If the reader uses the directory at all, it must read entry `e` as
+a position at `data_base + e` (never `file + e`); the dword there is itself a
+data-base-relative offset, and adding `data_base` to both yields the pointer.
+That generic relocation is valid because every sampled entry resolves in range,
+but the engine does not depend on it: the schema is the authoritative traversal
+and the directory is corroboration. Do not derive record types or block sizes
+from directory spacing.
+
+Evidence class: engine reads zero entries CONFIRMED (drain and builder code);
+entry origin CONFIRMED (three real units, 2,392 entries); structural relocation
+CONFIRMED (code); directory completeness over every nested pointer field
+INFERRED (three units, not all 89); writer-tool identity UNKNOWN.
 
 ## Method / box
 
@@ -49,7 +103,7 @@ zero or out of range.
 |---|---|---|
 | B1 | Tag 2 reaches the level builder only after the loader shifted the payload down by a 512-dword-rounded `N`; the builder receives the payload at offset 0 and never reads the directory. Both tag-2 completion copies do the same shift. | CONFIRMED |
 | B2 | The directory is a relocation map: in 5/5 sampled units every header dword slot that the builder treats as an offset is listed when its value is non-zero, and omitted when it is zero (24/24 slots per unit). | CONFIRMED |
-| B3 | In all 89 area units, **46,124 / 46,124** directory entries hold a value in `1..data_len`; none is zero or out of range. | CONFIRMED |
+| B3 | In all 89 area units, the dword at `data_base + entry` is in `1..data_len` for **46,124 / 46,124** entries; none is zero or out of range. Entry `0` (the header itself) is allowed. | CONFIRMED |
 | B4 | The level builder has **no loop over the directory**. Its only per-record loops are over header-declared arrays (36-byte records; 16-byte name entries). | CONFIRMED |
 | B5 | Type is decided by the **header slot**, not by size, content or ordinal. Each slot has a dedicated builder or copy. | CONFIRMED |
 | B6 | 36-byte source to 40-byte runtime is a nine-dword copy with the first dword widened to an 8-byte pointer (table in §3). | CONFIRMED |
