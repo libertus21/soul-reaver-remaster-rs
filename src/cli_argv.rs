@@ -235,6 +235,10 @@ mod tests {
                 &["level", "links", "LAIR1.PCM"],
                 &["--level-links", "LAIR1.PCM"],
             ),
+            (
+                &["level", "render", "LAIR1.PCM"],
+                &["--level-render", "LAIR1.PCM"],
+            ),
         ];
         for (input, expected) in cases {
             assert_dispatch(input, expected);

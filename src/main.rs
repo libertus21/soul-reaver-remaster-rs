@@ -157,6 +157,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--level-geometry") {
         return run_level_geometry(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--level-render") {
+        return run_level_render(&args[1..]);
+    }
     let Some(arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs <path-to-DDS | path-to-directory>");
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --list");
@@ -176,6 +179,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-structure <.PCM file | room directory>");
         eprintln!("   or: soul-reaver-remaster-rs --level-links <.PCM file | room directory>");
         eprintln!("   or: soul-reaver-remaster-rs --level-geometry <.PCM file | room directory>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
@@ -1138,6 +1142,32 @@ fn run_level_geometry(args: &[String]) -> ExitCode {
         for line in level::geometry_lines(name, geometry) {
             outln!("{line}");
         }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `--level-render` arm: one `.PCM` unit through the existing mesh viewer.
+/// The geometry line prints before the window opens.
+fn run_level_render(args: &[String]) -> ExitCode {
+    let result = match args {
+        [path] if !path.starts_with('-') => level::read_room_mesh(Path::new(path)),
+        _ => Err(level::LevelError::Usage("expected --level-render <path>")),
+    };
+    let (name, mesh) = match result {
+        Ok(unit) => unit,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    outln!(
+        "level {name} vertices={} faces={} showing room geometry",
+        mesh.vertices.len(), mesh.indices.len() / 3
+    );
+    let title = format!("level {name}");
+    if let Err(error) = render::show_mesh(&mesh.vertices, &mesh.indices, &title) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
     }
     ExitCode::SUCCESS
 }

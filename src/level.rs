@@ -115,6 +115,14 @@ pub struct GeometryReport {
     pub max_index: Option<u16>,
 }
 
+/// CPU mesh for one unit: `i16` positions widened 1:1 to `f32` and the face
+/// indices passed through unchanged. No normal, UV or transform is derived.
+#[derive(Debug, Default, PartialEq)]
+pub struct RoomMesh {
+    pub vertices: Vec<[f32; 3]>,
+    pub indices: Vec<u16>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
     pub target: String,
@@ -157,6 +165,9 @@ pub enum LevelError {
     RelocationOutOfRange,
     GeometryRecordOutOfRange,
     GeometryArrayOutOfRange,
+    RenderDirectory,
+    RenderEmpty,
+    RenderArrayOutOfRange,
     MissingUnitName,
     SidecarIncomplete,
     BadSidecarMagic,
@@ -168,6 +179,8 @@ impl LevelError {
         match self {
             LevelError::Usage(_) => 1,
             LevelError::RefusedPath => 3,
+            LevelError::RenderDirectory | LevelError::RenderEmpty
+            | LevelError::RenderArrayOutOfRange => 1,
             _ => 2,
         }
     }
@@ -194,6 +207,11 @@ impl fmt::Display for LevelError {
             }
             LevelError::GeometryArrayOutOfRange => {
                 "room geometry vertex or face array runs outside the level data"
+            }
+            LevelError::RenderDirectory => "expected one .PCM file, not a directory",
+            LevelError::RenderEmpty => "unit has no room geometry (0 vertices or 0 faces)",
+            LevelError::RenderArrayOutOfRange => {
+                "room geometry array or face index is out of range"
             }
             LevelError::MissingUnitName => "name table does not contain the unit's own name",
             LevelError::SidecarIncomplete => "PMF and PNF must be present together",
@@ -293,6 +311,74 @@ fn geometry_report(data: &[u8]) -> Result<GeometryReport, LevelError> {
         report.max_index = Some(max_index);
     }
     Ok(report)
+}
+
+/// CPU mesh behind header slot `0x00`: the same record and bounds rule as
+/// [`geometry_report`], with positions widened to `f32` and every face index
+/// range-checked instead of counted.
+fn room_mesh(data: &[u8]) -> Result<RoomMesh, LevelError> {
+    let room_offset =
+        read_u32(data, 4 * SLOT_ROOM_RECORD).ok_or(LevelError::GeometryRecordOutOfRange)?;
+    if room_offset == 0 {
+        return Ok(RoomMesh::default());
+    }
+    let record = room_offset as usize;
+    if record.checked_add(ROOM_FACE_OFFSET + 4).is_none_or(|end| end > data.len()) {
+        return Err(LevelError::GeometryRecordOutOfRange);
+    }
+    let field = |at| read_u32(data, record + at).unwrap_or(0);
+    let vertices = field(ROOM_VERTEX_COUNT);
+    let faces = field(ROOM_FACE_COUNT);
+    let (vertex_start, vertex_end) =
+        array_range(data.len(), field(ROOM_VERTEX_OFFSET), vertices, VERTEX_STRIDE)
+            .ok_or(LevelError::GeometryArrayOutOfRange)?;
+    let (face_start, face_end) =
+        array_range(data.len(), field(ROOM_FACE_OFFSET), faces, FACE_STRIDE)
+            .ok_or(LevelError::GeometryArrayOutOfRange)?;
+    let mut mesh = RoomMesh::default();
+    for at in (vertex_start..vertex_end).step_by(VERTEX_STRIDE) {
+        let mut xyz = [0.0f32; 3];
+        for (axis, value) in xyz.iter_mut().enumerate() {
+            let raw = read_i16(data, at + 2 * axis).ok_or(LevelError::GeometryArrayOutOfRange)?;
+            *value = f32::from(raw);
+        }
+        mesh.vertices.push(xyz);
+    }
+    for at in (face_start..face_end).step_by(FACE_STRIDE) {
+        for slot in 0..3 {
+            let index = read_u16(data, at + 2 * slot).ok_or(LevelError::GeometryArrayOutOfRange)?;
+            if u32::from(index) >= vertices {
+                return Err(LevelError::GeometryArrayOutOfRange);
+            }
+            mesh.indices.push(index);
+        }
+    }
+    Ok(mesh)
+}
+
+/// One-unit reader for `--level-render`: a directory is refused because this
+/// slice renders exactly one `.PCM` file. An empty mesh is a distinct error so
+/// the window never opens on nothing.
+pub fn read_room_mesh(path: &Path) -> Result<(String, RoomMesh), LevelError> {
+    if path.is_dir() {
+        return Err(LevelError::RenderDirectory);
+    }
+    if !is_pcm(path) {
+        return Err(LevelError::RefusedPath);
+    }
+    let stem = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).ok_or(LevelError::Io)?;
+    let bytes = std::fs::read(path).map_err(|_| LevelError::Io)?;
+    let unit = parse_pcm(&bytes, &stem)?;
+    let mesh = room_mesh(&bytes[unit.structure.data_base..]).map_err(|error| match error {
+        LevelError::GeometryRecordOutOfRange | LevelError::GeometryArrayOutOfRange => {
+            LevelError::RenderArrayOutOfRange
+        }
+        other => other,
+    })?;
+    if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+        return Err(LevelError::RenderEmpty);
+    }
+    Ok((unit.name, mesh))
 }
 
 /// Geometry rows for one file or room directory, sorted by unit name. This
@@ -1272,6 +1358,27 @@ mod tests {
         let count = data_base(2) + 16 + ROOM_VERTEX_COUNT;
         array[count..count + 4].copy_from_slice(&2u32.to_le_bytes());
         assert_eq!(geometry_of(&array).err(), Some(LevelError::GeometryArrayOutOfRange));
+    }
+
+    #[test]
+    fn room_mesh_widens_positions_and_passes_indices() {
+        let bytes = geometry_pcm(&[[-3, 4, 5], [7, -8, 9], [0, 1, 2]], &[[0, 1, 2]]);
+        let unit = parse_pcm(&bytes, "lair5").expect("must parse");
+        let mesh = room_mesh(&bytes[unit.structure.data_base..]).expect("must read");
+        assert_eq!(mesh.vertices, vec![[-3.0, 4.0, 5.0], [7.0, -8.0, 9.0], [0.0, 1.0, 2.0]]);
+        assert_eq!(mesh.indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn read_room_mesh_refuses_a_directory_and_codeless_units() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        assert_eq!(read_room_mesh(tmp.path()).err(), Some(LevelError::RenderDirectory));
+        let pcm = tmp.path().join("lair5.PCM");
+        write(tmp.path(), "lair5.PCM", &geometry_pcm(&[], &[]));
+        assert_eq!(read_room_mesh(&pcm).err(), Some(LevelError::RenderEmpty));
+        assert_eq!(read_room_mesh(&tmp.path().join("missing.PCM")).err(), Some(LevelError::Io));
+        write(tmp.path(), "lair5.PCM", &geometry_pcm(&[[0, 0, 0]], &[[0, 1, 9]]));
+        assert_eq!(read_room_mesh(&pcm).err(), Some(LevelError::RenderArrayOutOfRange));
     }
 
     fn block_of(size: usize, byte: u8) -> Vec<u8> {
