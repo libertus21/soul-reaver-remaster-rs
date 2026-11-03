@@ -782,24 +782,89 @@ impl OrbitCamera {
             self.target[2] + self.distance * cp * cy,
         ];
         let forward = [-cp * sy, -sp, -cp * cy];
-        let (right, up) = self.basis();
-        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-        let view = [
-            [right[0], up[0], -forward[0], 0.0],
-            [right[1], up[1], -forward[1], 0.0],
-            [right[2], up[2], -forward[2], 0.0],
-            [-dot(right, eye), -dot(up, eye), dot(forward, eye), 1.0],
-        ];
         let near = (self.distance * 0.02).max(1e-3);
-        let far = self.distance + 4.0;
-        let f = 1.0 / std::f32::consts::FRAC_PI_8.tan();
-        let proj = [
-            [f / aspect.max(1e-6), 0.0, 0.0, 0.0],
-            [0.0, f, 0.0, 0.0],
-            [0.0, 0.0, far / (near - far), -1.0],
-            [0.0, 0.0, -far * near / (far - near), 0.0],
-        ];
-        mul4(&proj, &view)
+        view_proj(eye, self.basis(), forward, near, self.distance + 4.0, aspect)
+    }
+}
+
+/// Shared view/projection: `right`/`up` are unit, `forward` is the view direction.
+fn view_proj(
+    eye: [f32; 3],
+    (right, up): ([f32; 3], [f32; 3]),
+    forward: [f32; 3],
+    near: f32,
+    far: f32,
+    aspect: f32,
+) -> [[f32; 4]; 4] {
+    let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let view = [
+        [right[0], up[0], -forward[0], 0.0],
+        [right[1], up[1], -forward[1], 0.0],
+        [right[2], up[2], -forward[2], 0.0],
+        [-dot(right, eye), -dot(up, eye), dot(forward, eye), 1.0],
+    ];
+    let f = 1.0 / std::f32::consts::FRAC_PI_8.tan();
+    let proj = [
+        [f / aspect.max(1e-6), 0.0, 0.0, 0.0],
+        [0.0, f, 0.0, 0.0],
+        [0.0, 0.0, far / (near - far), -1.0],
+        [0.0, 0.0, -far * near / (far - near), 0.0],
+    ];
+    mul4(&proj, &view)
+}
+
+// --- fly camera ---
+
+const FLY_LOOK_SENSITIVITY: f32 = 0.003;
+const FLY_SPEED: f32 = 0.8;
+const FLY_FAST_MULTIPLIER: f32 = 3.0;
+/// Frame-time ceiling: a stalled frame cannot teleport the eye through walls.
+const FLY_MAX_STEP: f32 = 0.1;
+const FLY_NEAR: f32 = 0.01;
+const FLY_FAR: f32 = 100.0;
+
+/// Pure first-person fly state: a world position plus yaw/pitch in radians.
+/// Movement is relative to the view basis; no animation or collision is claimed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlyCamera {
+    position: [f32; 3],
+    yaw: f32,
+    pitch: f32,
+}
+
+impl FlyCamera {
+    pub const fn new(position: [f32; 3]) -> Self {
+        Self { position, yaw: 0.0, pitch: 0.0 }
+    }
+
+    pub fn look(&mut self, dx: f32, dy: f32) {
+        self.yaw -= dx * FLY_LOOK_SENSITIVITY;
+        self.pitch =
+            (self.pitch - dy * FLY_LOOK_SENSITIVITY).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    }
+
+    /// Move by `forward`/`strafe` in view space and `rise` along world up.
+    pub fn fly(&mut self, forward: f32, strafe: f32, rise: f32, seconds: f32, fast: bool) {
+        let step = FLY_SPEED
+            * if fast { FLY_FAST_MULTIPLIER } else { 1.0 }
+            * seconds.clamp(0.0, FLY_MAX_STEP);
+        let (front, right, _) = self.basis();
+        for axis in 0..3 {
+            self.position[axis] += step * (front[axis] * forward + right[axis] * strafe);
+        }
+        self.position[1] += step * rise;
+    }
+
+    /// View direction, right and up; all unit length.
+    fn basis(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        ([-cp * sy, -sp, -cp * cy], [cy, 0.0, -sy], [-sy * sp, cp, -cy * sp])
+    }
+
+    fn mvp(&self, aspect: f32) -> [[f32; 4]; 4] {
+        let (forward, right, up) = self.basis();
+        view_proj(self.position, (right, up), forward, FLY_NEAR, FLY_FAR, aspect)
     }
 }
 
@@ -1990,8 +2055,8 @@ pub fn show_mesh_gallery(entries: &[PathBuf], tex_dir: &Path) -> Result<(), Stri
 #[cfg(test)]
 mod mesh_tests {
     use super::{
-        fit_positions, validate_entry_shape, OrbitCamera, FIT_DISTANCE, MAX_DISTANCE,
-        MIN_DISTANCE, PITCH_LIMIT,
+        fit_positions, validate_entry_shape, FlyCamera, OrbitCamera, FIT_DISTANCE,
+        FLY_FAST_MULTIPLIER, FLY_MAX_STEP, FLY_SPEED, MAX_DISTANCE, MIN_DISTANCE, PITCH_LIMIT,
     };
 
     fn origin_clip(camera: &OrbitCamera, aspect: f32) -> [f32; 4] {
@@ -2059,6 +2124,61 @@ mod mesh_tests {
         }
         assert_eq!(camera.distance, MAX_DISTANCE);
         assert!(camera.distance.is_finite(), "zoom-out never reaches infinity");
+    }
+
+    #[test]
+    fn fly_moves_forward_and_strafes_in_view_space() {
+        let mut fly = FlyCamera::new([0.0; 3]);
+        fly.fly(1.0, 0.0, 0.0, 0.1, false);
+        assert!((fly.position[2] + FLY_SPEED * 0.1).abs() < 1e-5, "forward is -Z at yaw 0");
+        fly.fly(0.0, 1.0, 0.0, 0.1, false);
+        assert!((fly.position[0] - FLY_SPEED * 0.1).abs() < 1e-5, "strafe follows +X");
+    }
+
+    #[test]
+    fn fly_rises_along_world_up_and_shift_scales_the_step() {
+        let mut fly = FlyCamera::new([0.0; 3]);
+        fly.fly(0.0, 0.0, 1.0, 0.1, false);
+        assert!((fly.position[1] - FLY_SPEED * 0.1).abs() < 1e-5);
+        let mut fast = FlyCamera::new([0.0; 3]);
+        fast.fly(1.0, 0.0, 0.0, 0.1, true);
+        assert!((fast.position[2] + FLY_SPEED * 0.1 * FLY_FAST_MULTIPLIER).abs() < 1e-5);
+    }
+
+    #[test]
+    fn fly_step_is_clamped_against_long_frames() {
+        let mut fly = FlyCamera::new([0.0; 3]);
+        fly.fly(1.0, 0.0, 0.0, 10.0, false);
+        assert!((fly.position[2] + FLY_SPEED * FLY_MAX_STEP).abs() < 1e-5);
+    }
+
+    #[test]
+    fn fly_look_clamps_pitch_and_starts_at_the_given_point() {
+        let mut fly = FlyCamera::new([1.0, 2.0, 3.0]);
+        fly.look(0.0, 1e6);
+        assert!((fly.pitch + PITCH_LIMIT).abs() < 1e-5);
+        fly.look(0.0, -2e6);
+        assert!((fly.pitch - PITCH_LIMIT).abs() < 1e-5);
+        assert_eq!(fly.position, [1.0, 2.0, 3.0], "look never moves the eye");
+    }
+
+    #[test]
+    fn fly_yaw_turns_the_forward_axis() {
+        let mut fly = FlyCamera::new([0.0; 3]);
+        fly.look(523.5988, 0.0);
+        fly.fly(1.0, 0.0, 0.0, 0.1, false);
+        assert!((fly.position[0] - FLY_SPEED * 0.1).abs() < 1e-3, "a quarter turn faces +X");
+        assert!(fly.position[2].abs() < 1e-3);
+    }
+
+    #[test]
+    fn fly_projection_keeps_a_point_ahead_in_front() {
+        let m = FlyCamera::new([0.0; 3]).mvp(1.0);
+        let point = [0.0, 0.0, -1.0, 1.0];
+        let clip: Vec<f32> =
+            (0..4).map(|row| (0..4).map(|col| m[col][row] * point[col]).sum()).collect();
+        assert!(clip.iter().all(|v| v.is_finite()));
+        assert!(clip[3] > 0.0, "a point down the view axis stays in front");
     }
 
     #[test]
