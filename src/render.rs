@@ -918,6 +918,7 @@ impl FlyKeys {
                 "a" => self.left = held,
                 "d" => self.right = held,
                 "e" => self.up = held,
+                "c" => self.down = held,
                 "q" => self.down = held,
                 _ => {}
             },
