@@ -704,6 +704,15 @@ fn fit_point(positions: &[[f32; 3]], point: [f32; 3]) -> Result<[f32; 3], String
     ])
 }
 
+/// Fitted fly eye for `spawn`, aimed at the fitted scene centre (the origin).
+fn initial_fly_camera(positions: &[[f32; 3]], spawn: Option<[f32; 3]>) -> Result<FlyCamera, String> {
+    let eye = match spawn {
+        Some(point) => fit_point(positions, point)?,
+        None => [0.0; 3],
+    };
+    Ok(FlyCamera::looking_at(eye, [0.0; 3]))
+}
+
 fn mul4(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let mut out = [[0.0f32; 4]; 4];
     for col in 0..4 {
@@ -849,6 +858,25 @@ pub struct FlyCamera {
 impl FlyCamera {
     pub const fn new(position: [f32; 3]) -> Self {
         Self { position, yaw: 0.0, pitch: 0.0 }
+    }
+
+    /// Start at `position` facing `target`. The fitted scene is centred on the
+    /// origin, so this aims the eye at the geometry instead of blindly down -Z:
+    /// a spawn on the scene edge would otherwise look out into the void.
+    pub fn looking_at(position: [f32; 3], target: [f32; 3]) -> Self {
+        let dir = [
+            target[0] - position[0],
+            target[1] - position[1],
+            target[2] - position[2],
+        ];
+        let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+        if !(len > 1e-6) || !len.is_finite() {
+            return Self::new(position);
+        }
+        let unit = [dir[0] / len, dir[1] / len, dir[2] / len];
+        let pitch = (-unit[1]).asin().clamp(-PITCH_LIMIT, PITCH_LIMIT);
+        let yaw = (-unit[0]).atan2(-unit[2]);
+        Self { position, yaw, pitch }
     }
 
     pub fn look(&mut self, dx: f32, dy: f32) {
@@ -1048,7 +1076,7 @@ struct MeshState<'window> {
     depth_view: wgpu::TextureView,
     camera: OrbitCamera,
     fly: FlyCamera,
-    start: [f32; 3],
+    start: FlyCamera,
     input: CameraInput,
     keys: FlyKeys,
     last_frame: std::time::Instant,
@@ -1073,7 +1101,7 @@ impl<'window> MeshState<'window> {
         window: Arc<Window>,
         vertices: &[[f32; 3]],
         indices: &[u16],
-        start: [f32; 3],
+        start: FlyCamera,
     ) -> Result<Self, String> {
         let mut vbytes = Vec::with_capacity(vertices.len() * 12);
         for v in vertices {
@@ -1195,7 +1223,7 @@ impl<'window> MeshState<'window> {
             uniform_bind_group,
             depth_view,
             camera: OrbitCamera::new(),
-            fly: FlyCamera::new(start),
+            fly: start,
             start,
             input: CameraInput::default(),
             keys: FlyKeys::default(),
@@ -1214,7 +1242,7 @@ impl<'window> MeshState<'window> {
 
     fn reset_camera(&mut self) {
         self.camera.reset();
-        self.fly = FlyCamera::new(self.start);
+        self.fly = self.start;
         self.input.mode = CameraMode::Orbit;
         self.keys = FlyKeys::default();
     }
@@ -1282,7 +1310,7 @@ struct MeshApp {
     title: String,
     vertices: Vec<[f32; 3]>,
     indices: Vec<u16>,
-    start: [f32; 3],
+    start: FlyCamera,
     state: Option<MeshState<'static>>,
     init_error: Option<String>,
 }
@@ -1378,10 +1406,7 @@ pub fn show_mesh(
     spawn: Option<[f32; 3]>,
 ) -> Result<(), String> {
     let fitted = fit_positions(positions)?;
-    let start = match spawn {
-        Some(point) => fit_point(positions, point)?,
-        None => [0.0; 3],
-    };
+    let start = initial_fly_camera(positions, spawn)?;
     if indices.is_empty() {
         return Err("cannot show a mesh with 0 indices".to_string());
     }
@@ -2202,8 +2227,9 @@ pub fn show_mesh_gallery(entries: &[PathBuf], tex_dir: &Path) -> Result<(), Stri
 #[cfg(test)]
 mod mesh_tests {
     use super::{
-        fit_point, fit_positions, validate_entry_shape, FlyCamera, OrbitCamera, FIT_DISTANCE,
-        FLY_FAST_MULTIPLIER, FLY_MAX_STEP, FLY_SPEED, MAX_DISTANCE, MIN_DISTANCE, PITCH_LIMIT,
+        fit_point, fit_positions, initial_fly_camera, validate_entry_shape, FlyCamera, OrbitCamera,
+        FIT_DISTANCE, FLY_FAST_MULTIPLIER, FLY_MAX_STEP, FLY_SPEED, MAX_DISTANCE, MIN_DISTANCE,
+        PITCH_LIMIT,
     };
 
     fn origin_clip(camera: &OrbitCamera, aspect: f32) -> [f32; 4] {
@@ -2342,6 +2368,25 @@ mod mesh_tests {
         assert_ne!(camera.target, [0.0; 3]);
         assert_eq!(camera.distance, FIT_DISTANCE);
         assert!(!camera.auto_rotate);
+    }
+
+    #[test]
+    fn fly_starts_facing_the_scene_from_an_edge_spawn() {
+        // Reproduces the `under`-group shape without game bytes: the spawn sits
+        // on the x-min edge while the scene centre is 5 world units along +X and
+        // the scene is thin in Z. A default -Z eye looks away and renders black.
+        let positions = [[0.0, -1.0, -1.0], [10.0, 1.0, 1.0]];
+        let fly = initial_fly_camera(&positions, Some([0.0, 0.0, 0.0])).unwrap();
+        let m = fly.mvp(1.0);
+        let centre = [0.0f32, 0.0, 0.0, 1.0];
+        let clip: Vec<f32> =
+            (0..4).map(|row| (0..4).map(|col| m[col][row] * centre[col]).sum()).collect();
+        assert!(clip[3] > 0.0, "scene centre is in front of the initial eye");
+        let ndc = [clip[0] / clip[3], clip[1] / clip[3], clip[2] / clip[3]];
+        assert!(
+            ndc[0].abs() <= 1.0 && ndc[1].abs() <= 1.0 && (0.0..=1.0).contains(&ndc[2]),
+            "scene centre lands inside the frustum, got {ndc:?}"
+        );
     }
 
     #[test]
