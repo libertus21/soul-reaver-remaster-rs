@@ -41,6 +41,7 @@
 //! exits `0`.
 
 mod bigfile;
+mod cli_catalog;
 mod cli_out;
 // Launcher CLI arg parser (pure). Viewer only strips three no-op flags.
 #[allow(dead_code)]
@@ -73,6 +74,20 @@ fn main() -> ExitCode {
     // Compatibility no-ops: stripped before dispatch, no output, no exit
     // change. (Parser-only flags are never wired into the viewer.)
     let args = strip_launcher_noops(raw);
+    if let Some(group) = match args.first().map(String::as_str) {
+        Some("--help" | "-h" | "help") => Some(args.get(1).map(String::as_str)),
+        _ => None,
+    } {
+        let text = cli_catalog::render_help(group);
+        if group.is_none_or(cli_catalog::is_known_group) {
+            for line in text.lines() {
+                outln!("{line}");
+            }
+            return ExitCode::SUCCESS;
+        }
+        eprintln!("{text}");
+        return ExitCode::from(1);
+    }
     if let Some(message) = pose_mode_conflict(&args) {
         eprintln!("{message}");
         return ExitCode::from(1);
