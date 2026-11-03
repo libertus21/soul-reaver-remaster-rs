@@ -21,6 +21,8 @@ pub struct LevelUnit {
     pub block_all_zero: Vec<bool>,
     /// Header sanity, relocation-directory integrity, and header offset slots.
     pub structure: LevelStructure,
+    /// Records decoded from the header `0x34` link table, in table order.
+    pub link_table: Vec<TableLink>,
 }
 
 /// Shape class of one block. Labels describe a size (and zero-ness) only;
@@ -58,6 +60,13 @@ const TABLE36_STRIDE: usize = 0x24;
 const SLOT_TABLE36_COUNT: usize = 0x3A;
 const SLOT_TABLE36_OFFSET: usize = 0x3B;
 
+/// Decoded link table: header slot `0x34` holds a data-base-relative offset;
+/// records are 40 bytes, `[5 x u32][12-byte name][2 x u32]`. The table ends at
+/// the first record whose name is not `<target>,<digits>`.
+const SLOT_LINK_TABLE: usize = 0x34;
+const LINK_RECORD_STRIDE: usize = 40;
+const LINK_NAME_LEN: usize = 12;
+
 /// Directory integrity: entry `i` is the position of a dword that holds a
 /// non-zero data-base-relative offset.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -92,6 +101,15 @@ pub struct LevelStructure {
 pub struct Link {
     pub target: String,
     pub index: u16,
+}
+
+/// One 40-byte link-table record. Every prelude value is reported as a raw
+/// signed 32-bit integer; no field is interpreted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableLink {
+    pub target: String,
+    pub index: u32,
+    pub prelude: [i32; 5],
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -250,6 +268,52 @@ fn table36_report(data: &[u8]) -> Table36Report {
     Table36Report { count, stride: TABLE36_STRIDE as u32, lengths }
 }
 
+/// Walk the link table from header slot `0x34`. A zero offset means no table;
+/// a record that would leave the data region ends the walk without an error.
+fn link_table(data: &[u8]) -> Vec<TableLink> {
+    let Some(relative) = read_u32(data, 4 * SLOT_LINK_TABLE) else {
+        return Vec::new();
+    };
+    if relative == 0 {
+        return Vec::new();
+    }
+    let mut links = Vec::new();
+    let mut at = relative as usize;
+    loop {
+        let Some(end) = at.checked_add(LINK_RECORD_STRIDE) else {
+            break;
+        };
+        let Some(record) = data.get(at..end) else {
+            break;
+        };
+        let Some((target, index)) = decode_link_name(&record[20..20 + LINK_NAME_LEN]) else {
+            break;
+        };
+        let mut prelude = [0i32; 5];
+        for (slot, value) in prelude.iter_mut().enumerate() {
+            *value = read_u32(record, 4 * slot).unwrap_or(0) as i32;
+        }
+        links.push(TableLink { target, index, prelude });
+        at = end;
+    }
+    links
+}
+
+/// `^[a-z][a-z0-9]*,[0-9]+$` inside one NUL-terminated 12-byte field.
+fn decode_link_name(field: &[u8]) -> Option<(String, u32)> {
+    let text = std::str::from_utf8(&field[..field.iter().position(|&byte| byte == 0)?]).ok()?;
+    let (target, digits) = text.split_once(',')?;
+    let (first, rest) = target.as_bytes().split_first()?;
+    if !first.is_ascii_lowercase()
+        || !rest.iter().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        || digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((target.to_string(), digits.parse().ok()?))
+}
+
 /// `u32 N` + `N` ascending relative offsets + zero padding up to
 /// `4 * roundup512(N)`, which is the level-data base, then the level data and
 /// the name table. Blocks are addressed relative to that padded base.
@@ -295,6 +359,7 @@ pub fn parse_pcm(bytes: &[u8], expected_name: &str) -> Result<LevelUnit, LevelEr
         block_all_zero.push(block.iter().all(|&byte| byte == 0));
     }
     let data = &bytes[data_base..];
+    let table = link_table(data);
     let structure = LevelStructure {
         data_base,
         data_len: data.len(),
@@ -318,6 +383,7 @@ pub fn parse_pcm(bytes: &[u8], expected_name: &str) -> Result<LevelUnit, LevelEr
         block_sizes,
         block_all_zero,
         structure,
+        link_table: table,
     })
 }
 
@@ -499,6 +565,20 @@ pub fn report_lines(unit: &LevelUnit) -> Vec<String> {
         unit.links.len()
     )];
     lines.extend(unit.links.iter().map(|link| format!("  link {} {}", link.target, link.index)));
+    lines
+}
+
+/// One `links` line per unit, then one line per decoded link-table record.
+/// Prelude values are raw integers; nothing is named or interpreted.
+pub fn link_lines(unit: &LevelUnit) -> Vec<String> {
+    let mut lines = vec![format!("links {} count={}", unit.name, unit.link_table.len())];
+    lines.extend(unit.link_table.iter().map(|link| {
+        let [a, b, c, d, e] = link.prelude;
+        format!(
+            "  link {} {} prelude={a},{b},{c},{d},{e}",
+            link.target, link.index
+        )
+    }));
     lines
 }
 
@@ -1029,6 +1109,77 @@ mod tests {
         let unit = parse_pcm(&past, "lair5").expect("must parse");
         assert_eq!(unit.structure.reloc.out_of_range, 1);
         assert!(structure_lines(&unit).is_err());
+    }
+
+    /// Header slot `0x34` points 256 bytes into the data region; each record
+    /// fills its 12-byte name field and leaves its tail as written.
+    fn link_pcm(records: &[([i32; 5], &str)], tail: usize) -> Vec<u8> {
+        let offset = 256usize;
+        let mut bytes = structure_pcm(&[0, 4], &[(SLOT_LINK_TABLE, offset as u32)], offset + tail);
+        let base = data_base(2);
+        for (index, (prelude, name)) in records.iter().enumerate() {
+            let at = base + offset + index * LINK_RECORD_STRIDE;
+            for (slot, value) in prelude.iter().enumerate() {
+                bytes[at + 4 * slot..at + 4 * slot + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            bytes[at + 20..at + 20 + name.len()].copy_from_slice(name.as_bytes());
+        }
+        bytes
+    }
+
+    fn links_of(bytes: &[u8]) -> Vec<TableLink> {
+        parse_pcm(bytes, "lair5").expect("must parse").link_table
+    }
+
+    #[test]
+    fn link_table_decodes_records_and_stops_at_the_terminator() {
+        let bytes = link_pcm(
+            &[
+                ([1, 67, 18, 67, -4579], "lair29,66"),
+                ([1, 52, 18, 52, -4605], "lair3,51"),
+            ],
+            2 * LINK_RECORD_STRIDE,
+        );
+        let links = links_of(&bytes);
+        assert_eq!(links.len(), 2);
+        assert_eq!(
+            links[0],
+            TableLink {
+                target: "lair29".into(),
+                index: 66,
+                prelude: [1, 67, 18, 67, -4579]
+            }
+        );
+        assert_eq!((links[1].target.as_str(), links[1].index), ("lair3", 51));
+    }
+
+    #[test]
+    fn a_zero_slot_or_a_non_link_first_record_means_no_table() {
+        let no_slot = structure_pcm(&[0, 4], &[], 300);
+        assert!(links_of(&no_slot).is_empty());
+        let non_link = link_pcm(&[([9, 8, 7, 6, 5], "junk")], LINK_RECORD_STRIDE);
+        assert!(links_of(&non_link).is_empty());
+    }
+
+    #[test]
+    fn a_record_that_leaves_the_data_region_ends_the_walk() {
+        let bytes = link_pcm(&[([1, 2, 3, 4, 5], "lair7,3")], LINK_RECORD_STRIDE + 20);
+        let links = links_of(&bytes);
+        assert_eq!(links.len(), 1);
+        assert_eq!((links[0].target.as_str(), links[0].index), ("lair7", 3));
+    }
+
+    #[test]
+    fn link_lines_report_the_count_targets_and_raw_preludes() {
+        let bytes = link_pcm(&[([1, 67, 18, 67, -4579], "lair29,66")], LINK_RECORD_STRIDE);
+        let unit = parse_pcm(&bytes, "lair5").expect("must parse");
+        assert_eq!(
+            link_lines(&unit),
+            vec![
+                "links lair5 count=1",
+                "  link lair29 66 prelude=1,67,18,67,-4579",
+            ]
+        );
     }
 
     #[test]

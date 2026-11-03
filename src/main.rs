@@ -104,6 +104,9 @@ fn main() -> ExitCode {
     if args.first().is_some_and(|a| a == "--level-structure") {
         return run_level_structure(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--level-links") {
+        return run_level_links(&args[1..]);
+    }
     let Some(arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs <path-to-DDS | path-to-directory>");
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --list");
@@ -121,6 +124,7 @@ fn main() -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-info <.PCM file | room directory>");
         eprintln!("   or: soul-reaver-remaster-rs --level-records <.PCM file | room directory>");
         eprintln!("   or: soul-reaver-remaster-rs --level-structure <.PCM file | room directory>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-links <.PCM file | room directory>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
@@ -1045,6 +1049,26 @@ fn run_level_structure(args: &[String]) -> ExitCode {
     }
 }
 
+/// Read-only `--level-links` arm: per unit, the decoded link-table count and
+/// one line per record. Prelude values print raw; no field is interpreted.
+fn run_level_links(args: &[String]) -> ExitCode {
+    let result = match args {
+        [path] if !path.starts_with('-') => level::read_path(Path::new(path)),
+        _ => Err(level::LevelError::Usage("expected --level-links <path>")),
+    };
+    let units = match result {
+        Ok(units) => units,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    for line in units.iter().flat_map(level::link_lines) {
+        outln!("{line}");
+    }
+    ExitCode::SUCCESS
+}
+
 /// Track label for messages: the file stem, never an install path.
 fn track_name(path: &Path) -> String {
     path.file_stem()
@@ -1070,8 +1094,8 @@ mod cli_tests {
     use super::run_level_info;
     use super::{
         list_report, pose_mode_conflict, resolve_texture_name, run_audio, run_bigfile,
-        run_level_records, run_level_structure, run_mesh, run_mesh_all, run_mesh_textured,
-        run_mesh_with, run_textures, strip_launcher_noops, tshow_suffix,
+        run_level_links, run_level_records, run_level_structure, run_mesh, run_mesh_all,
+        run_mesh_textured, run_mesh_with, run_textures, strip_launcher_noops, tshow_suffix,
     };
     use std::process::ExitCode;
     use std::rc::Rc;
@@ -1136,6 +1160,31 @@ mod cli_tests {
         assert_eq!(run_level_info(&[pmf_path]), ExitCode::from(3));
         assert_eq!(run_level_info(&[empty]), ExitCode::from(2));
         assert_eq!(run_level_info(&[pcm_path]), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn level_links_maps_the_exit_matrix() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let mut body = vec![0u8; 300];
+        body[4 * 0x34..4 * 0x34 + 4].copy_from_slice(&256u32.to_le_bytes());
+        body[276..285].copy_from_slice(b"lair29,66");
+        body[294..299].copy_from_slice(b"lair5");
+        let pcm_path = write_tmp(&tmp, "lair5.PCM", &level_pcm(&[vec![0u8; 4], body]));
+        let pmf_path = write_tmp(&tmp, "notes.PMF", &[0u8; 44]);
+        let empty = tmp.path().join("EMPTY");
+        std::fs::create_dir(&empty).expect("EMPTY must be creatable");
+        let empty = empty.to_string_lossy().into_owned();
+        assert_eq!(run_level_links(&[]), ExitCode::from(1));
+        assert_eq!(run_level_links(&["--other".to_string()]), ExitCode::from(1));
+        assert_eq!(
+            run_level_links(&[pcm_path.clone(), pcm_path.clone()]),
+            ExitCode::from(1)
+        );
+        assert_eq!(run_level_links(&[pmf_path]), ExitCode::from(3));
+        assert_eq!(run_level_links(&[empty]), ExitCode::from(2));
+        assert_eq!(run_level_links(&[pcm_path]), ExitCode::SUCCESS);
+        let dir = tmp.path().to_string_lossy().into_owned();
+        assert_eq!(run_level_links(&[dir]), ExitCode::SUCCESS);
     }
 
     /// Minimal ascending `.PCM` whose block 0 is 4 bytes and whose name

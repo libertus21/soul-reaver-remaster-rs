@@ -352,6 +352,42 @@ Not claimed by this slice: field semantics, slot roles, record types, geometry,
 positions, transforms, or any downstream consumer. `BlockClass` stays a shape
 hint and `--level-records` is unchanged.
 
+## Level-link table (decoded)
+
+The level header is the u32 array at the data base. Slot `0x34` is a
+data-base-relative offset to the link table; it is `392` in every observed unit
+that carries one. The table is an array of 40-byte records:
+
+| offset | size | content |
+|---|---|---|
+| `0x00` | 20 | five u32 prelude values |
+| `0x14` | 12 | NUL-terminated name, `<target>,<index>` |
+| `0x20` | 8 | two u32 tail values |
+
+The table ends at the first record whose 12-byte name field does not match
+`^[a-z][a-z0-9]*,[0-9]+$`. A zero slot, a name that does not match on the first
+record, or a record that would leave the data region ends the walk with zero or
+fewer links; none of those cases is an error. `MOVIE3` is the zero-link example:
+it has no link table, and the reader reports `count=0`.
+
+Real units: `LAIR1` has two records, `lair29,66` (prelude
+`1,67,18,67,-4579`) and `lair3,51` (`1,52,18,52,-4605`). `LAIR14` has
+`lair10,27` and `lair27,59`; `LAIR13` has `lair10,26` and `lair26,57`.
+Across all 89 SR1 area units the walk finds 52 links in the 31 `LAIR` units
+(24 with links, 7 with none) and zero links in every other unit; 65 units
+report zero.
+
+The prelude values are reported as raw signed 32-bit integers. No field is
+named or interpreted - not "index", "mask", "flags", geometry, or placement.
+The two tail values are not read. `--level-links` is the reader:
+`cargo run -- --level-links <.PCM file | room directory>`.
+
+**Correction to `--level-info`.** That arm still counts links by scanning the
+whole file for `<target>,<index>` strings, so it over-counts when the same name
+appears more than once. `LAIR1` reports 4 links (`lair29,66`, `lair3,51`,
+`lair3,51`, `lair29,66`); the decoded table has 2. This slice deliberately
+leaves `--level-info` unchanged; the discrepancy is documented here, not fixed.
+
 ## Legal
 
 Behaviour notes only. Role names, field offsets and a few short engine

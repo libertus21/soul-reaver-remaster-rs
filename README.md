@@ -273,6 +273,20 @@ extracted files, decompiled code, or database files.
   `0x1B..=0x32` unenumerated, so those slots are not read. Synthetic-byte tests
   only (`docs/notes/level-builder.md`, reader slice).
 
+- `level-links` (read-only counts; no window): `cargo run -- --level-links
+  <.PCM file | room directory>` reports per unit the decoded link-table count
+  and one line per record (`target`, `index`, and the five raw prelude
+  integers). Header slot `0x34` points at 40-byte records
+  (`[5 x u32][12-byte name][2 x u32]`); the walk stops at the first name that is
+  not `<target>,<digits>`, a zero slot, or a record that would leave the data
+  region. A unit with no table reports `count=0`, not an error. Real-unit
+  check: `LAIR1` 2 (`lair29 66`, `lair3 51`), `LAIR14` 2, `LAIR13` 2,
+  `MOVIE3` 0; all 89 area units give 52 links in 31 `LAIR` units and 0
+  elsewhere (65 units zero). Prelude fields, the two tail values, geometry and
+  placement stay NOT interpreted. `--level-info` is unchanged: it still scans
+  the whole file and over-counts duplicates (`LAIR1` 4 vs the table's 2; see
+  `docs/notes/level-builder.md`).
+
 ## What's missing
 
 - [ ] Room geometry inside the `.PCM` records stays **UNPROVEN**, and the next
