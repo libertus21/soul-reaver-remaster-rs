@@ -303,15 +303,15 @@ extracted files, decompiled code, or database files.
 
 ## What's missing
 
-- [ ] Room geometry inside the `.PCM` records stays **UNPROVEN**, and the next
-      slice targets **placement and transforms**, not geometry. The
-      `level-builder` pass shows the offset table is a relocation directory,
-      not a block table: its sizes are pointer spacings, the level builder
-      walks a fixed header schema, and it composes no transform. The earlier
-      12-byte `[u32][f32][u32]` reading is refuted. `--level-records` still
-      counts spans by shape only. Collision, object placement, transforms, room
-      rendering, and PMF playback stay NO-GO; no vertex, face, transform, or
-      playback claim.
+- [ ] Room geometry and object placement are **located, not rendered**. Header
+      slot `0x00` (the room record) exposes a 12-byte vertex array (three `i16`
+      position at `+0/2/4`) and a 12-byte face array whose first three `u16`
+      are vertex indices; the room object array carries a 3 x `i16` world
+      position at `+0x20` in each `0x4C` source record. Slot `0x03` is NOT
+      geometry (it is a small `0x3C`-stride record array). The renderer/spawner,
+      the trailing vertex attribute, the 8-byte array C, object orientation and
+      the 143,872-byte dominant block stay UNKNOWN; no render or transform
+      claim. See `docs/notes/level-geometry.md`.
 - [x] `.BIG` fixed-slot layout and slot decoding, slices `big-slots` +
       `big-decompressor` (see `docs/changes/big-slots/design.md` and
       `docs/changes/big-decompressor/design.md`): the four containers share a
@@ -375,6 +375,7 @@ the `animation` slice is archived as PARTIAL: bone decode and one-bone pose
 are in, but full-body pose is blocked by the absent hierarchy. The
 `room-geometry` is archived: `--level-records` is in and counts blocks by shape
 class only, records 0 and 1 are all-zero padding, and geometry stays unproven.
-A placement/transform probe (12-byte `[u32 id-ish][f32 value][u32 flags]`
-groups) is next; the PMF codec is a separate audio slice. `.SRA` scoping (227
-sibling files) stays open under animation.
+The `level-geometry` probe located the vertex/face arrays and the object
+position field; a counts-only `--level-geometry` reader is the next slice, and
+the renderer/spawner trace is the probe after it. The PMF codec is a separate
+audio slice. `.SRA` scoping (227 sibling files) stays open under animation.
