@@ -322,9 +322,9 @@ extracted files, decompiled code, or database files.
   and culling stay out of scope; the interactive camera (orbit, wheel zoom,
   pan, `R` reset) is shared with the mesh window above, including the `F`
   first-person fly mode. In fly mode the eye starts at the room's first object
-  named `raziel` (mapped through the same auto-fit) looking along -Z, or at the
-  scene bbox centre when the room places no such object. Synthetic-byte tests
-  only (`docs/notes/level-geometry.md`).
+  named `raziel` (mapped through the same auto-fit) looking at the scene bbox
+  centre, or at that centre when the room places no such object. Synthetic-byte
+  tests only (`docs/notes/level-geometry.md`).
 
 - `level-archive` (first-level path): `cargo run -- --level-geometry --bigfile
   <BIGFILE.DAT> --entry <INDEX>` (or `--level-render` with the same flags)
