@@ -20,7 +20,7 @@ pub struct Capability {
 pub const GROUPS: [&str; 5] = ["texture", "archive", "mesh", "audio", "level"];
 
 /// Every existing mode, exactly once. This is the single source for help.
-pub const CAPABILITIES: [Capability; 15] = [
+pub const CAPABILITIES: [Capability; 16] = [
     Capability { group: "texture", name: "list", legacy: "--textures <BIG> --tlist [--map <MAP>]", summary: "List the remaster .BIG header and slot classes.", window: false },
     Capability { group: "texture", name: "show", legacy: "--textures <BIG> --tshow <SEL> [--map <MAP>]", summary: "Show one slot as its raw 256x256 image.", window: true },
     Capability { group: "texture", name: "file", legacy: "<FILE.DDS>", summary: "Show one .DDS texture file.", window: true },
@@ -36,6 +36,7 @@ pub const CAPABILITIES: [Capability; 15] = [
     Capability { group: "level", name: "records", legacy: "--level-records <PATH>", summary: "Print the per-unit block census.", window: false },
     Capability { group: "level", name: "structure", legacy: "--level-structure <PATH>", summary: "Print header and relocation-directory integrity.", window: false },
     Capability { group: "level", name: "links", legacy: "--level-links <PATH>", summary: "Print the decoded link table.", window: false },
+    Capability { group: "level", name: "geometry", legacy: "--level-geometry <PATH>", summary: "Print room vertex and face counts with a box.", window: false },
 ];
 
 /// The capability table.
@@ -83,7 +84,7 @@ pub fn render_help(group: Option<&str>) -> String {
 mod tests {
     use super::{catalog, is_known_group, render_help, GROUPS};
 
-    const EXPECTED: [(&str, &str); 15] = [
+    const EXPECTED: [(&str, &str); 16] = [
         ("texture", "list"),
         ("texture", "show"),
         ("texture", "file"),
@@ -99,6 +100,7 @@ mod tests {
         ("level", "records"),
         ("level", "structure"),
         ("level", "links"),
+        ("level", "geometry"),
     ];
 
     #[test]
