@@ -287,16 +287,19 @@ extracted files, decompiled code, or database files.
   the whole file and over-counts duplicates (`LAIR1` 4 vs the table's 2; see
   `docs/notes/level-builder.md`).
 
-- `unified-cli` (PR 3 of 3, chain complete): the grouped entry point is live.
-  `cargo run -- --help` (or `help <group>`) lists every capability;
-  `cargo run -- <group> <command> ...` rewrites to the exact legacy argv
-  (`texture list <BIG>` is byte-identical to `--textures <BIG> --tlist`). On a
-  terminal, `cargo run -- menu` (or no arguments) opens a numbered picker that
-  asks for a group, a command, then each required operand, and dispatches the
-  same canonical argv; `q` or EOF leaves it. A redirected stdout keeps the old
-  usage error and exits 1 without reading stdin. `menu` and the five group
-  words are the reserved names (use `./mesh` for a local directory). No new
-  dependency: `Cargo.toml` and `Cargo.lock` are unchanged.
+- `unified-cli` (3-PR chain complete, archived): the grouped entry point is
+  live. `cargo run -- --help` (or `help <group>`) lists the 15 capabilities in
+  five groups; `cargo run -- <group> <command> ...` rewrites to the exact
+  legacy argv (`texture list <BIG>` is byte-identical to
+  `--textures <BIG> --tlist`). On a terminal, `cargo run -- menu` (or no
+  arguments) opens a numbered picker that asks for a group, a command, then
+  each required operand, and dispatches the same canonical argv; `q` or EOF
+  leaves it. A redirected stdout keeps the old usage error and exits 1
+  without reading stdin. `menu` and the five group words are the reserved
+  names (use `./mesh` for a local directory). Legacy flags are unchanged, and
+  equality is asserted as an argv vector comparison, not output snapshots. No
+  new dependency: `Cargo.toml` and `Cargo.lock` are unchanged. See
+  `docs/changes/unified-viewer/archive.md`.
 
 ## What's missing
 
@@ -342,6 +345,12 @@ extracted files, decompiled code, or database files.
       ADSR envelopes and pitch resampling. Multi-track playback and the other
       audio banks are separate scopes. See
       `docs/changes/audio-snd/archive.md` and `docs/notes/s9-audio-snd.md`.
+- [ ] Picker operand prompts (UX polish from the `unified-viewer` playtest):
+      each prompt shows only the operand token (e.g. `SND>`), with no hint that
+      a filesystem path is expected, so a menu-style number is accepted as a
+      path and fails downstream with `cannot read <value>` (exit 1, by
+      design). Add a short hint or example per prompt in `src/menu.rs`. This is
+      polish, not a defect. See `docs/changes/unified-viewer/archive.md`.
 - [ ] Binary loader follow-ups (UNSCOPED, TBD by user): S2 and S3 both
       landed docs-only — S2's static call-edge tracing resolved zero
       post-open rows; S3 confirmed the launcher reaches `run`
