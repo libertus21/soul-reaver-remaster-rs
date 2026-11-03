@@ -337,6 +337,22 @@ extracted files, decompiled code, or database files.
   no window. Synthetic archive tests only
   (`docs/changes/level-group/proposal.md`).
 
+- `level-objects` (read-only; no window): `cargo run -- --level-objects <PATH>`
+  or `--level-objects --bigfile <DAT> --entry <INDEX>` / `--group <PREFIX>`
+  prints, per room, `objects <name> count=<N> array=<OFFSET>` and one
+  `  object <name> pos=x,y,z type=<T> flags=<F>` line per record, then a
+  `group <prefix> rooms=<N> objects=<T>` total. The array sits in the same room
+  record as the geometry: count at `+0x08`, data-base-relative offset at
+  `+0x0C`, records of `0x4C` bytes with a 12-byte NUL-terminated name, three
+  `i16` world positions at `+0x20`, a type in the high 16 bits of `+0x28`, and
+  raw flags at `+0x2C`. Rooms are world space, so no transform is applied;
+  orientation is not stored in the record. On `under1` (entry 115) the count is
+  95 with `undhost`, `raziel`, and `marker` first. `--level-render ... --objects`
+  appends one small cube per object (side = 1% of the largest scene axis, at
+  least 2 units) merged into the same vertex/index buffers; every marker is
+  identical and no per-type colour is claimed. Without `--objects` the render
+  path is unchanged. Synthetic-byte tests only.
+
 - `unified-cli` (3-PR chain complete, archived): the grouped entry point is
   live. `cargo run -- --help` (or `help <group>`) lists the 21 capabilities in
   five groups; `cargo run -- <group> <command> ...` rewrites to the exact
@@ -362,9 +378,11 @@ extracted files, decompiled code, or database files.
       `u16` are vertex indices; the room object array carries a 3 x `i16` world
       position at `+0x20` in each `0x4C` source record. Slot `0x03` is NOT
       geometry (it is a small `0x3C`-stride record array). The renderer/spawner,
-      the trailing vertex attribute, the 8-byte array C, object orientation and
-      the 143,872-byte dominant block stay UNKNOWN; no placement or transform
-      claim. See `docs/notes/level-geometry.md`.
+      the trailing vertex attribute, the 8-byte array C, object orientation,
+      object type semantics and the 143,872-byte dominant block stay UNKNOWN.
+      Object positions are decoded and listed by `--level-objects` and can be
+      drawn by `--level-render --objects`; no transform claim. See
+      `docs/notes/level-geometry.md`.
 - [x] `.BIG` fixed-slot layout and slot decoding, slices `big-slots` +
       `big-decompressor` (see `docs/changes/big-slots/design.md` and
       `docs/changes/big-decompressor/design.md`): the four containers share a
