@@ -123,6 +123,9 @@ pub struct GeometryReport {
 pub struct RoomMesh {
     pub vertices: Vec<[f32; 3]>,
     pub indices: Vec<u16>,
+    /// First object named `raziel`, widened to world `f32`; the fly camera's
+    /// optional start point. `None` when the room places no such record.
+    pub spawn: Option<[f32; 3]>,
 }
 
 /// One placed object behind header slot `0x00`. `object_type` is the high 16
@@ -495,6 +498,15 @@ fn object_report(data: &[u8]) -> Result<ObjectReport, LevelError> {
     Ok(report)
 }
 
+/// First object named `raziel`, if the room places one: the fly camera's
+/// optional start point. Names compare case-insensitively; the record carries
+/// no facing, so the camera starts looking along -Z.
+pub fn spawn_position(data: &[u8]) -> Option<[f32; 3]> {
+    object_report(data).ok()?.objects.iter()
+        .find(|object| object.name.eq_ignore_ascii_case("raziel"))
+        .map(|object| object.position.map(f32::from))
+}
+
 /// Marker side as a fraction of the largest scene axis, and the smallest side
 /// so a flat or zero-extent scene still shows something.
 const MARKER_SCENE_FRACTION: f32 = 0.01;
@@ -586,6 +598,7 @@ fn room_mesh_of(
     if mesh.vertices.is_empty() || mesh.indices.is_empty() {
         return Err(LevelError::RenderEmpty);
     }
+    mesh.spawn = spawn_position(data);
     if markers {
         append_markers(&mut mesh, &object_report(data)?.objects)?;
     }
@@ -766,6 +779,9 @@ pub fn read_group_room_mesh(
         let base = merged.vertices.len() as u16;
         merged.vertices.extend(mesh.vertices);
         merged.indices.extend(mesh.indices.iter().map(|&index| index + base));
+        if merged.spawn.is_none() {
+            merged.spawn = spawn_position(data);
+        }
         if markers {
             placed.extend(object_report(data)?.objects);
         }
@@ -1975,6 +1991,15 @@ mod tests {
             (report.objects[2].name.as_str(), report.objects[2].position),
             ("marker", [10, -20, 30])
         );
+    }
+
+    #[test]
+    fn spawn_position_finds_raziel_case_insensitively() {
+        let bytes =
+            object_pcm(&[("undhost", [-5, 0, 0], 0), ("Raziel", [1, 2, 3], 4)]);
+        assert_eq!(spawn_position(&bytes[data_base(2)..]), Some([1.0, 2.0, 3.0]));
+        let bytes = object_pcm(&[("marker", [0, 0, 0], 1)]);
+        assert_eq!(spawn_position(&bytes[data_base(2)..]), None);
     }
 
     #[test]

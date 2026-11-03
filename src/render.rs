@@ -16,10 +16,10 @@ use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::cli_out::outln;
 use crate::dds::{self, DecodedImage, LoadedTexture};
@@ -653,7 +653,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-pub fn fit_positions(positions: &[[f32; 3]]) -> Result<Vec<[f32; 3]>, String> {
+fn fit_bounds(positions: &[[f32; 3]]) -> Result<([f32; 3], f32), String> {
     if positions.is_empty() {
         return Err("cannot frame an empty mesh (0 vertices)".to_string());
     }
@@ -677,7 +677,11 @@ pub fn fit_positions(positions: &[[f32; 3]]) -> Result<Vec<[f32; 3]>, String> {
         (min[1] + max[1]) / 2.0,
         (min[2] + max[2]) / 2.0,
     ];
-    let scale = 1.0 / extent;
+    Ok((center, 1.0 / extent))
+}
+
+pub fn fit_positions(positions: &[[f32; 3]]) -> Result<Vec<[f32; 3]>, String> {
+    let (center, scale) = fit_bounds(positions)?;
     Ok(positions
         .iter()
         .map(|p| {
@@ -688,6 +692,16 @@ pub fn fit_positions(positions: &[[f32; 3]]) -> Result<Vec<[f32; 3]>, String> {
             ]
         })
         .collect())
+}
+
+/// Map a world-space point through the same auto-fit applied to `positions`.
+fn fit_point(positions: &[[f32; 3]], point: [f32; 3]) -> Result<[f32; 3], String> {
+    let (center, scale) = fit_bounds(positions)?;
+    Ok([
+        (point[0] - center[0]) * scale,
+        (point[1] - center[1]) * scale,
+        (point[2] - center[2]) * scale,
+    ])
 }
 
 fn mul4(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
@@ -868,6 +882,83 @@ impl FlyCamera {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CameraMode {
+    #[default]
+    Orbit,
+    Fly,
+}
+
+impl CameraMode {
+    fn toggle(&mut self) -> bool {
+        *self = match *self { Self::Orbit => Self::Fly, Self::Fly => Self::Orbit };
+        *self == Self::Fly
+    }
+}
+
+/// Held movement keys; press/release tracking keeps movement frame-stable.
+#[derive(Default)]
+struct FlyKeys {
+    forward: bool,
+    back: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    fast: bool,
+}
+
+impl FlyKeys {
+    fn update(&mut self, event: &KeyEvent) {
+        let held = event.state == ElementState::Pressed;
+        match &event.logical_key {
+            Key::Character(text) => match text.to_ascii_lowercase().as_str() {
+                "w" => self.forward = held,
+                "s" => self.back = held,
+                "a" => self.left = held,
+                "d" => self.right = held,
+                "e" => self.up = held,
+                "q" => self.down = held,
+                _ => {}
+            },
+            Key::Named(NamedKey::Space) => self.up = held,
+            Key::Named(NamedKey::Shift) => self.fast = held,
+            _ => {}
+        }
+    }
+
+    fn axes(&self) -> (f32, f32, f32) {
+        let axis = |on: bool, off: bool| f32::from(on as u8) - f32::from(off as u8);
+        (axis(self.forward, self.back), axis(self.right, self.left), axis(self.up, self.down))
+    }
+}
+
+fn next_fly_mvp(
+    fly: &mut FlyCamera,
+    keys: &FlyKeys,
+    last_frame: &mut std::time::Instant,
+    aspect: f32,
+) -> [u8; 64] {
+    let now = std::time::Instant::now();
+    let dt = now.duration_since(*last_frame).as_secs_f32();
+    *last_frame = now;
+    let (forward, strafe, rise) = keys.axes();
+    fly.fly(forward, strafe, rise, dt, keys.fast);
+    mat_bytes(&fly.mvp(aspect))
+}
+
+fn set_fly_cursor(window: &Window, fly: bool) {
+    let grab = if fly {
+        window
+            .set_cursor_grab(CursorGrabMode::Locked)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
+    } else {
+        window.set_cursor_grab(CursorGrabMode::None)
+    };
+    let _ = grab;
+    window.set_cursor_visible(!fly);
+}
+
 fn next_mvp(camera: &mut OrbitCamera, last_frame: &mut std::time::Instant, aspect: f32) -> [u8; 64] {
     let now = std::time::Instant::now();
     let dt = now.duration_since(*last_frame).as_secs_f32();
@@ -880,34 +971,50 @@ fn next_mvp(camera: &mut OrbitCamera, last_frame: &mut std::time::Instant, aspec
 struct CameraInput {
     drag: Option<MouseButton>,
     last: Option<PhysicalPosition<f64>>,
+    mode: CameraMode,
 }
 
 impl CameraInput {
-    fn handle(&mut self, camera: &mut OrbitCamera, event: &WindowEvent) -> bool {
+    fn toggle_mode(&mut self) -> bool { self.mode.toggle() }
+
+    fn handle(
+        &mut self,
+        camera: &mut OrbitCamera,
+        fly: Option<&mut FlyCamera>,
+        event: &WindowEvent,
+    ) -> bool {
         match event {
             WindowEvent::MouseInput { state, button, .. } => {
-                if *state == ElementState::Pressed {
-                    self.drag = Some(*button);
-                } else if self.drag == Some(*button) {
-                    self.drag = None;
+                if self.mode == CameraMode::Orbit {
+                    if *state == ElementState::Pressed {
+                        self.drag = Some(*button);
+                    } else if self.drag == Some(*button) {
+                        self.drag = None;
+                    }
                 }
                 true
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if let (Some(button), Some(prev)) = (self.drag, self.last) {
+                if let Some(prev) = self.last {
                     let (dx, dy) = ((position.x - prev.x) as f32, (position.y - prev.y) as f32);
-                    if button == MouseButton::Left { camera.apply_orbit(dx, dy); }
-                    else { camera.apply_pan(dx, dy); }
+                    if let Some(fly) = fly.filter(|_| self.mode == CameraMode::Fly) {
+                        fly.look(dx, dy);
+                    } else if let (Some(button), CameraMode::Orbit) = (self.drag, self.mode) {
+                        if button == MouseButton::Left { camera.apply_orbit(dx, dy); }
+                        else { camera.apply_pan(dx, dy); }
+                    }
                 }
                 self.last = Some(*position);
                 true
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let notches = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => *y,
-                    MouseScrollDelta::PixelDelta(p) => (p.y / 50.0) as f32,
-                };
-                camera.apply_zoom(notches);
+                if self.mode == CameraMode::Orbit {
+                    let notches = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => *y,
+                        MouseScrollDelta::PixelDelta(p) => (p.y / 50.0) as f32,
+                    };
+                    camera.apply_zoom(notches);
+                }
                 true
             }
             _ => false,
@@ -939,6 +1046,10 @@ struct MeshState<'window> {
     uniform_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
     camera: OrbitCamera,
+    fly: FlyCamera,
+    start: [f32; 3],
+    input: CameraInput,
+    keys: FlyKeys,
     last_frame: std::time::Instant,
 }
 
@@ -961,6 +1072,7 @@ impl<'window> MeshState<'window> {
         window: Arc<Window>,
         vertices: &[[f32; 3]],
         indices: &[u16],
+        start: [f32; 3],
     ) -> Result<Self, String> {
         let mut vbytes = Vec::with_capacity(vertices.len() * 12);
         for v in vertices {
@@ -1082,6 +1194,10 @@ impl<'window> MeshState<'window> {
             uniform_bind_group,
             depth_view,
             camera: OrbitCamera::new(),
+            fly: FlyCamera::new(start),
+            start,
+            input: CameraInput::default(),
+            keys: FlyKeys::default(),
             last_frame: std::time::Instant::now(),
         })
     }
@@ -1095,9 +1211,21 @@ impl<'window> MeshState<'window> {
         }
     }
 
+    fn reset_camera(&mut self) {
+        self.camera.reset();
+        self.fly = FlyCamera::new(self.start);
+        self.input.mode = CameraMode::Orbit;
+        self.keys = FlyKeys::default();
+    }
+
     fn render(&mut self) {
         let aspect = self.config.width.max(1) as f32 / self.config.height.max(1) as f32;
-        let mvp = next_mvp(&mut self.camera, &mut self.last_frame, aspect);
+        let mvp = match self.input.mode {
+            CameraMode::Orbit => next_mvp(&mut self.camera, &mut self.last_frame, aspect),
+            CameraMode::Fly => {
+                next_fly_mvp(&mut self.fly, &self.keys, &mut self.last_frame, aspect)
+            }
+        };
         self.queue.write_buffer(&self.uniform_buffer, 0, &mvp);
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -1153,9 +1281,9 @@ struct MeshApp {
     title: String,
     vertices: Vec<[f32; 3]>,
     indices: Vec<u16>,
+    start: [f32; 3],
     state: Option<MeshState<'static>>,
     init_error: Option<String>,
-    input: CameraInput,
 }
 
 impl ApplicationHandler for MeshApp {
@@ -1175,7 +1303,7 @@ impl ApplicationHandler for MeshApp {
         };
         let vertices = std::mem::take(&mut self.vertices);
         let indices = std::mem::take(&mut self.indices);
-        match pollster::block_on(MeshState::new(window, &vertices, &indices)) {
+        match pollster::block_on(MeshState::new(window, &vertices, &indices, self.start)) {
             Ok(state) => {
                 self.state = Some(state);
                 self.vertices = vertices;
@@ -1202,7 +1330,7 @@ impl ApplicationHandler for MeshApp {
         if window_id != state.window.id() {
             return;
         }
-        if self.input.handle(&mut state.camera, &event) {
+        if state.input.handle(&mut state.camera, Some(&mut state.fly), &event) {
             return;
         }
         match event {
@@ -1212,13 +1340,22 @@ impl ApplicationHandler for MeshApp {
                 state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => state.render(),
+            WindowEvent::Focused(false) => state.keys = FlyKeys::default(),
             WindowEvent::KeyboardInput { event, .. } => {
+                state.keys.update(&event);
                 if event.state != ElementState::Pressed || event.repeat {
                     return;
                 }
                 match &event.logical_key {
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
-                    Key::Character(text) if text.eq_ignore_ascii_case("r") => state.camera.reset(),
+                    Key::Character(text) if text.eq_ignore_ascii_case("f") => {
+                        let flying = state.input.toggle_mode();
+                        set_fly_cursor(&state.window, flying);
+                    }
+                    Key::Character(text) if text.eq_ignore_ascii_case("r") => {
+                        state.reset_camera();
+                        set_fly_cursor(&state.window, false);
+                    }
                     _ => {}
                 }
             }
@@ -1233,8 +1370,17 @@ impl ApplicationHandler for MeshApp {
     }
 }
 
-pub fn show_mesh(positions: &[[f32; 3]], indices: &[u16], title: &str) -> Result<(), String> {
+pub fn show_mesh(
+    positions: &[[f32; 3]],
+    indices: &[u16],
+    title: &str,
+    spawn: Option<[f32; 3]>,
+) -> Result<(), String> {
     let fitted = fit_positions(positions)?;
+    let start = match spawn {
+        Some(point) => fit_point(positions, point)?,
+        None => [0.0; 3],
+    };
     if indices.is_empty() {
         return Err("cannot show a mesh with 0 indices".to_string());
     }
@@ -1250,9 +1396,9 @@ pub fn show_mesh(positions: &[[f32; 3]], indices: &[u16], title: &str) -> Result
         title: title.to_string(),
         vertices: fitted,
         indices: indices.to_vec(),
+        start,
         state: None,
         init_error: None,
-        input: CameraInput::default(),
     };
     event_loop
         .run_app(&mut app)
@@ -1815,7 +1961,7 @@ impl ApplicationHandler for TexturedMeshApp {
     ) {
         let Some(state) = &mut self.state else { return };
         if window_id != state.window.id() { return; }
-        if self.input.handle(&mut state.camera, &event) { return; }
+        if self.input.handle(&mut state.camera, None, &event) { return; }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -1961,7 +2107,7 @@ impl<'a> ApplicationHandler for MeshGalleryApp<'a> {
     ) {
         let Some(state) = &mut self.state else { return };
         if window_id != state.window.id() { return; }
-        if self.input.handle(&mut state.camera, &event) { return; }
+        if self.input.handle(&mut state.camera, None, &event) { return; }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -2055,7 +2201,7 @@ pub fn show_mesh_gallery(entries: &[PathBuf], tex_dir: &Path) -> Result<(), Stri
 #[cfg(test)]
 mod mesh_tests {
     use super::{
-        fit_positions, validate_entry_shape, FlyCamera, OrbitCamera, FIT_DISTANCE,
+        fit_point, fit_positions, validate_entry_shape, FlyCamera, OrbitCamera, FIT_DISTANCE,
         FLY_FAST_MULTIPLIER, FLY_MAX_STEP, FLY_SPEED, MAX_DISTANCE, MIN_DISTANCE, PITCH_LIMIT,
     };
 
@@ -2169,6 +2315,13 @@ mod mesh_tests {
         fly.fly(1.0, 0.0, 0.0, 0.1, false);
         assert!((fly.position[0] - FLY_SPEED * 0.1).abs() < 1e-3, "a quarter turn faces +X");
         assert!(fly.position[2].abs() < 1e-3);
+    }
+
+    #[test]
+    fn fit_point_maps_a_world_position_into_the_fitted_scene() {
+        let mesh = [[0.0, 0.0, 0.0], [4.0, 2.0, 0.0]];
+        assert_eq!(fit_point(&mesh, [2.0, 1.0, 0.0]).unwrap(), [0.0, 0.0, 0.0]);
+        assert_eq!(fit_point(&mesh, [4.0, 2.0, 0.0]).unwrap(), [0.5, 0.25, 0.0]);
     }
 
     #[test]
