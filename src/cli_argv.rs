@@ -3,9 +3,6 @@
 
 use crate::cli_catalog::{self, Capability};
 
-/// Flags accepted as `--flag <value>`; every other placeholder is positional.
-const OPTION_FLAGS: [&str; 4] = ["--map", "--pose", "--tex-dir", "--out"];
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
     Help(Option<String>),
@@ -75,7 +72,7 @@ fn parse_operands<'a>(
     let mut i = 0;
     while i < rest.len() {
         let token = rest[i].as_str();
-        if OPTION_FLAGS.contains(&token) {
+        if cap.takes_value(token) {
             let Some(value) = rest.get(i + 1) else {
                 return Err(format!("error: option '{token}' needs a value\n{}", usage(cap)));
             };
@@ -121,7 +118,7 @@ fn build(
                 argv.push(group[0].to_string());
                 argv.push(value.to_string());
             }
-        } else if OPTION_FLAGS.contains(&token) {
+        } else if cap.takes_value(token) {
             let Some(value) = option(options, token) else {
                 return Err(format!("error: missing required option '{token}'\n{}", usage(cap)));
             };
@@ -238,6 +235,22 @@ mod tests {
             (
                 &["level", "render", "LAIR1.PCM"],
                 &["--level-render", "LAIR1.PCM"],
+            ),
+            (
+                &[
+                    "level", "geometry-entry", "--bigfile", "BIGFILE.DAT", "--entry", "115",
+                ],
+                &[
+                    "--level-geometry", "--bigfile", "BIGFILE.DAT", "--entry", "115",
+                ],
+            ),
+            (
+                &[
+                    "level", "render-entry", "--entry", "115", "--bigfile", "BIGFILE.DAT",
+                ],
+                &[
+                    "--level-render", "--bigfile", "BIGFILE.DAT", "--entry", "115",
+                ],
             ),
         ];
         for (input, expected) in cases {

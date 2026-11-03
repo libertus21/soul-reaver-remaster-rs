@@ -16,11 +16,21 @@ pub struct Capability {
     pub window: bool,
 }
 
+impl Capability {
+    /// Whether this capability emits `token` as a named option with a value
+    /// instead of a literal token followed by its operand placeholder.
+    pub fn takes_value(&self, token: &str) -> bool {
+        matches!(token, "--map" | "--pose" | "--tex-dir" | "--out")
+            || (self.name.ends_with("-entry")
+                && matches!(token, "--bigfile" | "--entry"))
+    }
+}
+
 /// Display order for the grouped help.
 pub const GROUPS: [&str; 5] = ["texture", "archive", "mesh", "audio", "level"];
 
 /// Every existing mode, exactly once. This is the single source for help.
-pub const CAPABILITIES: [Capability; 17] = [
+pub const CAPABILITIES: [Capability; 19] = [
     Capability { group: "texture", name: "list", legacy: "--textures <BIG> --tlist [--map <MAP>]", summary: "List the remaster .BIG header and slot classes.", window: false },
     Capability { group: "texture", name: "show", legacy: "--textures <BIG> --tshow <SEL> [--map <MAP>]", summary: "Show one slot as its raw 256x256 image.", window: true },
     Capability { group: "texture", name: "file", legacy: "<FILE.DDS>", summary: "Show one .DDS texture file.", window: true },
@@ -38,6 +48,8 @@ pub const CAPABILITIES: [Capability; 17] = [
     Capability { group: "level", name: "links", legacy: "--level-links <PATH>", summary: "Print the decoded link table.", window: false },
     Capability { group: "level", name: "geometry", legacy: "--level-geometry <PATH>", summary: "Print room vertex and face counts with a box.", window: false },
     Capability { group: "level", name: "render", legacy: "--level-render <PATH>", summary: "Show one unit's room geometry as a flat-shaded solid.", window: true },
+    Capability { group: "level", name: "geometry-entry", legacy: "--level-geometry --bigfile <DAT> --entry <INDEX>", summary: "Print one archive entry's room vertex and face counts.", window: false },
+    Capability { group: "level", name: "render-entry", legacy: "--level-render --bigfile <DAT> --entry <INDEX>", summary: "Show one archive entry's room geometry.", window: true },
 ];
 
 /// The capability table.
@@ -85,7 +97,7 @@ pub fn render_help(group: Option<&str>) -> String {
 mod tests {
     use super::{catalog, is_known_group, render_help, GROUPS};
 
-    const EXPECTED: [(&str, &str); 17] = [
+    const EXPECTED: [(&str, &str); 19] = [
         ("texture", "list"),
         ("texture", "show"),
         ("texture", "file"),
@@ -103,6 +115,8 @@ mod tests {
         ("level", "links"),
         ("level", "geometry"),
         ("level", "render"),
+        ("level", "geometry-entry"),
+        ("level", "render-entry"),
     ];
 
     #[test]
