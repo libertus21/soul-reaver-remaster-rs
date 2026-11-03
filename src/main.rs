@@ -729,7 +729,9 @@ fn prepare_pose(
 /// pose failure is a loud stderr error + exit 1 with no window; Esc/window
 /// close exits 0.
 fn run_mesh(args: &[String]) -> ExitCode {
-    run_mesh_with(args, render::show_mesh)
+    run_mesh_with(args, |positions, indices, title| {
+        render::show_mesh(positions, indices, title, None)
+    })
 }
 
 fn run_mesh_with(
@@ -1283,7 +1285,7 @@ fn run_level_render(args: &[String]) -> ExitCode {
         mesh.vertices.len(), mesh.indices.len() / 3
     );
     let title = format!("level {name}");
-    if let Err(error) = render::show_mesh(&mesh.vertices, &mesh.indices, &title) {
+    if let Err(error) = render::show_mesh(&mesh.vertices, &mesh.indices, &title, mesh.spawn) {
         eprintln!("error: {error}");
         return ExitCode::from(1);
     }
