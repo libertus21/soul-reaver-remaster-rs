@@ -5,6 +5,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::bigfile;
+
 pub const MAX_RECORDS: u32 = 1 << 20;
 pub const MAX_SEGMENTS: u16 = 1 << 10;
 pub const MAX_NAME_LEN: usize = 20;
@@ -172,6 +174,12 @@ pub enum LevelError {
     SidecarIncomplete,
     BadSidecarMagic,
     SidecarMismatch,
+    ArchiveUnreadable { detail: String },
+    EntryIndexOutOfRange { index: usize, entries: usize },
+    EntryOutsideFile { detail: String },
+    EntryNotPcm { detail: String },
+    ArchiveWithoutEntry,
+    EntryWithoutArchive,
 }
 
 impl LevelError {
@@ -181,6 +189,12 @@ impl LevelError {
             LevelError::RefusedPath => 3,
             LevelError::RenderDirectory | LevelError::RenderEmpty
             | LevelError::RenderArrayOutOfRange => 1,
+            LevelError::ArchiveUnreadable { .. }
+            | LevelError::EntryIndexOutOfRange { .. }
+            | LevelError::EntryOutsideFile { .. }
+            | LevelError::EntryNotPcm { .. }
+            | LevelError::ArchiveWithoutEntry
+            | LevelError::EntryWithoutArchive => 1,
             _ => 2,
         }
     }
@@ -217,6 +231,23 @@ impl fmt::Display for LevelError {
             LevelError::SidecarIncomplete => "PMF and PNF must be present together",
             LevelError::BadSidecarMagic => "sidecar magic or header length is invalid",
             LevelError::SidecarMismatch => "PMF/PNF id, count, or length disagreement",
+            LevelError::ArchiveUnreadable { detail } => {
+                return write!(f, "cannot read the archive: {detail}");
+            }
+            LevelError::EntryIndexOutOfRange { index, entries } => {
+                return write!(
+                    f,
+                    "entry index {index} is out of range (archive has {entries} entries)"
+                );
+            }
+            LevelError::EntryOutsideFile { detail } => {
+                return write!(f, "entry slice lies outside the archive file: {detail}");
+            }
+            LevelError::EntryNotPcm { detail } => {
+                return write!(f, "entry does not parse as a .PCM: {detail}");
+            }
+            LevelError::ArchiveWithoutEntry => "--bigfile requires --entry <index>",
+            LevelError::EntryWithoutArchive => "--entry requires --bigfile <DAT>",
         };
         f.write_str(message)
     }
@@ -236,6 +267,8 @@ fn read_i16(bytes: &[u8], at: usize) -> Option<i16> {
 /// 12-byte vertex array, `+0x14`/`+0x20` a 12-byte face array whose first
 /// three `u16` are vertex indices.
 const SLOT_ROOM_RECORD: usize = 0x00;
+/// Header word pointing at the unit's own NUL-terminated name.
+const SLOT_UNIT_NAME: usize = 0x26;
 const ROOM_VERTEX_COUNT: usize = 0x10;
 const ROOM_FACE_COUNT: usize = 0x14;
 const ROOM_VERTEX_OFFSET: usize = 0x1C;
@@ -369,6 +402,13 @@ pub fn read_room_mesh(path: &Path) -> Result<(String, RoomMesh), LevelError> {
     let stem = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).ok_or(LevelError::Io)?;
     let bytes = std::fs::read(path).map_err(|_| LevelError::Io)?;
     let unit = parse_pcm(&bytes, &stem)?;
+    room_mesh_of(unit, &bytes)
+}
+
+/// Shared mesh step for a parsed unit: the same bounds rule as
+/// [`read_room_mesh`], with an empty mesh refused so a window never opens on
+/// nothing.
+fn room_mesh_of(unit: LevelUnit, bytes: &[u8]) -> Result<(String, RoomMesh), LevelError> {
     let mesh = room_mesh(&bytes[unit.structure.data_base..]).map_err(|error| match error {
         LevelError::GeometryRecordOutOfRange | LevelError::GeometryArrayOutOfRange => {
             LevelError::RenderArrayOutOfRange
@@ -379,6 +419,47 @@ pub fn read_room_mesh(path: &Path) -> Result<(String, RoomMesh), LevelError> {
         return Err(LevelError::RenderEmpty);
     }
     Ok((unit.name, mesh))
+}
+
+/// Read one archive entry into memory and feed it to the same `.PCM` parser
+/// as a loose file. No extraction, no temporary file.
+fn entry_bytes(path: &Path, index: usize) -> Result<Vec<u8>, LevelError> {
+    let entries = bigfile::load_index(path)
+        .map_err(|error| LevelError::ArchiveUnreadable { detail: error.to_string() })?;
+    let entry = entries
+        .get(index)
+        .ok_or(LevelError::EntryIndexOutOfRange { index, entries: entries.len() })?;
+    bigfile::read_entry(path, entry).map_err(|error| match error {
+        error @ bigfile::BigfileError::BadEntry(_) => {
+            LevelError::EntryOutsideFile { detail: error.to_string() }
+        }
+        error => LevelError::ArchiveUnreadable { detail: error.to_string() },
+    })
+}
+
+/// `--level-geometry --bigfile ... --entry ...`: one archive entry, in memory.
+pub fn read_entry_geometry(
+    path: &Path,
+    index: usize,
+) -> Result<Vec<(String, GeometryReport)>, LevelError> {
+    let (unit, bytes) = entry_unit(path, index)?;
+    let report = geometry_report(&bytes[unit.structure.data_base..])?;
+    Ok(vec![(unit.name, report)])
+}
+
+/// `--level-render --bigfile ... --entry ...`: the same mesh path as a loose file.
+pub fn read_entry_room_mesh(path: &Path, index: usize) -> Result<(String, RoomMesh), LevelError> {
+    let (unit, bytes) = entry_unit(path, index)?;
+    room_mesh_of(unit, &bytes)
+}
+
+/// Parse one archive entry with the same in-memory reader as a loose `.PCM`.
+fn entry_unit(path: &Path, index: usize) -> Result<(LevelUnit, Vec<u8>), LevelError> {
+    let bytes = entry_bytes(path, index)?;
+    let unit = parse_pcm_bytes(&bytes).map_err(|error| LevelError::EntryNotPcm {
+        detail: error.to_string(),
+    })?;
+    Ok((unit, bytes))
 }
 
 /// Geometry rows for one file or room directory, sorted by unit name. This
@@ -544,6 +625,28 @@ fn decode_link_name(field: &[u8]) -> Option<(String, u32)> {
 /// `4 * roundup512(N)`, which is the level-data base, then the level data and
 /// the name table. Blocks are addressed relative to that padded base.
 pub fn parse_pcm(bytes: &[u8], expected_name: &str) -> Result<LevelUnit, LevelError> {
+    parse_pcm_inner(bytes, Some(expected_name))
+}
+
+/// In-memory `.PCM` reader for bytes with no loose-file name, such as an
+/// archive entry. The unit name comes from header word `0x26`.
+pub fn parse_pcm_bytes(bytes: &[u8]) -> Result<LevelUnit, LevelError> {
+    parse_pcm_inner(bytes, None)
+}
+
+/// The level's own name: header word `0x26` is a data-base-relative offset to
+/// a NUL-terminated lowercase name. Anything else is `None`, never a guess.
+fn header_name(bytes: &[u8], data_base: usize) -> Option<String> {
+    let offset = read_u32(bytes, data_base.checked_add(4 * SLOT_UNIT_NAME)?)? as usize;
+    let tail = bytes.get(data_base.checked_add(offset)?..)?;
+    let end = tail.iter().position(|&byte| byte == 0)?;
+    accepted_name(tail.get(..end)?).map(str::to_string)
+}
+
+fn parse_pcm_inner(
+    bytes: &[u8],
+    expected_name: Option<&str>,
+) -> Result<LevelUnit, LevelError> {
     let records = read_u32(bytes, 0).ok_or(LevelError::TablePastEof)?;
     if !(2..=MAX_RECORDS).contains(&records) {
         return Err(LevelError::CountCeiling);
@@ -594,11 +697,14 @@ pub fn parse_pcm(bytes: &[u8], expected_name: &str) -> Result<LevelUnit, LevelEr
         table36: table36_report(data),
     };
     let names = extract_names(bytes);
-    let name = names
-        .iter()
-        .find(|name| name.eq_ignore_ascii_case(expected_name))
-        .ok_or(LevelError::MissingUnitName)?
-        .clone();
+    let name = match expected_name {
+        Some(expected) => names
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(expected))
+            .ok_or(LevelError::MissingUnitName)?
+            .clone(),
+        None => header_name(bytes, data_base).ok_or(LevelError::MissingUnitName)?,
+    };
     let links = table
         .iter()
         .map(|link| Link { target: link.target.clone(), index: link.index })
@@ -1288,13 +1394,18 @@ mod tests {
     }
 
     /// Room record at 16; its fields and both arrays sit after it, and the
-    /// unit name stays in the last six bytes.
+    /// unit name stays in the last six bytes behind header word `0x26`.
     fn geometry_pcm(vertices: &[[i16; 3]], faces: &[[u16; 3]]) -> Vec<u8> {
         let room = 16usize;
         let face_at = room + 0x24;
         let vertex_at = face_at + faces.len() * FACE_STRIDE;
-        let len = vertex_at + vertices.len() * VERTEX_STRIDE + 6;
-        let mut bytes = structure_pcm(&[0, 4], &[(SLOT_ROOM_RECORD, room as u32)], len);
+        let len = (vertex_at + vertices.len() * VERTEX_STRIDE + 6).max(0xA6);
+        let name_at = len - 6;
+        let mut bytes = structure_pcm(
+            &[0, 4],
+            &[(SLOT_ROOM_RECORD, room as u32), (SLOT_UNIT_NAME, name_at as u32)],
+            len,
+        );
         let base = data_base(2);
         let record = base + room;
         for (field, value) in [
@@ -1320,9 +1431,55 @@ mod tests {
         bytes
     }
 
+    /// Minimal SR1PC archive: count, 16-byte entries, then raw payloads.
+    fn archive(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut dat = (entries.len() as u32).to_le_bytes().to_vec();
+        let mut offset = 4 + 16 * entries.len();
+        for (index, entry) in entries.iter().enumerate() {
+            dat.extend_from_slice(&(index as u32).to_le_bytes());
+            dat.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+            dat.extend_from_slice(&(offset as u32).to_le_bytes());
+            dat.extend_from_slice(&0u32.to_le_bytes());
+            offset += entry.len();
+        }
+        for entry in entries {
+            dat.extend_from_slice(entry);
+        }
+        dat
+    }
+
     fn geometry_of(bytes: &[u8]) -> Result<GeometryReport, LevelError> {
         let unit = parse_pcm(bytes, "lair5")?;
         geometry_report(&bytes[unit.structure.data_base..])
+    }
+
+    #[test]
+    fn archive_entry_feeds_the_same_parser_and_mesh_path() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let pcm = geometry_pcm(&[[0, 0, 0], [4, 0, 0], [0, 4, 0]], &[[0, 1, 2]]);
+        let dat = archive(&[b"not a pcm".to_vec(), pcm]);
+        let path = tmp.path().join("BIGFILE.DAT");
+        std::fs::write(&path, dat).expect("synthetic archive must be writable");
+
+        let rows = read_entry_geometry(&path, 1).expect("entry 1 must read");
+        assert_eq!(rows[0].0, "lair5");
+        assert_eq!((rows[0].1.vertices, rows[0].1.faces), (3, 1));
+        let (name, mesh) = read_entry_room_mesh(&path, 1).expect("entry 1 must mesh");
+        assert_eq!((name.as_str(), mesh.vertices.len(), mesh.indices.len()), ("lair5", 3, 3));
+
+        assert!(matches!(
+            read_entry_geometry(&path, 0),
+            Err(LevelError::EntryNotPcm { .. })
+        ));
+        assert!(matches!(
+            read_entry_geometry(&path, 2),
+            Err(LevelError::EntryIndexOutOfRange { index: 2, entries: 2 })
+        ));
+        assert!(
+            LevelError::EntryOutsideFile { detail: "x".into() }
+                .to_string()
+                .contains("outside the archive")
+        );
     }
 
     #[test]
@@ -1356,7 +1513,7 @@ mod tests {
         assert_eq!(geometry_of(&record).err(), Some(LevelError::GeometryRecordOutOfRange));
         let mut array = geometry_pcm(&[[0, 0, 0]], &[]);
         let count = data_base(2) + 16 + ROOM_VERTEX_COUNT;
-        array[count..count + 4].copy_from_slice(&2u32.to_le_bytes());
+        array[count..count + 4].copy_from_slice(&20u32.to_le_bytes());
         assert_eq!(geometry_of(&array).err(), Some(LevelError::GeometryArrayOutOfRange));
     }
 
