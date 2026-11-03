@@ -78,17 +78,27 @@ fn main() -> ExitCode {
         Some("--help" | "-h" | "help") => Some(args.get(1).map(String::as_str)),
         _ => None,
     } {
-        let text = cli_catalog::render_help(group);
-        if group.is_none_or(cli_catalog::is_known_group) {
-            for line in text.lines() {
-                outln!("{line}");
-            }
-            return ExitCode::SUCCESS;
-        }
-        eprintln!("{text}");
-        return ExitCode::from(1);
+        return run_help(group);
     }
-    if let Some(message) = pose_mode_conflict(&args) {
+    dispatch(&args)
+}
+
+/// `--help|-h|help [group]`: the existing help surface, moved out of `main`.
+fn run_help(group: Option<&str>) -> ExitCode {
+    let text = cli_catalog::render_help(group);
+    if group.is_none_or(cli_catalog::is_known_group) {
+        for line in text.lines() {
+            outln!("{line}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    eprintln!("{text}");
+    ExitCode::from(1)
+}
+
+/// The existing linear dispatch chain, moved here verbatim.
+fn dispatch(args: &[String]) -> ExitCode {
+    if let Some(message) = pose_mode_conflict(args) {
         eprintln!("{message}");
         return ExitCode::from(1);
     }
