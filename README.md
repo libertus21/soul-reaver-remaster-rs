@@ -302,8 +302,20 @@ extracted files, decompiled code, or database files.
   placement, orientation, normals, UVs and rendering stay NOT claimed.
   Synthetic-byte tests only (`docs/notes/level-geometry.md`).
 
+- `level-render` (opens a window): `cargo run -- --level-render <.PCM file>`
+  converts one unit's confirmed room arrays through the existing `show_mesh`
+  path: the 12-byte vertex records become `[f32; 3]` positions (1:1 from the
+  three `i16`) and the face array's first three `u16` pass through unchanged
+  as triangle indices. It prints one line,
+  `level <name> vertices=<V> faces=<F> showing room geometry`, before the
+  window opens; the title is `level <name>`. A directory, a unit with 0
+  vertices or 0 faces, and any record/array/index outside the data region are
+  loud errors (exit 1, no window). Object placement, textures/materials, BSP,
+  culling and extra camera controls are NOT included. Synthetic-byte tests
+  only (`docs/notes/level-geometry.md`).
+
 - `unified-cli` (3-PR chain complete, archived): the grouped entry point is
-  live. `cargo run -- --help` (or `help <group>`) lists the 16 capabilities in
+  live. `cargo run -- --help` (or `help <group>`) lists the 17 capabilities in
   five groups; `cargo run -- <group> <command> ...` rewrites to the exact
   legacy argv (`texture list <BIG>` is byte-identical to
   `--textures <BIG> --tlist`). On a terminal, `cargo run -- menu` (or no
@@ -318,16 +330,17 @@ extracted files, decompiled code, or database files.
 
 ## What's missing
 
-- [ ] Room geometry has a validated summary reader, not a renderer.
-      `--level-geometry` reports counts, offsets, a vertex box and face-index
-      validation. Header
-      slot `0x00` (the room record) exposes a 12-byte vertex array (three `i16`
-      position at `+0/2/4`) and a 12-byte face array whose first three `u16`
-      are vertex indices; the room object array carries a 3 x `i16` world
+- [ ] Room geometry has a validated summary reader (`--level-geometry`) and a
+      single-unit renderer (`--level-render` over the same arrays, through the
+      existing `show_mesh`). Counts, offsets, a vertex box and face-index
+      validation come from header
+      slot `0x00` (the room record), which exposes a 12-byte vertex array (three
+      `i16` position at `+0/2/4`) and a 12-byte face array whose first three
+      `u16` are vertex indices; the room object array carries a 3 x `i16` world
       position at `+0x20` in each `0x4C` source record. Slot `0x03` is NOT
       geometry (it is a small `0x3C`-stride record array). The renderer/spawner,
       the trailing vertex attribute, the 8-byte array C, object orientation and
-      the 143,872-byte dominant block stay UNKNOWN; no render or transform
+      the 143,872-byte dominant block stay UNKNOWN; no placement or transform
       claim. See `docs/notes/level-geometry.md`.
 - [x] `.BIG` fixed-slot layout and slot decoding, slices `big-slots` +
       `big-decompressor` (see `docs/changes/big-slots/design.md` and
