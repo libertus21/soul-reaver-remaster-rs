@@ -139,7 +139,11 @@ extracted files, decompiled code, or database files.
   wheel zooms, right/middle-drag pans, `R` restores the auto-fit, and Esc
   or window close exits 0. Zoom goes inside the mesh: eye distance clamps
   between 0.005 and 20 units (the fit is 2.2) and near/far scale with it,
-  so interior geometry survives instead of clipping away. It
+  so interior geometry survives instead of clipping away. `F` toggles a
+  first-person fly mode: `W`/`A`/`S`/`D` move relative to the view, `Space`/`E`
+  rise, `C`/`Q` sink, `Shift` flies faster, and the mouse looks around with the
+  cursor grabbed (released when toggling back). `R` restores the auto-fit and
+  returns to orbit; Esc or window close still exits 0. It
   prints `N vertices, M triangles` (counts only) to stdout; bad magic,
   truncated headers, insane counts, and short vertex/face data fail
   loud (stderr + exit 1, no window). Mesh bytes stay in process memory
@@ -316,7 +320,10 @@ extracted files, decompiled code, or database files.
   vertices or 0 faces, and any record/array/index outside the data region are
   loud errors (exit 1, no window). Object placement, textures/materials, BSP
   and culling stay out of scope; the interactive camera (orbit, wheel zoom,
-  pan, `R` reset) is shared with the mesh window above. Synthetic-byte tests
+  pan, `R` reset) is shared with the mesh window above, including the `F`
+  first-person fly mode. In fly mode the eye starts at the room's first object
+  named `raziel` (mapped through the same auto-fit) looking along -Z, or at the
+  scene bbox centre when the room places no such object. Synthetic-byte tests
   only (`docs/notes/level-geometry.md`).
 
 - `level-archive` (first-level path): `cargo run -- --level-geometry --bigfile
