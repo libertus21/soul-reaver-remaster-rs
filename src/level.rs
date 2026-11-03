@@ -1,5 +1,6 @@
-//! Untrusted SR1-remaster room containers: the `.PCM` header and name table.
-//! Read-only inventory: no geometry, placement, transform, or audio decode.
+//! Untrusted SR1-remaster room containers: the `.PCM` header, name table, and
+//! the room-geometry summary. Read-only: no placement, transform, or audio
+//! decode.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -87,7 +88,7 @@ pub struct Table36Report {
 }
 
 /// Structural facts about one unit. `slots` holds every non-null enumerated
-/// header offset as `(slot, data_base + value)`. No geometry or type claim.
+/// header offset as `(slot, data_base + value)`. No record type is claimed.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct LevelStructure {
     pub data_base: usize,
@@ -95,6 +96,23 @@ pub struct LevelStructure {
     pub reloc: RelocationReport,
     pub slots: Vec<(usize, usize)>,
     pub table36: Table36Report,
+}
+
+/// Room geometry behind header slot `0x00`: counts, data-base-relative array
+/// offsets, the `i16` position box, and face-index validation. The trailing
+/// vertex triple is not read; no normal or UV is claimed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct GeometryReport {
+    pub vertices: u32,
+    pub faces: u32,
+    pub room_offset: u32,
+    pub vertex_offset: u32,
+    pub face_offset: u32,
+    pub min: [i16; 3],
+    pub max: [i16; 3],
+    /// Face indices that do not address a vertex; zero on every valid unit.
+    pub out_of_range: u32,
+    pub max_index: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +155,8 @@ pub enum LevelError {
     TablePastEof,
     PaddingTruncated,
     RelocationOutOfRange,
+    GeometryRecordOutOfRange,
+    GeometryArrayOutOfRange,
     MissingUnitName,
     SidecarIncomplete,
     BadSidecarMagic,
@@ -169,6 +189,12 @@ impl fmt::Display for LevelError {
             LevelError::RelocationOutOfRange => {
                 "relocation directory entry points outside the level data"
             }
+            LevelError::GeometryRecordOutOfRange => {
+                "room geometry record points outside the level data"
+            }
+            LevelError::GeometryArrayOutOfRange => {
+                "room geometry vertex or face array runs outside the level data"
+            }
             LevelError::MissingUnitName => "name table does not contain the unit's own name",
             LevelError::SidecarIncomplete => "PMF and PNF must be present together",
             LevelError::BadSidecarMagic => "sidecar magic or header length is invalid",
@@ -183,6 +209,118 @@ fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
 }
 fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.get(at..at.checked_add(4)?)?.try_into().ok()?))
+}
+fn read_i16(bytes: &[u8], at: usize) -> Option<i16> {
+    Some(i16::from_le_bytes(bytes.get(at..at.checked_add(2)?)?.try_into().ok()?))
+}
+
+/// Header slot `0x00` points at the room/zone record: `+0x10`/`+0x1C` give a
+/// 12-byte vertex array, `+0x14`/`+0x20` a 12-byte face array whose first
+/// three `u16` are vertex indices.
+const SLOT_ROOM_RECORD: usize = 0x00;
+const ROOM_VERTEX_COUNT: usize = 0x10;
+const ROOM_FACE_COUNT: usize = 0x14;
+const ROOM_VERTEX_OFFSET: usize = 0x1C;
+const ROOM_FACE_OFFSET: usize = 0x20;
+const VERTEX_STRIDE: usize = 12;
+const FACE_STRIDE: usize = 12;
+
+/// Data-region range of `count` records at a data-base-relative `offset`.
+/// A zero count is always valid and reads nothing; a non-zero array that would
+/// leave the region yields `None` so the caller can fail loud, never clamp.
+fn array_range(len: usize, offset: u32, count: u32, stride: usize) -> Option<(usize, usize)> {
+    if count == 0 {
+        return Some((offset as usize, offset as usize));
+    }
+    let start = offset as usize;
+    let end = start.checked_add((count as usize).checked_mul(stride)?)?;
+    (end <= len).then_some((start, end))
+}
+
+/// Read the room record behind header slot `0x00`. A zero slot means no
+/// geometry; a record or non-empty array outside the data region is a distinct
+/// error; face indices are validated but a bad one is reported, not fatal.
+fn geometry_report(data: &[u8]) -> Result<GeometryReport, LevelError> {
+    let room_offset = read_u32(data, 4 * SLOT_ROOM_RECORD)
+        .ok_or(LevelError::GeometryRecordOutOfRange)?;
+    let mut report = GeometryReport { room_offset, ..GeometryReport::default() };
+    if room_offset == 0 {
+        return Ok(report);
+    }
+    let record = room_offset as usize;
+    if record.checked_add(ROOM_FACE_OFFSET + 4).is_none_or(|end| end > data.len()) {
+        return Err(LevelError::GeometryRecordOutOfRange);
+    }
+    let vertices = read_u32(data, record + ROOM_VERTEX_COUNT).unwrap_or(0);
+    let faces = read_u32(data, record + ROOM_FACE_COUNT).unwrap_or(0);
+    let vertex_offset = read_u32(data, record + ROOM_VERTEX_OFFSET).unwrap_or(0);
+    let face_offset = read_u32(data, record + ROOM_FACE_OFFSET).unwrap_or(0);
+    let (vertex_start, vertex_end) = array_range(data.len(), vertex_offset, vertices, VERTEX_STRIDE)
+        .ok_or(LevelError::GeometryArrayOutOfRange)?;
+    let (face_start, face_end) =
+        array_range(data.len(), face_offset, faces, FACE_STRIDE)
+            .ok_or(LevelError::GeometryArrayOutOfRange)?;
+    report.vertices = vertices;
+    report.faces = faces;
+    report.vertex_offset = vertex_offset;
+    report.face_offset = face_offset;
+    if vertices > 0 {
+        let mut minimum = [i16::MAX; 3];
+        let mut maximum = [i16::MIN; 3];
+        for at in (vertex_start..vertex_end).step_by(VERTEX_STRIDE) {
+            for axis in 0..3 {
+                let value =
+                    read_i16(data, at + 2 * axis).ok_or(LevelError::GeometryArrayOutOfRange)?;
+                minimum[axis] = minimum[axis].min(value);
+                maximum[axis] = maximum[axis].max(value);
+            }
+        }
+        report.min = minimum;
+        report.max = maximum;
+    }
+    if faces > 0 {
+        let mut max_index = 0u16;
+        for at in (face_start..face_end).step_by(FACE_STRIDE) {
+            for slot in 0..3 {
+                let index =
+                    read_u16(data, at + 2 * slot).ok_or(LevelError::GeometryArrayOutOfRange)?;
+                max_index = max_index.max(index);
+                if u32::from(index) >= vertices {
+                    report.out_of_range += 1;
+                }
+            }
+        }
+        report.max_index = Some(max_index);
+    }
+    Ok(report)
+}
+
+/// Geometry rows for one file or room directory, sorted by unit name. This
+/// keeps its own read pass so a malformed room record cannot break the other
+/// level arms.
+pub fn read_geometry_path(path: &Path) -> Result<Vec<(String, GeometryReport)>, LevelError> {
+    let paths = if path.is_dir() {
+        let bin = path.join("BIN");
+        let directory = if bin.is_dir() { bin } else { path.to_path_buf() };
+        let index = SidecarIndex::read(&directory)?;
+        if index.pcm_paths.is_empty() {
+            return Err(LevelError::NoUnits);
+        }
+        index.pcm_paths
+    } else if is_pcm(path) {
+        vec![path.to_path_buf()]
+    } else {
+        return Err(LevelError::RefusedPath);
+    };
+    let mut rows = Vec::with_capacity(paths.len());
+    for pcm_path in paths {
+        let stem = pcm_path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).ok_or(LevelError::Io)?;
+        let bytes = std::fs::read(&pcm_path).map_err(|_| LevelError::Io)?;
+        let unit = parse_pcm(&bytes, &stem)?;
+        rows.push((unit.name, geometry_report(&bytes[unit.structure.data_base..])?));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(rows)
 }
 
 /// Word count the offset table is padded to: 512 words, i.e. a 2048-byte
@@ -505,6 +643,35 @@ pub fn structure_lines(unit: &LevelUnit) -> Result<Vec<String>, LevelError> {
             structure.table36.count, structure.table36.stride
         ),
     ])
+}
+
+/// Per-unit geometry summary: counts, offsets, the `i16` position box and its
+/// centre, and face-index validation. No trailing vertex triple or face
+/// attribute word is read.
+pub fn geometry_lines(name: &str, g: &GeometryReport) -> Vec<String> {
+    let box_line = if g.vertices > 0 {
+        let [nx, ny, nz] = g.min;
+        let [xx, xy, xz] = g.max;
+        let center = format!(
+            "{:.1},{:.1},{:.1}",
+            (f64::from(nx) + f64::from(xx)) / 2.0,
+            (f64::from(ny) + f64::from(xy)) / 2.0,
+            (f64::from(nz) + f64::from(xz)) / 2.0
+        );
+        format!("  bbox min={nx},{ny},{nz} max={xx},{xy},{xz} center={center}")
+    } else {
+        "  bbox none".to_string()
+    };
+    let max_index =
+        g.max_index.map_or_else(|| "none".to_string(), |index| index.to_string());
+    vec![
+        format!(
+            "geometry {} vertices={} faces={} room={} vertex_at={} face_at={}",
+            name, g.vertices, g.faces, g.room_offset, g.vertex_offset, g.face_offset
+        ),
+        box_line,
+        format!("  indices out_of_range={} max_index={max_index}", g.out_of_range),
+    ]
 }
 
 /// `FMPa` magic, 16-bit id, segment count, and the rate field at `0x28`.
@@ -1034,6 +1201,79 @@ mod tests {
         );
     }
 
+    /// Room record at 16; its fields and both arrays sit after it, and the
+    /// unit name stays in the last six bytes.
+    fn geometry_pcm(vertices: &[[i16; 3]], faces: &[[u16; 3]]) -> Vec<u8> {
+        let room = 16usize;
+        let face_at = room + 0x24;
+        let vertex_at = face_at + faces.len() * FACE_STRIDE;
+        let len = vertex_at + vertices.len() * VERTEX_STRIDE + 6;
+        let mut bytes = structure_pcm(&[0, 4], &[(SLOT_ROOM_RECORD, room as u32)], len);
+        let base = data_base(2);
+        let record = base + room;
+        for (field, value) in [
+            (ROOM_VERTEX_COUNT, vertices.len() as u32),
+            (ROOM_FACE_COUNT, faces.len() as u32),
+            (ROOM_VERTEX_OFFSET, vertex_at as u32),
+            (ROOM_FACE_OFFSET, face_at as u32),
+        ] {
+            bytes[record + field..record + field + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        for (index, vertex) in vertices.iter().enumerate() {
+            let at = base + vertex_at + index * VERTEX_STRIDE;
+            for (axis, value) in vertex.iter().enumerate() {
+                bytes[at + 2 * axis..at + 2 * axis + 2].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        for (index, face) in faces.iter().enumerate() {
+            let at = base + face_at + index * FACE_STRIDE;
+            for (slot, value) in face.iter().enumerate() {
+                bytes[at + 2 * slot..at + 2 * slot + 2].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    fn geometry_of(bytes: &[u8]) -> Result<GeometryReport, LevelError> {
+        let unit = parse_pcm(bytes, "lair5")?;
+        geometry_report(&bytes[unit.structure.data_base..])
+    }
+
+    #[test]
+    fn geometry_reports_counts_offsets_box_and_index_validation() {
+        let vertices = [[-10, 4, 0], [30, -6, 12], [2, 8, -20]];
+        let faces = [[0u16, 1, 2], [2, 2, 1]];
+        let g = geometry_of(&geometry_pcm(&vertices, &faces)).expect("must read");
+        assert_eq!((g.vertices, g.faces, g.room_offset), (3, 2, 16));
+        assert_eq!((g.min, g.max), ([-10, -6, -20], [30, 8, 12]));
+        assert_eq!((g.out_of_range, g.max_index), (0, Some(2)));
+        assert!(geometry_lines("lair5", &g)[1].ends_with("center=10.0,1.0,-4.0"));
+    }
+
+    #[test]
+    fn geometry_counts_out_of_range_indices_without_failing() {
+        let g = geometry_of(&geometry_pcm(&[[0, 0, 0]], &[[0, 1, 9]])).expect("must read");
+        assert_eq!((g.out_of_range, g.max_index), (2, Some(9)));
+    }
+
+    #[test]
+    fn geometry_zero_counts_report_zero_and_no_box() {
+        let g = geometry_of(&geometry_pcm(&[], &[])).expect("must read");
+        assert_eq!((g.vertices, g.faces, g.max_index), (0, 0, None));
+        assert_eq!(geometry_lines("lair5", &g)[1], "  bbox none");
+    }
+
+    #[test]
+    fn geometry_record_or_array_out_of_range_fails_loud() {
+        let mut record = geometry_pcm(&[], &[]);
+        record[data_base(2)..data_base(2) + 4].copy_from_slice(&2000u32.to_le_bytes());
+        assert_eq!(geometry_of(&record).err(), Some(LevelError::GeometryRecordOutOfRange));
+        let mut array = geometry_pcm(&[[0, 0, 0]], &[]);
+        let count = data_base(2) + 16 + ROOM_VERTEX_COUNT;
+        array[count..count + 4].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(geometry_of(&array).err(), Some(LevelError::GeometryArrayOutOfRange));
+    }
+
     fn block_of(size: usize, byte: u8) -> Vec<u8> {
         vec![byte; size]
     }
@@ -1309,6 +1549,8 @@ mod tests {
             LevelError::TablePastEof,
             LevelError::PaddingTruncated,
             LevelError::RelocationOutOfRange,
+            LevelError::GeometryRecordOutOfRange,
+            LevelError::GeometryArrayOutOfRange,
             LevelError::MissingUnitName,
             LevelError::SidecarIncomplete,
             LevelError::BadSidecarMagic,
