@@ -182,6 +182,8 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file>");
         eprintln!("   or: soul-reaver-remaster-rs --level-geometry --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --level-render --bigfile <BIGFILE.DAT> --entry <INDEX>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-geometry --bigfile <BIGFILE.DAT> --group <PREFIX>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-render --bigfile <BIGFILE.DAT> --group <PREFIX>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
@@ -1129,6 +1131,7 @@ fn run_level_links(args: &[String]) -> ExitCode {
 enum LevelInput<'a> {
     Path(&'a str),
     Entry { dat: &'a str, index: usize },
+    Group { dat: &'a str, prefix: &'a str },
 }
 
 /// Parse a loose `<path>` or the `--bigfile <DAT> --entry <INDEX>` pair.
@@ -1138,40 +1141,53 @@ fn level_input<'a>(
     args: &'a [String],
     usage: &'static str,
 ) -> Result<LevelInput<'a>, level::LevelError> {
-    if !args.iter().any(|arg| arg == "--bigfile" || arg == "--entry") {
+    if !args.iter().any(|arg| arg == "--bigfile" || arg == "--entry" || arg == "--group") {
         return match args {
             [path] if !path.starts_with('-') => Ok(LevelInput::Path(path)),
             _ => Err(level::LevelError::Usage(usage)),
         };
     }
-    let (mut dat, mut entry, mut index) = (None, None, 0);
+    let (mut dat, mut entry, mut group, mut index) = (None, None, None, 0);
     while index < args.len() {
         let value = args.get(index + 1).map(String::as_str);
         match (args[index].as_str(), value) {
             ("--bigfile", Some(value)) => dat = Some(value),
             ("--entry", Some(value)) => entry = Some(value),
+            ("--group", Some(value)) => group = Some(value),
             _ => return Err(level::LevelError::Usage(usage)),
         }
         index += 2;
     }
-    let (dat, raw) = match (dat, entry) {
-        (Some(dat), Some(raw)) => (dat, raw),
-        (Some(_), None) => return Err(level::LevelError::ArchiveWithoutEntry),
-        (None, _) => return Err(level::LevelError::EntryWithoutArchive),
-    };
-    let index = raw
-        .parse::<usize>()
-        .map_err(|_| level::LevelError::Usage("expected --entry <index>"))?;
-    Ok(LevelInput::Entry { dat, index })
+    if entry.is_some() && group.is_some() {
+        return Err(level::LevelError::GroupWithEntry);
+    }
+    match (dat, entry, group) {
+        (Some(dat), Some(raw), None) => {
+            let index = raw
+                .parse::<usize>()
+                .map_err(|_| level::LevelError::Usage("expected --entry <index>"))?;
+            Ok(LevelInput::Entry { dat, index })
+        }
+        (Some(dat), None, Some(prefix)) => Ok(LevelInput::Group { dat, prefix }),
+        (Some(_), None, None) => Err(level::LevelError::ArchiveWithoutEntry),
+        (None, _, Some(_)) => Err(level::LevelError::GroupWithoutArchive),
+        _ => Err(level::LevelError::EntryWithoutArchive),
+    }
 }
 
 /// Read-only `--level-geometry` arm: counts, offsets, vertex box and
 /// face-index validation. A record or array outside the data region fails.
 fn run_level_geometry(args: &[String]) -> ExitCode {
-    let usage = "expected --level-geometry <path> or --level-geometry --bigfile <DAT> --entry <INDEX>";
-    let result = level_input(args, usage).and_then(|input| match input {
+    let usage = "expected --level-geometry <path> or --level-geometry --bigfile <DAT> --entry <INDEX> or --level-geometry --bigfile <DAT> --group <PREFIX>";
+    let input = level_input(args, usage);
+    let prefix = match &input {
+        Ok(LevelInput::Group { prefix, .. }) => Some((*prefix).to_string()),
+        _ => None,
+    };
+    let result = input.and_then(|input| match input {
         LevelInput::Path(path) => level::read_geometry_path(Path::new(path)),
         LevelInput::Entry { dat, index } => level::read_entry_geometry(Path::new(dat), index),
+        LevelInput::Group { dat, prefix } => level::read_group_geometry(Path::new(dat), prefix),
     });
     let rows = match result {
         Ok(rows) => rows,
@@ -1185,16 +1201,22 @@ fn run_level_geometry(args: &[String]) -> ExitCode {
             outln!("{line}");
         }
     }
+    if let Some(prefix) = prefix {
+        let vertices: u32 = rows.iter().map(|(_, geometry)| geometry.vertices).sum();
+        let faces: u32 = rows.iter().map(|(_, geometry)| geometry.faces).sum();
+        outln!("group {prefix} rooms={} vertices={vertices} faces={faces}", rows.len());
+    }
     ExitCode::SUCCESS
 }
 
 /// `--level-render` arm: one `.PCM` unit through the existing mesh viewer.
 /// The geometry line prints before the window opens.
 fn run_level_render(args: &[String]) -> ExitCode {
-    let usage = "expected --level-render <path> or --level-render --bigfile <DAT> --entry <INDEX>";
+    let usage = "expected --level-render <path> or --level-render --bigfile <DAT> --entry <INDEX> or --level-render --bigfile <DAT> --group <PREFIX>";
     let result = level_input(args, usage).and_then(|input| match input {
         LevelInput::Path(path) => level::read_room_mesh(Path::new(path)),
         LevelInput::Entry { dat, index } => level::read_entry_room_mesh(Path::new(dat), index),
+        LevelInput::Group { dat, prefix } => level::read_group_room_mesh(Path::new(dat), prefix),
     });
     let (name, mesh) = match result {
         Ok(unit) => unit,
@@ -1889,14 +1911,20 @@ mod cli_tests {
         );
     }
 
-    /// One-entry archive; the entry starts right after the 20-byte header.
-    fn synthetic_archive(entry: &[u8]) -> Vec<u8> {
-        let mut dat = 1u32.to_le_bytes().to_vec();
-        dat.extend_from_slice(&[0u8; 4]);
-        dat.extend_from_slice(&(entry.len() as u32).to_le_bytes());
-        dat.extend_from_slice(&20u32.to_le_bytes());
-        dat.extend_from_slice(&[0u8; 4]);
-        dat.extend_from_slice(entry);
+    /// Archive whose entries start right after the `4 + 16N` header.
+    fn synthetic_archive(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut dat = (entries.len() as u32).to_le_bytes().to_vec();
+        let mut offset = 4 + 16 * entries.len();
+        for (index, entry) in entries.iter().enumerate() {
+            dat.extend_from_slice(&(index as u32).to_le_bytes());
+            dat.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+            dat.extend_from_slice(&(offset as u32).to_le_bytes());
+            dat.extend_from_slice(&[0u8; 4]);
+            offset += entry.len();
+        }
+        for entry in entries {
+            dat.extend_from_slice(entry);
+        }
         dat
     }
 
@@ -1917,7 +1945,11 @@ mod cli_tests {
     #[test]
     fn level_archive_entry_reads_the_entry_bytes() {
         let tmp = tempfile::tempdir().expect("tempdir must succeed");
-        let dat = write_tmp(&tmp, "BIGFILE.DAT", &synthetic_archive(&synthetic_entry_pcm("under1")));
+        let dat = write_tmp(
+            &tmp,
+            "BIGFILE.DAT",
+            &synthetic_archive(&[synthetic_entry_pcm("under1")]),
+        );
         let args = ["--bigfile".to_string(), dat, "--entry".to_string(), "0".to_string()];
         assert_eq!(run_level_geometry(&args), ExitCode::SUCCESS);
     }
@@ -1925,7 +1957,11 @@ mod cli_tests {
     #[test]
     fn level_archive_entry_errors_are_loud_and_distinct() {
         let tmp = tempfile::tempdir().expect("tempdir must succeed");
-        let dat = write_tmp(&tmp, "BIGFILE.DAT", &synthetic_archive(b"not a pcm entry"));
+        let dat = write_tmp(
+            &tmp,
+            "BIGFILE.DAT",
+            &synthetic_archive(&[b"not a pcm entry".to_vec()]),
+        );
         let entry = |index: &str| {
             vec!["--bigfile".to_string(), dat.clone(), "--entry".to_string(), index.to_string()]
         };
@@ -1936,6 +1972,42 @@ mod cli_tests {
         assert_eq!(run_level_render(&["--entry".to_string(), "0".to_string()]), ExitCode::from(1));
         assert_eq!(
             run_level_geometry(&["--bigfile".to_string(), dat, "--entry".to_string(), "x".to_string()]),
+            ExitCode::from(1)
+        );
+    }
+
+    #[test]
+    fn level_group_discovers_a_family_and_refuses_bad_shapes() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let dat = write_tmp(
+            &tmp,
+            "BIGFILE.DAT",
+            &synthetic_archive(&[
+                synthetic_entry_pcm("under1"),
+                synthetic_entry_pcm("under2"),
+                synthetic_entry_pcm("underx"),
+            ]),
+        );
+        let group = |prefix: &str| {
+            vec!["--bigfile".to_string(), dat.clone(), "--group".to_string(), prefix.to_string()]
+        };
+        assert_eq!(run_level_geometry(&group("under")), ExitCode::SUCCESS);
+        assert_eq!(run_level_geometry(&group("nosuch")), ExitCode::from(1));
+        assert_eq!(run_level_geometry(&group("")), ExitCode::from(1));
+        assert_eq!(run_level_render(&group("under")), ExitCode::from(1));
+        assert_eq!(
+            run_level_geometry(&[
+                "--bigfile".to_string(),
+                dat.clone(),
+                "--entry".to_string(),
+                "0".to_string(),
+                "--group".to_string(),
+                "under".to_string(),
+            ]),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            run_level_geometry(&["--group".to_string(), "under".to_string()]),
             ExitCode::from(1)
         );
     }
