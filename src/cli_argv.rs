@@ -237,6 +237,22 @@ mod tests {
                 &["--level-render", "LAIR1.PCM"],
             ),
             (
+                &["level", "objects", "LAIR1.PCM"],
+                &["--level-objects", "LAIR1.PCM"],
+            ),
+            (
+                &["level", "render-objects", "LAIR1.PCM"],
+                &["--level-render", "LAIR1.PCM", "--objects"],
+            ),
+            (
+                &["level", "objects-entry", "--entry", "115", "--bigfile", "BIGFILE.DAT"],
+                &["--level-objects", "--bigfile", "BIGFILE.DAT", "--entry", "115"],
+            ),
+            (
+                &["level", "objects-group", "--bigfile", "BIGFILE.DAT", "--group", "under"],
+                &["--level-objects", "--bigfile", "BIGFILE.DAT", "--group", "under"],
+            ),
+            (
                 &[
                     "level", "geometry-entry", "--bigfile", "BIGFILE.DAT", "--entry", "115",
                 ],
