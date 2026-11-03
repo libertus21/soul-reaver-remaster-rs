@@ -414,11 +414,13 @@ placement, mask, or flag meaning is claimed for any field. The two tail values
 are not read. `--level-links` is the reader:
 `cargo run -- --level-links <.PCM file | room directory>`.
 
-**Correction to `--level-info`.** That arm still counts links by scanning the
-whole file for `<target>,<index>` strings, so it over-counts when the same name
-appears more than once. `LAIR1` reports 4 links (`lair29,66`, `lair3,51`,
-`lair3,51`, `lair29,66`); the decoded table has 2. This slice deliberately
-leaves `--level-info` unchanged; the discrepancy is documented here, not fixed.
+**Correction to `--level-info` (RESOLVED, PR #53).** This paragraph previously
+recorded that `--level-info` counted links by scanning the whole file for
+`<target>,<index>` strings, and therefore over-counted (`LAIR1` reported 4 where
+the decoded table has 2). That is now fixed: `--level-info` takes its links from
+the decoded table at slot `0x34`, the same source as `--level-links`. Both arms
+agree (`LAIR1` = 2, `LAIR/BIN` total = 52). The whole-file name scan remains in
+use for the `names=` count only, which is unrelated to links.
 
 ## Legal
 
