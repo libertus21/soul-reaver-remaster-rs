@@ -314,8 +314,20 @@ extracted files, decompiled code, or database files.
   culling and extra camera controls are NOT included. Synthetic-byte tests
   only (`docs/notes/level-geometry.md`).
 
+- `level-archive` (first-level path): `cargo run -- --level-geometry --bigfile
+  <BIGFILE.DAT> --entry <INDEX>` (or `--level-render` with the same flags)
+  reads the entry's
+  `[offset, offset + length)` slice into memory and feeds it to the same
+  `.PCM` reader as a loose file; nothing is extracted and no temporary file is
+  written. The unit name comes from header word `0x26`. `--bigfile` without
+  `--entry`, the reverse, an out-of-range index, an entry slice past EOF, and
+  an entry that does not parse as `.PCM` are loud exit-1 errors. Entry 115 of
+  the SR1 archive is `under1`: 1,468 vertices, 2,922 faces,
+  `out_of_range=0`, `max_index=1467`. Synthetic-byte tests only
+  (`docs/notes/level-geometry.md`).
+
 - `unified-cli` (3-PR chain complete, archived): the grouped entry point is
-  live. `cargo run -- --help` (or `help <group>`) lists the 17 capabilities in
+  live. `cargo run -- --help` (or `help <group>`) lists the 19 capabilities in
   five groups; `cargo run -- <group> <command> ...` rewrites to the exact
   legacy argv (`texture list <BIG>` is byte-identical to
   `--textures <BIG> --tlist`). On a terminal, `cargo run -- menu` (or no
