@@ -133,9 +133,13 @@ extracted files, decompiled code, or database files.
   block, 128 flag bytes, 32-byte vertex stride, `u16` triangles — both
   planning probes land exactly on EOF) for positions + triangle indices
   ONLY (normals, UVs, weights, materials, bones skipped as opaque byte
-  ranges) and shows it as a flat-shaded auto-rotating solid (fixed
-  perspective, derivative face normals, culling OFF, depth ON, CPU
-  auto-fit to a unit cube, ~0.6 rad/s; Esc or window close exits 0). It
+  ranges) and shows it as a flat-shaded solid (derivative face normals,
+  culling OFF, depth ON, CPU auto-fit to a unit cube). The camera
+  auto-rotates at ~0.6 rad/s until the first interaction: left-drag orbits,
+  wheel zooms, right/middle-drag pans, `R` restores the auto-fit, and Esc
+  or window close exits 0. Zoom goes inside the mesh: eye distance clamps
+  between 0.005 and 20 units (the fit is 2.2) and near/far scale with it,
+  so interior geometry survives instead of clipping away. It
   prints `N vertices, M triangles` (counts only) to stdout; bad magic,
   truncated headers, insane counts, and short vertex/face data fail
   loud (stderr + exit 1, no window). Mesh bytes stay in process memory
@@ -152,7 +156,7 @@ extracted files, decompiled code, or database files.
   rotates exactly one decoded slot's weighted vertices (integer bone
   `0..=127`, finite `|degrees| <= 360`), prints `pose bone B, D deg, V
   vertices moved`, and shows the deformed mesh through the unchanged
-  auto-rotating flat-shaded path. The math is one-bone linear blend
+  interactive flat-shaded path. The math is one-bone linear blend
   skinning in mesh space (joint Z negated per design P5):
   `p' = sum(w_i * (M_i * p)) / sum(w_i)`; zero-weight vertices are
   untouched. CAVEAT: this is a LOCAL CLUSTER rotation, not a pose. The
@@ -310,8 +314,9 @@ extracted files, decompiled code, or database files.
   `level <name> vertices=<V> faces=<F> showing room geometry`, before the
   window opens; the title is `level <name>`. A directory, a unit with 0
   vertices or 0 faces, and any record/array/index outside the data region are
-  loud errors (exit 1, no window). Object placement, textures/materials, BSP,
-  culling and extra camera controls are NOT included. Synthetic-byte tests
+  loud errors (exit 1, no window). Object placement, textures/materials, BSP
+  and culling stay out of scope; the interactive camera (orbit, wheel zoom,
+  pan, `R` reset) is shared with the mesh window above. Synthetic-byte tests
   only (`docs/notes/level-geometry.md`).
 
 - `level-archive` (first-level path): `cargo run -- --level-geometry --bigfile
