@@ -287,6 +287,17 @@ extracted files, decompiled code, or database files.
   the whole file and over-counts duplicates (`LAIR1` 4 vs the table's 2; see
   `docs/notes/level-builder.md`).
 
+- `unified-cli` (PR 3 of 3, chain complete): the grouped entry point is live.
+  `cargo run -- --help` (or `help <group>`) lists every capability;
+  `cargo run -- <group> <command> ...` rewrites to the exact legacy argv
+  (`texture list <BIG>` is byte-identical to `--textures <BIG> --tlist`). On a
+  terminal, `cargo run -- menu` (or no arguments) opens a numbered picker that
+  asks for a group, a command, then each required operand, and dispatches the
+  same canonical argv; `q` or EOF leaves it. A redirected stdout keeps the old
+  usage error and exits 1 without reading stdin. `menu` and the five group
+  words are the reserved names (use `./mesh` for a local directory). No new
+  dependency: `Cargo.toml` and `Cargo.lock` are unchanged.
+
 ## What's missing
 
 - [ ] Room geometry inside the `.PCM` records stays **UNPROVEN**, and the next

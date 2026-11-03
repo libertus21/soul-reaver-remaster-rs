@@ -9,15 +9,23 @@ const OPTION_FLAGS: [&str; 4] = ["--map", "--pose", "--tex-dir", "--out"];
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
     Help(Option<String>),
+    Menu,
     Dispatch(Vec<String>),
     Error(String),
 }
 
 pub fn route(args: &[String]) -> Route {
+    route_with_terminal(args, false)
+}
+
+/// Empty argv enters the picker only on an interactive stdout; explicit
+/// `menu` always routes there and `main` gates the terminal.
+pub fn route_with_terminal(args: &[String], stdout_is_terminal: bool) -> Route {
     let Some(first) = args.first() else {
-        return Route::Dispatch(Vec::new());
+        return if stdout_is_terminal { Route::Menu } else { Route::Dispatch(Vec::new()) };
     };
     let first = first.as_str();
+    if first == "menu" { return Route::Menu; }
     if matches!(first, "--help" | "-h" | "help") {
         return Route::Help(args.get(1).cloned());
     }
@@ -152,7 +160,7 @@ fn usage(cap: &Capability) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{route, Route};
+    use super::{route, route_with_terminal, Route};
 
     fn argv(input: &[&str]) -> Vec<String> {
         input.iter().map(|token| token.to_string()).collect()
@@ -286,6 +294,14 @@ mod tests {
         let missing = error(&["level"]);
         assert!(missing.contains("requires a command"), "{missing}");
         assert!(missing.contains("info, records, structure, links"), "{missing}");
+    }
+
+    #[test]
+    fn menu_requires_an_interactive_stdout_and_is_a_reserved_word() {
+        assert_eq!(route_with_terminal(&[], true), Route::Menu);
+        assert_eq!(route_with_terminal(&[], false), Route::Dispatch(Vec::new()));
+        assert_eq!(route_with_terminal(&argv(&["menu"]), false), Route::Menu);
+        assert_eq!(route(&argv(&["menu"])), Route::Menu);
     }
 
     #[test]

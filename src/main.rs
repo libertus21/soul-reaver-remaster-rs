@@ -50,6 +50,7 @@ mod launcher_cli;
 mod dds;
 mod gallery;
 mod level;
+mod menu;
 mod mesh_entry;
 // Pure one-bone pose math, wired into the `--mesh --pose` arm below.
 mod pose;
@@ -65,6 +66,7 @@ mod textures;
 mod textures_object;
 mod wav;
 
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -75,13 +77,31 @@ fn main() -> ExitCode {
     // Compatibility no-ops: stripped before dispatch, no output, no exit
     // change. (Parser-only flags are never wired into the viewer.)
     let args = strip_launcher_noops(raw);
-    match cli_argv::route(&args) {
+    let interactive = std::io::stdout().is_terminal();
+    match cli_argv::route_with_terminal(&args, interactive) {
         cli_argv::Route::Help(group) => run_help(group.as_deref()),
+        cli_argv::Route::Menu => run_menu(interactive),
         cli_argv::Route::Dispatch(argv) => dispatch(&argv),
         cli_argv::Route::Error(message) => {
             eprintln!("{message}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Interactive picker: collect argv, then run it through `dispatch`.
+/// A non-terminal stdout is a loud exit 1, never a blocking read.
+fn run_menu(interactive: bool) -> ExitCode {
+    if !interactive {
+        eprintln!("error: the interactive menu needs a terminal; pass arguments or use --help");
+        return ExitCode::from(1);
+    }
+    let (stdin, stdout) = (std::io::stdin(), std::io::stdout());
+    match menu::run(&mut stdin.lock(), &mut stdout.lock()) {
+        Ok(menu::Outcome::Dispatch(argv)) => dispatch(&argv),
+        Ok(menu::Outcome::Cancelled) => ExitCode::SUCCESS,
+        Ok(menu::Outcome::Exhausted) => ExitCode::from(1),
+        Err(error) => { eprintln!("error: menu: {error}"); ExitCode::from(1) }
     }
 }
 
