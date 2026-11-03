@@ -259,6 +259,20 @@ extracted files, decompiled code, or database files.
   `--level-info` is unchanged (see `docs/notes/room-geometry.md` and
   `docs/changes/room-geometry/archive.md`).
 
+- `level-structure` (read-only counts; no window): `cargo run --
+  --level-structure <.PCM file | room directory>` reports per unit the header
+  sanity (`N`, `data_base`, `data_len`), relocation-directory integrity
+  (`entries` / `valid` / `zero` / `out_of_range`), the enumerated header offset
+  slots that are non-null (resolved as `data_base + value`), and the 36-byte
+  table's `count`, `stride` and per-record tagged-blob length or `null`. One
+  out-of-range directory entry fails the whole run (exit 2). Real-unit check:
+  `LAIR5` 62/62, `LAIR14` 74/74, `CATHY44` 326/326, `LAIR1` 1655/1655 and
+  `MOVIE3` 2256/2256 entries valid, zero zero and zero out-of-range; the `LAIR`
+  room directory 12,641/12,641 across 31 units. Slot roles, field semantics,
+  geometry, placement and transforms stay NOT claimed; the note leaves
+  `0x1B..=0x32` unenumerated, so those slots are not read. Synthetic-byte tests
+  only (`docs/notes/level-builder.md`, reader slice).
+
 ## What's missing
 
 - [ ] Room geometry inside the `.PCM` records stays **UNPROVEN**, and the next
