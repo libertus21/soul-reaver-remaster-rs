@@ -287,8 +287,23 @@ extracted files, decompiled code, or database files.
   the whole file and over-counts duplicates (`LAIR1` 4 vs the table's 2; see
   `docs/notes/level-builder.md`).
 
+- `level-geometry` (read-only counts; no window): `cargo run --
+  --level-geometry <.PCM file | room directory>` reports per unit the room
+  record's vertex and face counts, both data-base-relative offsets, the axis
+  box over the `i16` positions with its centre, and a face-index validation
+  line (`out_of_range`, `max_index`). Header slot `0x00` points at the room
+  record: `+0x10`/`+0x1C` give the 12-byte vertex array (three `i16` at
+  `+0/+2/+4`) and `+0x14`/`+0x20` the 12-byte face array (first three `u16`
+  are vertex indices). A record or non-empty array outside the data region
+  fails the run (exit 2); zero counts report `count=0`. Real corpus (89 units,
+  11 rooms): 78,020 vertices, 139,877 faces, zero out-of-range indices, and
+  `max_index = vertices - 1` in every unit; `LAIR5` 81V/130F, `LAIR14`
+  95V/164F, `LAIR1` 2829V/5571F. The trailing vertex triple, array C, object
+  placement, orientation, normals, UVs and rendering stay NOT claimed.
+  Synthetic-byte tests only (`docs/notes/level-geometry.md`).
+
 - `unified-cli` (3-PR chain complete, archived): the grouped entry point is
-  live. `cargo run -- --help` (or `help <group>`) lists the 15 capabilities in
+  live. `cargo run -- --help` (or `help <group>`) lists the 16 capabilities in
   five groups; `cargo run -- <group> <command> ...` rewrites to the exact
   legacy argv (`texture list <BIG>` is byte-identical to
   `--textures <BIG> --tlist`). On a terminal, `cargo run -- menu` (or no
@@ -303,7 +318,9 @@ extracted files, decompiled code, or database files.
 
 ## What's missing
 
-- [ ] Room geometry and object placement are **located, not rendered**. Header
+- [ ] Room geometry has a validated summary reader, not a renderer.
+      `--level-geometry` reports counts, offsets, a vertex box and face-index
+      validation. Header
       slot `0x00` (the room record) exposes a 12-byte vertex array (three `i16`
       position at `+0/2/4`) and a 12-byte face array whose first three `u16`
       are vertex indices; the room object array carries a 3 x `i16` world
