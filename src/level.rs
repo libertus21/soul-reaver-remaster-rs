@@ -1,4 +1,4 @@
-//! Untrusted SR1-remaster room containers: the `.PCM` header and name table.
+﻿//! Untrusted SR1-remaster room containers: the `.PCM` header and name table.
 //! Read-only inventory: no geometry, placement, transform, or audio decode.
 
 use std::fmt;
@@ -19,6 +19,8 @@ pub struct LevelUnit {
     pub block_sizes: Vec<u32>,
     /// Parallel to `block_sizes`: whether every byte of that block is zero.
     pub block_all_zero: Vec<bool>,
+    /// Header sanity, relocation-directory integrity, and header offset slots.
+    pub structure: LevelStructure,
 }
 
 /// Shape class of one block. Labels describe a size (and zero-ness) only;
@@ -43,6 +45,32 @@ pub struct BlockCensus {
     pub other: Vec<(u32, u32)>,
     /// `(ordinal, size)`; ties go to the lowest ordinal.
     pub largest: (u32, u32),
+}
+
+/// Header dword slots the builder walks as base-relative offsets. The note
+/// enumerates these individually and leaves `0x1B..=0x32` unenumerated, so
+/// that range is deliberately not claimed here.
+pub const SCHEMA_OFFSET_SLOTS: [usize; 14] =
+    [0x00, 0x01, 0x03, 0x0D, 0x15, 0x17, 0x23, 0x26, 0x34, 0x35, 0x37, 0x39, 0x3B, 0x3D];
+
+/// Directory integrity: entry `i` is the position of a dword that holds a
+/// non-zero data-base-relative offset.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RelocationReport {
+    pub entries: u32,
+    pub valid: u32,
+    pub zero: u32,
+    pub out_of_range: u32,
+}
+
+/// Structural facts about one unit. `slots` holds every non-null enumerated
+/// header offset as `(slot, data_base + value)`. No geometry or type claim.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LevelStructure {
+    pub data_base: usize,
+    pub data_len: usize,
+    pub reloc: RelocationReport,
+    pub slots: Vec<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +101,7 @@ pub enum LevelError {
     TableNotAscending,
     TablePastEof,
     PaddingTruncated,
+    RelocationOutOfRange,
     MissingUnitName,
     SidecarIncomplete,
     BadSidecarMagic,
@@ -102,6 +131,9 @@ impl fmt::Display for LevelError {
             LevelError::PaddingTruncated => {
                 "offset table padding is missing: file ends before the level-data base"
             }
+            LevelError::RelocationOutOfRange => {
+                "relocation directory entry points outside the level data"
+            }
             LevelError::MissingUnitName => "name table does not contain the unit's own name",
             LevelError::SidecarIncomplete => "PMF and PNF must be present together",
             LevelError::BadSidecarMagic => "sidecar magic or header length is invalid",
@@ -130,6 +162,35 @@ pub(crate) fn data_base(records: u32) -> usize {
     let words = (records as usize).saturating_add(1);
     let rounded = words.saturating_add(OFFSET_ALIGN - 1) & !(OFFSET_ALIGN - 1);
     rounded.saturating_mul(4)
+}
+
+/// Classify every directory entry by the dword it points at, relative to the
+/// data base: a non-zero offset inside the data region is valid.
+fn relocation_report(data: &[u8], offsets: &[u32]) -> RelocationReport {
+    let mut report = RelocationReport { entries: offsets.len() as u32, ..RelocationReport::default() };
+    for &entry in offsets {
+        match data.get(entry as usize..).and_then(|rest| read_u32(rest, 0)) {
+            Some(0) => report.zero += 1,
+            Some(value)
+                if (value as usize).checked_add(4).is_some_and(|end| end <= data.len()) =>
+            {
+                report.valid += 1;
+            }
+            _ => report.out_of_range += 1,
+        }
+    }
+    report
+}
+
+/// Read the enumerated offset slots: null when zero or past the header.
+fn schema_slots(data: &[u8], data_base: usize) -> Vec<(usize, usize)> {
+    SCHEMA_OFFSET_SLOTS
+        .iter()
+        .filter_map(|&slot| {
+            let value = read_u32(data, 4 * slot)?;
+            (value != 0).then_some((slot, data_base + value as usize))
+        })
+        .collect()
 }
 
 /// `u32 N` + `N` ascending relative offsets + zero padding up to
@@ -176,6 +237,13 @@ pub fn parse_pcm(bytes: &[u8], expected_name: &str) -> Result<LevelUnit, LevelEr
         block_sizes.push((end - start) as u32);
         block_all_zero.push(block.iter().all(|&byte| byte == 0));
     }
+    let data = &bytes[data_base..];
+    let structure = LevelStructure {
+        data_base,
+        data_len: data.len(),
+        reloc: relocation_report(data, &offsets),
+        slots: schema_slots(data, data_base),
+    };
     let names = extract_names(bytes);
     let name = names
         .iter()
@@ -191,6 +259,7 @@ pub fn parse_pcm(bytes: &[u8], expected_name: &str) -> Result<LevelUnit, LevelEr
         sidecar: Sidecar::Absent,
         block_sizes,
         block_all_zero,
+        structure,
     })
 }
 
@@ -265,6 +334,37 @@ pub fn record_lines(unit: &LevelUnit) -> Vec<String> {
     );
     lines.push(format!("largest {} {}", counts.largest.0, counts.largest.1));
     lines
+}
+
+/// Structural report: header sanity, relocation integrity, header offset
+/// slots. Fails loud when any directory entry points outside the level data.
+pub fn structure_lines(unit: &LevelUnit) -> Result<Vec<String>, LevelError> {
+    let structure = &unit.structure;
+    if structure.reloc.out_of_range > 0 {
+        return Err(LevelError::RelocationOutOfRange);
+    }
+    let reloc = &structure.reloc;
+    let at: String = structure
+        .slots
+        .iter()
+        .map(|(slot, position)| format!(" 0x{slot:02X}:{position}"))
+        .collect();
+    Ok(vec![
+        format!(
+            "level {} pcm_records={} data_base={} data_len={}",
+            unit.name, unit.records, structure.data_base, structure.data_len
+        ),
+        format!(
+            "  reloc entries={} valid={} zero={} out_of_range={}",
+            reloc.entries, reloc.valid, reloc.zero, reloc.out_of_range
+        ),
+        format!(
+            "  schema slots={} non_null={}{}",
+            SCHEMA_OFFSET_SLOTS.len(),
+            structure.slots.len(),
+            at
+        ),
+    ])
 }
 
 /// `FMPa` magic, 16-bit id, segment count, and the rate field at `0x28`.
@@ -782,6 +882,52 @@ mod tests {
         (bytes, data_len)
     }
 
+    /// Body with chosen header dwords and the unit name in its last 6 bytes.
+    fn structure_pcm(offsets: &[u32], slots: &[(usize, u32)], len: usize) -> Vec<u8> {
+        let mut body = vec![0u8; len];
+        for &(slot, value) in slots {
+            body[4 * slot..4 * slot + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        body[len - 6..].copy_from_slice(b"lair5\0");
+        pcm_bytes(offsets, &body)
+    }
+
+    #[test]
+    fn structure_reports_relocation_and_schema_slots() {
+        let bytes = structure_pcm(&[0, 4, 12], &[(0x00, 16), (0x01, 0), (0x03, 20)], 40);
+        let unit = parse_pcm(&bytes, "lair5").expect("must parse");
+        assert_eq!((unit.structure.data_base, unit.structure.data_len), (2048, 40));
+        let reloc = &unit.structure.reloc;
+        assert_eq!(
+            (reloc.entries, reloc.valid, reloc.zero, reloc.out_of_range),
+            (3, 2, 1, 0)
+        );
+        assert_eq!(unit.structure.slots, vec![(0x00, 2064), (0x03, 2068)]);
+        assert_eq!(
+            structure_lines(&unit).expect("in range"),
+            vec![
+                "level lair5 pcm_records=3 data_base=2048 data_len=40",
+                "  reloc entries=3 valid=2 zero=1 out_of_range=0",
+                "  schema slots=14 non_null=2 0x00:2064 0x03:2068",
+            ]
+        );
+    }
+
+    #[test]
+    fn structure_fails_loud_on_an_out_of_range_directory_entry() {
+        let bytes = structure_pcm(&[0, 4], &[(0x01, 90)], 40);
+        let unit = parse_pcm(&bytes, "lair5").expect("must parse");
+        assert_eq!((unit.structure.reloc.zero, unit.structure.reloc.out_of_range), (1, 1));
+        assert_eq!(
+            structure_lines(&unit).err(),
+            Some(LevelError::RelocationOutOfRange)
+        );
+        let past = structure_pcm(&[0, 4, 40], &[], 40);
+        let unit = parse_pcm(&past, "lair5").expect("must parse");
+        assert_eq!(unit.structure.reloc.out_of_range, 1);
+        assert!(structure_lines(&unit).is_err());
+    }
+
     #[test]
     fn classify_is_zero_first_then_size() {
         for size in [0, 4, 40, 48, 72] {
@@ -863,6 +1009,7 @@ mod tests {
             LevelError::TableNotAscending,
             LevelError::TablePastEof,
             LevelError::PaddingTruncated,
+            LevelError::RelocationOutOfRange,
             LevelError::MissingUnitName,
             LevelError::SidecarIncomplete,
             LevelError::BadSidecarMagic,
