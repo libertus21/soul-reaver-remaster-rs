@@ -100,7 +100,7 @@ pub struct LevelStructure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
     pub target: String,
-    pub index: u16,
+    pub index: u32,
 }
 
 /// One 40-byte link-table record. Every prelude value is reported as a raw
@@ -373,7 +373,10 @@ pub fn parse_pcm(bytes: &[u8], expected_name: &str) -> Result<LevelUnit, LevelEr
         .find(|name| name.eq_ignore_ascii_case(expected_name))
         .ok_or(LevelError::MissingUnitName)?
         .clone();
-    let links = names.iter().filter_map(|entry| split_link(entry)).collect();
+    let links = table
+        .iter()
+        .map(|link| Link { target: link.target.clone(), index: link.index })
+        .collect();
     Ok(LevelUnit {
         name,
         records,
@@ -691,10 +694,6 @@ fn accepted_name(run: &[u8]) -> Option<&str> {
     Some(text)
 }
 
-fn split_link(name: &str) -> Option<Link> {
-    let (target, index) = name.split_once(',')?;
-    Some(Link { target: target.to_string(), index: index.parse().ok()? })
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,8 +743,17 @@ mod tests {
         assert_eq!(unit.name, "lair5");
         assert_eq!(unit.records, 2);
         assert_eq!(unit.names, vec!["lair5", "lair6,8"]);
-        assert_eq!(unit.links, vec![Link { target: "lair6".into(), index: 8 }]);
+        assert_eq!(unit.links, Vec::new());
         assert_eq!(unit.sidecar, Sidecar::Absent);
+    }
+
+    #[test]
+    fn a_unit_without_a_link_table_reports_no_links() {
+        let unit = parse_pcm(&synthetic_pcm("lair5", b"lair6,8"), "lair5").expect("must parse");
+        assert_eq!(unit.names.len(), 2, "the name scan still sees the link name");
+        assert!(unit.link_table.is_empty());
+        assert!(unit.links.is_empty(), "no table means no links");
+        assert!(report_lines(&unit)[0].contains("links=0"));
     }
 
     #[test]
@@ -855,15 +863,30 @@ mod tests {
     }
 
     #[test]
-    fn links_split_and_keep_order_and_duplicates() {
-        let unit = parse_pcm(
-            &synthetic_pcm("lair5", b"lair6,8\0lair5\0lair6,8"),
-            "lair5",
-        )
-        .expect("must parse");
-        assert_eq!(unit.names.len(), 4);
-        let expected = Link { target: "lair6".into(), index: 8 };
-        assert_eq!(unit.links, vec![expected.clone(), expected]);
+    fn links_come_from_the_link_table_not_the_name_scan() {
+        let mut bytes = link_pcm(
+            &[
+                ([1, 67, 18, 67, -4579], "lair29,66"),
+                ([1, 52, 18, 52, -4605], "lair3,51"),
+            ],
+            2 * LINK_RECORD_STRIDE,
+        );
+        let base = data_base(2);
+        bytes[base + 16..base + 24].copy_from_slice(b"lair9,9\0");
+        let unit = parse_pcm(&bytes, "lair5").expect("must parse");
+        assert!(
+            unit.names.iter().any(|name| name == "lair9,9"),
+            "the scan sees a link-like name the table does not contain"
+        );
+        assert_eq!(unit.link_table.len(), 2);
+        assert_eq!(
+            unit.links,
+            vec![
+                Link { target: "lair29".into(), index: 66 },
+                Link { target: "lair3".into(), index: 51 },
+            ]
+        );
+        assert!(report_lines(&unit)[0].contains("links=2"));
     }
 
     #[test]
@@ -913,7 +936,7 @@ mod tests {
         write(tmp.path(), "lair5.pnf", &pnf(7, 3));
         let units = read_path(&tmp.path().join("lair5.PCM")).expect("must read");
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].links.len(), 1);
+        assert_eq!(units[0].links.len(), 0);
         assert_eq!(
             units[0].sidecar,
             Sidecar::Present {
@@ -987,8 +1010,9 @@ mod tests {
 
     #[test]
     fn report_lines_shape() {
-        let mut unit =
-            parse_pcm(&synthetic_pcm("lair5", b"lair6,8"), "lair5").expect("must parse");
+        let bytes = link_pcm(&[([1, 2, 3, 4, 5], "lair6,8")], LINK_RECORD_STRIDE);
+        let mut unit = parse_pcm(&bytes, "lair5").expect("must parse");
+        assert_eq!(unit.names, vec!["lair6,8", "lair5"]);
         assert_eq!(
             report_lines(&unit),
             vec![
