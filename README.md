@@ -8,457 +8,105 @@ The engine reads data from the player's OWN installed copy of the game
 at runtime. This repo contains only our code — never game assets,
 extracted files, decompiled code, or database files.
 
-## Quick path
+## What works
 
-1. Install the game (GOG/Steam build) and verify it runs.
-2. `cargo test` — runs the suite (DDS header/error unit tests on
-   synthetic bytes; no game files in tests).
-3. `cargo run -- <path-to-a-DDS>` — opens a window showing that
-   texture (pass your own install path at runtime; never committed).
+Every row is backed by the exact command shown. Replace `<...>` with a path from
+your own install; nothing is bundled.
+
+| Capability | Command | What you get |
+|---|---|---|
+| Loose DDS textures (DXT1 + BC7) | `cargo run -- <FILE.DDS>` | Shows one texture. Legacy DXT1/DX10 files the `image` crate decodes; BC7 (`dxgiFormat` 98) is CPU-decoded. Bad input fails loud. |
+| DDS gallery | `cargo run -- <DIR>` | Browses sorted direct-child `*.DDS` one at a time (`←`/`→`, Esc). Undecodable entries are skipped loud. |
+| `.BIG` container textures | `cargo run -- --textures <TEXTURES.BIG> --tlist` / `--tshow <SEL>` | Validates the 512-byte header and fixed 131072-byte slots; `--tshow` decodes one 256×256 A1R5G5B5 slot. Works on `TEXTURES.BIG`, `MOVIES.BIG`, `BONUS.BIG`, `E3.BIG`. |
+| `.BIG` texture names | `cargo run -- --textures <TEXTURES.BIG> --tlist --map <TEX_HD.MAP>` / `--tshow <NAME> --map <TEX_HD.MAP>` | Decodes the engine alias matrix (1287/1287 `TEXTURES.BIG` slots named). `--tshow` accepts `<id>_<sub>`, `M\<id>_<sub>`, `B\<id>_<sub>`; shared names are refused. |
+| `.SRM` meshes | `cargo run -- --mesh <FILE.SRM>` | Parses one loose mesh (positions + triangle indices) and draws a flat-shaded auto-rotating solid. Left-drag orbit, wheel zoom, right/middle-drag pan, `R` reset, `F` fly. |
+| One-bone pose | `cargo run -- --mesh <FILE.SRM> --pose <BONE>:<DEG>` | Rotates exactly one decoded weighted bone slot (`0..=127`, `|deg| <= 360`) and shows the deformed mesh. A local cluster rotation, not a full pose. |
+| Textured meshes + mesh gallery | `cargo run -- --mesh-textured <FILE.SRM> --tex-dir <DIR>` / `cargo run -- --mesh-all <OBJECT_DIR> --tex-dir <DIR>` | Loads UVs, material indices and the three DDS textures per material; renders lit. `--mesh-all` browses a directory (`←`/`→`, Esc). |
+| `.SND`/`.SMP` audio → WAV | `cargo run -- --audio <FILE.SND> --alist` / `cargo run -- --audio <FILE.SND> --wave <N> --out <FILE.wav>` | Lists each wave's offset, bytes, frames, duration and loop span; decodes one wave as Sony 4-bit ADPCM to a canonical PCM16 mono WAV (44100 Hz chosen). The writer refuses paths inside a git work tree. |
+| `BIGFILE.DAT` index | `cargo run -- --bigfile <BIGFILE.DAT> --list` / `--show <SEL>` | Prints `index hash offset length` per entry; `--show` reads one entry in memory and shows it if it is a DDS. |
+| Archive-entry level access | `cargo run -- --level-geometry --bigfile <BIGFILE.DAT> --entry 115` | Reads the entry slice in memory as a `.PCM` unit. Entry 115 is `under1` (1,468 V / 2,922 F). No extraction, no temp file. |
+| Level structure | `cargo run -- --level-structure <PATH>` | Reports header sanity, relocation-directory integrity (`entries`/`valid`/`zero`/`out_of_range`), non-null header slots and the 36-byte table. |
+| Level links | `cargo run -- --level-links <PATH>` | Prints the decoded link table (`target`, `index`, `target_id`, five raw prelude words). |
+| Level geometry | `cargo run -- --level-geometry <PATH>` | Prints vertex/face counts, both offsets, the position axis box and centre, and face-index validation. |
+| Level objects | `cargo run -- --level-objects <PATH>` | Prints each placed object's name, world position, type and flags. |
+| `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` | Renders one unit's confirmed room geometry. Orbit as above; `F` enters a first-person fly camera. |
+| Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 25 capabilities in five groups; grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
+
+`<PATH>` accepts a `.PCM` file or a room directory. The level arms also accept
+`--bigfile <DAT> --entry <INDEX>` or `--bigfile <DAT> --group <PREFIX>`.
+
+## Opening level quick-start
+
+The new-game opening unit is `under1`, reached through the archive (entry 115),
+not the loose `UNDRCT1.PCM`. Render the whole tutorial family with two commands:
+
+```text
+cargo run -- --level-objects --bigfile <BIGFILE.DAT> --group under
+cargo run -- --level-render  --bigfile <BIGFILE.DAT> --group under --objects
+```
+
+The first prints the four rooms' object counts and placements; the second opens
+one window with the merged `under` geometry plus one cube marker per object.
+
+Fly camera keys: `F` toggles orbit/fly; `W`/`A`/`S`/`D` move relative to the
+view; the mouse looks around; `Space`/`E` rise; `C`/`Q` sink; `Shift` flies
+faster; `R` resets the camera; `Esc` exits.
+
+## What's missing / known limits
+
+- **No textures on level geometry.** UVs are unlocated (the trailing vertex
+  triple is not the face normal), so `--level-render` is flat-shaded.
+- **Objects render as uniform markers.** Model files for placed objects are not
+  yet located, and the object `type` semantics are UNKNOWN; no per-type colour is
+  claimed.
+- **No animation.** `.SRA` is not parsed by this build (the loader callback is a
+  `RET 0` stub) and `.SRM` has no hierarchy, so `--pose` is a local cluster
+  rotation only and the mesh tears at cluster seams.
+- **No sound for level music beyond WAV export.** Loops are reported but decoded
+  one-shot; there is no sequence playback (`QSMa`), mixing or ADSR.
+- **No game logic.** This is a viewer/analysis tool, not a playable engine.
+- **Object records carry no orientation.** There is no rotation field; the
+  `+0x18` triple is a cross-level offset, not angles.
+- **`--group` scans the whole archive per run** (no cached index).
+- **Level geometry gaps.** Array C, the face attribute words, the room-local
+  group records and the dominant 143,872-byte block stay UNKNOWN; no UV, normal,
+  BSP or culling claim is made.
+- **BC7 sRGB (`dxgiFormat` 99) fails loud.** sRGB correctness, resize handling
+  and a full mip-chain UI are deferred.
+- **Binary startup beyond `run` stays UNKNOWN**, and the loader's post-open error
+  rows remain HELD with their existing prefixes pinned by regression tests.
+- **`.SRL` (60 files) and the `.PMF` codec are undecoded**; the SR2 side is
+  unscoped.
+- **Menu prompts show only the operand token** (no path hint), so a menu-style
+  number typed as a path fails downstream by design.
+
+## Repository rules
+
+- `.gitignore` is a whitelist: only `*.rs`, `Cargo.toml`, `Cargo.lock`, `*.md`,
+  `.gitignore` and `.gitattributes` can be committed; `/target/` stays ignored.
+- No game bytes, extracted files, decompiled listings, Ghidra databases, hashes
+  or absolute install paths. Game data is read-only at runtime from the user's
+  own single-player/offline copy.
+- Evidence lives in `docs/notes/` as behavior paraphrases, field offsets and
+  counts; tests use synthetic bytes only.
+- Community work is credited in `THIRD-PARTY-NOTICES.md`; no community code is
+  vendored without a notice.
+- The repository is private.
+- Process: small chained slices (≤400 changed lines each), proposal → spec →
+  tasks → code → playtest report.
 
 ## Details
 
 | Topic | Decision |
 |---|---|
-| Stack | Rust (cargo 1.99.0), wgpu + winit + image for slice 1; `bevy_ecs` later if game logic needs it (see `docs/notes/03-dds-viewer-direction.md`) |
-| Game data | Read-only at runtime from the user's install; paths via CLI args/env only, never committed |
-| Legal guardrails | Whitelist `.gitignore` (verified every commit); single-player/offline owned copy only; credit community work in `THIRD-PARTY-NOTICES.md` once reuse starts |
-| Process | Small chained slices (≤400 lines each); proposal → spec → tasks → code → playtest report |
+| Stack | Rust 2024 (cargo 1.99.0): winit 0.30, wgpu 30, image 0.25, bytemuck, pollster; pinned `bcdec_rs` 0.2.0 (MIT) for CPU BC7. No game-logic ECS. |
+| Game data | Read-only at runtime from the user's install; paths via CLI args/env only, never committed. |
+| Legal guardrails | Whitelist `.gitignore` verified every commit; single-player/offline owned copy only; community work credited in `THIRD-PARTY-NOTICES.md` once reuse starts. |
+| Process | Small chained slices (≤400 changed lines each); proposal → spec → tasks → code → playtest report. |
+| Tests | `cargo test` — 291 tests on synthetic bytes only; no game files in the suite. |
 
-## Checklist
+## Further reading
 
-- [x] Slice 1 `dds-texture-viewer`: load one real `.DDS` from the install, show it in a window
-- [x] `THIRD-PARTY-NOTICES.md` created on first community-code reuse
-      (`bcdec_rs`, slice `bc7-cpu-decode`)
-- [ ] README "What works" updated every slice
-
-## What works
-
-- `.BIG` textures (playtest-accepted): reads and renders textures from the
-  `.BIG` containers (256 × 256 A1R5G5B5). `--tshow` renders real content
-  (stone, faces, legible runes) from `TEXTURES.BIG`, `BONUS.BIG`, `E3.BIG`, and
-  `MOVIES.BIG` slots; large flat regions are atlas fill/padding, not a decode
-  error. Container contract in the `big-slots` bullet; format proof in
-  `docs/changes/big-decompressor/archive.md`.
-- `dds-texture-viewer`: `cargo run -- <path-to-a-DDS>` decodes one
-  `.DDS` (DX10 extended header via the `image` crate, base mip to
-  RGBA8) and shows it as a stretched fullscreen quad in a winit/wgpu
-  window. Bad magic, unsupported `dxgiFormat`, and unreadable paths
-  fail loud (stderr + nonzero exit, no guessing).
-- `bc7-cpu-decode`: BC7 textures via CPU decode (playtest-accepted):
-  `cargo run -- <path-to-a-BC7-DDS>` (`dxgiFormat` 98) CPU-decodes the base-mip blocks to RGBA8 (pinned
-  `bcdec_rs` 0.2.0, MIT — see `THIRD-PARTY-NOTICES.md`) and shows them
-  through the same `Rgba8Unorm` upload as slice 1, so it works on GPUs
-  WITHOUT `TEXTURE_COMPRESSION_BC`. Malformed BC7 input fails loud via
-  `InvalidBc7`; any other undecodable `dxgiFormat` (including 99) still
-  fails loud via `UnsupportedFormat`. Supersedes the slice-2 native
-  BC7 upload (kept in git history), which this machine's adapter cannot
-  run.
-- `texture-gallery` (playtest-accepted: browses 8066 TEX with
-  arrows): `cargo run -- <directory>` browses that
-  directory's direct-child `*.DDS` files (case-insensitive extension,
-  sorted ascending by file name, no recursion) one at a time in the
-  existing window through the existing decode + upload path (lazy
-  decode, no pre-scan). ArrowRight steps forward, ArrowLeft steps back
-  (clamped at the ends, key auto-repeat ignored); the window title and
-  one console line both show `<index>/<total> <filename>` (1-based;
-  `index/total` counts list entries). Esc or window close exits 0.
-  Gallery skip policy: an undecodable entry prints
-  `warning: skipping <filename>: <error>` to stderr and browsing
-  continues; an empty or all-undecodable directory exits 1 with no
-   window. Single-file mode is unchanged.
-- `bigfile-index`: `cargo run -- --bigfile <BIGFILE.DAT> --list`
-  prints the SR1PC archive index (one `index hash offset length` line
-  per entry; `hash` is the stored 8-hex-digit name hash) and exits 0;
-  `cargo run -- --bigfile <BIGFILE.DAT> --show <index|hash>` reads
-  that entry IN MEMORY (extracted bytes are never written to disk or
-  repo) and, when it is a DDS texture, shows it through the existing
-  single-file window (close/Esc exits 0). The selector is the decimal
-  list index from `--list` or the stored name hash (case-insensitive,
-  optional `0x`); DDS entries only — any other archived type is
-  listed, never decoded (loud stderr + exit 1). Corrupt/truncated
-  containers, out-of-range selectors, and unknown hashes all fail
-  loud (stderr + nonzero exit, no guessing). Single-file and gallery
-  modes are byte-for-byte unchanged. Layout facts reimplemented
-  clean-room from Soul Spiral's `BenLincoln.TheLostWorlds.CDBigFile`
-  (GPL-3.0-only, mirror `github.com/TheSerioliOfNosgoth/SoulSpiral-Official`;
-  NO Soul Spiral code copied — facts only, so no THIRD-PARTY-NOTICES.md
-   entry; see `docs/changes/bigfile-index/design.md`).
-- `big-slots`: the four SR1 `.BIG` containers (`TEXTURES.BIG`,
-  `MOVIES.BIG`, `BONUS.BIG`, `E3.BIG`) share a verified 512-byte header
-  (`0..2` = header size, must be 512; `2..4` = entry count, must be
-  `1..=32768`, little-endian) and fixed 131072-byte slots:
-  `file_len == 4096 + count * 131072` exactly, slot `i` at
-  `4096 + i * 131072`. `cargo run -- --textures <TEXTURES.BIG> --tlist`
-  validates that geometry, prints the header report (header size, entry
-  count, size class, window classes) plus the addressing line, one
-  `slot <i> offset <off> <class>` line per slot (`empty` = all `0xFF`,
-  `zero` = all `0x00`, else `data`; whole-slot read, no sampling), and a
-  per-class footer, then exits 0. Any length mismatch is a DISTINCT loud
-  `slot geometry mismatch` error (exit 1, never clamped). Truncated
-  files, wrong header sizes, and implausible counts each fail loud with
-  their distinct stderr message. `--tshow <i>` rejects a non-integer or
-  out-of-range index distinctly and, for a valid `data` slot, reads exactly
-  that one slot, converts its raw 256 x 256 little-endian A1R5G5B5 pixels
-  to RGBA8 (bit 15 = alpha, each 5-bit channel expanded by bit replication)
-  and shows it through the existing window (close/Esc exits 0); `empty` and
-  `zero` slots stay loud (exit 1) with no window. There is no decompressor
-  because the payload is not compressed (see
-  `docs/notes/s7-big-slot-payload-format.md`). `bigfile.rs` is
-  untouched (this is not the SR1PC layout). Bytes `4..512` are observed
-   but not validated. Synthetic-bytes tests only. Slot listing is
-   playtest-accepted: `--tlist` exits 0 for all four containers with the
-   footer `slots: 29 total, 1 empty, 0 zero, 28 data` (`MOVIES.BIG`),
-   `1287 total, 1 empty, 0 zero, 1286 data` (`TEXTURES.BIG`),
-   `268 total, 1 empty, 0 zero, 267 data` (`BONUS.BIG`), and
-   `178 total, 0 empty, 2 zero, 176 data` (`E3.BIG`); see
-   `docs/changes/big-slots/archive.md` and the `big-header` slice
-   (`docs/changes/big-header/archive.md`).
-- `slot-name` (playtest-accepted: 1287/1287 `TEXTURES.BIG` slots named,
-  shared names refused): `--map <TEX_HD.MAP>` decodes the engine's own alias
-  matrix (exactly 384,000 bytes = 6,000 rows x 64 bytes, 16 little-endian
-  `u32` codes per slot row, `0xFFFFFFFF` = none) into numeric asset names.
-  `--tlist --map` appends `; names <n1>,<n2>,...` (or `; names -`) to each
-  slot line; `--tshow <name> --map` accepts `<id>_<sub>`, `M\<id>_<sub>`, or
-  `B\<id>_<sub>` and refuses to guess when a name is shared by several slots
-  (loud error listing the candidates, no window). Blocks: `TEXTURES` base 0,
-  `MOVIES` base 2,000, `BONUS` base 4,000; `E3.BIG` has no block and stays
-  index-only. Without `--map`, every prior line, message, and exit code is
-  unchanged. Names are the engine's numeric asset names, not descriptive
-  labels. Format proof in `docs/notes/s8-big-slot-names.md`; archive in
-  `docs/changes/slot-name/archive.md`.
-- `models-3d` (playtest-accepted on a real mesh): `cargo run -- --mesh
-  <FILE.SRM>` parses one SR1-remaster loose mesh (format verdict: magic
-  `SRM\x01`, 44-byte shader records, 32-byte material records, bone
-  block, 128 flag bytes, 32-byte vertex stride, `u16` triangles — both
-  planning probes land exactly on EOF) for positions + triangle indices
-  ONLY (normals, UVs, weights, materials, bones skipped as opaque byte
-  ranges) and shows it as a flat-shaded solid (derivative face normals,
-  culling OFF, depth ON, CPU auto-fit to a unit cube). The camera
-  auto-rotates at ~0.6 rad/s until the first interaction: left-drag orbits,
-  wheel zooms, right/middle-drag pans, `R` restores the auto-fit, and Esc
-  or window close exits 0. Zoom goes inside the mesh: eye distance clamps
-  between 0.005 and 20 units (the fit is 2.2) and near/far scale with it,
-  so interior geometry survives instead of clipping away. `F` toggles a
-  first-person fly mode: `W`/`A`/`S`/`D` move relative to the view, `Space`/`E`
-  rise, `C`/`Q` sink, `Shift` flies faster, and the mouse looks around with the
-  cursor grabbed (released when toggling back). `R` restores the auto-fit and
-  returns to orbit; Esc or window close still exits 0. It
-  prints `N vertices, M triangles` (counts only) to stdout; bad magic,
-  truncated headers, insane counts, and short vertex/face data fail
-  loud (stderr + exit 1, no window). Mesh bytes stay in process memory
-  (never written to disk or repo); tests use synthetic bytes only.
-   Playtest file: the 86-vertex / 56-triangle loose SRM named by relative
-   name in `docs/changes/models-3d/proposal.md`, resolved against the
-   user's own install at runtime.
-- `animation` decode + one-bone pose — PARTIAL (PRs 1-3 of 3, all merged):
-  `--mesh` decodes the `.SRM` bone block — `extra` HD 3x4 matrices, 128
-  joint slots, per-vertex bone indices and weights — validates orthonormal
-  matrices, 255-weight triples, and indices below 128, and prints
-  `skeleton: K matrices, 128 joints` (349/349 loose `.SRM` files decode to
-  exact EOF). `cargo run -- --mesh <FILE.SRM> --pose <bone>:<degrees>`
-  rotates exactly one decoded slot's weighted vertices (integer bone
-  `0..=127`, finite `|degrees| <= 360`), prints `pose bone B, D deg, V
-  vertices moved`, and shows the deformed mesh through the unchanged
-  interactive flat-shaded path. The math is one-bone linear blend
-  skinning in mesh space (joint Z negated per design P5):
-  `p' = sum(w_i * (M_i * p)) / sum(w_i)`; zero-weight vertices are
-  untouched. CAVEAT: this is a LOCAL CLUSTER rotation, not a pose. The
-  `.SRM` has NO hierarchy (128 independent slots, no parent/child, no
-  keyframes, no clips), so the other 127 slots never follow; rotating a
-  slot that reads as a parent leaves its children fixed and the mesh tears
-  at the boundary. Full-body posing is NOT delivered. Without `--pose`, the
-  `--mesh` path is byte-for-byte unchanged. `extra > 0` models still decode
-  but `--pose` refuses them because the matrix/joint relation is UNKNOWN;
-  malformed specs, out-of-range or unweighted bones, and `--pose` in any
-  other mode all fail loud (stderr + exit 1, no window). Playtest: `7:0`
-  rest, `7:45` mostly coherent with one odd leg edge, `12:45` scattered —
-  see `docs/changes/animation/archive.md`. Supersedes the "bones skipped"
-  note in the `models-3d` bullet.
-- `s1-bigfile-loader` (playtest-accepted error parity, SR1 only):
-  open-stage failures (`--bigfile <absent> --list`) report the
-  original loader's load-failure prefix —
-  `Can't load big file named "<path>" (<OS detail>)`, exit 1. Five
-  post-open failure rows keep their existing messages (stage mapping
-  unconfirmed — no call-edge evidence, held by regression tests);
-  termination behavior unchanged. `cargo test` 86/86 green on
-  synthetic bytes (see `docs/changes/s1-bigfile-loader/archive.md`).
-- `s2-read-error-parity` (docs-only, SR1 only): the bounded call-edge
-   trace (2 of 2 probe passes) found zero caller-to-callee edges into
-   either error half, so no post-open row resolved to PROVEN and no
-   production message was aligned. All 5 post-open failure rows stay
-   HELD with their existing prefixes pinned by new regression tests
-   (truncated count/bad count, truncated index table, past-EOF,
-   seek-failure, short-read); termination unchanged; loud-stderr +
-   exit-1 contract untouched. `cargo test` 88/88 green on synthetic
-   bytes (see `docs/changes/s2-read-error-parity/archive.md`).
-- `s3-launcher-run` (docs-only, SR1 only): launcher-to-engine handshake
-   documented — SRX.exe has NO static import of `run` from `sr1.dll`
-   (L1 NOT CONFIRMED); it dynamically loads the engine library via
-   `LoadLibraryA` with the `1\sr1.dll` literal and resolves `run` via
-   `GetProcAddress` in the same function (L2 CONFIRMED, so linkage is
-   dynamic); `run` is the engine entry (also ordinal 1) and references
-   the default archive name `bigfile.dat` within its first bytes (L4
-   CONFIRMED). Engine startup contract beyond entry stays PARTIAL/UNKNOWN.
-   `cargo test` 88/88 green (no code touched; see
-   `docs/changes/s3-launcher-run/archive.md` and
-   `docs/notes/s3-launcher-run-behavior.md`).
-- `f4-launcher-cli` (playtest-accepted: no-op flags strip cleanly, unknown arg
-   still fails loud): the launcher flag surface found in `SRX.exe` strings is
-   replicated as a pure parser (`src/launcher_cli.rs`: `parse` +
-   `LauncherArgs` + `Game` + `EgsEnv` + `LauncherCliError`; no IO, env, or
-   process spawn) with unit tests on synthetic argv only. Every flag effect
-   stays UNKNOWN (static evidence only). The viewer strips
-   `--nosteam`/`-nocheck`/`-skipintro` (single- and double-dash forms) before
-   dispatch as compatibility no-ops — no output, no exit-code change; the
-   remaining flags are parser-only. `-nocheck`/`-skipintro` are absent from
-   this build, so they exist only as compatibility no-ops. `cargo test` 102/102
-   green (see `docs/changes/f4-launcher-cli/archive.md`).
-- `audio-snd` (playtest-accepted: one wave decoded and heard — the tone sounded
-  natural, and 44100 Hz is confirmed by ear; the scratch WAV stays in `%TEMP%`):
-  the paired `.SND`+`.SMP` instrument banks under `MUSIC/<track>/` are
-  readable. `cargo run -- --audio <FILE.SND> --alist` parses the 40-byte
-  `DNSa` header, the program (8 B) and zone (16 B) tables and the `u32`
-  wave/sequence/label offset tables, validates every structural invariant,
-  and lists each wave's offset, bytes, frames, decoded samples, duration and
-  loop span. `--audio <FILE.SND> --wave <n> --out <FILE.wav>` decodes exactly
-  one wave from the paired `PMSa` sample bank as Sony 4-bit ADPCM (16-byte
-  frame, 28 samples, filters 0-4, flag 7 stops before its samples) and writes
-  a canonical 44-byte RIFF/WAVE PCM16 mono file. The container stores no
-  sample rate: 44100 Hz is the community convention and every message prints
-  it as `(chosen)`; the audible playtest accepted 44100, so the 22050
-  alternative was not needed. The writer refuses a missing parent and any path
-  inside a git working tree, so game audio cannot enter this repository; the WAV
-  is a scratch playtest artifact, never an export path. Waves decode one-shot
-  even when the bank marks them looped (the loop span is reported only). No
-  sequence playback, no mixing, no new dependency; tests use synthetic bytes
-  only (see `docs/notes/s9-audio-snd.md` and
-  `docs/changes/audio-snd/archive.md`).
-- `area-levels` (playtest-accepted: level graph on a linked room and a
-  single-unit room; opens no window): `cargo run -- --level-info
-  <.PCM file | room directory>` prints one `level` line per unit
-  (`pcm_records`, accepted `names`, `links`, and the `PMF`/`PNF` sidecar
-  `segments`/`rate_field`/`pnf` counts) plus one `  link <target> <index>`
-  line per `<target>,<index>` cross-link name. A room directory resolves its
-  `BIN` when present (else itself) and units print sorted by name; a lone
-  `.PCM` path prints that one unit. Census: 89 `.PCM` units across 11 rooms;
-  368 cross-links, 346 (94.0%) resolve; 23 units carry a PMF/PNF pair.
-  Header and name table only: geometry, object placement, transforms, and
-  audio playback stay NOT decoded. Malformed input exits 2, a refused path
-  exits 3, a bad invocation exits 1. Synthetic-byte tests only; `cargo test`
-  226/226 green.
-
-- `room-geometry` (playtest-accepted: `LAIR5`, `MOVIE3`, and the `LAIR` room
-  directory; no window): `cargo run -- --level-records <.PCM file | room
-  directory>` counts each unit's blocks by **shape class** from the offset table
-  alone (`zero`, `small4`, `fixed40`, `fixed48`, `other:<size>`) and prints the
-  largest block's ordinal and size. These are SIZE classes, not types: no block
-  carries a type tag. The `level-builder` pass shows the offset table is a
-  relocation directory (each entry is the position of a dword holding a
-  non-zero base-relative offset), so these sizes are spacings between pointers,
-  not record types (`docs/notes/level-builder.md`). Census (89 units): 46,124
-  blocks, median 281 per unit; the
-  4/48/40-byte classes are ~92.7% of all blocks and 8.2% are all zero. Accepted
-  runs: `LAIR5` 62 blocks (zero 23, small4 14, fixed40 10, fixed48 11, other 4;
-  largest 61/3616), `MOVIE3` 2256 blocks (largest 549/143872), and the `LAIR`
-  room directory (31 units, exit 0); every unit's class counts sum to its header
-  count. Records 0 and 1 are all-zero padding, so the offset table is the only
-  directory. No vertex, face, placement, transform, or render claim;
-  `--level-info` is unchanged (see `docs/notes/room-geometry.md` and
-  `docs/changes/room-geometry/archive.md`).
-
-- `level-structure` (read-only counts; no window): `cargo run --
-  --level-structure <.PCM file | room directory>` reports per unit the header
-  sanity (`N`, `data_base`, `data_len`), relocation-directory integrity
-  (`entries` / `valid` / `zero` / `out_of_range`), the enumerated header offset
-  slots that are non-null (resolved as `data_base + value`), and the 36-byte
-  table's `count`, `stride` and per-record tagged-blob length or `null`. One
-  out-of-range directory entry fails the whole run (exit 2). Real-unit check:
-  `LAIR5` 62/62, `LAIR14` 74/74, `CATHY44` 326/326, `LAIR1` 1655/1655 and
-  `MOVIE3` 2256/2256 entries valid, zero zero and zero out-of-range; the `LAIR`
-  room directory 12,641/12,641 across 31 units. Slot roles, field semantics,
-  geometry, placement and transforms stay NOT claimed; the note leaves
-  `0x1B..=0x32` unenumerated, so those slots are not read. Synthetic-byte tests
-  only (`docs/notes/level-builder.md`, reader slice).
-
-- `level-links` (read-only counts; no window): `cargo run -- --level-links
-  <.PCM file | room directory>` reports per unit the decoded link-table count
-  and one line per record (`target`, `index`, the stable `target_id`, and the
-  five raw prelude integers). Header slot `0x34` points at 40-byte records
-  (`[5 x u32][12-byte name][2 x u32]`); the walk stops at the first name that is
-  not `<target>,<digits>`, a zero slot, or a record that would leave the data
-  region. A unit with no table reports `count=0`, not an error. Real-unit
-  check: `LAIR1` 2 (`lair29 66`, `lair3 51`), `LAIR14` 2, `LAIR13` 2,
-  `MOVIE3` 0; all 89 area units give 52 links in 31 `LAIR` units and 0
-  elsewhere (65 units zero). Prelude fields, the two tail values, geometry and
-  placement stay NOT interpreted. `--level-info` is unchanged: it still scans
-  the whole file and over-counts duplicates (`LAIR1` 4 vs the table's 2; see
-  `docs/notes/level-builder.md`).
-
-- `level-geometry` (read-only counts; no window): `cargo run --
-  --level-geometry <.PCM file | room directory>` reports per unit the room
-  record's vertex and face counts, both data-base-relative offsets, the axis
-  box over the `i16` positions with its centre, and a face-index validation
-  line (`out_of_range`, `max_index`). Header slot `0x00` points at the room
-  record: `+0x10`/`+0x1C` give the 12-byte vertex array (three `i16` at
-  `+0/+2/+4`) and `+0x14`/`+0x20` the 12-byte face array (first three `u16`
-  are vertex indices). A record or non-empty array outside the data region
-  fails the run (exit 2); zero counts report `count=0`. Real corpus (89 units,
-  11 rooms): 78,020 vertices, 139,877 faces, zero out-of-range indices, and
-  `max_index = vertices - 1` in every unit; `LAIR5` 81V/130F, `LAIR14`
-  95V/164F, `LAIR1` 2829V/5571F. The trailing vertex triple, array C, object
-  placement, orientation, normals, UVs and rendering stay NOT claimed.
-  Synthetic-byte tests only (`docs/notes/level-geometry.md`).
-
-- `level-render` (opens a window): `cargo run -- --level-render <.PCM file>`
-  converts one unit's confirmed room arrays through the existing `show_mesh`
-  path: the 12-byte vertex records become `[f32; 3]` positions (1:1 from the
-  three `i16`) and the face array's first three `u16` pass through unchanged
-  as triangle indices. It prints one line,
-  `level <name> vertices=<V> faces=<F> showing room geometry`, before the
-  window opens; the title is `level <name>`. A directory, a unit with 0
-  vertices or 0 faces, and any record/array/index outside the data region are
-  loud errors (exit 1, no window). Object placement, textures/materials, BSP
-  and culling stay out of scope; the interactive camera (orbit, wheel zoom,
-  pan, `R` reset) is shared with the mesh window above, including the `F`
-  first-person fly mode. In fly mode the eye starts at the room's first object
-  named `raziel` (mapped through the same auto-fit) looking at the scene bbox
-  centre, or at that centre when the room places no such object. Synthetic-byte
-  tests only (`docs/notes/level-geometry.md`).
-
-- `level-archive` (first-level path): `cargo run -- --level-geometry --bigfile
-  <BIGFILE.DAT> --entry <INDEX>` (or `--level-render` with the same flags)
-  reads the entry's
-  `[offset, offset + length)` slice into memory and feeds it to the same
-  `.PCM` reader as a loose file; nothing is extracted and no temporary file is
-  written. The unit name comes from header word `0x26`. `--bigfile` without
-  `--entry`, the reverse, an out-of-range index, an entry slice past EOF, and
-  an entry that does not parse as `.PCM` are loud exit-1 errors. Entry 115 of
-  the SR1 archive is `under1`: 1,468 vertices, 2,922 faces,
-  `out_of_range=0`, `max_index=1467`. Synthetic-byte tests only
-  (`docs/notes/level-geometry.md`).
-
-- `level-group` (whole level family): `cargo run -- --level-geometry --bigfile
-  <BIGFILE.DAT> --group under` scans the archive, keeps entries whose `.PCM`
-  self-name is `under` plus digits, and prints each room's `V`/`F` plus a
-  `group under rooms=<N> vertices=<V> faces=<F>` total. `--level-render` with
-  the same flags concatenates the rooms' world-space vertices and offsets each
-  room's face indices by its vertex base, so one solid shows the whole family
-  (no per-room transform). Empty prefix, no match, a matched room whose
-  geometry fails, and `--group` plus `--entry` are distinct exit-1 errors with
-  no window. Synthetic archive tests only
-  (`docs/changes/level-group/proposal.md`).
-
-- `level-objects` (read-only; no window): `cargo run -- --level-objects <PATH>`
-  or `--level-objects --bigfile <DAT> --entry <INDEX>` / `--group <PREFIX>`
-  prints, per room, `objects <name> count=<N> array=<OFFSET>` and one
-  `  object <name> pos=x,y,z type=<T> flags=<F>` line per record, then a
-  `group <prefix> rooms=<N> objects=<T>` total. The array sits in the same room
-  record as the geometry: count at `+0x08`, data-base-relative offset at
-  `+0x0C`, records of `0x4C` bytes with a 12-byte NUL-terminated name, three
-  `i16` world positions at `+0x20`, a type in the high 16 bits of `+0x28`, and
-  raw flags at `+0x2C`. Rooms are world space, so no transform is applied;
-  orientation is not stored in the record. On `under1` (entry 115) the count is
-  95 with `undhost`, `raziel`, and `marker` first. `--level-render ... --objects`
-  appends one small cube per object (side = 1% of the largest scene axis, at
-  least 2 units) merged into the same vertex/index buffers; every marker is
-  identical and no per-type colour is claimed. Without `--objects` the render
-  path is unchanged. Synthetic-byte tests only.
-
-- `unified-cli` (3-PR chain complete, archived): the grouped entry point is
-  live. `cargo run -- --help` (or `help <group>`) lists the 21 capabilities in
-  five groups; `cargo run -- <group> <command> ...` rewrites to the exact
-  legacy argv (`texture list <BIG>` is byte-identical to
-  `--textures <BIG> --tlist`). On a terminal, `cargo run -- menu` (or no
-  arguments) opens a numbered picker that asks for a group, a command, then
-  each required operand, and dispatches the same canonical argv; `q` or EOF
-  leaves it. A redirected stdout keeps the old usage error and exits 1
-  without reading stdin. `menu` and the five group words are the reserved
-  names (use `./mesh` for a local directory). Legacy flags are unchanged, and
-  equality is asserted as an argv vector comparison, not output snapshots. No
-  new dependency: `Cargo.toml` and `Cargo.lock` are unchanged. See
-  `docs/changes/unified-viewer/archive.md`.
-
-## What's missing
-
-- [ ] Room geometry has a validated summary reader (`--level-geometry`) and a
-      single-unit renderer (`--level-render` over the same arrays, through the
-      existing `show_mesh`). Counts, offsets, a vertex box and face-index
-      validation come from header
-      slot `0x00` (the room record), which exposes a 12-byte vertex array (three
-      `i16` position at `+0/2/4`) and a 12-byte face array whose first three
-      `u16` are vertex indices; the room object array carries a 3 x `i16` world
-      position at `+0x20` in each `0x4C` source record. Slot `0x03` is NOT
-      geometry (it is a small `0x3C`-stride record array). The renderer/spawner,
-      the trailing vertex attribute, the 8-byte array C, object orientation,
-      object type semantics and the 143,872-byte dominant block stay UNKNOWN.
-      Object positions are decoded and listed by `--level-objects` and can be
-      drawn by `--level-render --objects`; no transform claim. See
-      `docs/notes/level-geometry.md`.
-- [x] `.BIG` fixed-slot layout and slot decoding, slices `big-slots` +
-      `big-decompressor` (see `docs/changes/big-slots/design.md` and
-      `docs/changes/big-decompressor/design.md`): the four containers share a
-      verified 512-byte header plus entry count (1287 / 29 / 268 / 178
-      respectively) and `4096 + count * 131072`-byte fixed slots.
-      `--tlist` lists every slot with index/offset/class and a per-class
-      footer, exits 0; `--tshow` decodes one `data` slot as a raw 256 x 256
-      little-endian A1R5G5B5 image and shows it, while `empty`/`zero` slots
-      stay loud. Verdict: `data` slots are NOT compressed, so no decompressor
-      is needed. Visual acceptance of decoded slots is a playtest, not a test.
-- [x] 3D models, slice 1 `models-3d` (parse-one + render-one, see
-      `docs/changes/models-3d/`): single loose SRM as a flat-shaded
-      auto-rotating solid. Still unscoped: skeleton/animation, room
-      meshes, multi-mesh browsing, textured meshes.
-- [ ] Animation — **NOT solved** by the `animation` slice. What landed is
-      the `.SRM` bone-block decode plus one-bone deformation (`--mesh
-      --pose`), and it works only as a LOCAL CLUSTER rotation: a rotated
-      slot moves its own weighted vertices and nothing else. `.SRM` carries
-      no hierarchy (128 independent slots, no parent/child, no keyframes, no
-      clips), so posing a "parent" leaves children fixed and the mesh tears
-      — confirmed by playtest (`7:45` mostly coherent with one odd leg edge;
-      `12:45` scattered). The limb/body still cannot be animated. Next
-      candidate: scope the `.SRA` siblings (227 files, still undecoded) for
-      clips and hierarchy. Also open: joint/chain overlay, `extra > 0` HD
-      matrix interpretation, and bone names. See
-      `docs/changes/animation/archive.md`. Room meshes, multi-mesh browsing
-      and textured meshes stay separate scopes.
-- [ ] Audio follow-ups (unscoped, after animation): 322 of 841 waves are looped
-      but rendering is one-shot (the loop span is reported only); the 155
-      `QSMa` sequences are still unread and need a MIDI-like interpreter, SPU
-      ADSR envelopes and pitch resampling. Multi-track playback and the other
-      audio banks are separate scopes. See
-      `docs/changes/audio-snd/archive.md` and `docs/notes/s9-audio-snd.md`.
-- [ ] Picker operand prompts (UX polish from the `unified-viewer` playtest):
-      each prompt shows only the operand token (e.g. `SND>`), with no hint that
-      a filesystem path is expected, so a menu-style number is accepted as a
-      path and fails downstream with `cannot read <value>` (exit 1, by
-      design). Add a short hint or example per prompt in `src/menu.rs`. This is
-      polish, not a defect. See `docs/changes/unified-viewer/archive.md`.
-- [ ] Binary loader follow-ups (UNSCOPED, TBD by user): S2 and S3 both
-      landed docs-only — S2's static call-edge tracing resolved zero
-      post-open rows; S3 confirmed the launcher reaches `run`
-      dynamically but the engine startup contract beyond entry stays
-      UNKNOWN. Next binary slice open: a DYNAMIC-trace candidate to
-      resolve the still-HELD post-open rows and the still-UNKNOWN
-      contract rows, or S4 `run` internals — each needs its own slice
-      cycle, same slice discipline. F4 launcher CLI is done (see
-      `docs/changes/f4-launcher-cli/archive.md`); its remaining
-      parser-only flags get wired only if a future slice needs them.
-- [ ] sRGB correctness pass, resize handling, full mipmap-chain UI —
-      still deferred; `dxgiFormat` 99 (BC7 sRGB) still fails loud.
-- [ ] Visual playtest confirmation against a reference DDS viewer
-      (done by the user per slice; see the change PR).
-- [ ] Everything after that (gameplay, UI, SR2-side data) — unscoped
-
-## Next step
-
-Read `AGENTS.md`, then `docs/notes/` (survey + community tools + format
-notes). The `.SND`+`.SMP` audio probe and its one-wave slice are done, and
-the `animation` slice is archived as PARTIAL: bone decode and one-bone pose
-are in, but full-body pose is blocked by the absent hierarchy. The
-`room-geometry` is archived: `--level-records` is in and counts blocks by shape
-class only, records 0 and 1 are all-zero padding, and geometry stays unproven.
-The `level-geometry` probe located the vertex/face arrays and the object
-position field; a counts-only `--level-geometry` reader is the next slice, and
-the renderer/spawner trace is the probe after it. The PMF codec is a separate
-audio slice. `.SRA` scoping (227 sibling files) stays open under animation.
+- `docs/notes/` — evidence notes: formats, field offsets, counts and UNKNOWN lists.
+- `docs/changes/` — per-slice proposal/spec/design/tasks and archives.
+- `AGENTS.md` — repository rules and the session log.
