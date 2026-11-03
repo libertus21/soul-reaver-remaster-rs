@@ -41,6 +41,7 @@
 //! exits `0`.
 
 mod bigfile;
+mod cli_argv;
 mod cli_catalog;
 mod cli_out;
 // Launcher CLI arg parser (pure). Viewer only strips three no-op flags.
@@ -74,13 +75,14 @@ fn main() -> ExitCode {
     // Compatibility no-ops: stripped before dispatch, no output, no exit
     // change. (Parser-only flags are never wired into the viewer.)
     let args = strip_launcher_noops(raw);
-    if let Some(group) = match args.first().map(String::as_str) {
-        Some("--help" | "-h" | "help") => Some(args.get(1).map(String::as_str)),
-        _ => None,
-    } {
-        return run_help(group);
+    match cli_argv::route(&args) {
+        cli_argv::Route::Help(group) => run_help(group.as_deref()),
+        cli_argv::Route::Dispatch(argv) => dispatch(&argv),
+        cli_argv::Route::Error(message) => {
+            eprintln!("{message}");
+            ExitCode::from(1)
+        }
     }
-    dispatch(&args)
 }
 
 /// `--help|-h|help [group]`: the existing help surface, moved out of `main`.
@@ -1119,7 +1121,7 @@ mod cli_tests {
     use super::run_level_info;
     use super::{
         list_report, pose_mode_conflict, resolve_texture_name, run_audio, run_bigfile,
-        run_level_links, run_level_records, run_level_structure, run_mesh, run_mesh_all,
+        dispatch, run_level_links, run_level_records, run_level_structure, run_mesh, run_mesh_all,
         run_mesh_textured, run_mesh_with, run_textures, strip_launcher_noops, tshow_suffix,
     };
     use std::process::ExitCode;
@@ -2238,5 +2240,21 @@ mod cli_tests {
             run_audio(&[snd, "--alist".to_string(), "extra".to_string()]),
             ExitCode::from(1)
         );
+    }
+
+    #[test]
+    fn routed_archive_list_matches_the_legacy_exit_code() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let big = write_tmp(&tmp, "BIGFILE.DAT", &[0u8; 4]);
+        let legacy = dispatch(&["--bigfile".to_string(), big.clone(), "--list".to_string()]);
+        let routed = match crate::cli_argv::route(&[
+            "archive".to_string(),
+            "list".to_string(),
+            big,
+        ]) {
+            crate::cli_argv::Route::Dispatch(argv) => argv,
+            other => panic!("expected Dispatch, got {other:?}"),
+        };
+        assert_eq!(legacy, dispatch(&routed));
     }
 }
