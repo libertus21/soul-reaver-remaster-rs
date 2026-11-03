@@ -137,6 +137,20 @@ and 6,765 faces (`UNDRCT1`). Largest C array is 29,944 bytes (`LAIR33`).
 The earlier "dominant block" of up to 143,872 bytes (`MOVIE3`) is therefore
 **not** a geometry array. Its role stays UNKNOWN.
 
+## 1.7 Reader slice (implemented)
+
+`--level-geometry` reads slot `0x00`, then `+0x10/+0x1C` and `+0x14/+0x20`.
+It prints counts, both data-base-relative offsets, the axis box and its centre
+over the three `i16` positions, and face-index validation. A record or a
+non-empty array outside the data region is a distinct error (never clamped);
+zero counts print `0` without error. The trailing vertex triple, the face
+attribute words and array C are never read.
+
+Corpus check (89 units, 11 rooms): 78,020 vertices, 139,877 faces, zero
+out-of-range indices, and `max_index = vertices - 1` in every unit. `LAIR5`
+81/130, `LAIR14` 95/164, `LAIR1` 2829/5571. This reader adds no normal, UV,
+array C, placement, orientation or render claim.
+
 ## 2. Placement
 
 ### 2.1 Data path

@@ -154,6 +154,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--level-links") {
         return run_level_links(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--level-geometry") {
+        return run_level_geometry(&args[1..]);
+    }
     let Some(arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs <path-to-DDS | path-to-directory>");
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --list");
@@ -172,6 +175,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-records <.PCM file | room directory>");
         eprintln!("   or: soul-reaver-remaster-rs --level-structure <.PCM file | room directory>");
         eprintln!("   or: soul-reaver-remaster-rs --level-links <.PCM file | room directory>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-geometry <.PCM file | room directory>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
@@ -1112,6 +1116,28 @@ fn run_level_links(args: &[String]) -> ExitCode {
     };
     for line in units.iter().flat_map(level::link_lines) {
         outln!("{line}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Read-only `--level-geometry` arm: counts, offsets, vertex box and
+/// face-index validation. A record or array outside the data region fails.
+fn run_level_geometry(args: &[String]) -> ExitCode {
+    let result = match args {
+        [path] if !path.starts_with('-') => level::read_geometry_path(Path::new(path)),
+        _ => Err(level::LevelError::Usage("expected --level-geometry <path>")),
+    };
+    let rows = match result {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    for (name, geometry) in &rows {
+        for line in level::geometry_lines(name, geometry) {
+            outln!("{line}");
+        }
     }
     ExitCode::SUCCESS
 }
