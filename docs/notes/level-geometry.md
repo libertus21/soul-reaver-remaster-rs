@@ -151,6 +151,22 @@ out-of-range indices, and `max_index = vertices - 1` in every unit. `LAIR5`
 81/130, `LAIR14` 95/164, `LAIR1` 2829/5571. This reader adds no normal, UV,
 array C, placement, orientation or render claim.
 
+## 1.8 Archive entries (implemented)
+
+`--level-geometry` and `--level-render` also accept
+`--bigfile <BIGFILE.DAT> --entry <INDEX>`. The entry's
+`[offset, offset + length)` slice is read into memory and passed to the same
+in-memory `.PCM` reader as a loose file; the data-base rule is relative to the
+entry start. Nothing is extracted and no temporary file is written.
+
+The unit name is read from header word `0x26`, a data-base-relative offset to
+the unit's own NUL-terminated name. In the SR1 archive, entry 115 reports
+`under1` with 1,468 vertices, 2,922 faces, `out_of_range=0` and
+`max_index=1467`. Entry 0 fails as "does not parse as a .PCM", and index 9999
+fails as out of range; both exit 1 without a window. Object placement,
+textures, BSP and extraction stay out of scope. Tests use synthetic archives
+only.
+
 ## 2. Placement
 
 ### 2.1 Data path

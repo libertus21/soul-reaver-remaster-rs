@@ -5,7 +5,6 @@ use std::io::{BufRead, Write};
 use crate::cli_argv::{self, Route};
 use crate::cli_catalog::{self, Capability};
 const MAX_INVALID: usize = 3;
-const OPTION_FLAGS: [&str; 4] = ["--map", "--pose", "--tex-dir", "--out"];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome { Dispatch(Vec<String>), Cancelled, Exhausted }
@@ -99,7 +98,7 @@ fn prompts(cap: &Capability) -> Vec<(String, Option<&'static str>)> {
     let mut prompts = Vec::new();
     let mut i = 0;
     while i < tokens.len() {
-        if OPTION_FLAGS.contains(&tokens[i]) {
+        if cap.takes_value(tokens[i]) {
             if let Some(value) = tokens.get(i + 1) { prompts.push((angle(value), Some(tokens[i]))); }
             i += 2;
         } else if tokens[i].starts_with('<') {

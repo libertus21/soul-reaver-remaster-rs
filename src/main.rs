@@ -180,6 +180,8 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-links <.PCM file | room directory>");
         eprintln!("   or: soul-reaver-remaster-rs --level-geometry <.PCM file | room directory>");
         eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-geometry --bigfile <BIGFILE.DAT> --entry <INDEX>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-render --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
@@ -1124,13 +1126,53 @@ fn run_level_links(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+enum LevelInput<'a> {
+    Path(&'a str),
+    Entry { dat: &'a str, index: usize },
+}
+
+/// Parse a loose `<path>` or the `--bigfile <DAT> --entry <INDEX>` pair.
+/// Mixing one flag with a loose path, or omitting either flag, is a loud usage
+/// error; an entry index must be a non-negative decimal integer.
+fn level_input<'a>(
+    args: &'a [String],
+    usage: &'static str,
+) -> Result<LevelInput<'a>, level::LevelError> {
+    if !args.iter().any(|arg| arg == "--bigfile" || arg == "--entry") {
+        return match args {
+            [path] if !path.starts_with('-') => Ok(LevelInput::Path(path)),
+            _ => Err(level::LevelError::Usage(usage)),
+        };
+    }
+    let (mut dat, mut entry, mut index) = (None, None, 0);
+    while index < args.len() {
+        let value = args.get(index + 1).map(String::as_str);
+        match (args[index].as_str(), value) {
+            ("--bigfile", Some(value)) => dat = Some(value),
+            ("--entry", Some(value)) => entry = Some(value),
+            _ => return Err(level::LevelError::Usage(usage)),
+        }
+        index += 2;
+    }
+    let (dat, raw) = match (dat, entry) {
+        (Some(dat), Some(raw)) => (dat, raw),
+        (Some(_), None) => return Err(level::LevelError::ArchiveWithoutEntry),
+        (None, _) => return Err(level::LevelError::EntryWithoutArchive),
+    };
+    let index = raw
+        .parse::<usize>()
+        .map_err(|_| level::LevelError::Usage("expected --entry <index>"))?;
+    Ok(LevelInput::Entry { dat, index })
+}
+
 /// Read-only `--level-geometry` arm: counts, offsets, vertex box and
 /// face-index validation. A record or array outside the data region fails.
 fn run_level_geometry(args: &[String]) -> ExitCode {
-    let result = match args {
-        [path] if !path.starts_with('-') => level::read_geometry_path(Path::new(path)),
-        _ => Err(level::LevelError::Usage("expected --level-geometry <path>")),
-    };
+    let usage = "expected --level-geometry <path> or --level-geometry --bigfile <DAT> --entry <INDEX>";
+    let result = level_input(args, usage).and_then(|input| match input {
+        LevelInput::Path(path) => level::read_geometry_path(Path::new(path)),
+        LevelInput::Entry { dat, index } => level::read_entry_geometry(Path::new(dat), index),
+    });
     let rows = match result {
         Ok(rows) => rows,
         Err(error) => {
@@ -1149,10 +1191,11 @@ fn run_level_geometry(args: &[String]) -> ExitCode {
 /// `--level-render` arm: one `.PCM` unit through the existing mesh viewer.
 /// The geometry line prints before the window opens.
 fn run_level_render(args: &[String]) -> ExitCode {
-    let result = match args {
-        [path] if !path.starts_with('-') => level::read_room_mesh(Path::new(path)),
-        _ => Err(level::LevelError::Usage("expected --level-render <path>")),
-    };
+    let usage = "expected --level-render <path> or --level-render --bigfile <DAT> --entry <INDEX>";
+    let result = level_input(args, usage).and_then(|input| match input {
+        LevelInput::Path(path) => level::read_room_mesh(Path::new(path)),
+        LevelInput::Entry { dat, index } => level::read_entry_room_mesh(Path::new(dat), index),
+    });
     let (name, mesh) = match result {
         Ok(unit) => unit,
         Err(error) => {
@@ -1198,7 +1241,8 @@ mod cli_tests {
     use super::{
         list_report, pose_mode_conflict, resolve_texture_name, run_audio, run_bigfile,
         dispatch, run_level_links, run_level_records, run_level_structure, run_mesh, run_mesh_all,
-        run_mesh_textured, run_mesh_with, run_textures, strip_launcher_noops, tshow_suffix,
+        run_level_geometry, run_level_render, run_mesh_textured, run_mesh_with, run_textures,
+        strip_launcher_noops, tshow_suffix,
     };
     use std::process::ExitCode;
     use std::rc::Rc;
@@ -1841,6 +1885,57 @@ mod cli_tests {
         let absent_show = tmp.path().join("absent-show.big").to_string_lossy().into_owned();
         assert_eq!(
             run_bigfile(&[absent_show, "--show".to_string(), "0".to_string()]),
+            ExitCode::from(1)
+        );
+    }
+
+    /// One-entry archive; the entry starts right after the 20-byte header.
+    fn synthetic_archive(entry: &[u8]) -> Vec<u8> {
+        let mut dat = 1u32.to_le_bytes().to_vec();
+        dat.extend_from_slice(&[0u8; 4]);
+        dat.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+        dat.extend_from_slice(&20u32.to_le_bytes());
+        dat.extend_from_slice(&[0u8; 4]);
+        dat.extend_from_slice(entry);
+        dat
+    }
+
+    /// Minimal in-memory `.PCM`: header name at word `0x26`, no room record.
+    fn synthetic_entry_pcm(name: &str) -> Vec<u8> {
+        let name_at = 0xA0usize;
+        let mut body = vec![0u8; name_at + name.len() + 1];
+        body[4 * 0x26..4 * 0x26 + 4].copy_from_slice(&(name_at as u32).to_le_bytes());
+        body[name_at..name_at + name.len()].copy_from_slice(name.as_bytes());
+        let mut bytes = 2u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.resize(crate::level::data_base(2), 0);
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    #[test]
+    fn level_archive_entry_reads_the_entry_bytes() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let dat = write_tmp(&tmp, "BIGFILE.DAT", &synthetic_archive(&synthetic_entry_pcm("under1")));
+        let args = ["--bigfile".to_string(), dat, "--entry".to_string(), "0".to_string()];
+        assert_eq!(run_level_geometry(&args), ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn level_archive_entry_errors_are_loud_and_distinct() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let dat = write_tmp(&tmp, "BIGFILE.DAT", &synthetic_archive(b"not a pcm entry"));
+        let entry = |index: &str| {
+            vec!["--bigfile".to_string(), dat.clone(), "--entry".to_string(), index.to_string()]
+        };
+        assert_eq!(run_level_geometry(&entry("9")), ExitCode::from(1));
+        assert_eq!(run_level_render(&entry("9")), ExitCode::from(1));
+        assert_eq!(run_level_geometry(&entry("0")), ExitCode::from(1));
+        assert_eq!(run_level_geometry(&["--bigfile".to_string(), dat.clone()]), ExitCode::from(1));
+        assert_eq!(run_level_render(&["--entry".to_string(), "0".to_string()]), ExitCode::from(1));
+        assert_eq!(
+            run_level_geometry(&["--bigfile".to_string(), dat, "--entry".to_string(), "x".to_string()]),
             ExitCode::from(1)
         );
     }
