@@ -1,4 +1,4 @@
-﻿//! Untrusted SR1-remaster room containers: the `.PCM` header and name table.
+//! Untrusted SR1-remaster room containers: the `.PCM` header and name table.
 //! Read-only inventory: no geometry, placement, transform, or audio decode.
 
 use std::fmt;
@@ -53,6 +53,11 @@ pub struct BlockCensus {
 pub const SCHEMA_OFFSET_SLOTS: [usize; 14] =
     [0x00, 0x01, 0x03, 0x0D, 0x15, 0x17, 0x23, 0x26, 0x34, 0x35, 0x37, 0x39, 0x3B, 0x3D];
 
+/// 36-byte source records: count at header slot `0x3A`, offset at `0x3B`.
+const TABLE36_STRIDE: usize = 0x24;
+const SLOT_TABLE36_COUNT: usize = 0x3A;
+const SLOT_TABLE36_OFFSET: usize = 0x3B;
+
 /// Directory integrity: entry `i` is the position of a dword that holds a
 /// non-zero data-base-relative offset.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -63,6 +68,15 @@ pub struct RelocationReport {
     pub out_of_range: u32,
 }
 
+/// The 36-byte source table: count, stride, and one blob length or null per
+/// record. Field meaning stays UNKNOWN; only the tagged-blob length applies.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Table36Report {
+    pub count: u32,
+    pub stride: u32,
+    pub lengths: Vec<Option<u32>>,
+}
+
 /// Structural facts about one unit. `slots` holds every non-null enumerated
 /// header offset as `(slot, data_base + value)`. No geometry or type claim.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -71,6 +85,7 @@ pub struct LevelStructure {
     pub data_len: usize,
     pub reloc: RelocationReport,
     pub slots: Vec<(usize, usize)>,
+    pub table36: Table36Report,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +208,48 @@ fn schema_slots(data: &[u8], data_base: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Length of the tagged blob at `at`, or `None` when the magic is absent, a
+/// type byte is unknown, or the walk leaves the data region.
+fn tagged_blob_len(data: &[u8], at: usize) -> Option<u32> {
+    let blob = data.get(at..)?;
+    if blob.first() != Some(&0xBE) || blob.get(1) != Some(&0xEF) {
+        return None;
+    }
+    let count = *blob.get(2)?;
+    let mut cursor = 4usize;
+    for _ in 0..count {
+        let kind = *blob.get(cursor)?;
+        let length = usize::from(*blob.get(cursor.checked_add(1)?)?);
+        let entry = match kind {
+            0 => 0x12,
+            1..=4 => 0x0E,
+            _ => return None,
+        };
+        cursor = cursor.checked_add(entry + 2 * length)?;
+    }
+    u32::try_from(cursor).ok()
+}
+
+/// Walk the 36-byte table: one tagged-blob length or null per record. The
+/// count is capped so an untrusted header cannot force unbounded work.
+fn table36_report(data: &[u8]) -> Table36Report {
+    let count = read_u32(data, 4 * SLOT_TABLE36_COUNT).unwrap_or(0).min(MAX_RECORDS);
+    let offset = read_u32(data, 4 * SLOT_TABLE36_OFFSET).unwrap_or(0) as usize;
+    let mut lengths = Vec::new();
+    for index in 0..count as usize {
+        let length = if offset == 0 {
+            None
+        } else {
+            let at = offset + index * TABLE36_STRIDE;
+            read_u32(data, at)
+                .filter(|&relative| relative != 0)
+                .and_then(|relative| tagged_blob_len(data, relative as usize))
+        };
+        lengths.push(length);
+    }
+    Table36Report { count, stride: TABLE36_STRIDE as u32, lengths }
+}
+
 /// `u32 N` + `N` ascending relative offsets + zero padding up to
 /// `4 * roundup512(N)`, which is the level-data base, then the level data and
 /// the name table. Blocks are addressed relative to that padded base.
@@ -243,6 +300,7 @@ pub fn parse_pcm(bytes: &[u8], expected_name: &str) -> Result<LevelUnit, LevelEr
         data_len: data.len(),
         reloc: relocation_report(data, &offsets),
         slots: schema_slots(data, data_base),
+        table36: table36_report(data),
     };
     let names = extract_names(bytes);
     let name = names
@@ -349,6 +407,13 @@ pub fn structure_lines(unit: &LevelUnit) -> Result<Vec<String>, LevelError> {
         .iter()
         .map(|(slot, position)| format!(" 0x{slot:02X}:{position}"))
         .collect();
+    let list: Vec<String> = structure
+        .table36
+        .lengths
+        .iter()
+        .map(|length| length.map_or_else(|| "null".to_string(), |bytes| bytes.to_string()))
+        .collect();
+    let lengths = if list.is_empty() { "none".to_string() } else { list.join(",") };
     Ok(vec![
         format!(
             "level {} pcm_records={} data_base={} data_len={}",
@@ -363,6 +428,10 @@ pub fn structure_lines(unit: &LevelUnit) -> Result<Vec<String>, LevelError> {
             SCHEMA_OFFSET_SLOTS.len(),
             structure.slots.len(),
             at
+        ),
+        format!(
+            "  table36 count={} stride={} lengths={lengths}",
+            structure.table36.count, structure.table36.stride
         ),
     ])
 }
@@ -909,8 +978,42 @@ mod tests {
                 "level lair5 pcm_records=3 data_base=2048 data_len=40",
                 "  reloc entries=3 valid=2 zero=1 out_of_range=0",
                 "  schema slots=14 non_null=2 0x00:2064 0x03:2068",
+                "  table36 count=0 stride=36 lengths=none",
             ]
         );
+    }
+
+    #[test]
+    fn table36_reports_blob_lengths_and_nulls() {
+        let mut bytes = structure_pcm(
+            &[0, 4],
+            &[(0x00, 16), (0x01, 20), (0x3A, 6), (0x3B, 256)],
+            800,
+        );
+        let base = data_base(2);
+        for (index, first) in [500u32, 0, 600, 640, 700, 660].iter().enumerate() {
+            let at = base + 256 + index * TABLE36_STRIDE;
+            bytes[at..at + 4].copy_from_slice(&first.to_le_bytes());
+        }
+        let mut typed = vec![0u8; 20];
+        typed[..6].copy_from_slice(&[0xBE, 0xEF, 0x02, 0x00, 0x01, 0x00]);
+        for (at, blob) in [
+            (500, &b"\xBE\xEF\x01\x00\x01\x03"[..]),
+            (640, &b"\xBE\xEF\x00"[..]),
+            (660, &typed[..]),
+        ] {
+            bytes[base + at..base + at + blob.len()].copy_from_slice(blob);
+        }
+        let unit = parse_pcm(&bytes, "lair5").expect("must parse");
+        let table = &unit.structure.table36;
+        assert_eq!((table.count, table.stride), (6, 36));
+        assert_eq!(
+            table.lengths,
+            vec![Some(24), None, None, Some(4), None, Some(36)]
+        );
+        assert!(structure_lines(&unit).expect("in range")[3].ends_with(
+            "table36 count=6 stride=36 lengths=24,null,null,4,null,36"
+        ));
     }
 
     #[test]
