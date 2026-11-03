@@ -321,6 +321,37 @@ records into world transforms.
 - `src/level.rs` `BlockClass` is a shape classifier only. It must not be read as
   a type taxonomy.
 
+## Reader slice (implemented)
+
+The structural reader is `--level-structure` over `src/level.rs`. Per unit it
+reports, without interpreting anything:
+
+1. Header sanity: `N`, `data_base = 4 * roundup512(N)`, and
+   `data_len = file_len - data_base`.
+2. Relocation-directory integrity: every entry is read as a position
+   (`u32(data_base + entry)`), classified `valid` (`1..=data_len-4`), `zero`, or
+   `out_of_range`. Any out-of-range entry fails the run (exit 2).
+3. Header offset slots: the slots the note individually enumerates
+   (`0x00 0x01 0x03 0x0D 0x15 0x17 0x23 0x26 0x34 0x35 0x37 0x39 0x3B 0x3D`).
+   A non-null slot is reported as `data_base + value`; `0` is null. The
+   `0x1B..=0x32` range is summarized in §1 but not enumerated there, so the
+   reader does not claim or read it.
+4. The 36-byte table (`count` at header slot `0x3A`, offset at `0x3B`): count,
+   stride `0x24`, and one tagged-blob length per record. `null` means a zero
+   first field, absent `0xBE 0xEF` magic, or a walk that leaves the data region.
+   No field of the record is interpreted (UNKNOWN 1).
+
+Real-unit verification (read-only, counts only): `LAIR5` 62/62, `LAIR14` 74/74,
+`CATHY44` 326/326, `LAIR1` 1655/1655 and `MOVIE3` 2256/2256 directory entries
+valid, with zero zero-valued and zero out-of-range entries; the `LAIR` room
+directory resolves 12,641/12,641 entries across 31 units. The 36-byte table
+appears in three of those units (6, 3 and 7 records), all stride `0x24`; the
+three records with zero first fields are the LAIR10 case from §3.
+
+Not claimed by this slice: field semantics, slot roles, record types, geometry,
+positions, transforms, or any downstream consumer. `BlockClass` stays a shape
+hint and `--level-records` is unchanged.
+
 ## Legal
 
 Behaviour notes only. Role names, field offsets and a few short engine
