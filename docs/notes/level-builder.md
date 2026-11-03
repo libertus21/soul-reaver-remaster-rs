@@ -360,9 +360,40 @@ that carries one. The table is an array of 40-byte records:
 
 | offset | size | content |
 |---|---|---|
-| `0x00` | 20 | five u32 prelude values |
+| `0x00` | 20 | five u32 prelude fields |
 | `0x14` | 12 | NUL-terminated name, `<target>,<index>` |
-| `0x20` | 8 | two u32 tail values |
+| `0x20` | 8 | two u32 tail fields (not read) |
+
+### Prelude field semantics
+
+Observed across the 52 links found in the 31 `LAIR` units:
+
+| field | offset | meaning | evidence | status |
+|---|---|---|---|---|
+| `field0` | `0x00` | constant `1` | `1` in all 52 links | CONFIRMED |
+| `field1` | `0x04` | related index, always equal to `field3` | equal to `field3` in all 52 links; direction below | CONFIRMED equality, meaning partial |
+| `field2` | `0x08` | constant `18` | `18` in all 52 links | CONFIRMED |
+| `field3` | `0x0C` | same value as `field1` | equal to `field1` in all 52 links | CONFIRMED |
+| `field4` | `0x10` | stable per-target ID | 28 distinct targets map to 28 distinct values, zero mixing; range `-10919..=-4577` | CONFIRMED |
+
+`field1`/`field3` is the **related index - direction UNKNOWN**. The shared value
+is within `+/-1` of the name's `,N` index in 51 of 52 links, but the sign is not
+explained: it follows neither record ordinal nor target. Do not state it as
+`index + 1` or `index - 1`.
+
+One outlier is open: `mrlock12` has a `+55` delta between `field1` and the name's
+`,N` index. Why it diverges is an open question, not a second rule.
+
+Real-unit sample (`--level-links`):
+
+```
+links lair1 count=2
+  link lair29 66 target_id=-4579 prelude=1,67,18,67,-4579
+  link lair3 51 target_id=-4605 prelude=1,52,18,52,-4605
+links lair14 count=2
+  link lair10 27 target_id=-4598 prelude=1,28,18,28,-4598
+  link lair27 59 target_id=-4581 prelude=1,60,18,60,-4581
+```
 
 The table ends at the first record whose 12-byte name field does not match
 `^[a-z][a-z0-9]*,[0-9]+$`. A zero slot, a name that does not match on the first
@@ -370,16 +401,17 @@ record, or a record that would leave the data region ends the walk with zero or
 fewer links; none of those cases is an error. `MOVIE3` is the zero-link example:
 it has no link table, and the reader reports `count=0`.
 
-Real units: `LAIR1` has two records, `lair29,66` (prelude
-`1,67,18,67,-4579`) and `lair3,51` (`1,52,18,52,-4605`). `LAIR14` has
+Real units: `LAIR1` has two records, `lair29,66` and `lair3,51`; `LAIR14` has
 `lair10,27` and `lair27,59`; `LAIR13` has `lair10,26` and `lair26,57`.
 Across all 89 SR1 area units the walk finds 52 links in the 31 `LAIR` units
 (24 with links, 7 with none) and zero links in every other unit; 65 units
 report zero.
 
-The prelude values are reported as raw signed 32-bit integers. No field is
-named or interpreted - not "index", "mask", "flags", geometry, or placement.
-The two tail values are not read. `--level-links` is the reader:
+`--level-links` prints all five prelude values as raw signed 32-bit integers and
+additionally prints `target_id` (field 4). `field0` and `field2` are constants,
+`field1`/`field3` are the related index with unknown direction, and no geometry,
+placement, mask, or flag meaning is claimed for any field. The two tail values
+are not read. `--level-links` is the reader:
 `cargo run -- --level-links <.PCM file | room directory>`.
 
 **Correction to `--level-info`.** That arm still counts links by scanning the
