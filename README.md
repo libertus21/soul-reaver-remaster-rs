@@ -275,8 +275,8 @@ extracted files, decompiled code, or database files.
 
 - `level-links` (read-only counts; no window): `cargo run -- --level-links
   <.PCM file | room directory>` reports per unit the decoded link-table count
-  and one line per record (`target`, `index`, and the five raw prelude
-  integers). Header slot `0x34` points at 40-byte records
+  and one line per record (`target`, `index`, the stable `target_id`, and the
+  five raw prelude integers). Header slot `0x34` points at 40-byte records
   (`[5 x u32][12-byte name][2 x u32]`); the walk stops at the first name that is
   not `<target>,<digits>`, a zero slot, or a record that would leave the data
   region. A unit with no table reports `count=0`, not an error. Real-unit

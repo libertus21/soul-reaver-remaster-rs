@@ -104,11 +104,13 @@ pub struct Link {
 }
 
 /// One 40-byte link-table record. Every prelude value is reported as a raw
-/// signed 32-bit integer; no field is interpreted.
+/// signed 32-bit integer. `target_id` repeats prelude field 4, the value that
+/// stays stable per target across units; no other field is interpreted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableLink {
     pub target: String,
     pub index: u32,
+    pub target_id: i32,
     pub prelude: [i32; 5],
 }
 
@@ -293,7 +295,7 @@ fn link_table(data: &[u8]) -> Vec<TableLink> {
         for (slot, value) in prelude.iter_mut().enumerate() {
             *value = read_u32(record, 4 * slot).unwrap_or(0) as i32;
         }
-        links.push(TableLink { target, index, prelude });
+        links.push(TableLink { target, index, target_id: prelude[4], prelude });
         at = end;
     }
     links
@@ -572,14 +574,15 @@ pub fn report_lines(unit: &LevelUnit) -> Vec<String> {
 }
 
 /// One `links` line per unit, then one line per decoded link-table record.
-/// Prelude values are raw integers; nothing is named or interpreted.
+/// Prelude values are raw integers and are still printed in full; `target_id`
+/// repeats field 4 so the stable target identity is visible without indexing.
 pub fn link_lines(unit: &LevelUnit) -> Vec<String> {
     let mut lines = vec![format!("links {} count={}", unit.name, unit.link_table.len())];
     lines.extend(unit.link_table.iter().map(|link| {
         let [a, b, c, d, e] = link.prelude;
         format!(
-            "  link {} {} prelude={a},{b},{c},{d},{e}",
-            link.target, link.index
+            "  link {} {} target_id={} prelude={a},{b},{c},{d},{e}",
+            link.target, link.index, link.target_id
         )
     }));
     lines
@@ -1171,10 +1174,28 @@ mod tests {
             TableLink {
                 target: "lair29".into(),
                 index: 66,
+                target_id: -4579,
                 prelude: [1, 67, 18, 67, -4579]
             }
         );
         assert_eq!((links[1].target.as_str(), links[1].index), ("lair3", 51));
+        assert_eq!(links[1].target_id, -4605);
+    }
+
+    #[test]
+    fn target_id_exposes_the_fourth_prelude_field() {
+        let bytes = link_pcm(
+            &[
+                ([1, 67, 18, 67, -4579], "lair29,66"),
+                ([1, 52, 18, 52, -4605], "lair3,51"),
+            ],
+            2 * LINK_RECORD_STRIDE,
+        );
+        let links = links_of(&bytes);
+        for link in &links {
+            assert_eq!(link.target_id, link.prelude[4]);
+        }
+        assert_ne!(links[0].target_id, links[1].target_id);
     }
 
     #[test]
@@ -1194,14 +1215,14 @@ mod tests {
     }
 
     #[test]
-    fn link_lines_report_the_count_targets_and_raw_preludes() {
+    fn link_lines_report_the_count_targets_target_ids_and_raw_preludes() {
         let bytes = link_pcm(&[([1, 67, 18, 67, -4579], "lair29,66")], LINK_RECORD_STRIDE);
         let unit = parse_pcm(&bytes, "lair5").expect("must parse");
         assert_eq!(
             link_lines(&unit),
             vec![
                 "links lair5 count=1",
-                "  link lair29 66 prelude=1,67,18,67,-4579",
+                "  link lair29 66 target_id=-4579 prelude=1,67,18,67,-4579",
             ]
         );
     }
