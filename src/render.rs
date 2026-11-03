@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, WindowEvent};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -703,29 +703,151 @@ fn mul4(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     out
 }
 
-fn mvp_for(angle: f32, aspect: f32) -> [[f32; 4]; 4] {
-    let (s, c) = angle.sin_cos();
-    let rot = [
-        [c, 0.0, -s, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [s, 0.0, c, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ];
-    let view = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, -2.2, 1.0],
-    ];
-    let f = 1.0 / (std::f32::consts::FRAC_PI_8).tan();
-    let (near, far) = (0.1, 100.0);
-    let proj = [
-        [f / aspect, 0.0, 0.0, 0.0],
-        [0.0, f, 0.0, 0.0],
-        [0.0, 0.0, far / (near - far), -1.0],
-        [0.0, 0.0, -far * near / (far - near), 0.0],
-    ];
-    mul4(&proj, &mul4(&view, &rot))
+// --- interactive orbit camera (mesh/level windows) ---
+
+const ORBIT_SENSITIVITY: f32 = 0.008;
+const ZOOM_SENSITIVITY: f32 = 0.15;
+const PAN_SENSITIVITY: f32 = 0.0015;
+const AUTO_ROTATE_SPEED: f32 = 0.6;
+/// Historical eye distance: reproduces the fixed auto-fit framing exactly.
+const FIT_DISTANCE: f32 = 2.2;
+/// 0.005 is ~0.6% of the ~0.87 scene radius, so the eye can sit inside.
+const MIN_DISTANCE: f32 = 0.005;
+/// Finite ceiling: zoom-out can never send the eye to infinity.
+const MAX_DISTANCE: f32 = 20.0;
+/// Just short of the pole, so the orbit basis never degenerates.
+const PITCH_LIMIT: f32 = 1.553_343;
+
+/// Pure orbit/zoom/pan state. `fit_positions` normalises meshes to a unit
+/// extent, so `new` frames them exactly as the historical fixed view did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OrbitCamera {
+    yaw: f32,
+    pitch: f32,
+    distance: f32,
+    target: [f32; 3],
+    auto_rotate: bool,
+}
+
+impl OrbitCamera {
+    pub const fn new() -> Self {
+        Self { yaw: 0.0, pitch: 0.0, distance: FIT_DISTANCE, target: [0.0; 3], auto_rotate: true }
+    }
+
+    pub fn reset(&mut self) { *self = Self::new(); }
+
+    fn interact(&mut self) { self.auto_rotate = false; }
+
+    pub fn apply_orbit(&mut self, dx: f32, dy: f32) {
+        self.interact();
+        self.yaw -= dx * ORBIT_SENSITIVITY;
+        self.pitch = (self.pitch + dy * ORBIT_SENSITIVITY).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    }
+
+    pub fn apply_zoom(&mut self, notches: f32) {
+        self.interact();
+        let rate = (-notches * ZOOM_SENSITIVITY).exp();
+        self.distance = (self.distance * rate).clamp(MIN_DISTANCE, MAX_DISTANCE);
+    }
+
+    pub fn apply_pan(&mut self, dx: f32, dy: f32) {
+        self.interact();
+        let (right, up) = self.basis();
+        let step = self.distance * PAN_SENSITIVITY;
+        for axis in 0..3 {
+            self.target[axis] += (-right[axis] * dx + up[axis] * dy) * step;
+        }
+    }
+
+    pub fn tick(&mut self, seconds: f32) {
+        if self.auto_rotate {
+            self.yaw += seconds * AUTO_ROTATE_SPEED;
+        }
+    }
+
+    /// World-space camera right and up; both unit length.
+    fn basis(&self) -> ([f32; 3], [f32; 3]) {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        ([cy, 0.0, -sy], [-sy * sp, cp, -cy * sp])
+    }
+
+    /// Near/far scale with distance, so interior geometry survives any zoom.
+    fn mvp(&self, aspect: f32) -> [[f32; 4]; 4] {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        let eye = [
+            self.target[0] + self.distance * cp * sy,
+            self.target[1] + self.distance * sp,
+            self.target[2] + self.distance * cp * cy,
+        ];
+        let forward = [-cp * sy, -sp, -cp * cy];
+        let (right, up) = self.basis();
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let view = [
+            [right[0], up[0], -forward[0], 0.0],
+            [right[1], up[1], -forward[1], 0.0],
+            [right[2], up[2], -forward[2], 0.0],
+            [-dot(right, eye), -dot(up, eye), dot(forward, eye), 1.0],
+        ];
+        let near = (self.distance * 0.02).max(1e-3);
+        let far = self.distance + 4.0;
+        let f = 1.0 / std::f32::consts::FRAC_PI_8.tan();
+        let proj = [
+            [f / aspect.max(1e-6), 0.0, 0.0, 0.0],
+            [0.0, f, 0.0, 0.0],
+            [0.0, 0.0, far / (near - far), -1.0],
+            [0.0, 0.0, -far * near / (far - near), 0.0],
+        ];
+        mul4(&proj, &view)
+    }
+}
+
+fn next_mvp(camera: &mut OrbitCamera, last_frame: &mut std::time::Instant, aspect: f32) -> [u8; 64] {
+    let now = std::time::Instant::now();
+    let dt = now.duration_since(*last_frame).as_secs_f32();
+    *last_frame = now;
+    camera.tick(dt);
+    mat_bytes(&camera.mvp(aspect))
+}
+
+#[derive(Default)]
+struct CameraInput {
+    drag: Option<MouseButton>,
+    last: Option<PhysicalPosition<f64>>,
+}
+
+impl CameraInput {
+    fn handle(&mut self, camera: &mut OrbitCamera, event: &WindowEvent) -> bool {
+        match event {
+            WindowEvent::MouseInput { state, button, .. } => {
+                if *state == ElementState::Pressed {
+                    self.drag = Some(*button);
+                } else if self.drag == Some(*button) {
+                    self.drag = None;
+                }
+                true
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let (Some(button), Some(prev)) = (self.drag, self.last) {
+                    let (dx, dy) = ((position.x - prev.x) as f32, (position.y - prev.y) as f32);
+                    if button == MouseButton::Left { camera.apply_orbit(dx, dy); }
+                    else { camera.apply_pan(dx, dy); }
+                }
+                self.last = Some(*position);
+                true
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let notches = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => *y,
+                    MouseScrollDelta::PixelDelta(p) => (p.y / 50.0) as f32,
+                };
+                camera.apply_zoom(notches);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 fn mat_bytes(m: &[[f32; 4]; 4]) -> [u8; 64] {
@@ -751,7 +873,8 @@ struct MeshState<'window> {
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
-    start: std::time::Instant,
+    camera: OrbitCamera,
+    last_frame: std::time::Instant,
 }
 
 impl<'window> MeshState<'window> {
@@ -893,7 +1016,8 @@ impl<'window> MeshState<'window> {
             uniform_buffer,
             uniform_bind_group,
             depth_view,
-            start: std::time::Instant::now(),
+            camera: OrbitCamera::new(),
+            last_frame: std::time::Instant::now(),
         })
     }
 
@@ -908,8 +1032,8 @@ impl<'window> MeshState<'window> {
 
     fn render(&mut self) {
         let aspect = self.config.width.max(1) as f32 / self.config.height.max(1) as f32;
-        let mvp = mvp_for(self.start.elapsed().as_secs_f32() * 0.6, aspect);
-        self.queue.write_buffer(&self.uniform_buffer, 0, &mat_bytes(&mvp));
+        let mvp = next_mvp(&mut self.camera, &mut self.last_frame, aspect);
+        self.queue.write_buffer(&self.uniform_buffer, 0, &mvp);
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -966,6 +1090,7 @@ struct MeshApp {
     indices: Vec<u16>,
     state: Option<MeshState<'static>>,
     init_error: Option<String>,
+    input: CameraInput,
 }
 
 impl ApplicationHandler for MeshApp {
@@ -1012,6 +1137,9 @@ impl ApplicationHandler for MeshApp {
         if window_id != state.window.id() {
             return;
         }
+        if self.input.handle(&mut state.camera, &event) {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -1023,8 +1151,10 @@ impl ApplicationHandler for MeshApp {
                 if event.state != ElementState::Pressed || event.repeat {
                     return;
                 }
-                if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
-                    event_loop.exit();
+                match &event.logical_key {
+                    Key::Named(NamedKey::Escape) => event_loop.exit(),
+                    Key::Character(text) if text.eq_ignore_ascii_case("r") => state.camera.reset(),
+                    _ => {}
                 }
             }
             _ => {}
@@ -1057,6 +1187,7 @@ pub fn show_mesh(positions: &[[f32; 3]], indices: &[u16], title: &str) -> Result
         indices: indices.to_vec(),
         state: None,
         init_error: None,
+        input: CameraInput::default(),
     };
     event_loop
         .run_app(&mut app)
@@ -1231,7 +1362,8 @@ struct TexturedMeshState<'window> {
     texture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     depth_view: wgpu::TextureView,
-    start: std::time::Instant,
+    camera: OrbitCamera,
+    last_frame: std::time::Instant,
     vertex_buffer: wgpu::Buffer,
     index_buffers: Vec<(u32, wgpu::Buffer, u32)>,
     texture_bind_groups: Vec<wgpu::BindGroup>,
@@ -1414,7 +1546,8 @@ impl<'window> TexturedMeshState<'window> {
             texture_layout,
             sampler,
             depth_view,
-            start: std::time::Instant::now(),
+            camera: OrbitCamera::new(),
+            last_frame: std::time::Instant::now(),
             vertex_buffer: dummy,
             index_buffers: Vec::new(),
             texture_bind_groups: Vec::new(),
@@ -1519,8 +1652,8 @@ impl<'window> TexturedMeshState<'window> {
 
     fn render(&mut self) {
         let aspect = self.config.width.max(1) as f32 / self.config.height.max(1) as f32;
-        let mvp = mvp_for(self.start.elapsed().as_secs_f32() * 0.6, aspect);
-        self.queue.write_buffer(&self.uniform_buffer, 0, &mat_bytes(&mvp));
+        let mvp = next_mvp(&mut self.camera, &mut self.last_frame, aspect);
+        self.queue.write_buffer(&self.uniform_buffer, 0, &mvp);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
@@ -1582,6 +1715,7 @@ struct TexturedMeshApp {
     entry: crate::mesh_entry::MeshEntry,
     state: Option<TexturedMeshState<'static>>,
     init_error: Option<String>,
+    input: CameraInput,
 }
 
 impl ApplicationHandler for TexturedMeshApp {
@@ -1616,6 +1750,7 @@ impl ApplicationHandler for TexturedMeshApp {
     ) {
         let Some(state) = &mut self.state else { return };
         if window_id != state.window.id() { return; }
+        if self.input.handle(&mut state.camera, &event) { return; }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -1625,8 +1760,10 @@ impl ApplicationHandler for TexturedMeshApp {
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state != ElementState::Pressed || event.repeat { return; }
-                if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
-                    event_loop.exit();
+                match &event.logical_key {
+                    Key::Named(NamedKey::Escape) => event_loop.exit(),
+                    Key::Character(text) if text.eq_ignore_ascii_case("r") => state.camera.reset(),
+                    _ => {}
                 }
             }
             _ => {}
@@ -1662,7 +1799,7 @@ pub fn show_mesh_textured(
     validate_entry_shape(&entry)?;
     let event_loop =
         EventLoop::new().map_err(|e| format!("cannot create window event loop: {e}"))?;
-    let mut app = TexturedMeshApp { entry, state: None, init_error: None };
+    let mut app = TexturedMeshApp { entry, state: None, init_error: None, input: CameraInput::default() };
     event_loop
         .run_app(&mut app)
         .map_err(|e| format!("window event loop failed: {e}"))?;
@@ -1719,6 +1856,7 @@ struct MeshGalleryApp<'a> {
     current: crate::mesh_entry::MeshEntry,
     state: Option<TexturedMeshState<'static>>,
     init_error: Option<String>,
+    input: CameraInput,
 }
 
 impl<'a> ApplicationHandler for MeshGalleryApp<'a> {
@@ -1758,6 +1896,7 @@ impl<'a> ApplicationHandler for MeshGalleryApp<'a> {
     ) {
         let Some(state) = &mut self.state else { return };
         if window_id != state.window.id() { return; }
+        if self.input.handle(&mut state.camera, &event) { return; }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -1785,6 +1924,9 @@ impl<'a> ApplicationHandler for MeshGalleryApp<'a> {
                         Direction::Prev,
                     ),
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
+                    Key::Character(text) if text.eq_ignore_ascii_case("r") => {
+                        state.camera.reset()
+                    }
                     _ => {}
                 }
             }
@@ -1834,6 +1976,7 @@ pub fn show_mesh_gallery(entries: &[PathBuf], tex_dir: &Path) -> Result<(), Stri
         current,
         state: None,
         init_error: None,
+        input: CameraInput::default(),
     };
     event_loop
         .run_app(&mut app)
@@ -1846,7 +1989,15 @@ pub fn show_mesh_gallery(entries: &[PathBuf], tex_dir: &Path) -> Result<(), Stri
 
 #[cfg(test)]
 mod mesh_tests {
-    use super::{fit_positions, mvp_for, validate_entry_shape};
+    use super::{
+        fit_positions, validate_entry_shape, OrbitCamera, FIT_DISTANCE, MAX_DISTANCE,
+        MIN_DISTANCE, PITCH_LIMIT,
+    };
+
+    fn origin_clip(camera: &OrbitCamera, aspect: f32) -> [f32; 4] {
+        let m = camera.mvp(aspect);
+        [m[3][0], m[3][1], m[3][2], m[3][3]]
+    }
 
     #[test]
     fn autofit_centers_and_scales_to_unit_extent() {
@@ -1865,19 +2016,58 @@ mod mesh_tests {
     }
 
     #[test]
-    fn origin_lands_in_front_of_camera() {
-        let m = mvp_for(0.0, 1.0);
-        let clip_z = m[3][2];
-        let clip_w = m[3][3];
-        assert!(
-            clip_w > 0.0,
-            "clip.w must be positive for a point in front of the camera, got {clip_w}"
-        );
-        let ndc_z = clip_z / clip_w;
-        assert!(
-            (0.0..=1.0).contains(&ndc_z),
-            "NDC z must lie in [0, 1] for WebGPU, got {ndc_z}"
-        );
+    fn camera_starts_at_the_historical_auto_fit() {
+        let camera = OrbitCamera::new();
+        assert_eq!((camera.yaw, camera.pitch), (0.0, 0.0));
+        assert_eq!(camera.distance, FIT_DISTANCE);
+        assert!(camera.auto_rotate);
+        let clip = origin_clip(&camera, 1.0);
+        assert!(clip[0].abs() < 1e-6 && clip[1].abs() < 1e-6, "origin stays centred");
+        assert!((clip[3] - FIT_DISTANCE).abs() < 1e-5, "eye distance is the fit distance");
+        assert!((0.0..=1.0).contains(&(clip[2] / clip[3])), "NDC z lies in [0, 1]");
+    }
+
+    #[test]
+    fn orbit_clamps_pitch_and_freezes_auto_rotation() {
+        let mut camera = OrbitCamera::new();
+        camera.apply_orbit(10.0, 0.0);
+        assert!(camera.yaw < 0.0);
+        assert!(!camera.auto_rotate);
+        let yaw = camera.yaw;
+        camera.tick(1.0);
+        assert_eq!(camera.yaw, yaw, "auto-rotation stays stopped after input");
+        camera.apply_orbit(0.0, 1e6);
+        assert!((camera.pitch - PITCH_LIMIT).abs() < 1e-5);
+        camera.apply_orbit(0.0, -2e6);
+        assert!((camera.pitch + PITCH_LIMIT).abs() < 1e-5);
+        camera.reset();
+        camera.tick(0.5);
+        assert!(camera.yaw > 0.0, "reset re-arms auto-rotation");
+    }
+
+    #[test]
+    fn zoom_reaches_the_interior_without_inverting() {
+        let mut camera = OrbitCamera::new();
+        for _ in 0..200 {
+            camera.apply_zoom(1.0);
+        }
+        assert_eq!(camera.distance, MIN_DISTANCE);
+        assert!(camera.distance < 0.01, "eye enters well inside the unit scene");
+        assert!(origin_clip(&camera, 1.0)[3] > 0.0, "target stays ahead of the eye");
+        for _ in 0..200 {
+            camera.apply_zoom(-1.0);
+        }
+        assert_eq!(camera.distance, MAX_DISTANCE);
+        assert!(camera.distance.is_finite(), "zoom-out never reaches infinity");
+    }
+
+    #[test]
+    fn pan_moves_the_target_and_keeps_the_zoom() {
+        let mut camera = OrbitCamera::new();
+        camera.apply_pan(10.0, -10.0);
+        assert_ne!(camera.target, [0.0; 3]);
+        assert_eq!(camera.distance, FIT_DISTANCE);
+        assert!(!camera.auto_rotate);
     }
 
     #[test]
