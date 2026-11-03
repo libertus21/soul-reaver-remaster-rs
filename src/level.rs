@@ -125,6 +125,27 @@ pub struct RoomMesh {
     pub indices: Vec<u16>,
 }
 
+/// One placed object behind header slot `0x00`. `object_type` is the high 16
+/// bits of the record's `+0x28` dword and `flags` is the raw `+0x2C` dword.
+/// The record carries no rotation.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ObjectRecord {
+    pub name: String,
+    pub position: [i16; 3],
+    pub object_type: u16,
+    pub flags: u32,
+}
+
+/// Object array beside the room geometry: count, data-base-relative offset and
+/// the decoded records. Positions are world space; nothing is transformed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ObjectReport {
+    pub room_offset: u32,
+    pub count: u32,
+    pub array_offset: u32,
+    pub objects: Vec<ObjectRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
     pub target: String,
@@ -167,9 +188,12 @@ pub enum LevelError {
     RelocationOutOfRange,
     GeometryRecordOutOfRange,
     GeometryArrayOutOfRange,
+    ObjectRecordOutOfRange,
+    ObjectArrayOutOfRange,
     RenderDirectory,
     RenderEmpty,
     RenderArrayOutOfRange,
+    RenderTooLarge,
     MissingUnitName,
     SidecarIncomplete,
     BadSidecarMagic,
@@ -194,7 +218,7 @@ impl LevelError {
             LevelError::Usage(_) => 1,
             LevelError::RefusedPath => 3,
             LevelError::RenderDirectory | LevelError::RenderEmpty
-            | LevelError::RenderArrayOutOfRange => 1,
+            | LevelError::RenderArrayOutOfRange | LevelError::RenderTooLarge => 1,
             LevelError::ArchiveUnreadable { .. }
             | LevelError::EntryIndexOutOfRange { .. }
             | LevelError::EntryOutsideFile { .. }
@@ -234,10 +258,19 @@ impl fmt::Display for LevelError {
             LevelError::GeometryArrayOutOfRange => {
                 "room geometry vertex or face array runs outside the level data"
             }
+            LevelError::ObjectRecordOutOfRange => {
+                "room object record points outside the level data"
+            }
+            LevelError::ObjectArrayOutOfRange => {
+                "room object array runs outside the level data"
+            }
             LevelError::RenderDirectory => "expected one .PCM file, not a directory",
             LevelError::RenderEmpty => "unit has no room geometry (0 vertices or 0 faces)",
             LevelError::RenderArrayOutOfRange => {
                 "room geometry array or face index is out of range"
+            }
+            LevelError::RenderTooLarge => {
+                "merged mesh with object markers exceeds the 16-bit vertex index range"
             }
             LevelError::MissingUnitName => "name table does not contain the unit's own name",
             LevelError::SidecarIncomplete => "PMF and PNF must be present together",
@@ -299,6 +332,16 @@ const ROOM_VERTEX_OFFSET: usize = 0x1C;
 const ROOM_FACE_OFFSET: usize = 0x20;
 const VERTEX_STRIDE: usize = 12;
 const FACE_STRIDE: usize = 12;
+
+/// Object array in the same room record: count at `+0x08`, data-base-relative
+/// array offset at `+0x0C`, records of `0x4C` bytes.
+const OBJECT_COUNT: usize = 0x08;
+const OBJECT_OFFSET: usize = 0x0C;
+const OBJECT_STRIDE: usize = 0x4C;
+const OBJECT_NAME_LEN: usize = 12;
+const OBJECT_X: usize = 0x20;
+const OBJECT_TYPE: usize = 0x28;
+const OBJECT_FLAGS: usize = 0x2C;
 
 /// Data-region range of `count` records at a data-base-relative `offset`.
 /// A zero count is always valid and reads nothing; a non-zero array that would
@@ -413,10 +456,106 @@ fn room_mesh(data: &[u8]) -> Result<RoomMesh, LevelError> {
     Ok(mesh)
 }
 
+/// Read the object array behind the same room record as [`room_mesh`]. Each
+/// record is a 12-byte NUL-terminated name, three `i16` world positions at
+/// `+0x20`, a type in the high 16 bits of `+0x28`, and raw flags at `+0x2C`.
+/// A record or array outside the data region is a distinct error.
+fn object_report(data: &[u8]) -> Result<ObjectReport, LevelError> {
+    let room_offset =
+        read_u32(data, 4 * SLOT_ROOM_RECORD).ok_or(LevelError::ObjectRecordOutOfRange)?;
+    let mut report = ObjectReport { room_offset, ..ObjectReport::default() };
+    if room_offset == 0 {
+        return Ok(report);
+    }
+    let record = room_offset as usize;
+    if record.checked_add(OBJECT_OFFSET + 4).is_none_or(|end| end > data.len()) {
+        return Err(LevelError::ObjectRecordOutOfRange);
+    }
+    let count = read_u32(data, record + OBJECT_COUNT).unwrap_or(0);
+    let offset = read_u32(data, record + OBJECT_OFFSET).unwrap_or(0);
+    let (start, end) = array_range(data.len(), offset, count, OBJECT_STRIDE)
+        .ok_or(LevelError::ObjectArrayOutOfRange)?;
+    report.count = count;
+    report.array_offset = offset;
+    for at in (start..end).step_by(OBJECT_STRIDE) {
+        let raw = &data[at..at + OBJECT_NAME_LEN];
+        let name = raw.split(|&byte| byte == 0).next().unwrap_or(&[]);
+        let type_word = read_u32(data, at + OBJECT_TYPE).ok_or(LevelError::ObjectArrayOutOfRange)?;
+        report.objects.push(ObjectRecord {
+            name: String::from_utf8_lossy(name).into_owned(),
+            position: [
+                read_i16(data, at + OBJECT_X).ok_or(LevelError::ObjectArrayOutOfRange)?,
+                read_i16(data, at + OBJECT_X + 2).ok_or(LevelError::ObjectArrayOutOfRange)?,
+                read_i16(data, at + OBJECT_X + 4).ok_or(LevelError::ObjectArrayOutOfRange)?,
+            ],
+            object_type: (type_word >> 16) as u16,
+            flags: read_u32(data, at + OBJECT_FLAGS).ok_or(LevelError::ObjectArrayOutOfRange)?,
+        });
+    }
+    Ok(report)
+}
+
+/// Marker side as a fraction of the largest scene axis, and the smallest side
+/// so a flat or zero-extent scene still shows something.
+const MARKER_SCENE_FRACTION: f32 = 0.01;
+const MARKER_MIN_SIDE: f32 = 2.0;
+
+/// Largest axis span of `vertices`.
+fn scene_extent(vertices: &[[f32; 3]]) -> f32 {
+    let mut minimum = [f32::INFINITY; 3];
+    let mut maximum = [f32::NEG_INFINITY; 3];
+    for vertex in vertices {
+        for axis in 0..3 {
+            minimum[axis] = minimum[axis].min(vertex[axis]);
+            maximum[axis] = maximum[axis].max(vertex[axis]);
+        }
+    }
+    (0..3).map(|axis| maximum[axis] - minimum[axis]).fold(0.0, f32::max)
+}
+
+/// Append one small axis-aligned cube per object, merged into the same vertex
+/// and index buffers. Every marker is identical: no per-type shape, colour or
+/// orientation is claimed.
+fn append_markers(mesh: &mut RoomMesh, objects: &[ObjectRecord]) -> Result<(), LevelError> {
+    if objects.is_empty() {
+        return Ok(());
+    }
+    let half =
+        (scene_extent(&mesh.vertices) * MARKER_SCENE_FRACTION / 2.0).max(MARKER_MIN_SIDE / 2.0);
+    const CORNERS: [[f32; 3]; 8] = [
+        [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0],
+        [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0],
+    ];
+    const FACES: [u16; 36] = [
+        0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2, 0, 4, 7, 0, 7, 3,
+        1, 2, 6, 1, 6, 5,
+    ];
+    if mesh.vertices.len().saturating_add(objects.len().saturating_mul(8))
+        > usize::from(u16::MAX) + 1
+    {
+        return Err(LevelError::RenderTooLarge);
+    }
+    for object in objects {
+        let base = mesh.vertices.len() as u16;
+        for corner in CORNERS {
+            mesh.vertices.push([
+                f32::from(object.position[0]) + corner[0] * half,
+                f32::from(object.position[1]) + corner[1] * half,
+                f32::from(object.position[2]) + corner[2] * half,
+            ]);
+        }
+        mesh.indices.extend(FACES.iter().map(|&index| base + index));
+    }
+    Ok(())
+}
+
 /// One-unit reader for `--level-render`: a directory is refused because this
 /// slice renders exactly one `.PCM` file. An empty mesh is a distinct error so
 /// the window never opens on nothing.
-pub fn read_room_mesh(path: &Path) -> Result<(String, RoomMesh), LevelError> {
+pub fn read_room_mesh(
+    path: &Path,
+    markers: bool,
+) -> Result<(String, RoomMesh), LevelError> {
     if path.is_dir() {
         return Err(LevelError::RenderDirectory);
     }
@@ -426,14 +565,19 @@ pub fn read_room_mesh(path: &Path) -> Result<(String, RoomMesh), LevelError> {
     let stem = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).ok_or(LevelError::Io)?;
     let bytes = std::fs::read(path).map_err(|_| LevelError::Io)?;
     let unit = parse_pcm(&bytes, &stem)?;
-    room_mesh_of(unit, &bytes)
+    room_mesh_of(unit, &bytes, markers)
 }
 
 /// Shared mesh step for a parsed unit: the same bounds rule as
 /// [`read_room_mesh`], with an empty mesh refused so a window never opens on
-/// nothing.
-fn room_mesh_of(unit: LevelUnit, bytes: &[u8]) -> Result<(String, RoomMesh), LevelError> {
-    let mesh = room_mesh(&bytes[unit.structure.data_base..]).map_err(|error| match error {
+/// nothing. `markers` appends the object cubes to the same buffers.
+fn room_mesh_of(
+    unit: LevelUnit,
+    bytes: &[u8],
+    markers: bool,
+) -> Result<(String, RoomMesh), LevelError> {
+    let data = &bytes[unit.structure.data_base..];
+    let mut mesh = room_mesh(data).map_err(|error| match error {
         LevelError::GeometryRecordOutOfRange | LevelError::GeometryArrayOutOfRange => {
             LevelError::RenderArrayOutOfRange
         }
@@ -441,6 +585,9 @@ fn room_mesh_of(unit: LevelUnit, bytes: &[u8]) -> Result<(String, RoomMesh), Lev
     })?;
     if mesh.vertices.is_empty() || mesh.indices.is_empty() {
         return Err(LevelError::RenderEmpty);
+    }
+    if markers {
+        append_markers(&mut mesh, &object_report(data)?.objects)?;
     }
     Ok((unit.name, mesh))
 }
@@ -472,9 +619,54 @@ pub fn read_entry_geometry(
 }
 
 /// `--level-render --bigfile ... --entry ...`: the same mesh path as a loose file.
-pub fn read_entry_room_mesh(path: &Path, index: usize) -> Result<(String, RoomMesh), LevelError> {
+pub fn read_entry_room_mesh(
+    path: &Path,
+    index: usize,
+    markers: bool,
+) -> Result<(String, RoomMesh), LevelError> {
     let (unit, bytes) = entry_unit(path, index)?;
-    room_mesh_of(unit, &bytes)
+    room_mesh_of(unit, &bytes, markers)
+}
+
+/// `--level-objects <PATH>`: one loose `.PCM` unit's object array.
+pub fn read_objects_path(path: &Path) -> Result<Vec<(String, ObjectReport)>, LevelError> {
+    if path.is_dir() {
+        return Err(LevelError::RenderDirectory);
+    }
+    if !is_pcm(path) {
+        return Err(LevelError::RefusedPath);
+    }
+    let stem = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).ok_or(LevelError::Io)?;
+    let bytes = std::fs::read(path).map_err(|_| LevelError::Io)?;
+    let unit = parse_pcm(&bytes, &stem)?;
+    let report = object_report(&bytes[unit.structure.data_base..])?;
+    Ok(vec![(unit.name, report)])
+}
+
+/// `--level-objects --bigfile ... --entry ...`: one archive entry, in memory.
+pub fn read_entry_objects(
+    path: &Path,
+    index: usize,
+) -> Result<Vec<(String, ObjectReport)>, LevelError> {
+    let (unit, bytes) = entry_unit(path, index)?;
+    let report = object_report(&bytes[unit.structure.data_base..])?;
+    Ok(vec![(unit.name, report)])
+}
+
+/// `--level-objects --bigfile ... --group ...`: one object report per matching
+/// room, in numeric-suffix order.
+pub fn read_group_objects(
+    path: &Path,
+    prefix: &str,
+) -> Result<Vec<(String, ObjectReport)>, LevelError> {
+    let mut rows = Vec::new();
+    for (unit, bytes) in discover_group(path, prefix)? {
+        let report = object_report(&bytes[unit.structure.data_base..]).map_err(|error| {
+            LevelError::GroupParseFailed { name: unit.name.clone(), detail: error.to_string() }
+        })?;
+        rows.push((unit.name, report));
+    }
+    Ok(rows)
 }
 
 /// Parse one archive entry with the same in-memory reader as a loose `.PCM`.
@@ -548,11 +740,18 @@ pub fn read_group_geometry(
 
 /// `--level-render --bigfile ... --group ...`: rooms are world space, so the
 /// merge concatenates vertices and offsets each room's face indices by its
-/// running vertex base. No transform is applied.
-pub fn read_group_room_mesh(path: &Path, prefix: &str) -> Result<(String, RoomMesh), LevelError> {
+/// running vertex base. No transform is applied. `markers` appends one cube per
+/// object of every room, after the whole scene is known.
+pub fn read_group_room_mesh(
+    path: &Path,
+    prefix: &str,
+    markers: bool,
+) -> Result<(String, RoomMesh), LevelError> {
     let mut merged = RoomMesh::default();
+    let mut placed = Vec::new();
     for (unit, bytes) in discover_group(path, prefix)? {
-        let mesh = room_mesh(&bytes[unit.structure.data_base..]).map_err(|error| match error {
+        let data = &bytes[unit.structure.data_base..];
+        let mesh = room_mesh(data).map_err(|error| match error {
             LevelError::GeometryRecordOutOfRange | LevelError::GeometryArrayOutOfRange => {
                 LevelError::RenderArrayOutOfRange
             }
@@ -567,6 +766,12 @@ pub fn read_group_room_mesh(path: &Path, prefix: &str) -> Result<(String, RoomMe
         let base = merged.vertices.len() as u16;
         merged.vertices.extend(mesh.vertices);
         merged.indices.extend(mesh.indices.iter().map(|&index| index + base));
+        if markers {
+            placed.extend(object_report(data)?.objects);
+        }
+    }
+    if markers {
+        append_markers(&mut merged, &placed)?;
     }
     Ok((format!("group {prefix}"), merged))
 }
@@ -973,6 +1178,25 @@ pub fn geometry_lines(name: &str, g: &GeometryReport) -> Vec<String> {
         box_line,
         format!("  indices out_of_range={} max_index={max_index}", g.out_of_range),
     ]
+}
+
+/// Per-unit object listing: a count line and one line per record. Positions are
+/// world-space `i16`; type and flags print as raw record fields.
+pub fn object_lines(name: &str, report: &ObjectReport) -> Vec<String> {
+    let mut lines =
+        vec![format!("objects {name} count={} array={}", report.count, report.array_offset)];
+    lines.extend(report.objects.iter().map(|object| {
+        format!(
+            "  object {} pos={},{},{} type={} flags={}",
+            object.name,
+            object.position[0],
+            object.position[1],
+            object.position[2],
+            object.object_type,
+            object.flags
+        )
+    }));
+    lines
 }
 
 /// `FMPa` magic, 16-bit id, segment count, and the rate field at `0x28`.
@@ -1540,6 +1764,32 @@ mod tests {
         bytes
     }
 
+    /// `geometry_pcm` with an object array appended after the room geometry;
+    /// the array offset is data-base-relative, as in the real record.
+    fn object_pcm(objects: &[(&str, [i16; 3], u16)]) -> Vec<u8> {
+        let mut bytes = geometry_pcm(&[[0, 0, 0], [100, 0, 0], [0, 100, 0]], &[[0, 1, 2]]);
+        let base = data_base(2);
+        let room = 16usize;
+        let array = (bytes.len() - base) as u32;
+        let count_at = base + room + OBJECT_COUNT;
+        let offset_at = base + room + OBJECT_OFFSET;
+        bytes[count_at..count_at + 4].copy_from_slice(&(objects.len() as u32).to_le_bytes());
+        bytes[offset_at..offset_at + 4].copy_from_slice(&array.to_le_bytes());
+        for (name, position, kind) in objects {
+            let mut record = [0u8; OBJECT_STRIDE];
+            let len = name.len().min(OBJECT_NAME_LEN - 1);
+            record[..len].copy_from_slice(&name.as_bytes()[..len]);
+            for (axis, value) in position.iter().enumerate() {
+                let at = OBJECT_X + 2 * axis;
+                record[at..at + 2].copy_from_slice(&value.to_le_bytes());
+            }
+            record[OBJECT_TYPE..OBJECT_TYPE + 4]
+                .copy_from_slice(&(u32::from(*kind) << 16).to_le_bytes());
+            bytes.extend_from_slice(&record);
+        }
+        bytes
+    }
+
     /// Minimal SR1PC archive: count, 16-byte entries, then raw payloads.
     fn archive(entries: &[Vec<u8>]) -> Vec<u8> {
         let mut dat = (entries.len() as u32).to_le_bytes().to_vec();
@@ -1600,7 +1850,7 @@ mod tests {
     #[test]
     fn group_mesh_offsets_each_room_by_the_running_vertex_base() {
         let tmp = tempfile::tempdir().expect("tempdir must succeed");
-        let (name, mesh) = read_group_room_mesh(&group_archive(tmp.path()), "under")
+        let (name, mesh) = read_group_room_mesh(&group_archive(tmp.path()), "under", false)
             .expect("group must merge");
         assert_eq!(name, "group under");
         assert_eq!(mesh.vertices.len(), 6);
@@ -1645,7 +1895,7 @@ mod tests {
         let rows = read_entry_geometry(&path, 1).expect("entry 1 must read");
         assert_eq!(rows[0].0, "lair5");
         assert_eq!((rows[0].1.vertices, rows[0].1.faces), (3, 1));
-        let (name, mesh) = read_entry_room_mesh(&path, 1).expect("entry 1 must mesh");
+        let (name, mesh) = read_entry_room_mesh(&path, 1, false).expect("entry 1 must mesh");
         assert_eq!((name.as_str(), mesh.vertices.len(), mesh.indices.len()), ("lair5", 3, 3));
 
         assert!(matches!(
@@ -1708,15 +1958,80 @@ mod tests {
     }
 
     #[test]
+    fn object_array_decodes_names_world_positions_types_and_flags() {
+        let bytes = object_pcm(&[
+            ("undhost", [-5914, 0, 0], 0),
+            ("raziel", [0, 0, 0], 4),
+            ("marker", [10, -20, 30], 2),
+        ]);
+        let report = object_report(&bytes[data_base(2)..]).expect("must decode");
+        assert_eq!((report.count, report.objects.len()), (3, 3));
+        assert_eq!(report.objects[0].name, "undhost");
+        assert_eq!(report.objects[0].position, [-5914, 0, 0]);
+        assert_eq!((report.objects[0].object_type, report.objects[0].flags), (0, 0));
+        assert_eq!(report.objects[1].name, "raziel");
+        assert_eq!(report.objects[1].object_type, 4);
+        assert_eq!(
+            (report.objects[2].name.as_str(), report.objects[2].position),
+            ("marker", [10, -20, 30])
+        );
+    }
+
+    #[test]
+    fn object_array_outside_the_data_region_fails_loud() {
+        let mut bytes = object_pcm(&[("marker", [0, 0, 0], 1)]);
+        let base = data_base(2);
+        let at = base + 16 + OBJECT_OFFSET;
+        bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(
+            object_report(&bytes[base..]).err(),
+            Some(LevelError::ObjectArrayOutOfRange)
+        );
+    }
+
+    #[test]
+    fn object_lines_report_count_and_each_record() {
+        let bytes = object_pcm(&[("undhost", [-5914, 0, 0], 0), ("raziel", [0, 0, 0], 4)]);
+        let report = object_report(&bytes[data_base(2)..]).expect("must decode");
+        let lines = object_lines("under1", &report);
+        assert_eq!(lines[0], format!("objects under1 count=2 array={}", report.array_offset));
+        assert_eq!(lines[1], "  object undhost pos=-5914,0,0 type=0 flags=0");
+        assert_eq!(lines[2], "  object raziel pos=0,0,0 type=4 flags=0");
+    }
+
+    #[test]
+    fn markers_add_one_cube_per_object_into_the_same_buffers() {
+        let bytes = object_pcm(&[("a", [0, 0, 0], 0), ("b", [100, 0, 0], 0)]);
+        let data = &bytes[data_base(2)..];
+        let mut mesh = room_mesh(data).expect("room must read");
+        let report = object_report(data).expect("objects must read");
+        let vertices = mesh.vertices.len();
+        let indices = mesh.indices.len();
+        append_markers(&mut mesh, &report.objects).expect("markers must append");
+        assert_eq!(mesh.vertices.len(), vertices + 16);
+        assert_eq!(mesh.indices.len(), indices + 72);
+        assert_eq!(mesh.vertices[vertices + 8][0] - mesh.vertices[vertices][0], 100.0);
+    }
+
+    #[test]
+    fn group_markers_are_optional_and_absent_without_objects() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let path = group_archive(tmp.path());
+        let (_, plain) = read_group_room_mesh(&path, "under", false).expect("plain merge");
+        let (_, marked) = read_group_room_mesh(&path, "under", true).expect("marked merge");
+        assert_eq!(plain, marked, "zero-count rooms must add no marker");
+    }
+
+    #[test]
     fn read_room_mesh_refuses_a_directory_and_codeless_units() {
         let tmp = tempfile::tempdir().expect("tempdir must succeed");
-        assert_eq!(read_room_mesh(tmp.path()).err(), Some(LevelError::RenderDirectory));
+        assert_eq!(read_room_mesh(tmp.path(), false).err(), Some(LevelError::RenderDirectory));
         let pcm = tmp.path().join("lair5.PCM");
         write(tmp.path(), "lair5.PCM", &geometry_pcm(&[], &[]));
-        assert_eq!(read_room_mesh(&pcm).err(), Some(LevelError::RenderEmpty));
-        assert_eq!(read_room_mesh(&tmp.path().join("missing.PCM")).err(), Some(LevelError::Io));
+        assert_eq!(read_room_mesh(&pcm, false).err(), Some(LevelError::RenderEmpty));
+        assert_eq!(read_room_mesh(&tmp.path().join("missing.PCM"), false).err(), Some(LevelError::Io));
         write(tmp.path(), "lair5.PCM", &geometry_pcm(&[[0, 0, 0]], &[[0, 1, 9]]));
-        assert_eq!(read_room_mesh(&pcm).err(), Some(LevelError::RenderArrayOutOfRange));
+        assert_eq!(read_room_mesh(&pcm, false).err(), Some(LevelError::RenderArrayOutOfRange));
     }
 
     fn block_of(size: usize, byte: u8) -> Vec<u8> {

@@ -154,6 +154,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--level-links") {
         return run_level_links(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--level-objects") {
+        return run_level_objects(&args[1..]);
+    }
     if args.first().is_some_and(|a| a == "--level-geometry") {
         return run_level_geometry(&args[1..]);
     }
@@ -184,6 +187,10 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-render --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --level-geometry --bigfile <BIGFILE.DAT> --group <PREFIX>");
         eprintln!("   or: soul-reaver-remaster-rs --level-render --bigfile <BIGFILE.DAT> --group <PREFIX>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-objects <.PCM file>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-objects --bigfile <BIGFILE.DAT> --entry <INDEX>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-objects --bigfile <BIGFILE.DAT> --group <PREFIX>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file> --objects");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
@@ -1142,13 +1149,19 @@ fn level_input<'a>(
     usage: &'static str,
 ) -> Result<LevelInput<'a>, level::LevelError> {
     if !args.iter().any(|arg| arg == "--bigfile" || arg == "--entry" || arg == "--group") {
-        return match args {
+        let paths: Vec<&str> =
+            args.iter().filter(|arg| arg.as_str() != "--objects").map(String::as_str).collect();
+        return match paths.as_slice() {
             [path] if !path.starts_with('-') => Ok(LevelInput::Path(path)),
             _ => Err(level::LevelError::Usage(usage)),
         };
     }
     let (mut dat, mut entry, mut group, mut index) = (None, None, None, 0);
     while index < args.len() {
+        if args[index] == "--objects" {
+            index += 1;
+            continue;
+        }
         let value = args.get(index + 1).map(String::as_str);
         match (args[index].as_str(), value) {
             ("--bigfile", Some(value)) => dat = Some(value),
@@ -1209,14 +1222,54 @@ fn run_level_geometry(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Read-only `--level-objects` arm: per room, the object count and one line per
+/// record. The archive arms reuse the same in-memory reader as the other level
+/// modes; a group prints its object total.
+fn run_level_objects(args: &[String]) -> ExitCode {
+    let usage = "expected --level-objects <path> or --level-objects --bigfile <DAT> --entry <INDEX> or --level-objects --bigfile <DAT> --group <PREFIX>";
+    let input = level_input(args, usage);
+    let prefix = match &input {
+        Ok(LevelInput::Group { prefix, .. }) => Some((*prefix).to_string()),
+        _ => None,
+    };
+    let result = input.and_then(|input| match input {
+        LevelInput::Path(path) => level::read_objects_path(Path::new(path)),
+        LevelInput::Entry { dat, index } => level::read_entry_objects(Path::new(dat), index),
+        LevelInput::Group { dat, prefix } => level::read_group_objects(Path::new(dat), prefix),
+    });
+    let rows = match result {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    for (name, report) in &rows {
+        for line in level::object_lines(name, report) {
+            outln!("{line}");
+        }
+    }
+    if let Some(prefix) = prefix {
+        let objects: u32 = rows.iter().map(|(_, report)| report.count).sum();
+        outln!("group {prefix} rooms={} objects={objects}", rows.len());
+    }
+    ExitCode::SUCCESS
+}
+
 /// `--level-render` arm: one `.PCM` unit through the existing mesh viewer.
-/// The geometry line prints before the window opens.
+/// The geometry line prints before the window opens. `--objects` appends one
+/// small cube per object to the same buffers.
 fn run_level_render(args: &[String]) -> ExitCode {
     let usage = "expected --level-render <path> or --level-render --bigfile <DAT> --entry <INDEX> or --level-render --bigfile <DAT> --group <PREFIX>";
+    let markers = args.iter().any(|arg| arg == "--objects");
     let result = level_input(args, usage).and_then(|input| match input {
-        LevelInput::Path(path) => level::read_room_mesh(Path::new(path)),
-        LevelInput::Entry { dat, index } => level::read_entry_room_mesh(Path::new(dat), index),
-        LevelInput::Group { dat, prefix } => level::read_group_room_mesh(Path::new(dat), prefix),
+        LevelInput::Path(path) => level::read_room_mesh(Path::new(path), markers),
+        LevelInput::Entry { dat, index } => {
+            level::read_entry_room_mesh(Path::new(dat), index, markers)
+        }
+        LevelInput::Group { dat, prefix } => {
+            level::read_group_room_mesh(Path::new(dat), prefix, markers)
+        }
     });
     let (name, mesh) = match result {
         Ok(unit) => unit,
@@ -1263,7 +1316,8 @@ mod cli_tests {
     use super::{
         list_report, pose_mode_conflict, resolve_texture_name, run_audio, run_bigfile,
         dispatch, run_level_links, run_level_records, run_level_structure, run_mesh, run_mesh_all,
-        run_level_geometry, run_level_render, run_mesh_textured, run_mesh_with, run_textures,
+        run_level_geometry, run_level_objects, run_level_render, run_mesh_textured, run_mesh_with,
+        run_textures,
         strip_launcher_noops, tshow_suffix,
     };
     use std::process::ExitCode;
@@ -1974,6 +2028,38 @@ mod cli_tests {
             run_level_geometry(&["--bigfile".to_string(), dat, "--entry".to_string(), "x".to_string()]),
             ExitCode::from(1)
         );
+    }
+
+    #[test]
+    fn level_objects_lists_archive_entries_and_totals_a_group() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let dat = write_tmp(
+            &tmp,
+            "BIGFILE.DAT",
+            &synthetic_archive(&[
+                synthetic_entry_pcm("under1"),
+                synthetic_entry_pcm("under2"),
+            ]),
+        );
+        let entry = vec![
+            "--bigfile".to_string(),
+            dat.clone(),
+            "--entry".to_string(),
+            "0".to_string(),
+        ];
+        assert_eq!(run_level_objects(&entry), ExitCode::SUCCESS);
+        let group = vec![
+            "--bigfile".to_string(),
+            dat.clone(),
+            "--group".to_string(),
+            "under".to_string(),
+        ];
+        assert_eq!(run_level_objects(&group), ExitCode::SUCCESS);
+        assert_eq!(
+            run_level_objects(&["--bigfile".to_string(), dat]),
+            ExitCode::from(1)
+        );
+        assert_eq!(run_level_objects(&[]), ExitCode::from(1));
     }
 
     #[test]
