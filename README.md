@@ -326,8 +326,19 @@ extracted files, decompiled code, or database files.
   `out_of_range=0`, `max_index=1467`. Synthetic-byte tests only
   (`docs/notes/level-geometry.md`).
 
+- `level-group` (whole level family): `cargo run -- --level-geometry --bigfile
+  <BIGFILE.DAT> --group under` scans the archive, keeps entries whose `.PCM`
+  self-name is `under` plus digits, and prints each room's `V`/`F` plus a
+  `group under rooms=<N> vertices=<V> faces=<F>` total. `--level-render` with
+  the same flags concatenates the rooms' world-space vertices and offsets each
+  room's face indices by its vertex base, so one solid shows the whole family
+  (no per-room transform). Empty prefix, no match, a matched room whose
+  geometry fails, and `--group` plus `--entry` are distinct exit-1 errors with
+  no window. Synthetic archive tests only
+  (`docs/changes/level-group/proposal.md`).
+
 - `unified-cli` (3-PR chain complete, archived): the grouped entry point is
-  live. `cargo run -- --help` (or `help <group>`) lists the 19 capabilities in
+  live. `cargo run -- --help` (or `help <group>`) lists the 21 capabilities in
   five groups; `cargo run -- <group> <command> ...` rewrites to the exact
   legacy argv (`texture list <BIG>` is byte-identical to
   `--textures <BIG> --tlist`). On a terminal, `cargo run -- menu` (or no

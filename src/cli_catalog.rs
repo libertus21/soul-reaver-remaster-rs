@@ -23,6 +23,8 @@ impl Capability {
         matches!(token, "--map" | "--pose" | "--tex-dir" | "--out")
             || (self.name.ends_with("-entry")
                 && matches!(token, "--bigfile" | "--entry"))
+            || (self.name.ends_with("-group")
+                && matches!(token, "--bigfile" | "--group"))
     }
 }
 
@@ -30,7 +32,7 @@ impl Capability {
 pub const GROUPS: [&str; 5] = ["texture", "archive", "mesh", "audio", "level"];
 
 /// Every existing mode, exactly once. This is the single source for help.
-pub const CAPABILITIES: [Capability; 19] = [
+pub const CAPABILITIES: [Capability; 21] = [
     Capability { group: "texture", name: "list", legacy: "--textures <BIG> --tlist [--map <MAP>]", summary: "List the remaster .BIG header and slot classes.", window: false },
     Capability { group: "texture", name: "show", legacy: "--textures <BIG> --tshow <SEL> [--map <MAP>]", summary: "Show one slot as its raw 256x256 image.", window: true },
     Capability { group: "texture", name: "file", legacy: "<FILE.DDS>", summary: "Show one .DDS texture file.", window: true },
@@ -50,6 +52,8 @@ pub const CAPABILITIES: [Capability; 19] = [
     Capability { group: "level", name: "render", legacy: "--level-render <PATH>", summary: "Show one unit's room geometry as a flat-shaded solid.", window: true },
     Capability { group: "level", name: "geometry-entry", legacy: "--level-geometry --bigfile <DAT> --entry <INDEX>", summary: "Print one archive entry's room vertex and face counts.", window: false },
     Capability { group: "level", name: "render-entry", legacy: "--level-render --bigfile <DAT> --entry <INDEX>", summary: "Show one archive entry's room geometry.", window: true },
+    Capability { group: "level", name: "geometry-group", legacy: "--level-geometry --bigfile <DAT> --group <PREFIX>", summary: "Print every room in an archive level family with totals.", window: false },
+    Capability { group: "level", name: "render-group", legacy: "--level-render --bigfile <DAT> --group <PREFIX>", summary: "Show a merged archive level family as one solid.", window: true },
 ];
 
 /// The capability table.
@@ -97,7 +101,7 @@ pub fn render_help(group: Option<&str>) -> String {
 mod tests {
     use super::{catalog, is_known_group, render_help, GROUPS};
 
-    const EXPECTED: [(&str, &str); 19] = [
+    const EXPECTED: [(&str, &str); 21] = [
         ("texture", "list"),
         ("texture", "show"),
         ("texture", "file"),
@@ -117,6 +121,8 @@ mod tests {
         ("level", "render"),
         ("level", "geometry-entry"),
         ("level", "render-entry"),
+        ("level", "geometry-group"),
+        ("level", "render-group"),
     ];
 
     #[test]

@@ -252,6 +252,22 @@ mod tests {
                     "--level-render", "--bigfile", "BIGFILE.DAT", "--entry", "115",
                 ],
             ),
+            (
+                &[
+                    "level", "geometry-group", "--bigfile", "BIGFILE.DAT", "--group", "under",
+                ],
+                &[
+                    "--level-geometry", "--bigfile", "BIGFILE.DAT", "--group", "under",
+                ],
+            ),
+            (
+                &[
+                    "level", "render-group", "--group", "under", "--bigfile", "BIGFILE.DAT",
+                ],
+                &[
+                    "--level-render", "--bigfile", "BIGFILE.DAT", "--group", "under",
+                ],
+            ),
         ];
         for (input, expected) in cases {
             assert_dispatch(input, expected);
