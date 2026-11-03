@@ -180,6 +180,12 @@ pub enum LevelError {
     EntryNotPcm { detail: String },
     ArchiveWithoutEntry,
     EntryWithoutArchive,
+    GroupEmptyPrefix,
+    GroupNoMatch { prefix: String },
+    GroupParseFailed { name: String, detail: String },
+    GroupWithoutArchive,
+    GroupWithEntry,
+    GroupTooLarge,
 }
 
 impl LevelError {
@@ -194,7 +200,13 @@ impl LevelError {
             | LevelError::EntryOutsideFile { .. }
             | LevelError::EntryNotPcm { .. }
             | LevelError::ArchiveWithoutEntry
-            | LevelError::EntryWithoutArchive => 1,
+            | LevelError::EntryWithoutArchive
+            | LevelError::GroupEmptyPrefix
+            | LevelError::GroupNoMatch { .. }
+            | LevelError::GroupParseFailed { .. }
+            | LevelError::GroupWithoutArchive
+            | LevelError::GroupWithEntry
+            | LevelError::GroupTooLarge => 1,
             _ => 2,
         }
     }
@@ -248,6 +260,18 @@ impl fmt::Display for LevelError {
             }
             LevelError::ArchiveWithoutEntry => "--bigfile requires --entry <index>",
             LevelError::EntryWithoutArchive => "--entry requires --bigfile <DAT>",
+            LevelError::GroupEmptyPrefix => "group prefix is empty",
+            LevelError::GroupNoMatch { prefix } => {
+                return write!(f, "no archive entry matches group prefix '{prefix}'");
+            }
+            LevelError::GroupParseFailed { name, detail } => {
+                return write!(f, "group entry '{name}' does not parse as a level: {detail}");
+            }
+            LevelError::GroupWithoutArchive => "--group requires --bigfile <DAT>",
+            LevelError::GroupWithEntry => "--group cannot be combined with --entry",
+            LevelError::GroupTooLarge => {
+                "merged level group exceeds the 16-bit vertex index range"
+            }
         };
         f.write_str(message)
     }
@@ -460,6 +484,91 @@ fn entry_unit(path: &Path, index: usize) -> Result<(LevelUnit, Vec<u8>), LevelEr
         detail: error.to_string(),
     })?;
     Ok((unit, bytes))
+}
+
+/// True when `name` is exactly `prefix` followed by one or more ASCII digits.
+fn group_member(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Numeric suffix as the sort key, so `under10` follows `under9`.
+fn group_rank(name: &str, prefix: &str) -> u64 {
+    name.strip_prefix(prefix).and_then(|suffix| suffix.parse().ok()).unwrap_or(u64::MAX)
+}
+
+/// Scan every archive entry, keep those that parse as a `.PCM` whose own name
+/// is `prefix` + digits, and return them in numeric-suffix order. Entries are
+/// read into memory only; nothing is extracted.
+fn discover_group(path: &Path, prefix: &str) -> Result<Vec<(LevelUnit, Vec<u8>)>, LevelError> {
+    if prefix.is_empty() {
+        return Err(LevelError::GroupEmptyPrefix);
+    }
+    let entries = bigfile::load_index(path)
+        .map_err(|error| LevelError::ArchiveUnreadable { detail: error.to_string() })?;
+    let mut rooms = Vec::new();
+    for entry in &entries {
+        let bytes = bigfile::read_entry(path, entry).map_err(|error| match error {
+            error @ bigfile::BigfileError::BadEntry(_) => {
+                LevelError::EntryOutsideFile { detail: error.to_string() }
+            }
+            error => LevelError::ArchiveUnreadable { detail: error.to_string() },
+        })?;
+        if let Ok(unit) = parse_pcm_bytes(&bytes)
+            && group_member(&unit.name, prefix)
+        {
+            rooms.push((unit, bytes));
+        }
+    }
+    if rooms.is_empty() {
+        return Err(LevelError::GroupNoMatch { prefix: prefix.to_string() });
+    }
+    rooms.sort_by_key(|(unit, _)| group_rank(&unit.name, prefix));
+    Ok(rooms)
+}
+
+/// `--level-geometry --bigfile ... --group ...`: one geometry report per
+/// matching room. A matched entry whose geometry fails to parse is loud.
+pub fn read_group_geometry(
+    path: &Path,
+    prefix: &str,
+) -> Result<Vec<(String, GeometryReport)>, LevelError> {
+    let mut rows = Vec::new();
+    for (unit, bytes) in discover_group(path, prefix)? {
+        let report = geometry_report(&bytes[unit.structure.data_base..]).map_err(|error| {
+            LevelError::GroupParseFailed {
+                name: unit.name.clone(),
+                detail: error.to_string(),
+            }
+        })?;
+        rows.push((unit.name, report));
+    }
+    Ok(rows)
+}
+
+/// `--level-render --bigfile ... --group ...`: rooms are world space, so the
+/// merge concatenates vertices and offsets each room's face indices by its
+/// running vertex base. No transform is applied.
+pub fn read_group_room_mesh(path: &Path, prefix: &str) -> Result<(String, RoomMesh), LevelError> {
+    let mut merged = RoomMesh::default();
+    for (unit, bytes) in discover_group(path, prefix)? {
+        let mesh = room_mesh(&bytes[unit.structure.data_base..]).map_err(|error| match error {
+            LevelError::GeometryRecordOutOfRange | LevelError::GeometryArrayOutOfRange => {
+                LevelError::RenderArrayOutOfRange
+            }
+            other => other,
+        })?;
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            return Err(LevelError::RenderEmpty);
+        }
+        if merged.vertices.len() + mesh.vertices.len() > usize::from(u16::MAX) + 1 {
+            return Err(LevelError::GroupTooLarge);
+        }
+        let base = merged.vertices.len() as u16;
+        merged.vertices.extend(mesh.vertices);
+        merged.indices.extend(mesh.indices.iter().map(|&index| index + base));
+    }
+    Ok((format!("group {prefix}"), merged))
 }
 
 /// Geometry rows for one file or room directory, sorted by unit name. This
@@ -1451,6 +1560,78 @@ mod tests {
     fn geometry_of(bytes: &[u8]) -> Result<GeometryReport, LevelError> {
         let unit = parse_pcm(bytes, "lair5")?;
         geometry_report(&bytes[unit.structure.data_base..])
+    }
+
+    /// `geometry_pcm` whose self-name is appended after the last block and
+    /// pointed at by header word `0x26`.
+    fn named_geometry_pcm(name: &str, vertices: &[[i16; 3]], faces: &[[u16; 3]]) -> Vec<u8> {
+        let mut bytes = geometry_pcm(vertices, faces);
+        let base = data_base(2);
+        let relative = (bytes.len() - base) as u32;
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        let slot = base + 4 * SLOT_UNIT_NAME;
+        bytes[slot..slot + 4].copy_from_slice(&relative.to_le_bytes());
+        bytes
+    }
+
+    fn group_archive(dir: &Path) -> PathBuf {
+        let one = named_geometry_pcm("under1", &[[0, 0, 0], [4, 0, 0], [0, 4, 0]], &[[0, 1, 2]]);
+        let two = named_geometry_pcm("under2", &[[10, 0, 0], [14, 0, 0], [10, 4, 0]], &[[0, 1, 2]]);
+        let noise = named_geometry_pcm("underx", &[[0, 0, 0]], &[[0, 0, 0]]);
+        let path = dir.join("BIGFILE.DAT");
+        std::fs::write(&path, archive(&[one, two, noise]))
+            .expect("synthetic archive must be writable");
+        path
+    }
+
+    #[test]
+    fn group_discovers_prefix_digit_names_and_reports_totals() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let rows = read_group_geometry(&group_archive(tmp.path()), "under")
+            .expect("group must discover two rooms");
+        let names: Vec<&str> = rows.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["under1", "under2"]);
+        let vertices: u32 = rows.iter().map(|(_, g)| g.vertices).sum();
+        let faces: u32 = rows.iter().map(|(_, g)| g.faces).sum();
+        assert_eq!((vertices, faces), (6, 2));
+    }
+
+    #[test]
+    fn group_mesh_offsets_each_room_by_the_running_vertex_base() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let (name, mesh) = read_group_room_mesh(&group_archive(tmp.path()), "under")
+            .expect("group must merge");
+        assert_eq!(name, "group under");
+        assert_eq!(mesh.vertices.len(), 6);
+        assert_eq!(mesh.vertices[0], [0.0, 0.0, 0.0]);
+        assert_eq!(mesh.vertices[3], [10.0, 0.0, 0.0], "world-space position is not transformed");
+        assert_eq!(mesh.indices, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn group_refuses_empty_prefix_no_match_and_bad_geometry() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let good = named_geometry_pcm("under1", &[[0, 0, 0]], &[[0, 0, 0]]);
+        let mut bad = named_geometry_pcm("under3", &[[0, 0, 0]], &[[0, 0, 0]]);
+        let slot = data_base(2) + 4 * SLOT_ROOM_RECORD;
+        bad[slot..slot + 4].copy_from_slice(&9000u32.to_le_bytes());
+        let path = tmp.path().join("BIGFILE.DAT");
+        std::fs::write(&path, archive(&[good, bad])).expect("synthetic archive must be writable");
+        assert_eq!(
+            read_group_geometry(&path, "").err(),
+            Some(LevelError::GroupEmptyPrefix)
+        );
+        assert!(matches!(
+            read_group_geometry(&path, "nosuch"),
+            Err(LevelError::GroupNoMatch { .. })
+        ));
+        assert!(matches!(
+            read_group_geometry(&path, "under"),
+            Err(LevelError::GroupParseFailed { .. })
+        ));
+        assert_eq!(LevelError::GroupWithEntry.exit_code(), 1);
+        assert_eq!(LevelError::GroupNoMatch { prefix: "x".into() }.exit_code(), 1);
     }
 
     #[test]
