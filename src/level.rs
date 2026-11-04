@@ -122,7 +122,7 @@ pub struct GeometryReport {
 #[derive(Debug, Default, PartialEq)]
 pub struct RoomMesh {
     pub vertices: Vec<[f32; 3]>,
-    pub indices: Vec<u16>,
+    pub indices: Vec<u32>,
     /// Per-vertex UVs and 1-based material indices, plus the page list for
     /// materials 2..; empty unless `--textures` was requested.
     pub uvs: Vec<[u8; 2]>,
@@ -172,7 +172,7 @@ pub struct ObjectStats {
 
 /// Resolves one placed-object name to a model-space triangle mesh.
 pub type ObjectModelSource<'a> =
-    &'a mut dyn FnMut(&str) -> Option<(Vec<[f32; 3]>, Vec<u16>)>;
+    &'a mut dyn FnMut(&str) -> Option<(Vec<[f32; 3]>, Vec<u32>)>;
 
 /// Resolves one placed-object name to a per-face textured model-space mesh.
 pub type TexturedObjectSource<'a> =
@@ -227,7 +227,6 @@ pub enum LevelError {
     RenderDirectory,
     RenderEmpty,
     RenderArrayOutOfRange,
-    RenderTooLarge,
     MissingUnitName,
     SidecarIncomplete,
     BadSidecarMagic,
@@ -243,7 +242,6 @@ pub enum LevelError {
     GroupParseFailed { name: String, detail: String },
     GroupWithoutArchive,
     GroupWithEntry,
-    GroupTooLarge,
 }
 
 impl LevelError {
@@ -252,7 +250,7 @@ impl LevelError {
             LevelError::Usage(_) => 1,
             LevelError::RefusedPath => 3,
             LevelError::RenderDirectory | LevelError::RenderEmpty
-            | LevelError::RenderArrayOutOfRange | LevelError::RenderTooLarge => 1,
+            | LevelError::RenderArrayOutOfRange => 1,
             LevelError::ArchiveUnreadable { .. }
             | LevelError::EntryIndexOutOfRange { .. }
             | LevelError::EntryOutsideFile { .. }
@@ -263,8 +261,7 @@ impl LevelError {
             | LevelError::GroupNoMatch { .. }
             | LevelError::GroupParseFailed { .. }
             | LevelError::GroupWithoutArchive
-            | LevelError::GroupWithEntry
-            | LevelError::GroupTooLarge => 1,
+            | LevelError::GroupWithEntry => 1,
             _ => 2,
         }
     }
@@ -309,9 +306,6 @@ impl fmt::Display for LevelError {
             LevelError::RenderArrayOutOfRange => {
                 "room geometry array or face index is out of range"
             }
-            LevelError::RenderTooLarge => {
-                "merged mesh with object markers exceeds the 16-bit vertex index range"
-            }
             LevelError::MissingUnitName => "name table does not contain the unit's own name",
             LevelError::SidecarIncomplete => "PMF and PNF must be present together",
             LevelError::BadSidecarMagic => "sidecar magic or header length is invalid",
@@ -342,9 +336,6 @@ impl fmt::Display for LevelError {
             }
             LevelError::GroupWithoutArchive => "--group requires --bigfile <DAT>",
             LevelError::GroupWithEntry => "--group cannot be combined with --entry",
-            LevelError::GroupTooLarge => {
-                "merged level group exceeds the 16-bit vertex index range"
-            }
         };
         f.write_str(message)
     }
@@ -496,7 +487,7 @@ fn room_mesh(data: &[u8]) -> Result<RoomMesh, LevelError> {
             if u32::from(index) >= vertices {
                 return Err(LevelError::GeometryArrayOutOfRange);
             }
-            mesh.indices.push(index);
+            mesh.indices.push(u32::from(index));
         }
     }
     Ok(mesh)
@@ -578,10 +569,7 @@ fn textured_room_mesh(data: &[u8]) -> Result<RoomMesh, LevelError> {
     let textures = room_texture_faces(data)?;
     let mut mesh = RoomMesh::default();
     for (triangle, texture) in flat.indices.chunks_exact(3).zip(&textures.faces) {
-        if mesh.vertices.len().saturating_add(3) > usize::from(u16::MAX) + 1 {
-            return Err(LevelError::RenderTooLarge);
-        }
-        let base = mesh.vertices.len() as u16;
+        let base = mesh.vertices.len() as u32;
         let material = texture
             .map_or(1, |texture| crate::object::page_material(&mut mesh.pages, texture.page));
         for (corner, &index) in triangle.iter().enumerate() {
@@ -675,17 +663,12 @@ fn append_markers(mesh: &mut RoomMesh, objects: &[ObjectRecord]) -> Result<(), L
         [-1.0, -1.0, -1.0], [1.0, -1.0, -1.0], [1.0, 1.0, -1.0], [-1.0, 1.0, -1.0],
         [-1.0, -1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, 1.0], [-1.0, 1.0, 1.0],
     ];
-    const FACES: [u16; 36] = [
+    const FACES: [u32; 36] = [
         0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2, 0, 4, 7, 0, 7, 3,
         1, 2, 6, 1, 6, 5,
     ];
-    if mesh.vertices.len().saturating_add(objects.len().saturating_mul(8))
-        > usize::from(u16::MAX) + 1
-    {
-        return Err(LevelError::RenderTooLarge);
-    }
     for object in objects {
-        let base = mesh.vertices.len() as u16;
+        let base = mesh.vertices.len() as u32;
         for corner in CORNERS {
             mesh.vertices.push([
                 f32::from(object.position[0]) + corner[0] * half,
@@ -717,10 +700,7 @@ fn append_objects(
             markers.push(object.clone());
             continue;
         };
-        if mesh.vertices.len() + vertices.len() > usize::from(u16::MAX) + 1 {
-            return Err(LevelError::RenderTooLarge);
-        }
-        let base = mesh.vertices.len() as u16;
+        let base = mesh.vertices.len() as u32;
         let offset = object.position.map(f32::from);
         mesh.vertices.extend(vertices.iter().map(|v| {
             [v[0] + offset[0], v[1] + offset[1], v[2] + offset[2]]
@@ -761,10 +741,7 @@ fn append_objects_textured(
             markers.push(object.clone());
             continue;
         };
-        if mesh.vertices.len() + model.positions.len() > usize::from(u16::MAX) + 1 {
-            return Err(LevelError::RenderTooLarge);
-        }
-        let base = mesh.vertices.len() as u16;
+        let base = mesh.vertices.len() as u32;
         let offset = object.position.map(f32::from);
         for index in 0..model.positions.len() {
             let position = model.positions[index];
@@ -806,7 +783,7 @@ fn append_textured_mesh(merged: &mut RoomMesh, room: RoomMesh) {
         unresolved_faces,
         ..
     } = room;
-    let base = merged.vertices.len() as u16;
+    let base = merged.vertices.len() as u32;
     for ((&uv, &material), position) in uvs.iter().zip(&material_indices).zip(vertices) {
         merged.vertices.push(position);
         merged.uvs.push(uv);
@@ -843,9 +820,6 @@ fn textured_scene(
         })?;
         if mesh.vertices.is_empty() || mesh.indices.is_empty() {
             return Err(LevelError::RenderEmpty);
-        }
-        if merged.vertices.len() + mesh.vertices.len() > usize::from(u16::MAX) + 1 {
-            return Err(LevelError::GroupTooLarge);
         }
         append_textured_mesh(&mut merged, mesh);
         if merged.spawn.is_none() {
@@ -1129,10 +1103,7 @@ pub fn read_group_room_mesh(
         if mesh.vertices.is_empty() || mesh.indices.is_empty() {
             return Err(LevelError::RenderEmpty);
         }
-        if merged.vertices.len() + mesh.vertices.len() > usize::from(u16::MAX) + 1 {
-            return Err(LevelError::GroupTooLarge);
-        }
-        let base = merged.vertices.len() as u16;
+        let base = merged.vertices.len() as u32;
         merged.vertices.extend(mesh.vertices);
         merged.indices.extend(mesh.indices.iter().map(|&index| index + base));
         if merged.spawn.is_none() {
@@ -2328,6 +2299,19 @@ mod tests {
         assert_eq!(&mesh.material_indices[3..6], &[1, 1, 1], "tail stays flat");
         assert_eq!(mesh.uvs[0], [1, 2]);
         assert_eq!(mesh.uvs[3], [0, 0]);
+    }
+
+    #[test]
+    fn textured_room_mesh_reaches_past_the_u16_vertex_range() {
+        let faces = vec![[0u16, 1, 2]; 22_000];
+        let offsets = vec![0u16; faces.len()];
+        let bytes = textured_pcm(&faces, &offsets, &[7]);
+        let mesh = textured_room_mesh(&bytes[data_base(2)..])
+            .expect("per-face expansion above 65_535 vertices must build u32 indices");
+        assert_eq!(mesh.vertices.len(), 66_000);
+        assert_eq!(mesh.indices.len(), 66_000);
+        assert_eq!(mesh.indices[65_536], 65_536, "index value exceeds u16::MAX");
+        assert_eq!(mesh.indices.iter().copied().max(), Some(65_999));
     }
 
     #[test]

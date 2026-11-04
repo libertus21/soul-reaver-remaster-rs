@@ -26,7 +26,7 @@ pub struct MeshEntry {
     pub title: String,
     pub positions: Vec<[f32; 3]>,
     pub uvs: Vec<[u8; 2]>,
-    pub indices: Vec<u16>,
+    pub indices: Vec<u32>,
     pub material_indices: Vec<u8>,
     pub materials: Vec<Material>,
     pub textures: Vec<MaterialTextures>,

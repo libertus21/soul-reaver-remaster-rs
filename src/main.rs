@@ -747,7 +747,7 @@ fn run_mesh(args: &[String]) -> ExitCode {
 
 fn run_mesh_with(
     args: &[String],
-    show: impl FnOnce(&[[f32; 3]], &[u16], &str) -> Result<(), String>,
+    show: impl FnOnce(&[[f32; 3]], &[u32], &str) -> Result<(), String>,
 ) -> ExitCode {
     let (path, pose_spec) = match parse_mesh_args(args) {
         Ok(parsed) => parsed,
@@ -1449,7 +1449,7 @@ fn run_object_mesh(args: &[String]) -> ExitCode {
 
 fn run_object_mesh_with(
     args: &[String],
-    render: impl Fn(&[[f32; 3]], &[u16], &str) -> Result<(), String>,
+    render: impl Fn(&[[f32; 3]], &[u32], &str) -> Result<(), String>,
 ) -> ExitCode {
     let usage = "expected --object-mesh --bigfile <DAT> --entry <INDEX>";
     match object_input(args, usage).and_then(|(dat, index)| object::read_entry(Path::new(dat), index))

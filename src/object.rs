@@ -331,12 +331,12 @@ pub fn rest_positions(model: &ObjectModel) -> Vec<[f32; 3]> {
 /// translated by the bone table and widened 1:1, and every polygon contributes
 /// its three `u16` indices as one triangle. Double-sided faces stay as two
 /// opposite-winding triangles; both are real draw calls.
-pub fn triangle_mesh(model: &ObjectModel) -> (Vec<[f32; 3]>, Vec<u16>) {
+pub fn triangle_mesh(model: &ObjectModel) -> (Vec<[f32; 3]>, Vec<u32>) {
     let positions = rest_positions(model);
     let indices = model
         .polygons
         .iter()
-        .flat_map(|(corners, _, _, _)| corners.iter().copied())
+        .flat_map(|(corners, _, _, _)| corners.iter().map(|&corner| u32::from(corner)))
         .collect();
     (positions, indices)
 }
@@ -349,7 +349,7 @@ pub fn triangle_mesh(model: &ObjectModel) -> (Vec<[f32; 3]>, Vec<u16>) {
 pub struct TexturedMesh {
     pub positions: Vec<[f32; 3]>,
     pub uvs: Vec<[u8; 2]>,
-    pub indices: Vec<u16>,
+    pub indices: Vec<u32>,
     pub material_indices: Vec<u8>,
     pub pages: Vec<u16>,
 }
@@ -371,7 +371,7 @@ pub fn textured_mesh(model: &ObjectModel) -> TexturedMesh {
     let positions = rest_positions(model);
     let mut out = TexturedMesh::default();
     for ((corners, _, _, _), texture) in model.polygons.iter().zip(&model.textures) {
-        let base = out.positions.len() as u16;
+        let base = out.positions.len() as u32;
         let material = texture.map_or(1, |record| page_material(&mut out.pages, record.page));
         for (corner, &vertex) in corners.iter().enumerate() {
             out.positions.push(positions[vertex as usize]);
@@ -399,7 +399,7 @@ pub struct ModelResolver {
     path: PathBuf,
     entries: Vec<bigfile::BigfileEntry>,
     by_suffix: HashMap<[u8; 4], Vec<usize>>,
-    cache: HashMap<String, Option<(Vec<[f32; 3]>, Vec<u16>)>>,
+    cache: HashMap<String, Option<(Vec<[f32; 3]>, Vec<u32>)>>,
     textured_cache: HashMap<String, Option<TexturedMesh>>,
 }
 
@@ -415,7 +415,7 @@ impl ModelResolver {
     }
 
     /// Model-space mesh for `name`, or `None` when no container matches.
-    pub fn mesh(&mut self, name: &str) -> Option<(Vec<[f32; 3]>, Vec<u16>)> {
+    pub fn mesh(&mut self, name: &str) -> Option<(Vec<[f32; 3]>, Vec<u32>)> {
         if !self.cache.contains_key(name) {
             let mesh = self.lookup(name).map(|model| triangle_mesh(&model));
             self.cache.insert(name.to_string(), mesh);
@@ -624,7 +624,7 @@ mod tests {
 
     /// Unique vertices, unique faces and unique undirected edges after welding
     /// coincident positions and collapsing double-sided duplicates.
-    fn welded_topology(positions: &[[f32; 3]], indices: &[u16]) -> (usize, usize, usize, usize) {
+    fn welded_topology(positions: &[[f32; 3]], indices: &[u32]) -> (usize, usize, usize, usize) {
         let mut welded = Vec::with_capacity(positions.len());
         let mut seen: HashMap<[i32; 3], usize> = HashMap::new();
         for position in positions {

@@ -76,7 +76,7 @@ pub struct Mesh {
     pub bones: BoneBlock,
     pub bone_indices: Vec<[u8; 3]>,
     pub bone_weights: Vec<[u8; 3]>,
-    pub indices: Vec<u16>,
+    pub indices: Vec<u32>,
 }
 
 impl Mesh {
@@ -334,7 +334,7 @@ pub fn parse(bytes: &[u8]) -> Result<Mesh, SrmError> {
     let mut indices = Vec::with_capacity(faces as usize);
     for i in 0..faces as usize {
         let o = fbase + i * 2;
-        indices.push(u16::from_le_bytes([bytes[o], bytes[o + 1]]));
+        indices.push(u32::from(u16::from_le_bytes([bytes[o], bytes[o + 1]])));
     }
 
     if offset != file_len {

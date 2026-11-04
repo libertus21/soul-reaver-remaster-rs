@@ -1165,7 +1165,7 @@ impl<'window> MeshState<'window> {
     async fn new(
         window: Arc<Window>,
         vertices: &[[f32; 3]],
-        indices: &[u16],
+        indices: &[u32],
         start: FlyCamera,
     ) -> Result<Self, String> {
         let mut vbytes = Vec::with_capacity(vertices.len() * 12);
@@ -1174,7 +1174,7 @@ impl<'window> MeshState<'window> {
                 vbytes.extend_from_slice(&c.to_le_bytes());
             }
         }
-        let mut ibytes = Vec::with_capacity(indices.len() * 2);
+        let mut ibytes = Vec::with_capacity(indices.len() * 4);
         for i in indices {
             ibytes.extend_from_slice(&i.to_le_bytes());
         }
@@ -1346,7 +1346,7 @@ impl<'window> MeshState<'window> {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(0..self.index_count, 0, 0..1);
         }
         self.queue.submit(std::iter::once(encoder.finish()));
@@ -1357,7 +1357,7 @@ impl<'window> MeshState<'window> {
 struct MeshApp {
     title: String,
     vertices: Vec<[f32; 3]>,
-    indices: Vec<u16>,
+    indices: Vec<u32>,
     start: FlyCamera,
     state: Option<MeshState<'static>>,
     init_error: Option<String>,
@@ -1436,7 +1436,7 @@ impl ApplicationHandler for MeshApp {
 
 pub fn show_mesh(
     positions: &[[f32; 3]],
-    indices: &[u16],
+    indices: &[u32],
     title: &str,
     spawn: Option<[f32; 3]>,
 ) -> Result<(), String> {
@@ -1856,7 +1856,7 @@ impl<'window> TexturedMeshState<'window> {
         });
         self.queue.write_buffer(&vertex_buffer, 0, &vbytes_padded);
 
-        let mut ranges: Vec<(usize, Vec<u16>)> =
+        let mut ranges: Vec<(usize, Vec<u32>)> =
             (0..entry.materials.len()).map(|i| (i + 1, Vec::new())).collect();
         for tri in entry.indices.chunks_exact(3) {
             let m = entry.material_indices[tri[0] as usize];
@@ -1972,7 +1972,7 @@ impl<'window> TexturedMeshState<'window> {
                 let bg_idx = (*mat_idx as usize) - 1;
                 if bg_idx < self.texture_bind_groups.len() {
                     pass.set_bind_group(1, &self.texture_bind_groups[bg_idx], &[]);
-                    pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint16);
+                    pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..*count, 0, 0..1);
                 }
             }
@@ -2048,7 +2048,7 @@ impl ApplicationHandler for TexturedMeshApp {
 pub fn show_mesh_textured(
     positions: &[[f32; 3]],
     uvs: &[[u8; 2]],
-    indices: &[u16],
+    indices: &[u32],
     material_indices: &[u8],
     materials: &[crate::srm::Material],
     textures: &[crate::textures_object::MaterialTextures],
