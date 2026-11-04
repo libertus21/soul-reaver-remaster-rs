@@ -24,15 +24,16 @@ your own install; nothing is bundled.
 | Textured meshes + mesh gallery | `cargo run -- --mesh-textured <FILE.SRM> --tex-dir <DIR>` / `cargo run -- --mesh-all <OBJECT_DIR> --tex-dir <DIR>` | Loads UVs, material indices and the three DDS textures per material; renders lit. `--mesh-all` browses a directory (`←`/`→`, Esc). |
 | `.SND`/`.SMP` audio → WAV | `cargo run -- --audio <FILE.SND> --alist` / `cargo run -- --audio <FILE.SND> --wave <N> --out <FILE.wav>` | Lists each wave's offset, bytes, frames, duration and loop span; decodes one wave as Sony 4-bit ADPCM to a canonical PCM16 mono WAV (44100 Hz chosen). The writer refuses paths inside a git work tree. |
 | `BIGFILE.DAT` index | `cargo run -- --bigfile <BIGFILE.DAT> --list` / `--show <SEL>` | Prints `index hash offset length` per entry; `--show` reads one entry in memory and shows it if it is a DDS. |
-| Archive-entry level access | `cargo run -- --level-geometry --bigfile <BIGFILE.DAT> --entry 115` | Reads the entry slice in memory as a `.PCM` unit. Entry 115 is `under1` (1,468 V / 2,922 F). No extraction, no temp file. |
+| Archive-entry and group level access | `cargo run -- --level-geometry --bigfile <BIGFILE.DAT> --entry 115` / `cargo run -- --level-geometry --bigfile <BIGFILE.DAT> --group under` | Reads one entry slice in memory as a `.PCM` unit (entry 115 is `under1`, 1,468 V / 2,922 F), or resolves every matching entry in a group. `--level-objects`, `--level-links` and `--level-render` accept both forms. No extraction, no temp file. |
 | Level structure | `cargo run -- --level-structure <PATH>` | Reports header sanity, relocation-directory integrity (`entries`/`valid`/`zero`/`out_of_range`), non-null header slots and the 36-byte table. |
-| Level links | `cargo run -- --level-links <PATH>` | Prints the decoded link table (`target`, `index`, `target_id`, five raw prelude words). |
+| Level links | `cargo run -- --level-links <PATH>` | Prints the decoded link table (`target`, `index`, `target_id`, five raw prelude words). The corrected parser accepts mixed-case targets and gates the prologue on the observed prelude; dumps keep stored case and graph work folds it. |
 | Level geometry | `cargo run -- --level-geometry <PATH>` | Prints vertex/face counts, both offsets, the position axis box and centre, and face-index validation. |
-| Level objects | `cargo run -- --level-objects <PATH>` | Prints each placed object's name, world position, type and flags. |
-| Archived object models | `cargo run -- --object-info --bigfile <BIGFILE.DAT> --entry 66` | Reads one object container in memory and prints vertex/polygon/material counts, both array-boundary identities and the out-of-range index count. Entry 66 is `raziel` (299 V / 640 P). No extraction. |
-| Object model render | `cargo run -- --object-mesh --bigfile <BIGFILE.DAT> --entry 66` | Parses the same container and draws its triangles through the flat-shaded viewer. `--textures <TEXTURES.BIG>` draws each face with its `TextureFT3` page. Louder refusals happen before any window opens. |
-| `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` | Renders one unit's confirmed room geometry. Orbit as above; `F` enters a first-person fly camera. `--objects` adds placed objects plus `--textures <TEXTURES.BIG>` to texture the models. |
-| Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 27 capabilities in five groups; grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
+| Level objects | `cargo run -- --level-objects <PATH>` / `cargo run -- --level-objects --bigfile <BIGFILE.DAT> --entry <INDEX>` / `cargo run -- --level-objects --bigfile <BIGFILE.DAT> --group under` | Prints each placed object's name, world position, type and flags. |
+| Archived object model info | `cargo run -- --object-info --bigfile <BIGFILE.DAT> --entry 66` | Reads one object container in memory and prints vertex/polygon/material counts, both array-boundary identities and the out-of-range index count. Entry 66 is `raziel` (299 V / 640 P). No extraction. |
+| Archived object model render | `cargo run -- --object-mesh --bigfile <BIGFILE.DAT> --entry 66` / `cargo run -- --object-mesh --bigfile <BIGFILE.DAT> --entry 66 --textures <TEXTURES.BIG>` | Parses the same container, applies the 24-byte bone rest pose and draws its triangles through the flat-shaded viewer. `--textures` draws each face with its `TextureFT3` page. Louder refusals happen before any window opens. |
+| `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --entry <INDEX>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --group under [--objects] [--textures <TEXTURES.BIG>]` | Renders room geometry, flat or textured from `TEXTURES.BIG`. Orbit, wheel zoom, pan, `R` reset; `F` enters a first-person fly camera. `--objects` adds each placed object's real archived model at its world position; `--textures` textures both rooms and models. |
+| Level reachability | `cargo run -- --level-reach --bigfile <BIGFILE.DAT> [--start <UNIT>] [--names]` | BFS from `under1` over the decoded link graph, then groups reachable, in-degree islands and inbound-but-unreachable units. `--names` lists each island unit. Corrected reader: 372 discovered / 334 reachable / 38 unreachable / 1 island (`push1`). |
+| Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 30 capabilities in five groups; grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
 
 `<PATH>` accepts a `.PCM` file or a room directory. The level arms also accept
 `--bigfile <DAT> --entry <INDEX>` or `--bigfile <DAT> --group <PREFIX>`.
@@ -40,19 +41,21 @@ your own install; nothing is bundled.
 ## Opening level quick-start
 
 The new-game opening unit is `under1`, reached through the archive (entry 115),
-not the loose `UNDRCT1.PCM`. Render the whole tutorial family with two commands:
+not the loose `UNDRCT1.PCM`. Render the whole tutorial family with these commands:
 
 ```text
 cargo run -- --level-objects --bigfile <BIGFILE.DAT> --group under
+cargo run -- --level-render  --bigfile <BIGFILE.DAT> --group under
 cargo run -- --level-render  --bigfile <BIGFILE.DAT> --group under --objects
+cargo run -- --level-render  --bigfile <BIGFILE.DAT> --group under --textures <TEXTURES.BIG>
 cargo run -- --level-render  --bigfile <BIGFILE.DAT> --group under --objects --textures <TEXTURES.BIG>
 ```
 
-The first prints the four rooms' object counts and placements; the second opens
-one window with the merged `under` geometry plus each object's real archived
-model at its world position. The third also samples each object's legacy
-`TEXTURES.BIG` page; names with no model (`campath`, `marker`, `splob`) keep a
-flat cube marker.
+The first prints the four rooms' object counts and placements. The next opens
+one window with the merged `under` geometry, flat or textured from
+`TEXTURES.BIG`. Adding `--objects` places each object's real archived model at
+its world position, also flat or textured; only `campath`, `marker` and `splob`
+keep a flat cube marker because they have no mesh.
 
 Fly camera keys: `F` toggles orbit/fly; `W`/`A`/`S`/`D` move relative to the
 view; the mouse looks around; `Space`/`E` rise; `C`/`Q` sink; `Shift` flies
@@ -60,24 +63,30 @@ faster; `R` resets the camera; `Esc` exits.
 
 ## What's missing / known limits
 
-- **No textures on level geometry.** UVs are unlocated (the trailing vertex
-  triple is not the face normal), so `--level-render` is flat-shaded.
-- **Objects are textured from `TEXTURES.BIG`.** Each textured face reads its
-  16-byte `TextureFT3` record: page = `textureWord & 0x07FF`, texel row = `v`.
-  The room and marker cubes stay flat material 1. Object `type` semantics and the
-  record's two attribute words and colour blend remain UNKNOWN.
 - **No animation.** `.SRA` is not parsed by this build (the loader callback is a
   `RET 0` stub) and `.SRM` has no hierarchy, so `--pose` is a local cluster
   rotation only and the mesh tears at cluster seams.
-- **No sound for level music beyond WAV export.** Loops are reported but decoded
-  one-shot; there is no sequence playback (`QSMa`), mixing or ADSR.
 - **No game logic.** This is a viewer/analysis tool, not a playable engine.
+- **No sound sequences.** `.SND` waves export to WAV and loops are reported, but
+  they are decoded one-shot; there is no `QSMa`/sequence playback, mixing or ADSR.
+- **Objects are real archived models, not markers.** `--level-render --objects`
+  resolves 375/378 placed names to their `.PCM` OBJECT containers; only
+  `campath`, `marker` and `splob` keep a flat marker. Object `type` semantics and
+  the `TextureFT3` attribute and colour-blend meanings remain UNKNOWN.
 - **Object records carry no orientation.** There is no rotation field; the
   `+0x18` triple is a cross-level offset, not angles.
+- **Room textures are implemented, with a small unresolved tail.** 99.76% of
+  faces address their 12-byte UV record; the 214 `0xFFFF` and 1,160 non-aligned
+  tails are counted and drawn flat, never dropped. Face attribute `+0x08` stays
+  UNKNOWN.
 - **`--group` scans the whole archive per run** (no cached index).
 - **Level geometry gaps.** Array C, the face attribute words, the room-local
-  group records and the dominant 143,872-byte block stay UNKNOWN; no UV, normal,
+  group records and the dominant 143,872-byte block stay UNKNOWN; no normal,
   BSP or culling claim is made.
+- **Cut content: 30 `Test` levels.** The engine's debug/media load list names
+  `Test 1` .. `Test 30`, but no shipped file or archive entry backs them. That
+  is the concrete target list for restoration work; absence from the archive
+  alone is not proof, because many levels ship loose under `AREA\`.
 - **BC7 sRGB (`dxgiFormat` 99) fails loud.** sRGB correctness, resize handling
   and a full mip-chain UI are deferred.
 - **Binary startup beyond `run` stays UNKNOWN**, and the loader's post-open error
@@ -110,7 +119,7 @@ faster; `R` resets the camera; `Esc` exits.
 | Game data | Read-only at runtime from the user's install; paths via CLI args/env only, never committed. |
 | Legal guardrails | Whitelist `.gitignore` verified every commit; single-player/offline owned copy only; community work credited in `THIRD-PARTY-NOTICES.md` once reuse starts. |
 | Process | Small chained slices (≤400 changed lines each); proposal → spec → tasks → code → playtest report. |
-| Tests | `cargo test` — 291 tests on synthetic bytes only; no game files in the suite. |
+| Tests | `cargo test` — 321 tests on synthetic bytes only; no game files in the suite. |
 
 ## Further reading
 
