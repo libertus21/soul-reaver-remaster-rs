@@ -53,6 +53,7 @@ mod level;
 mod menu;
 mod mesh_entry;
 mod object;
+mod object_texture;
 // Pure one-bone pose math, wired into the `--mesh --pose` arm below.
 mod pose;
 mod render;
@@ -200,6 +201,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file> --objects");
         eprintln!("   or: soul-reaver-remaster-rs --object-info --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX>");
+        eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --textures <TEXTURES.BIG>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
@@ -1160,6 +1162,9 @@ fn level_input<'a>(
     usage: &'static str,
 ) -> Result<LevelInput<'a>, level::LevelError> {
     if !args.iter().any(|arg| arg == "--bigfile" || arg == "--entry" || arg == "--group") {
+        if args.iter().any(|arg| arg == "--textures") {
+            return Err(level::LevelError::Usage(usage));
+        }
         let paths: Vec<&str> =
             args.iter().filter(|arg| arg.as_str() != "--objects").map(String::as_str).collect();
         return match paths.as_slice() {
@@ -1171,6 +1176,10 @@ fn level_input<'a>(
     while index < args.len() {
         if args[index] == "--objects" {
             index += 1;
+            continue;
+        }
+        if args[index] == "--textures" && index + 1 < args.len() {
+            index += 2;
             continue;
         }
         let value = args.get(index + 1).map(String::as_str);
@@ -1273,6 +1282,13 @@ fn run_level_objects(args: &[String]) -> ExitCode {
 fn run_level_render(args: &[String]) -> ExitCode {
     let usage = "expected --level-render <path> or --level-render --bigfile <DAT> --entry <INDEX> or --level-render --bigfile <DAT> --group <PREFIX>";
     let markers = args.iter().any(|arg| arg == "--objects");
+    if let Some(bank_path) = args
+        .iter()
+        .position(|arg| arg == "--textures")
+        .and_then(|at| args.get(at + 1))
+    {
+        return run_level_render_textured(args, usage, markers, bank_path);
+    }
     let input = level_input(args, usage);
     let mut resolver = match &input {
         Ok(LevelInput::Entry { dat, .. }) | Ok(LevelInput::Group { dat, .. }) if markers => {
@@ -1323,9 +1339,99 @@ fn run_level_render(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `--level-render --objects --textures`: room and markers keep flat material
+/// 1 while placed models are drawn with their bank pages.
+fn run_level_render_textured(
+    args: &[String],
+    usage: &'static str,
+    markers: bool,
+    bank_path: &str,
+) -> ExitCode {
+    if !markers {
+        eprintln!("error: --textures requires --objects (the room and markers stay flat)");
+        return ExitCode::from(1);
+    }
+    let input = level_input(args, usage);
+    let mut resolver = match &input {
+        Ok(LevelInput::Entry { dat, .. }) | Ok(LevelInput::Group { dat, .. }) => {
+            match object::ModelResolver::load(Path::new(dat)) {
+                Ok(resolver) => resolver,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(error.exit_code());
+                }
+            }
+        }
+        _ => {
+            eprintln!("error: {usage}");
+            return ExitCode::from(1);
+        }
+    };
+    let bank = match object_texture::PageBank::open(Path::new(bank_path)) {
+        Ok(bank) => bank,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let result = input.and_then(|input| {
+        let mut source = |name: &str| resolver.textured(name);
+        match input {
+            LevelInput::Entry { dat, index } => {
+                level::read_entry_room_mesh_textured(Path::new(dat), index, &mut source)
+            }
+            LevelInput::Group { dat, prefix } => {
+                level::read_group_room_mesh_textured(Path::new(dat), prefix, &mut source)
+            }
+            LevelInput::Path(_) => Err(level::LevelError::Usage(usage)),
+        }
+    });
+    let (name, mesh) = match result {
+        Ok(unit) => unit,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let (materials, textures) = match object_texture::scene(&bank, &mesh.pages) {
+        Ok(scene) => scene,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    outln!(
+        "objects {} ({} meshes, {} markers)",
+        mesh.objects.total, mesh.objects.meshes, mesh.objects.markers
+    );
+    outln!(
+        "level {name} vertices={} faces={} pages={} showing textured room and objects",
+        mesh.vertices.len(), mesh.indices.len() / 3, mesh.pages.len()
+    );
+    let title = format!("level {name}");
+    if let Err(error) = render::show_mesh_textured(
+        &mesh.vertices,
+        &mesh.uvs,
+        &mesh.indices,
+        &mesh.material_indices,
+        &materials,
+        &textures,
+        &title,
+    ) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
 /// `--object-mesh` arm: one archived object container rendered through the
-/// existing mesh viewer. Refusals happen before any window is created.
+/// existing mesh viewer. With `--textures`, the same container is drawn with
+/// its bank pages through the existing textured pipeline. Refusals happen
+/// before any window is created.
 fn run_object_mesh(args: &[String]) -> ExitCode {
+    if args.iter().any(|arg| arg == "--textures") {
+        return run_object_mesh_textured(args);
+    }
     run_object_mesh_with(args, |positions, indices, title| {
         render::show_mesh(positions, indices, title, None)
     })
@@ -1355,6 +1461,108 @@ fn run_object_mesh_with(
             ExitCode::from(error.exit_code())
         }
     }
+}
+
+/// `--bigfile <DAT> --entry <INDEX> --textures <BIG>`, in any order.
+fn object_textured_input<'a>(
+    args: &'a [String],
+    usage: &'static str,
+) -> Result<(&'a str, usize, &'a str), object::ObjectError> {
+    let (mut dat, mut index, mut textures) = (None, None, None);
+    let mut at = 0;
+    while at + 1 < args.len() {
+        match args[at].as_str() {
+            "--bigfile" => dat = Some(args[at + 1].as_str()),
+            "--textures" => textures = Some(args[at + 1].as_str()),
+            "--entry" => {
+                index = Some(
+                    args[at + 1].parse().map_err(|_| object::ObjectError::Usage(usage))?,
+                )
+            }
+            _ => return Err(object::ObjectError::Usage(usage)),
+        }
+        at += 2;
+    }
+    match (dat, index, textures, at == args.len()) {
+        (Some(dat), Some(index), Some(textures), true) => Ok((dat, index, textures)),
+        _ => Err(object::ObjectError::Usage(usage)),
+    }
+}
+
+/// `--object-mesh --textures`: decode each used bank page and feed the
+/// per-face UV mesh into the existing textured pipeline. One line reports the
+/// page count and the first face's texels before the window opens.
+fn run_object_mesh_textured(args: &[String]) -> ExitCode {
+    let usage = "expected --object-mesh --bigfile <DAT> --entry <INDEX> --textures <TEXTURES.BIG>";
+    let (dat, index, bank_path) = match object_textured_input(args, usage) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let model = match object::read_entry(Path::new(dat), index) {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let bank = match object_texture::PageBank::open(Path::new(bank_path)) {
+        Ok(bank) => bank,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let mesh = object::textured_mesh(&model);
+    let (materials, textures) = match object_texture::scene(&bank, &mesh.pages) {
+        Ok(scene) => scene,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    outln!(
+        "object {} faces={} textured={} pages={}",
+        model.name,
+        mesh.indices.len() / 3,
+        model.textures.iter().filter(|texture| texture.is_some()).count(),
+        mesh.pages.len()
+    );
+    if let Some(record) = model.textures.iter().flatten().next() {
+        let slot = mesh.pages.iter().position(|&page| page == record.page).unwrap_or(0) + 1;
+        let diffuse = &textures[slot].diffuse.rgba8;
+        let rgb: Vec<String> = (0..3)
+            .map(|corner| {
+                let [r, g, b, _] =
+                    object_texture::sample(diffuse, record.uvs[corner][0], record.uvs[corner][1]);
+                format!("{r},{g},{b}")
+            })
+            .collect();
+        outln!(
+            "texture page={} uvs=({},{}) ({},{}) ({},{}) rgb=({}) ({}) ({})",
+            record.page,
+            record.uvs[0][0], record.uvs[0][1],
+            record.uvs[1][0], record.uvs[1][1],
+            record.uvs[2][0], record.uvs[2][1],
+            rgb[0], rgb[1], rgb[2]
+        );
+    }
+    let title = format!("object {}", model.name);
+    if let Err(error) = render::show_mesh_textured(
+        &mesh.positions,
+        &mesh.uvs,
+        &mesh.indices,
+        &mesh.material_indices,
+        &materials,
+        &textures,
+        &title,
+    ) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
 }
 
 /// Read-only `--object-info` arm: one archived object container, counts and
@@ -1457,6 +1665,17 @@ mod cli_tests {
         let mut bytes = vec![0u8; 1024];
         bytes[0..2].copy_from_slice(&header_size.to_le_bytes());
         bytes[2..4].copy_from_slice(&count.to_le_bytes());
+        bytes
+    }
+
+    /// Synthetic texture bank: one `data` slot per page (value `0x8001`).
+    fn synthetic_texture_bank(count: u16) -> Vec<u8> {
+        let mut bytes = vec![0u8; 4096 + usize::from(count) * 131072];
+        bytes[0..2].copy_from_slice(&512u16.to_le_bytes());
+        bytes[2..4].copy_from_slice(&count.to_le_bytes());
+        for pixel in bytes[4096..].chunks_exact_mut(2) {
+            pixel.copy_from_slice(&0x8001u16.to_le_bytes());
+        }
         bytes
     }
 
@@ -2185,6 +2404,52 @@ mod cli_tests {
         let missing = vec!["--bigfile".to_string(), dat, "--entry".to_string(), "9".to_string()];
         assert_eq!(run_object_mesh(&missing), ExitCode::from(1));
         assert_eq!(run_object_mesh(&[]), ExitCode::from(1));
+    }
+
+    #[test]
+    fn textured_arms_refuse_before_a_window() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let dat = write_tmp(
+            &tmp,
+            "BIGFILE.DAT",
+            &synthetic_archive(&[crate::object::synthetic_model()]),
+        );
+        let bank = write_tmp(&tmp, "TEXTURES.BIG", &synthetic_texture_bank(1));
+        let object = vec![
+            "--bigfile".to_string(),
+            dat.clone(),
+            "--entry".to_string(),
+            "0".to_string(),
+            "--textures".to_string(),
+            bank.clone(),
+        ];
+        assert_eq!(
+            run_object_mesh(&object),
+            ExitCode::from(2),
+            "page 0x3AB is outside the one-page bank"
+        );
+        assert_eq!(
+            run_object_mesh(&["--textures".to_string(), bank.clone()]),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            run_level_render(&["--textures".to_string(), bank.clone()]),
+            ExitCode::from(1),
+            "--textures requires --objects"
+        );
+        assert_eq!(
+            run_level_render(&[
+                "--bigfile".to_string(),
+                dat,
+                "--entry".to_string(),
+                "0".to_string(),
+                "--objects".to_string(),
+                "--textures".to_string(),
+                bank,
+            ]),
+            ExitCode::from(1),
+            "an object container is not a PCM unit"
+        );
     }
 
     #[test]

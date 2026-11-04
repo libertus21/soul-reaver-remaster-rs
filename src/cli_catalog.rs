@@ -20,6 +20,12 @@ impl Capability {
     /// Whether this capability emits `token` as a named option with a value
     /// instead of a literal token followed by its operand placeholder.
     pub fn takes_value(&self, token: &str) -> bool {
+        if token == "--textures" {
+            return matches!(
+                self.name,
+                "object-mesh" | "render-objects" | "render-entry" | "render-group"
+            );
+        }
         matches!(token, "--map" | "--pose" | "--tex-dir" | "--out")
             || ((self.name.ends_with("-entry") || self.name == "object-info" || self.name == "object-mesh")
                 && matches!(token, "--bigfile" | "--entry"))
@@ -43,7 +49,7 @@ pub const CAPABILITIES: [Capability; 27] = [
     Capability { group: "mesh", name: "textured", legacy: "--mesh-textured <SRM> --tex-dir <TEX>", summary: "Show one .SRM with its material textures.", window: true },
     Capability { group: "mesh", name: "gallery", legacy: "--mesh-all <DIR> --tex-dir <TEX>", summary: "Browse a directory of .SRM meshes.", window: true },
     Capability { group: "mesh", name: "object-info", legacy: "--object-info --bigfile <DAT> --entry <INDEX>", summary: "Print one archived object container's counts and validation.", window: false },
-    Capability { group: "mesh", name: "object-mesh", legacy: "--object-mesh --bigfile <DAT> --entry <INDEX>", summary: "Show one archived object container's model.", window: true },
+    Capability { group: "mesh", name: "object-mesh", legacy: "--object-mesh --bigfile <DAT> --entry <INDEX> [--textures <BIG>]", summary: "Show one archived object container's model.", window: true },
     Capability { group: "audio", name: "list", legacy: "--audio <SND> --alist", summary: "List the waves in a .SND bank.", window: false },
     Capability { group: "audio", name: "wave", legacy: "--audio <SND> --wave <N> --out <OUT>", summary: "Write one .SND wave to a .wav file.", window: false },
     Capability { group: "level", name: "info", legacy: "--level-info <PATH>", summary: "Print the level header summary.", window: false },
@@ -53,13 +59,13 @@ pub const CAPABILITIES: [Capability; 27] = [
     Capability { group: "level", name: "geometry", legacy: "--level-geometry <PATH>", summary: "Print room vertex and face counts with a box.", window: false },
     Capability { group: "level", name: "objects", legacy: "--level-objects <PATH>", summary: "Print one unit's placed objects: name, position, type and flags.", window: false },
     Capability { group: "level", name: "render", legacy: "--level-render <PATH>", summary: "Show one unit's room geometry as a flat-shaded solid.", window: true },
-    Capability { group: "level", name: "render-objects", legacy: "--level-render <PATH> --objects", summary: "Show one unit's room geometry plus one cube per object.", window: true },
+    Capability { group: "level", name: "render-objects", legacy: "--level-render <PATH> --objects [--textures <BIG>]", summary: "Show one unit's room geometry plus one cube per object.", window: true },
     Capability { group: "level", name: "geometry-entry", legacy: "--level-geometry --bigfile <DAT> --entry <INDEX>", summary: "Print one archive entry's room vertex and face counts.", window: false },
     Capability { group: "level", name: "objects-entry", legacy: "--level-objects --bigfile <DAT> --entry <INDEX>", summary: "Print one archive entry's placed objects.", window: false },
-    Capability { group: "level", name: "render-entry", legacy: "--level-render --bigfile <DAT> --entry <INDEX>", summary: "Show one archive entry's room geometry.", window: true },
+    Capability { group: "level", name: "render-entry", legacy: "--level-render --bigfile <DAT> --entry <INDEX> [--textures <BIG>]", summary: "Show one archive entry's room geometry.", window: true },
     Capability { group: "level", name: "geometry-group", legacy: "--level-geometry --bigfile <DAT> --group <PREFIX>", summary: "Print every room in an archive level family with totals.", window: false },
     Capability { group: "level", name: "objects-group", legacy: "--level-objects --bigfile <DAT> --group <PREFIX>", summary: "Print every room's objects in an archive level family with a total.", window: false },
-    Capability { group: "level", name: "render-group", legacy: "--level-render --bigfile <DAT> --group <PREFIX>", summary: "Show a merged archive level family as one solid.", window: true },
+    Capability { group: "level", name: "render-group", legacy: "--level-render --bigfile <DAT> --group <PREFIX> [--textures <BIG>]", summary: "Show a merged archive level family as one solid.", window: true },
 ];
 
 /// The capability table.

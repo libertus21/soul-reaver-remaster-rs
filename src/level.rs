@@ -123,6 +123,11 @@ pub struct GeometryReport {
 pub struct RoomMesh {
     pub vertices: Vec<[f32; 3]>,
     pub indices: Vec<u16>,
+    /// Per-vertex UVs and 1-based material indices, plus the page list for
+    /// materials 2..; empty unless `--textures` was requested.
+    pub uvs: Vec<[u8; 2]>,
+    pub material_indices: Vec<u8>,
+    pub pages: Vec<u16>,
     /// Placed-object render counts; zero unless `--objects` was requested.
     pub objects: ObjectStats,
     /// First object named `raziel`, widened to world `f32`; the fly camera's
@@ -163,6 +168,10 @@ pub struct ObjectStats {
 /// Resolves one placed-object name to a model-space triangle mesh.
 pub type ObjectModelSource<'a> =
     &'a mut dyn FnMut(&str) -> Option<(Vec<[f32; 3]>, Vec<u16>)>;
+
+/// Resolves one placed-object name to a per-face textured model-space mesh.
+pub type TexturedObjectSource<'a> =
+    &'a mut dyn FnMut(&str) -> Option<crate::object::TexturedMesh>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
@@ -610,6 +619,124 @@ fn append_objects(
     mesh.objects.total = objects.len() as u32;
     mesh.objects.markers = markers.len() as u32;
     Ok(())
+}
+
+/// [`append_markers`] plus flat-material UVs for the textured scene buffers.
+fn append_markers_textured(
+    mesh: &mut RoomMesh,
+    objects: &[ObjectRecord],
+) -> Result<(), LevelError> {
+    let start = mesh.vertices.len();
+    append_markers(mesh, objects)?;
+    let added = mesh.vertices.len() - start;
+    mesh.uvs.extend(std::iter::repeat([0, 0]).take(added));
+    mesh.material_indices.extend(std::iter::repeat(1).take(added));
+    Ok(())
+}
+
+/// Append one textured model per placed object and a flat cube for every
+/// unresolved name. Object page ids are remapped onto the scene-wide material
+/// table (1 = flat, 2.. = pages in first-use order).
+fn append_objects_textured(
+    mesh: &mut RoomMesh,
+    objects: &[ObjectRecord],
+    models: TexturedObjectSource<'_>,
+) -> Result<(), LevelError> {
+    let mut markers = Vec::new();
+    for object in objects {
+        let Some(model) = models(&object.name) else {
+            markers.push(object.clone());
+            continue;
+        };
+        if mesh.vertices.len() + model.positions.len() > usize::from(u16::MAX) + 1 {
+            return Err(LevelError::RenderTooLarge);
+        }
+        let base = mesh.vertices.len() as u16;
+        let offset = object.position.map(f32::from);
+        for index in 0..model.positions.len() {
+            let position = model.positions[index];
+            mesh.vertices.push([
+                position[0] + offset[0],
+                position[1] + offset[1],
+                position[2] + offset[2],
+            ]);
+            mesh.uvs.push(model.uvs[index]);
+            let material = model.material_indices[index];
+            mesh.material_indices.push(if material <= 1 {
+                1
+            } else {
+                crate::object::page_material(
+                    &mut mesh.pages,
+                    model.pages[usize::from(material) - 2],
+                )
+            });
+        }
+        mesh.indices.extend(model.indices.iter().map(|&index| base + index));
+        mesh.objects.meshes += 1;
+    }
+    append_markers_textured(mesh, &markers)?;
+    mesh.objects.total = objects.len() as u32;
+    mesh.objects.markers = markers.len() as u32;
+    Ok(())
+}
+
+/// Merge one or more units into a textured room scene: room and markers use
+/// flat material 1, placed models keep their per-face UVs and page materials.
+fn textured_scene(
+    rooms: Vec<(LevelUnit, Vec<u8>)>,
+    prefix: Option<&str>,
+    models: TexturedObjectSource<'_>,
+) -> Result<(String, RoomMesh), LevelError> {
+    let mut merged = RoomMesh::default();
+    let mut placed = Vec::new();
+    let mut title = None;
+    for (unit, bytes) in rooms {
+        let data = &bytes[unit.structure.data_base..];
+        let mesh = room_mesh(data).map_err(|error| match error {
+            LevelError::GeometryRecordOutOfRange | LevelError::GeometryArrayOutOfRange => {
+                LevelError::RenderArrayOutOfRange
+            }
+            other => other,
+        })?;
+        if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+            return Err(LevelError::RenderEmpty);
+        }
+        if merged.vertices.len() + mesh.vertices.len() > usize::from(u16::MAX) + 1 {
+            return Err(LevelError::GroupTooLarge);
+        }
+        let base = merged.vertices.len() as u16;
+        let count = mesh.vertices.len();
+        merged.vertices.extend(mesh.vertices);
+        merged.uvs.extend(std::iter::repeat([0, 0]).take(count));
+        merged.material_indices.extend(std::iter::repeat(1).take(count));
+        merged.indices.extend(mesh.indices.iter().map(|&index| index + base));
+        if merged.spawn.is_none() {
+            merged.spawn = spawn_position(data);
+        }
+        placed.extend(object_report(data)?.objects);
+        title.get_or_insert(unit.name);
+    }
+    append_objects_textured(&mut merged, &placed, models)?;
+    let name = prefix.map_or_else(|| title.unwrap_or_default(), |p| format!("group {p}"));
+    Ok((name, merged))
+}
+
+/// `--level-render --bigfile ... --entry ... --textures ...`.
+pub fn read_entry_room_mesh_textured(
+    path: &Path,
+    index: usize,
+    models: TexturedObjectSource<'_>,
+) -> Result<(String, RoomMesh), LevelError> {
+    textured_scene(vec![entry_unit(path, index)?], None, models)
+}
+
+/// `--level-render --bigfile ... --group ... --textures ...`.
+pub fn read_group_room_mesh_textured(
+    path: &Path,
+    prefix: &str,
+    models: TexturedObjectSource<'_>,
+) -> Result<(String, RoomMesh), LevelError> {
+    textured_scene(discover_group(path, prefix)?, Some(prefix), models)
 }
 
 /// One-unit reader for `--level-render`: a directory is refused because this
@@ -1943,6 +2070,34 @@ mod tests {
         assert_eq!(mesh.objects, ObjectStats { total: 2, meshes: 1, markers: 1 });
         assert_eq!(mesh.vertices.len(), 3 + 3 + 8, "room, one model, one cube");
         assert_eq!(mesh.vertices[3], [5.0, 0.0, 0.0], "model follows the object position");
+        assert_eq!(mesh.indices.len(), 3 + 3 + 36);
+    }
+
+    #[test]
+    fn textured_entry_keeps_room_flat_and_maps_object_pages() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let pcm = object_pcm(&[("raziel", [5, 0, 0], 1), ("campath", [0, 0, 0], 1)]);
+        let path = tmp.path().join("BIGFILE.DAT");
+        std::fs::write(&path, archive(&[pcm])).expect("synthetic archive must be writable");
+        let mut source = |name: &str| {
+            (name == "raziel").then(|| crate::object::TexturedMesh {
+                positions: vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]],
+                uvs: vec![[1, 2], [3, 4], [5, 6]],
+                indices: vec![0, 1, 2],
+                material_indices: vec![2, 2, 2],
+                pages: vec![9],
+            })
+        };
+        let (_, mesh) = read_entry_room_mesh_textured(&path, 0, &mut source)
+            .expect("entry 0 must merge");
+        assert_eq!(mesh.objects, ObjectStats { total: 2, meshes: 1, markers: 1 });
+        assert_eq!(mesh.vertices.len(), 3 + 3 + 8, "room, one model, one cube");
+        assert_eq!(mesh.uvs.len(), mesh.vertices.len());
+        assert_eq!(mesh.material_indices.len(), mesh.vertices.len());
+        assert_eq!(&mesh.material_indices[..3], &[1, 1, 1], "room stays flat");
+        assert_eq!(&mesh.material_indices[3..6], &[2, 2, 2], "object page maps to 2");
+        assert_eq!(&mesh.uvs[3..6], &[[1, 2], [3, 4], [5, 6]]);
+        assert_eq!(mesh.pages, vec![9]);
         assert_eq!(mesh.indices.len(), 3 + 3 + 36);
     }
 
