@@ -7,11 +7,13 @@ shape and the measured counts of the opening graph.
 ## Tool
 
 ```
-soul-reaver-remaster-rs --level-reach --bigfile <BIGFILE.DAT> [--start <UNIT>]
+soul-reaver-remaster-rs --level-reach --bigfile <BIGFILE.DAT> [--start <UNIT>] [--names]
 ```
 
 `--start` defaults to `under1`, the new-game opening unit. The command is
-headless: it never opens a window.
+headless: it never opens a window. `--names` adds one `island-name <unit>` line
+per island after the grouped island counts; without it the output is unchanged.
+The flag lives on the legacy arm only.
 
 `--level-links` now accepts the same archive forms as the other level arms:
 
@@ -46,6 +48,7 @@ reach start=... discovered= reachable= unreachable= unparseable=
   unreachable <group> <count>
   islands total=N
   island <group> <count>
+  island-name <unit>
   inbound-unreachable total=N
   inbound-unreachable <group> <count>
   unparseable <entry>
@@ -53,6 +56,7 @@ reach start=... discovered= reachable= unreachable= unparseable=
 
 - The first block is the start-dependent BFS result and is unchanged.
 - `islands` lists units whose inbound degree is zero.
+- `island-name` lists those units individually, sorted, and only with `--names`.
 - `inbound-unreachable` lists units that have at least one inbound link but
   were not reached from `--start`.
 - Groups strip digits from the unit name, e.g. `cathy62` -> `cathy`.

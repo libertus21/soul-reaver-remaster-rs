@@ -1158,12 +1158,18 @@ fn run_level_links(args: &[String]) -> ExitCode {
 }
 
 /// Headless `--level-reach`: discover every archived `.PCM`, BFS the link graph
-/// from `--start` (default `under1`), and print both group sets.
+/// from `--start` (default `under1`), and print both group sets. `--names`
+/// also lists the individual island units.
 fn run_level_reach(args: &[String]) -> ExitCode {
-    let usage = "expected --level-reach --bigfile <DAT> [--start <UNIT>]";
-    let (mut dat, mut start) = (None, "under1".to_string());
+    let usage = "expected --level-reach --bigfile <DAT> [--start <UNIT>] [--names]";
+    let (mut dat, mut start, mut names) = (None, "under1".to_string(), false);
     let mut index = 0;
     while index < args.len() {
+        if args[index] == "--names" {
+            names = true;
+            index += 1;
+            continue;
+        }
         match (args[index].as_str(), args.get(index + 1).map(String::as_str)) {
             ("--bigfile", Some(value)) => dat = Some(value),
             ("--start", Some(value)) => start = value.to_string(),
@@ -1180,7 +1186,7 @@ fn run_level_reach(args: &[String]) -> ExitCode {
     };
     match level::read_reach(Path::new(dat), &start) {
         Ok(report) => {
-            for line in level::reach_lines(&report, &start) {
+            for line in level::reach_lines(&report, &start, names) {
                 outln!("{line}");
             }
             ExitCode::SUCCESS

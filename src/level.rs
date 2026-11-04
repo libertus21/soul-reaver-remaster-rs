@@ -1261,9 +1261,15 @@ pub fn read_reach(path: &Path, start: &str) -> Result<ReachReport, LevelError> {
     })
 }
 
+/// One `island-name <unit>` line per island, in sorted order.
+pub fn island_name_lines(report: &ReachReport) -> Vec<String> {
+    report.islands.iter().map(|name| format!("  island-name {name}")).collect()
+}
+
 /// `--level-reach` lines: totals, reachable/unreachable groups, in-degree
-/// sections, then unparseable entries.
-pub fn reach_lines(report: &ReachReport, start: &str) -> Vec<String> {
+/// sections, then unparseable entries. `names` adds one `island-name` line per
+/// island after the grouped island counts; the default shape is unchanged.
+pub fn reach_lines(report: &ReachReport, start: &str, names: bool) -> Vec<String> {
     let reachable_groups = group_counts(&report.reachable);
     let unreachable_groups = group_counts(&report.unreachable);
     let island_groups = group_counts(&report.islands);
@@ -1285,6 +1291,9 @@ pub fn reach_lines(report: &ReachReport, start: &str) -> Vec<String> {
     );
     lines.push(format!("  islands total={}", report.islands.len()));
     lines.extend(island_groups.iter().map(|(group, count)| format!("  island {group} {count}")));
+    if names {
+        lines.extend(island_name_lines(report));
+    }
     lines.push(format!("  inbound-unreachable total={}", report.inbound_unreachable.len()));
     lines.extend(
         inbound_groups
@@ -3099,7 +3108,7 @@ mod tests {
         assert_eq!(report.inbound_unreachable, vec!["lair9"]);
         assert_eq!(report.unparseable.len(), 1);
         assert_eq!(report.unreachable_total(), 3);
-        let lines = reach_lines(&report, "under1");
+        let lines = reach_lines(&report, "under1", false);
         assert_eq!(
             lines[0],
             "reach start=under1 discovered=6 reachable=3 unreachable=3 unparseable=1"
@@ -3111,6 +3120,10 @@ mod tests {
         assert!(lines.contains(&"  island city 1".to_string()));
         assert!(lines.contains(&"  inbound-unreachable total=1".to_string()));
         assert!(lines.contains(&"  inbound-unreachable lair 1".to_string()));
+        assert!(!lines.iter().any(|line| line.contains("island-name")));
+        let named = reach_lines(&report, "under1", true);
+        assert!(named.contains(&"  island-name city1".to_string()));
+        assert_eq!(named.len(), lines.len() + 1, "names only adds lines");
         assert_eq!(
             read_reach(&path, "city1").expect("reach must scan").islands,
             report.islands,
