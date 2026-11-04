@@ -30,8 +30,9 @@ your own install; nothing is bundled.
 | Level geometry | `cargo run -- --level-geometry <PATH>` | Prints vertex/face counts, both offsets, the position axis box and centre, and face-index validation. |
 | Level objects | `cargo run -- --level-objects <PATH>` | Prints each placed object's name, world position, type and flags. |
 | Archived object models | `cargo run -- --object-info --bigfile <BIGFILE.DAT> --entry 66` | Reads one object container in memory and prints vertex/polygon/material counts, both array-boundary identities and the out-of-range index count. Entry 66 is `raziel` (299 V / 640 P). No extraction. |
-| `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` | Renders one unit's confirmed room geometry. Orbit as above; `F` enters a first-person fly camera. |
-| Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 26 capabilities in five groups; grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
+| Object model render | `cargo run -- --object-mesh --bigfile <BIGFILE.DAT> --entry 66` | Parses the same container and draws its triangles through the flat-shaded viewer. Louder refusals happen before any window opens. |
+| `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` | Renders one unit's confirmed room geometry. Orbit as above; `F` enters a first-person fly camera. `--objects` adds placed objects. |
+| Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 27 capabilities in five groups; grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
 
 `<PATH>` accepts a `.PCM` file or a room directory. The level arms also accept
 `--bigfile <DAT> --entry <INDEX>` or `--bigfile <DAT> --group <PREFIX>`.
@@ -47,7 +48,9 @@ cargo run -- --level-render  --bigfile <BIGFILE.DAT> --group under --objects
 ```
 
 The first prints the four rooms' object counts and placements; the second opens
-one window with the merged `under` geometry plus one cube marker per object.
+one window with the merged `under` geometry plus each object's real archived
+model at its world position. Names with no model (`campath`, `marker`, `splob`)
+keep a cube marker.
 
 Fly camera keys: `F` toggles orbit/fly; `W`/`A`/`S`/`D` move relative to the
 view; the mouse looks around; `Space`/`E` rise; `C`/`Q` sink; `Shift` flies

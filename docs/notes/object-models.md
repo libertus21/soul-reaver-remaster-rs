@@ -293,7 +293,21 @@ port of that reader; no source code was copied.
 memory and prints the vertex/polygon counts, the count of distinct 16-byte
 material records referenced by textured polygons, both array-boundary identities,
 and the out-of-range polygon-index count. Multi-part containers are refused
-loudly. Rendering, bones, textures and world transforms are not decoded.
+loudly.
+
+`--object-mesh --bigfile <DAT> --entry <I>` parses the same container and renders
+it: `i16` positions are widened 1:1 to `f32` and each polygon contributes its
+first three `u16` indices as one triangle. Refusals happen before the window.
+
+`--level-render --bigfile <DAT> --group <PREFIX> --objects` builds a name index
+from the archive's 4th index dword once per run, resolves each placed object to
+its real model, and translates that model by the record's world position (the
+record carries no rotation). Unresolved names fall back to the existing cube
+marker. A summary line reports the mesh/marker split; without `--objects` the
+render output is unchanged.
+
+Rendering, textures, material interior, bones, orientation and world transforms
+beyond the record position are not decoded.
 
 ## 8. Legal
 
