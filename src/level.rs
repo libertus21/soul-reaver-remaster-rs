@@ -1165,6 +1165,8 @@ pub struct ReachReport {
     pub discovered: usize,
     pub reachable: Vec<String>,
     pub unreachable: Vec<String>,
+    pub islands: Vec<String>,
+    pub inbound_unreachable: Vec<String>,
     pub unparseable: Vec<String>,
 }
 
@@ -1186,6 +1188,26 @@ fn group_counts(names: &[String]) -> Vec<(String, u32)> {
         *counts.entry(name_group(name)).or_default() += 1;
     }
     counts.into_iter().collect()
+}
+
+/// Distinct source units whose link tables target each discovered unit. A
+/// self-link does not count, and unresolved targets are ignored, so this is the
+/// arrival-path count the reachability BFS cannot see.
+fn inbound_degrees(known: &BTreeMap<&str, &ArchivedUnit>) -> BTreeMap<String, usize> {
+    let mut degrees: BTreeMap<String, usize> =
+        known.keys().map(|name| ((*name).to_string(), 0)).collect();
+    for unit in known.values() {
+        let targets: BTreeSet<&str> = unit
+            .links
+            .iter()
+            .map(String::as_str)
+            .filter(|target| *target != unit.name.as_str() && known.contains_key(target))
+            .collect();
+        for target in targets {
+            *degrees.entry(target.to_string()).or_default() += 1;
+        }
+    }
+    degrees
 }
 
 /// BFS from `start` over outgoing link targets that name a discovered unit.
@@ -1217,18 +1239,35 @@ pub fn read_reach(path: &Path, start: &str) -> Result<ReachReport, LevelError> {
         .filter(|unit| !reachable.contains(&unit.name))
         .map(|unit| unit.name.clone())
         .collect();
+    let degrees = inbound_degrees(&by_name);
+    let reached: BTreeSet<&str> = reachable.iter().map(String::as_str).collect();
+    let islands = degrees
+        .iter()
+        .filter(|(_, degree)| **degree == 0)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let inbound_unreachable = degrees
+        .iter()
+        .filter(|(name, degree)| **degree > 0 && !reached.contains(name.as_str()))
+        .map(|(name, _)| name.clone())
+        .collect();
     Ok(ReachReport {
         discovered: scan.units.len() + scan.unparseable.len(),
         reachable,
         unreachable,
+        islands,
+        inbound_unreachable,
         unparseable: scan.unparseable,
     })
 }
 
-/// `--level-reach` lines: totals, both group sets, then unparseable entries.
+/// `--level-reach` lines: totals, reachable/unreachable groups, in-degree
+/// sections, then unparseable entries.
 pub fn reach_lines(report: &ReachReport, start: &str) -> Vec<String> {
     let reachable_groups = group_counts(&report.reachable);
     let unreachable_groups = group_counts(&report.unreachable);
+    let island_groups = group_counts(&report.islands);
+    let inbound_groups = group_counts(&report.inbound_unreachable);
     let mut lines = vec![format!(
         "reach start={start} discovered={} reachable={} unreachable={} unparseable={}",
         report.discovered,
@@ -1243,6 +1282,14 @@ pub fn reach_lines(report: &ReachReport, start: &str) -> Vec<String> {
     lines.push(format!("  unreachable groups={}", unreachable_groups.len()));
     lines.extend(
         unreachable_groups.iter().map(|(group, count)| format!("  unreachable {group} {count}")),
+    );
+    lines.push(format!("  islands total={}", report.islands.len()));
+    lines.extend(island_groups.iter().map(|(group, count)| format!("  island {group} {count}")));
+    lines.push(format!("  inbound-unreachable total={}", report.inbound_unreachable.len()));
+    lines.extend(
+        inbound_groups
+            .iter()
+            .map(|(group, count)| format!("  inbound-unreachable {group} {count}")),
     );
     lines.extend(report.unparseable.iter().map(|label| format!("  unparseable {label}")));
     lines
@@ -3031,7 +3078,7 @@ mod tests {
         let under1 = reach_pcm("under1", &["under2,1", "under3,1"]);
         let under2 = reach_pcm("under2", &["under1,1"]);
         let under3 = reach_pcm("under3", &[]);
-        let city = reach_pcm("city1", &[]);
+        let city = reach_pcm("city1", &["lair9,1"]);
         let lair = reach_pcm("lair9", &[]);
         let broken = structure_pcm(&[0, 4], &[], 40);
         let dat = archive_with_suffixes(&[
@@ -3048,6 +3095,8 @@ mod tests {
         assert_eq!(report.discovered, 6);
         assert_eq!(report.reachable, vec!["under1", "under2", "under3"]);
         assert_eq!(report.unreachable, vec!["city1", "lair9"]);
+        assert_eq!(report.islands, vec!["city1"]);
+        assert_eq!(report.inbound_unreachable, vec!["lair9"]);
         assert_eq!(report.unparseable.len(), 1);
         assert_eq!(report.unreachable_total(), 3);
         let lines = reach_lines(&report, "under1");
@@ -3058,6 +3107,15 @@ mod tests {
         assert!(lines.contains(&"  reachable under 3".to_string()));
         assert!(lines.contains(&"  unreachable city 1".to_string()));
         assert!(lines.contains(&"  unreachable lair 1".to_string()));
+        assert!(lines.contains(&"  islands total=1".to_string()));
+        assert!(lines.contains(&"  island city 1".to_string()));
+        assert!(lines.contains(&"  inbound-unreachable total=1".to_string()));
+        assert!(lines.contains(&"  inbound-unreachable lair 1".to_string()));
+        assert_eq!(
+            read_reach(&path, "city1").expect("reach must scan").islands,
+            report.islands,
+            "islands are start-independent"
+        );
         assert!(matches!(
             read_reach(&path, "nope"),
             Err(LevelError::ReachStartMissing { .. })
