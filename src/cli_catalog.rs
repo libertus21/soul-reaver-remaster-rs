@@ -69,7 +69,7 @@ pub const CAPABILITIES: [Capability; 30] = [
     Capability { group: "level", name: "render-group", legacy: "--level-render --bigfile <DAT> --group <PREFIX> [--textures <BIG>]", summary: "Show a merged archive level family as one solid.", window: true },
     Capability { group: "level", name: "links-entry", legacy: "--level-links --bigfile <DAT> --entry <INDEX>", summary: "Print one archive entry's decoded link table.", window: false },
     Capability { group: "level", name: "links-group", legacy: "--level-links --bigfile <DAT> --group <PREFIX>", summary: "Print every archive level family member's link table.", window: false },
-    Capability { group: "level", name: "reach", legacy: "--level-reach --bigfile <DAT> [--start <UNIT>]", summary: "BFS the archived level graph and group reachable and orphan units.", window: false },
+    Capability { group: "level", name: "reach", legacy: "--level-reach --bigfile <DAT> [--start <UNIT>]", summary: "BFS the archived level graph, then group reachable, island and inbound-but-unreachable units.", window: false },
 ];
 
 /// The capability table.
