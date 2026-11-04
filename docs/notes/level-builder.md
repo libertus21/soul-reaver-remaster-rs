@@ -364,6 +364,25 @@ that carries one. The table is an array of 40-byte records:
 | `0x14` | 12 | NUL-terminated name, `<target>,<index>` |
 | `0x20` | 8 | two u32 tail fields (not read) |
 
+### Record acceptance and prologue alignment
+
+A 40-byte record is accepted only when both tests pass:
+
+- prelude invariant: `field0 == 1`, `field1 == field3`, `field2 == 18`;
+- name grammar: a leading ASCII letter, then ASCII letters, digits or `_`, one
+  comma, and one or more digits, in either case.
+
+The prelude gate is what fixes the prologue scan. The true first record sits
+after a 24-, 36- or 48-byte prologue, so a four-byte shifted read turns the
+fields into `(index, 18, index, target_id, ...)`; that fails the invariant even
+when the shifted name (for example `a1,50` from `Aluka1,50`) still matches the
+grammar. The scan therefore advances until the first record that passes both
+tests, and the walk then stops at the first record that fails either.
+
+Names are stored mixed-case (`Aluka1,50` next to `aluka41,11`). The reader keeps
+the original case; graph work folds it to lower case because discovered unit
+names are lower case.
+
 ### Prelude field semantics
 
 Observed across the 52 links found in the 31 `LAIR` units:
@@ -395,8 +414,9 @@ links lair14 count=2
   link lair27 59 target_id=-4581 prelude=1,60,18,60,-4581
 ```
 
-The table ends at the first record whose 12-byte name field does not match
-`^[a-z][a-z0-9]*,[0-9]+$`. A zero slot, a name that does not match on the first
+The table ends at the first record whose prelude or 12-byte name field fails the
+tests above. A full 12-byte field with no NUL is a valid name (`chrono19,100`),
+not a malformed record. A zero slot, a name that does not match on the first
 record, or a record that would leave the data region ends the walk with zero or
 fewer links; none of those cases is an error. `MOVIE3` is the zero-link example:
 it has no link table, and the reader reports `count=0`.

@@ -1,5 +1,10 @@
 # island-crosscheck - the 38 islands against the SR1 module
 
+> Historical note: this cross-check used the pre-correction 38-island set. The
+> link reader is now case-insensitive and prelude-gated; the corrected `under1`
+> graph has one island, `push1`. See `level-reach.md`. The per-name table below
+> is kept as the record of what the module contains, not as the current graph.
+
 Cross-check of the `--level-reach` island set against the strings present in the
 SR1 game module (`sr1.dll`). Read-only on the game data; no bytes are copied
 into the repo and no retail offsets are recorded here.

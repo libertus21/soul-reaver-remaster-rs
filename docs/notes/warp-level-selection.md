@@ -161,9 +161,10 @@ test and the link-graph test were measuring different things.
 
 ## Next probes (ordered by cost)
 
-1. **Fix the link reader**: case-insensitive name comparison and a prelude-gated
-   prologue scan; re-run `--level-reach`. Verify the corrected island set on the
-   real archive. This is a separate change; no production code is touched here.
+1. **Fix the link reader** (DONE): case-insensitive name comparison and a
+   prelude-gated prologue scan. `--level-reach` from `under1` now reports
+   `334 reachable / 38 unreachable / 1 island`; `push1` is the only island. See
+   `level-reach.md` for the corrected counts.
 2. **Dynamic trace (user-run)**: stand on a warp face, log the selected table
    slot and the load-request name, and confirm the slot-to-path handoff at
    runtime.
