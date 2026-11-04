@@ -1061,6 +1061,76 @@ fn mat_bytes(m: &[[f32; 4]; 4]) -> [u8; 64] {
     out
 }
 
+/// Camera state and input handling shared by every interactive mesh window:
+/// orbit, zoom, pan, reset, and the optional first-person fly mode.
+struct CameraRig {
+    camera: OrbitCamera,
+    fly: FlyCamera,
+    start: FlyCamera,
+    input: CameraInput,
+    keys: FlyKeys,
+    last_frame: std::time::Instant,
+}
+
+impl CameraRig {
+    fn new(positions: &[[f32; 3]], spawn: Option<[f32; 3]>) -> Result<Self, String> {
+        Ok(Self::from_start(initial_fly_camera(positions, spawn)?))
+    }
+
+    fn from_start(start: FlyCamera) -> Self {
+        Self {
+            camera: OrbitCamera::new(),
+            fly: start,
+            start,
+            input: CameraInput::default(),
+            keys: FlyKeys::default(),
+            last_frame: std::time::Instant::now(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.camera.reset();
+        self.fly = self.start;
+        self.input.mode = CameraMode::Orbit;
+        self.keys = FlyKeys::default();
+    }
+
+    fn handle_input(&mut self, event: &WindowEvent) -> bool {
+        self.input.handle(&mut self.camera, Some(&mut self.fly), event)
+    }
+
+    /// Track held keys and apply the shared window keys; `true` means exit.
+    fn handle_key(&mut self, window: &Window, event: &KeyEvent) -> bool {
+        self.keys.update(event);
+        if event.state != ElementState::Pressed || event.repeat {
+            return false;
+        }
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => true,
+            Key::Character(text) if text.eq_ignore_ascii_case("f") => {
+                let flying = self.input.toggle_mode();
+                set_fly_cursor(window, flying);
+                false
+            }
+            Key::Character(text) if text.eq_ignore_ascii_case("r") => {
+                self.reset();
+                set_fly_cursor(window, false);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn mvp(&mut self, aspect: f32) -> [u8; 64] {
+        match self.input.mode {
+            CameraMode::Orbit => next_mvp(&mut self.camera, &mut self.last_frame, aspect),
+            CameraMode::Fly => {
+                next_fly_mvp(&mut self.fly, &self.keys, &mut self.last_frame, aspect)
+            }
+        }
+    }
+}
+
 struct MeshState<'window> {
     window: Arc<Window>,
     surface: wgpu::Surface<'window>,
@@ -1074,12 +1144,7 @@ struct MeshState<'window> {
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
-    camera: OrbitCamera,
-    fly: FlyCamera,
-    start: FlyCamera,
-    input: CameraInput,
-    keys: FlyKeys,
-    last_frame: std::time::Instant,
+    rig: CameraRig,
 }
 
 impl<'window> MeshState<'window> {
@@ -1222,12 +1287,7 @@ impl<'window> MeshState<'window> {
             uniform_buffer,
             uniform_bind_group,
             depth_view,
-            camera: OrbitCamera::new(),
-            fly: start,
-            start,
-            input: CameraInput::default(),
-            keys: FlyKeys::default(),
-            last_frame: std::time::Instant::now(),
+            rig: CameraRig::from_start(start),
         })
     }
 
@@ -1240,21 +1300,9 @@ impl<'window> MeshState<'window> {
         }
     }
 
-    fn reset_camera(&mut self) {
-        self.camera.reset();
-        self.fly = self.start;
-        self.input.mode = CameraMode::Orbit;
-        self.keys = FlyKeys::default();
-    }
-
     fn render(&mut self) {
         let aspect = self.config.width.max(1) as f32 / self.config.height.max(1) as f32;
-        let mvp = match self.input.mode {
-            CameraMode::Orbit => next_mvp(&mut self.camera, &mut self.last_frame, aspect),
-            CameraMode::Fly => {
-                next_fly_mvp(&mut self.fly, &self.keys, &mut self.last_frame, aspect)
-            }
-        };
+        let mvp = self.rig.mvp(aspect);
         self.queue.write_buffer(&self.uniform_buffer, 0, &mvp);
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -1359,7 +1407,7 @@ impl ApplicationHandler for MeshApp {
         if window_id != state.window.id() {
             return;
         }
-        if state.input.handle(&mut state.camera, Some(&mut state.fly), &event) {
+        if state.rig.handle_input(&event) {
             return;
         }
         match event {
@@ -1369,23 +1417,10 @@ impl ApplicationHandler for MeshApp {
                 state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => state.render(),
-            WindowEvent::Focused(false) => state.keys = FlyKeys::default(),
+            WindowEvent::Focused(false) => state.rig.keys = FlyKeys::default(),
             WindowEvent::KeyboardInput { event, .. } => {
-                state.keys.update(&event);
-                if event.state != ElementState::Pressed || event.repeat {
-                    return;
-                }
-                match &event.logical_key {
-                    Key::Named(NamedKey::Escape) => event_loop.exit(),
-                    Key::Character(text) if text.eq_ignore_ascii_case("f") => {
-                        let flying = state.input.toggle_mode();
-                        set_fly_cursor(&state.window, flying);
-                    }
-                    Key::Character(text) if text.eq_ignore_ascii_case("r") => {
-                        state.reset_camera();
-                        set_fly_cursor(&state.window, false);
-                    }
-                    _ => {}
+                if state.rig.handle_key(&state.window, &event) {
+                    event_loop.exit();
                 }
             }
             _ => {}
@@ -1599,8 +1634,7 @@ struct TexturedMeshState<'window> {
     texture_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     depth_view: wgpu::TextureView,
-    camera: OrbitCamera,
-    last_frame: std::time::Instant,
+    rig: CameraRig,
     vertex_buffer: wgpu::Buffer,
     index_buffers: Vec<(u32, wgpu::Buffer, u32)>,
     texture_bind_groups: Vec<wgpu::BindGroup>,
@@ -1624,6 +1658,7 @@ impl<'window> TexturedMeshState<'window> {
     async fn new(
         window: Arc<Window>,
         entry: &crate::mesh_entry::MeshEntry,
+        spawn: Option<[f32; 3]>,
     ) -> Result<Self, String> {
         let core = open_core(window.clone(), "srm textured").await?;
         let GpuCore { surface, device, queue, config } = core;
@@ -1783,8 +1818,7 @@ impl<'window> TexturedMeshState<'window> {
             texture_layout,
             sampler,
             depth_view,
-            camera: OrbitCamera::new(),
-            last_frame: std::time::Instant::now(),
+            rig: CameraRig::new(&entry.positions, spawn)?,
             vertex_buffer: dummy,
             index_buffers: Vec::new(),
             texture_bind_groups: Vec::new(),
@@ -1889,7 +1923,7 @@ impl<'window> TexturedMeshState<'window> {
 
     fn render(&mut self) {
         let aspect = self.config.width.max(1) as f32 / self.config.height.max(1) as f32;
-        let mvp = next_mvp(&mut self.camera, &mut self.last_frame, aspect);
+        let mvp = self.rig.mvp(aspect);
         self.queue.write_buffer(&self.uniform_buffer, 0, &mvp);
 
         let frame = match self.surface.get_current_texture() {
@@ -1950,9 +1984,9 @@ impl<'window> TexturedMeshState<'window> {
 
 struct TexturedMeshApp {
     entry: crate::mesh_entry::MeshEntry,
+    spawn: Option<[f32; 3]>,
     state: Option<TexturedMeshState<'static>>,
     init_error: Option<String>,
-    input: CameraInput,
 }
 
 impl ApplicationHandler for TexturedMeshApp {
@@ -1970,7 +2004,7 @@ impl ApplicationHandler for TexturedMeshApp {
                 return;
             }
         };
-        match pollster::block_on(TexturedMeshState::new(window, &self.entry)) {
+        match pollster::block_on(TexturedMeshState::new(window, &self.entry, self.spawn)) {
             Ok(state) => self.state = Some(state),
             Err(e) => {
                 self.init_error = Some(e);
@@ -1987,7 +2021,7 @@ impl ApplicationHandler for TexturedMeshApp {
     ) {
         let Some(state) = &mut self.state else { return };
         if window_id != state.window.id() { return; }
-        if self.input.handle(&mut state.camera, None, &event) { return; }
+        if state.rig.handle_input(&event) { return; }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -1996,11 +2030,8 @@ impl ApplicationHandler for TexturedMeshApp {
             }
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed || event.repeat { return; }
-                match &event.logical_key {
-                    Key::Named(NamedKey::Escape) => event_loop.exit(),
-                    Key::Character(text) if text.eq_ignore_ascii_case("r") => state.camera.reset(),
-                    _ => {}
+                if state.rig.handle_key(&state.window, &event) {
+                    event_loop.exit();
                 }
             }
             _ => {}
@@ -2022,6 +2053,7 @@ pub fn show_mesh_textured(
     materials: &[crate::srm::Material],
     textures: &[crate::textures_object::MaterialTextures],
     title: &str,
+    spawn: Option<[f32; 3]>,
 ) -> Result<(), String> {
     let entry = crate::mesh_entry::MeshEntry {
         srm_path: std::path::PathBuf::from(title),
@@ -2036,7 +2068,8 @@ pub fn show_mesh_textured(
     validate_entry_shape(&entry)?;
     let event_loop =
         EventLoop::new().map_err(|e| format!("cannot create window event loop: {e}"))?;
-    let mut app = TexturedMeshApp { entry, state: None, init_error: None, input: CameraInput::default() };
+    let mut app =
+        TexturedMeshApp { entry, spawn, state: None, init_error: None };
     event_loop
         .run_app(&mut app)
         .map_err(|e| format!("window event loop failed: {e}"))?;
@@ -2093,7 +2126,6 @@ struct MeshGalleryApp<'a> {
     current: crate::mesh_entry::MeshEntry,
     state: Option<TexturedMeshState<'static>>,
     init_error: Option<String>,
-    input: CameraInput,
 }
 
 impl<'a> ApplicationHandler for MeshGalleryApp<'a> {
@@ -2113,7 +2145,7 @@ impl<'a> ApplicationHandler for MeshGalleryApp<'a> {
                 return;
             }
         };
-        match pollster::block_on(TexturedMeshState::new(window, &self.current)) {
+        match pollster::block_on(TexturedMeshState::new(window, &self.current, None)) {
             Ok(state) => {
                 outln!("{label}");
                 self.state = Some(state);
@@ -2133,7 +2165,7 @@ impl<'a> ApplicationHandler for MeshGalleryApp<'a> {
     ) {
         let Some(state) = &mut self.state else { return };
         if window_id != state.window.id() { return; }
-        if self.input.handle(&mut state.camera, None, &event) { return; }
+        if state.rig.handle_input(&event) { return; }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -2142,29 +2174,28 @@ impl<'a> ApplicationHandler for MeshGalleryApp<'a> {
             }
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state != ElementState::Pressed || event.repeat { return; }
-                match event.logical_key {
-                    Key::Named(NamedKey::ArrowRight) => mesh_gallery_step(
-                        self.entries,
-                        self.tex_dir,
-                        &mut self.index,
-                        &mut self.current,
-                        state,
-                        Direction::Next,
-                    ),
-                    Key::Named(NamedKey::ArrowLeft) => mesh_gallery_step(
-                        self.entries,
-                        self.tex_dir,
-                        &mut self.index,
-                        &mut self.current,
-                        state,
-                        Direction::Prev,
-                    ),
-                    Key::Named(NamedKey::Escape) => event_loop.exit(),
-                    Key::Character(text) if text.eq_ignore_ascii_case("r") => {
-                        state.camera.reset()
+                let step = if event.state == ElementState::Pressed && !event.repeat {
+                    match event.logical_key {
+                        Key::Named(NamedKey::ArrowRight) => Some(Direction::Next),
+                        Key::Named(NamedKey::ArrowLeft) => Some(Direction::Prev),
+                        _ => None,
                     }
-                    _ => {}
+                } else {
+                    None
+                };
+                if let Some(dir) = step {
+                    mesh_gallery_step(
+                        self.entries,
+                        self.tex_dir,
+                        &mut self.index,
+                        &mut self.current,
+                        state,
+                        dir,
+                    );
+                    return;
+                }
+                if state.rig.handle_key(&state.window, &event) {
+                    event_loop.exit();
                 }
             }
             _ => {}
@@ -2213,7 +2244,6 @@ pub fn show_mesh_gallery(entries: &[PathBuf], tex_dir: &Path) -> Result<(), Stri
         current,
         state: None,
         init_error: None,
-        input: CameraInput::default(),
     };
     event_loop
         .run_app(&mut app)
@@ -2227,9 +2257,9 @@ pub fn show_mesh_gallery(entries: &[PathBuf], tex_dir: &Path) -> Result<(), Stri
 #[cfg(test)]
 mod mesh_tests {
     use super::{
-        fit_point, fit_positions, initial_fly_camera, validate_entry_shape, FlyCamera, OrbitCamera,
-        FIT_DISTANCE, FLY_FAST_MULTIPLIER, FLY_MAX_STEP, FLY_SPEED, MAX_DISTANCE, MIN_DISTANCE,
-        PITCH_LIMIT,
+        fit_point, fit_positions, initial_fly_camera, validate_entry_shape, CameraMode, CameraRig,
+        FlyCamera, OrbitCamera, FIT_DISTANCE, FLY_FAST_MULTIPLIER, FLY_MAX_STEP, FLY_SPEED,
+        MAX_DISTANCE, MIN_DISTANCE, PITCH_LIMIT,
     };
 
     fn origin_clip(camera: &OrbitCamera, aspect: f32) -> [f32; 4] {
@@ -2435,5 +2465,22 @@ mod mesh_tests {
         };
         let e = validate_entry_shape(&entry).unwrap_err();
         assert!(e.contains("indices") || e.contains("materials/textures"));
+    }
+
+    #[test]
+    fn rig_starts_in_orbit_and_resets_to_the_spawn_view() {
+        let positions = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]];
+        let spawn = Some([4.0, 0.0, 0.0]);
+        let start = initial_fly_camera(&positions, spawn).unwrap();
+        let mut rig = CameraRig::new(&positions, spawn).unwrap();
+        assert_eq!(rig.input.mode, CameraMode::Orbit);
+        assert_eq!(rig.fly, start);
+        assert_eq!(rig.start, start);
+        rig.input.toggle_mode();
+        rig.keys.forward = true;
+        rig.reset();
+        assert_eq!(rig.input.mode, CameraMode::Orbit);
+        assert_eq!(rig.fly, start, "reset returns the fly eye to its spawn");
+        assert!(!rig.keys.forward, "reset drops held movement keys");
     }
 }
