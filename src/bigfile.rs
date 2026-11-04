@@ -37,6 +37,9 @@ pub struct BigfileEntry {
     pub name_hash: u32,
     pub offset: u64,
     pub length: u64,
+    /// Raw bytes of the 4th index dword. On object containers this holds the
+    /// last four characters of the asset name, uppercased.
+    pub suffix: [u8; 4],
 }
 
 /// Every way reading a bigfile index or entry can fail. Each variant
@@ -157,6 +160,7 @@ pub fn parse_index(bytes: &[u8], file_len: u64) -> Result<Vec<BigfileEntry>, Big
             name_hash,
             offset: u64::from(offset),
             length: u64::from(length),
+            suffix: [bytes[base + 12], bytes[base + 13], bytes[base + 14], bytes[base + 15]],
         });
     }
     Ok(entries)
@@ -295,6 +299,7 @@ mod tests {
                 name_hash: 0x1234_ABCD,
                 offset: 500,
                 length: 100,
+                suffix: [0xEF, 0xBE, 0xAD, 0xDE],
             }
         );
     }
@@ -410,6 +415,7 @@ mod tests {
             name_hash: 0x4444_4444,
             offset: 64,
             length: 8,
+            suffix: [0; 4],
         };
         let err = read_entry(&path, &bad).expect_err("past-EOF read must fail loud");
         assert!(
@@ -491,6 +497,7 @@ mod tests {
             name_hash: 0x6666_6666,
             offset: 64,
             length: 8,
+            suffix: [0; 4],
         };
         let mut p = std::env::temp_dir();
         p.push(format!("bigfile-test-no-such-read-{}", std::process::id()));

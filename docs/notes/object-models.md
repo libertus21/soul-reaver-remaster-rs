@@ -23,6 +23,13 @@ falsifiable test), **INFERRED** (one side only), **UNKNOWN**.
   model and points at an **8-byte vertex array** (three `i16` positions plus a
   `u16` normal id) and a **12-byte polygon array** (three `u16` vertex indices,
   then a normal byte, a flag byte and a `u32` material offset).
+- **Vertex positions are bone-local, not model-space (CONFIRMED).** The 24-byte
+  bone table carries a vertex range plus a local translation and a parent id.
+  Adding the accumulated ancestor translations to each bone's vertex range
+  reconstructs the rest pose. Skipping that step leaves every body part at its
+  bone origin and renders as a triangle jumble; applying it turns `raziel` into
+  a recognisable upright humanoid. `--object-info` prints the bone count and the
+  shared count explicitly.
 - **The index test passes at corpus scale.** 394 single-model containers:
   **18,740 vertices / 32,557 polygons, 0 out-of-range indices**. Every one
   satisfies `vertexStart + vertexCount*8 == polygonStart` and
@@ -55,6 +62,9 @@ falsifiable test), **INFERRED** (one side only), **UNKNOWN**.
 | O12 | 47,629 relocation positions across the 397 object containers; 47,514 (99.76%) resolve to an in-payload offset, 0 resolve to zero, 115 fall between payload end and entry end | CONFIRMED |
 | O13 | Of 378 distinct placed-object names across 364 level units, 375 resolve to an object container by name; `campath`, `marker`, `splob` do not | CONFIRMED |
 | O14 | The object loader path walks the level's object-name table and builds one object request per name (prior `pcm-loader` L2); the container is self-identifying by its two name fields | CONFIRMED (prior code note + bytes) |
+| O15 | Vertex positions are bone-local. Bone record stride 24: `+8` first vertex, `+10` last vertex, `+12` three `i16` local translation, `+18` parent id. Rest pose adds the accumulated ancestor translations per vertex range. Omitting this yields a connected but exploded mesh (normal topology, humanoid silhouette only after applying). | CONFIRMED |
+| O16 | Double-sided faces are stored as two triangles with the same three indices and opposite winding (`raziel` 105 such pairs of 640 faces). For topology checks they are one surface face; keeping both makes every shared edge appear 4 times. | CONFIRMED |
+| O17 | After rest-pose armature, welding equal positions and merging double-sided duplicates: `raziel` V=283 E=816 F=535, Euler 2, 13 non-manifold edges; `morlock` V=166 E=484 F=320, Euler 2, 2 non-manifold edges. | CONFIRMED |
 
 ## 1. The container
 
@@ -163,9 +173,10 @@ For a single-model container, `table[0]` is a data-base-relative offset to:
 | `+4` | 2 | `i16` z |
 | `+6` | 2 | `u16` normal id |
 
-Positions are signed integer model-space units. No fixed-point divide is
+Positions are signed integer **bone-local** units. No fixed-point divide is
 applied. Across the corpus every normal id is below 256, which is consistent
-with the engine's normal table.
+with the engine's normal table. A renderer must add the bone chain translation
+(§2.5) before the positions describe the model.
 
 ### 2.3 Polygon array (stride 12)
 
@@ -196,9 +207,26 @@ For all 394 single-model objects:
 - total: **18,740 vertices, 32,557 polygons**.
 
 The `boneStart + boneCount*24 == vertexStart` identity holds for 226/394
-objects. The remaining 168 have a different gap between the bone table and the
-vertices; the bone stride or an intermediate array is UNKNOWN. Bones are not
-needed to draw the mesh.
+objects. The remaining 168 have a gap between the end of the 24-byte bone table
+and the vertex array; its content is UNKNOWN (padding or another array), but it
+does not change how the bone records are read. **Bones are required to draw the
+mesh**: the vertex array is bone-local.
+
+Rest pose, per bone `b` with `firstVertex != 0xFFFF` and `lastVertex != 0xFFFF`:
+
+```text
+world[b] = bone[b].local + world[bone[b].parent]   (0xFFFF or self ends the chain)
+position[v] += world[b] for firstVertex <= v <= lastVertex
+```
+
+This is a pure translation chain (no rotation/scale in the archived object
+model). `raziel`: 58/66 bones carry ranges; `morlock`: 34/37.
+
+Vertices are duplicated for hard shading, so a surface check must weld equal
+rest-pose positions first. Faces are also duplicated with opposite winding for
+two-sided drawing; a surface check must merge those pairs. Both normalisations
+are test-only; the renderer keeps every triangle because both sides are real
+draw calls.
 
 Named examples (counts only):
 
@@ -275,7 +303,9 @@ port of that reader; no source code was copied.
 2. Object-header fields `+0x08`, `+0x14`, `+0x28`, `+0x2C`, `+0x30`, `+0x34`,
    `+0x44..+0x4B`.
 3. Model-header `+0x08` role (observed `1` in 374/394).
-4. Bone record layout for the 168 objects where the 24-byte identity fails.
+4. The gap between the end of the bone table and `vertexStart` for the 168
+   objects where `boneStart + boneCount*24 != vertexStart` (padding or another
+   array; the 24-byte bone records themselves are confirmed).
 5. Interior of the 16-byte material record (UVs, tpage, attributes, colour) and
    its texture binding.
 6. The three multi-part containers (`human`, `vlgr`, `paths`) and how their
@@ -293,7 +323,23 @@ port of that reader; no source code was copied.
 memory and prints the vertex/polygon counts, the count of distinct 16-byte
 material records referenced by textured polygons, both array-boundary identities,
 and the out-of-range polygon-index count. Multi-part containers are refused
-loudly. Rendering, bones, textures and world transforms are not decoded.
+loudly.
+
+`--object-mesh --bigfile <DAT> --entry <I>` parses the same container, applies
+the bone rest-pose translations, widens the `i16` positions 1:1 to `f32` and
+renders each polygon as one triangle from its three `u16` indices. Refusals
+happen before the window. Without the bone step the triangles are connected but
+every part sits at its bone origin, which reads as a chaotic blob.
+
+`--level-render --bigfile <DAT> --group <PREFIX> --objects` builds a name index
+from the archive's 4th index dword once per run, resolves each placed object to
+its real model, and translates that model by the record's world position (the
+record carries no rotation). Unresolved names fall back to the existing cube
+marker. A summary line reports the mesh/marker split; without `--objects` the
+render output is unchanged.
+
+Rendering, textures, material interior, bones, orientation and world transforms
+beyond the record position are not decoded.
 
 ## 8. Legal
 

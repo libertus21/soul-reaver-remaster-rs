@@ -1,10 +1,11 @@
 //! SR1 archived object-model containers: relocation directory, object header,
-//! vertex/polygon arrays and the 16-byte material records they reference.
-//! In-memory decode only: no rendering, bones, textures or world transform.
+//! bone table, vertex/polygon arrays and the 16-byte material records they
+//! reference. Vertices are bone-local; [`rest_positions`] resolves them to the
+//! rest pose. In-memory decode only: no rendering, textures or world transform.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::bigfile;
 use crate::level;
@@ -12,12 +13,21 @@ use crate::level;
 pub const VERTEX_STRIDE: usize = 8;
 pub const POLYGON_STRIDE: usize = 12;
 pub const MATERIAL_STRIDE: usize = 16;
+pub const BONE_STRIDE: usize = 24;
 const MAX_RELOCATIONS: u32 = 1 << 20;
 pub const USAGE: &str = "expected --object-info --bigfile <DAT> --entry <INDEX>";
-/// `([x, y, z], normal id)` in model space; no fixed-point scaling.
+/// `([x, y, z], normal id)`; the position is **bone-local**, not model-space.
 pub type Vertex = ([i16; 3], u16);
 /// `([v1, v2, v3], normal, flags, material offset or colour)`.
 pub type Polygon = ([u16; 3], u8, u8, u32);
+
+/// One 24-byte bone record. Vertex positions stay in this bone's local frame
+/// until [`rest_positions`] adds the accumulated chain of `local` translations.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Bone {
+    pub first_vertex: u16, pub last_vertex: u16,
+    pub local: [i16; 3], pub parent: u16,
+}
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Counts { pub vertices: u32, pub polygons: u32, pub materials: u32 }
@@ -31,11 +41,13 @@ pub struct ObjectReport {
 }
 
 /// One parsed model. `materials` holds the distinct 16-byte records that
-/// textured polygons reference, in ascending offset order.
+/// textured polygons reference, in ascending offset order. `bones` is the raw
+/// bone table; `vertices` keep their on-disk bone-local coordinates.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ObjectModel {
     pub name: String, pub vertices: Vec<Vertex>, pub polygons: Vec<Polygon>,
-    pub materials: Vec<[u8; MATERIAL_STRIDE]>, pub counts: Counts, pub report: ObjectReport,
+    pub materials: Vec<[u8; MATERIAL_STRIDE]>, pub bones: Vec<Bone>,
+    pub counts: Counts, pub report: ObjectReport,
 }
 
 /// Every way an object container can be refused. Each variant has its own text.
@@ -43,7 +55,7 @@ pub struct ObjectModel {
 pub enum ObjectError {
     Usage(&'static str), TruncatedDirectory, CountOutOfRange(u32), DirectoryPastEof,
     PaddingTruncated, HeaderTruncated, NotObjectContainer, TableOutOfRange, MultiPart,
-    ModelHeaderOutOfRange, PolygonArrayOutOfRange,
+    ModelHeaderOutOfRange, PolygonArrayOutOfRange, BoneTableOutOfRange,
     VertexBoundary { vertex_start: usize, vertex_count: u32, polygon_start: usize },
     PolygonBoundary { polygon_start: usize, polygon_count: u32, end_of_polygons: usize },
     MaterialOffsetInvalid { polygon: u32, offset: u32 },
@@ -68,6 +80,7 @@ impl fmt::Display for ObjectError {
             Self::VertexBoundary { vertex_start, vertex_count, polygon_start } => write!(f, "vertex boundary violated: vertexStart {vertex_start} + vertexCount {vertex_count}*8 != polygonStart {polygon_start}"),
             Self::PolygonBoundary { polygon_start, polygon_count, end_of_polygons } => write!(f, "polygon boundary violated: polygonStart {polygon_start} + polygonCount {polygon_count}*12 != endOfPolygons {end_of_polygons}"),
             Self::PolygonArrayOutOfRange => f.write_str("polygon array runs outside the payload"),
+            Self::BoneTableOutOfRange => f.write_str("bone table runs outside the payload"),
             Self::MaterialOffsetInvalid { polygon, offset } => write!(f, "polygon {polygon} material offset {offset} is not a 16-byte record after the material start"),
             Self::IndexOutOfRange { polygons, vertex_count } => write!(f, "{polygons} polygons address vertices past the {vertex_count} loaded vertices"),
             Self::ArchiveUnreadable(detail) => write!(f, "cannot read the archive: {detail}"),
@@ -138,6 +151,8 @@ pub fn parse_object(bytes: &[u8]) -> Result<ObjectModel, ObjectError> {
     let end_of_polygons = read_u32(model, 0x0C).unwrap_or(0) as usize;
     let polygon_count = read_u32(model, 0x10).unwrap_or(0);
     let polygon_start = read_u32(model, 0x14).unwrap_or(0) as usize;
+    let bone_count = read_u32(model, 0x18).unwrap_or(0) as usize;
+    let bone_start = read_u32(model, 0x1C).unwrap_or(0) as usize;
     let material_start = read_u32(model, 0x30).unwrap_or(0) as usize;
     let vertex_end = vertex_start + vertex_count as usize * VERTEX_STRIDE;
     if vertex_end != polygon_start {
@@ -150,9 +165,26 @@ pub fn parse_object(bytes: &[u8]) -> Result<ObjectModel, ObjectError> {
     if polygon_end > data.len() {
         return Err(ObjectError::PolygonArrayOutOfRange);
     }
+    let bone_end = bone_start.saturating_add(bone_count.saturating_mul(BONE_STRIDE));
+    if bone_count > 0 && (bone_start == 0 || bone_end > data.len()) {
+        return Err(ObjectError::BoneTableOutOfRange);
+    }
     let vertices = data[vertex_start..vertex_end].chunks_exact(VERTEX_STRIDE).map(|v| {
         let position = [i16::from_le_bytes([v[0], v[1]]), i16::from_le_bytes([v[2], v[3]]), i16::from_le_bytes([v[4], v[5]])];
         (position, u16::from_le_bytes([v[6], v[7]]))
+    }).collect();
+    let bones = (0..bone_count).map(|index| {
+        let record = &data[bone_start + index * BONE_STRIDE..bone_start + (index + 1) * BONE_STRIDE];
+        Bone {
+            first_vertex: u16::from_le_bytes([record[8], record[9]]),
+            last_vertex: u16::from_le_bytes([record[10], record[11]]),
+            local: [
+                i16::from_le_bytes([record[12], record[13]]),
+                i16::from_le_bytes([record[14], record[15]]),
+                i16::from_le_bytes([record[16], record[17]]),
+            ],
+            parent: u16::from_le_bytes([record[18], record[19]]),
+        }
     }).collect();
     let mut offsets = BTreeSet::new();
     let mut polygons = Vec::with_capacity(polygon_count as usize);
@@ -183,7 +215,7 @@ pub fn parse_object(bytes: &[u8]) -> Result<ObjectModel, ObjectError> {
         record
     }).collect();
     Ok(ObjectModel {
-        name, vertices, polygons, materials,
+        name, vertices, polygons, bones, materials,
         counts: Counts { vertices: vertex_count, polygons: polygon_count, materials: offsets.len() as u32 },
         report: ObjectReport {
             vertex_start, vertex_count, vertex_end, polygon_start, polygon_count,
@@ -206,53 +238,217 @@ pub fn read_entry(path: &Path, index: usize) -> Result<ObjectModel, ObjectError>
     parse_object(&bytes)
 }
 
+/// Accumulated bone translation for each bone: its own `local` offset plus
+/// every ancestor's, exactly once. A bone that lists itself as parent ends the
+/// chain; `0xFFFF` marks an unparented (root) bone.
+fn bone_world_offsets(bones: &[Bone]) -> Vec<[i32; 3]> {
+    bones.iter().enumerate().map(|(index, _)| {
+        let mut offset = [0i32; 3];
+        let mut cursor = index;
+        for _ in 0..bones.len() {
+            let Some(bone) = bones.get(cursor) else { break };
+            for axis in 0..3 {
+                offset[axis] += i32::from(bone.local[axis]);
+            }
+            if bone.parent == u16::MAX || bone.parent as usize == cursor {
+                break;
+            }
+            cursor = bone.parent as usize;
+        }
+        offset
+    }).collect()
+}
+
+/// Rest-pose model-space positions: the on-disk values are bone-local, so each
+/// vertex in a bone's `first_vertex..=last_vertex` range is translated by that
+/// bone's accumulated translation. Skipping this leaves every body part at its
+/// bone origin, which is the "triangle jumble" symptom.
+pub fn rest_positions(model: &ObjectModel) -> Vec<[f32; 3]> {
+    let mut positions: Vec<[i32; 3]> = model.vertices.iter().map(|(p, _)| p.map(i32::from)).collect();
+    if positions.is_empty() {
+        return Vec::new();
+    }
+    let offsets = bone_world_offsets(&model.bones);
+    for (bone, offset) in model.bones.iter().zip(&offsets) {
+        if bone.first_vertex == u16::MAX || bone.last_vertex == u16::MAX {
+            continue;
+        }
+        let first = bone.first_vertex as usize;
+        let last = (bone.last_vertex as usize).min(positions.len() - 1);
+        if first > last {
+            continue;
+        }
+        for position in &mut positions[first..=last] {
+            for axis in 0..3 {
+                position[axis] += offset[axis];
+            }
+        }
+    }
+    positions.into_iter().map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]).collect()
+}
+
+/// Rest-pose model-space triangle mesh: bone-local `i16` positions are
+/// translated by the bone table and widened 1:1, and every polygon contributes
+/// its three `u16` indices as one triangle. Double-sided faces stay as two
+/// opposite-winding triangles; both are real draw calls.
+pub fn triangle_mesh(model: &ObjectModel) -> (Vec<[f32; 3]>, Vec<u16>) {
+    let positions = rest_positions(model);
+    let indices = model
+        .polygons
+        .iter()
+        .flat_map(|(corners, _, _, _)| corners.iter().copied())
+        .collect();
+    (positions, indices)
+}
+
+/// The index dword echoes the last four characters of an asset name,
+/// uppercased; `None` for names shorter than four characters.
+fn suffix_key(name: &str) -> Option<[u8; 4]> {
+    let bytes = name.as_bytes();
+    let mut key = [0u8; 4];
+    key.copy_from_slice(bytes.get(bytes.len().checked_sub(4)?..)?);
+    key.make_ascii_uppercase();
+    Some(key)
+}
+
+/// Resolve placed-object names to archived models through the index suffix.
+/// The index is loaded once; resolved meshes are cached per placed name.
+pub struct ModelResolver {
+    path: PathBuf,
+    entries: Vec<bigfile::BigfileEntry>,
+    by_suffix: HashMap<[u8; 4], Vec<usize>>,
+    cache: HashMap<String, Option<(Vec<[f32; 3]>, Vec<u16>)>>,
+}
+
+impl ModelResolver {
+    pub fn load(path: &Path) -> Result<Self, ObjectError> {
+        let entries = bigfile::load_index(path)
+            .map_err(|error| ObjectError::ArchiveUnreadable(error.to_string()))?;
+        let mut by_suffix: HashMap<[u8; 4], Vec<usize>> = HashMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            by_suffix.entry(entry.suffix).or_default().push(index);
+        }
+        Ok(Self { path: path.to_path_buf(), entries, by_suffix, cache: HashMap::new() })
+    }
+
+    /// Model-space mesh for `name`, or `None` when no container matches.
+    pub fn mesh(&mut self, name: &str) -> Option<(Vec<[f32; 3]>, Vec<u16>)> {
+        if !self.cache.contains_key(name) {
+            let mesh = self.lookup(name).map(|model| triangle_mesh(&model));
+            self.cache.insert(name.to_string(), mesh);
+        }
+        self.cache.get(name).cloned().flatten()
+    }
+
+    fn lookup(&self, name: &str) -> Option<ObjectModel> {
+        for &index in self.by_suffix.get(&suffix_key(name)?)? {
+            let Some(entry) = self.entries.get(index) else { continue };
+            let Ok(bytes) = bigfile::read_entry(&self.path, entry) else { continue };
+            if let Ok(model) = parse_object(&bytes)
+                && model.name.eq_ignore_ascii_case(name)
+            {
+                return Some(model);
+            }
+        }
+        None
+    }
+}
+
 /// Lines for `--object-info`: counts, both boundary identities and the index
 /// scan. A violated boundary or a non-zero index count never reaches this call.
 pub fn info_lines(model: &ObjectModel) -> Vec<String> {
     let r = &model.report;
+    let ranged = model.bones.iter()
+        .filter(|bone| bone.first_vertex != u16::MAX && bone.last_vertex != u16::MAX)
+        .count();
     vec![
-        format!("object {} vertices={} polygons={} materials={}", model.name, model.counts.vertices, model.counts.polygons, model.counts.materials),
+        format!("object {} vertices={} polygons={} materials={} bones={}", model.name, model.counts.vertices, model.counts.polygons, model.counts.materials, model.bones.len()),
         format!("  vertex boundary: vertexStart {} + vertexCount {}*8 = {} == polygonStart {} (satisfied)", r.vertex_start, r.vertex_count, r.vertex_end, r.polygon_start),
         format!("  polygon boundary: polygonStart {} + polygonCount {}*12 = {} == endOfPolygons {} (satisfied)", r.polygon_start, r.polygon_count, r.polygon_end, r.end_of_polygons),
         format!("  indices out_of_range={} (must be 0)", r.out_of_range),
+        format!("  rest pose: {ranged}/{} bones displace their vertex ranges; vertices are bone-local until applied", model.bones.len()),
     ]
+}
+
+/// Synthetic single-model container shared with the CLI tests: 3 vertices,
+/// 2 polygons, 1 material.
+#[cfg(test)]
+pub(crate) fn synthetic_model() -> Vec<u8> {
+    let mut bytes = 1u32.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&12u32.to_le_bytes());
+    bytes.resize(level::data_base(1), 0);
+    let mut data = vec![0u8; 0x100];
+    data[0x0C..0x10].copy_from_slice(&100u32.to_le_bytes());
+    data[0x4C..0x54].copy_from_slice(b"raziel__");
+    data[100..104].copy_from_slice(&120u32.to_le_bytes());
+    data[120..124].copy_from_slice(&3u32.to_le_bytes());
+    data[124..128].copy_from_slice(&176u32.to_le_bytes());
+    data[132..136].copy_from_slice(&224u32.to_le_bytes());
+    data[136..140].copy_from_slice(&2u32.to_le_bytes());
+    data[140..144].copy_from_slice(&200u32.to_le_bytes());
+    data[168..172].copy_from_slice(&228u32.to_le_bytes());
+    for (i, vertex) in [[1i16, 2, 3], [4, 5, 6], [7, 8, 9]].iter().enumerate() {
+        let at = 176 + i * 8;
+        for (j, value) in vertex.iter().enumerate() {
+            data[at + 2 * j..at + 2 * j + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        data[at + 6..at + 8].copy_from_slice(&(7 + i as u16).to_le_bytes());
+    }
+    data[200..206].copy_from_slice(&[0, 0, 1, 0, 2, 0]);
+    data[206] = 5;
+    data[207] = 0x02;
+    data[208..212].copy_from_slice(&228u32.to_le_bytes());
+    data[212..218].copy_from_slice(&[0, 0, 2, 0, 1, 0]);
+    data[220..224].copy_from_slice(&0x0011_2233u32.to_le_bytes());
+    data[228..244].copy_from_slice(&[0xAB; 16]);
+    bytes.extend_from_slice(&data);
+    bytes
+}
+
+/// Synthetic two-bone container: a tetrahedron whose two upper vertices are
+/// stored in a bone-local frame 10 units below their rest position, plus one
+/// opposite-winding duplicate face (a double-sided quad-less triangle).
+#[cfg(test)]
+pub(crate) fn synthetic_bone_model() -> Vec<u8> {
+    let mut bytes = 1u32.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&12u32.to_le_bytes());
+    bytes.resize(level::data_base(1), 0);
+    let mut data = vec![0u8; 0x200];
+    data[0x0C..0x10].copy_from_slice(&100u32.to_le_bytes());
+    data[0x4C..0x54].copy_from_slice(b"raziel__");
+    data[100..104].copy_from_slice(&120u32.to_le_bytes());
+    for (offset, value) in [(0x00, 4u32), (0x04, 220), (0x0C, 312), (0x10, 5), (0x14, 252), (0x18, 2), (0x1C, 172), (0x30, 312)] {
+        data[120 + offset..124 + offset].copy_from_slice(&value.to_le_bytes());
+    }
+    data[180..182].copy_from_slice(&0u16.to_le_bytes());
+    data[182..184].copy_from_slice(&1u16.to_le_bytes());
+    data[190..192].copy_from_slice(&0u16.to_le_bytes());
+    data[204..206].copy_from_slice(&2u16.to_le_bytes());
+    data[206..208].copy_from_slice(&3u16.to_le_bytes());
+    data[212..214].copy_from_slice(&10i16.to_le_bytes());
+    data[214..216].copy_from_slice(&0u16.to_le_bytes());
+    for (index, vertex) in [[0i16, 0, 0], [10, 0, 0], [0, 10, -10], [0, 0, 0]].iter().enumerate() {
+        let at = 220 + index * 8;
+        for (axis, value) in vertex.iter().enumerate() {
+            data[at + 2 * axis..at + 2 * axis + 2].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    for (index, corners) in [[0u16, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3], [0, 1, 2]].iter().enumerate() {
+        let at = 252 + index * POLYGON_STRIDE;
+        for (axis, value) in corners.iter().enumerate() {
+            data[at + 2 * axis..at + 2 * axis + 2].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+    bytes.extend_from_slice(&data);
+    bytes
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Synthetic single-model container: 3 vertices, 2 polygons, 1 material.
     fn model() -> Vec<u8> {
-        let mut bytes = 1u32.to_le_bytes().to_vec();
-        bytes.extend_from_slice(&12u32.to_le_bytes());
-        bytes.resize(level::data_base(1), 0);
-        let mut data = vec![0u8; 0x100];
-        data[0x0C..0x10].copy_from_slice(&100u32.to_le_bytes());
-        data[0x4C..0x54].copy_from_slice(b"raziel__");
-        data[100..104].copy_from_slice(&120u32.to_le_bytes());
-        data[120..124].copy_from_slice(&3u32.to_le_bytes());
-        data[124..128].copy_from_slice(&176u32.to_le_bytes());
-        data[132..136].copy_from_slice(&224u32.to_le_bytes());
-        data[136..140].copy_from_slice(&2u32.to_le_bytes());
-        data[140..144].copy_from_slice(&200u32.to_le_bytes());
-        data[168..172].copy_from_slice(&228u32.to_le_bytes());
-        for (i, vertex) in [[1i16, 2, 3], [4, 5, 6], [7, 8, 9]].iter().enumerate() {
-            let at = 176 + i * 8;
-            for (j, value) in vertex.iter().enumerate() {
-                data[at + 2 * j..at + 2 * j + 2].copy_from_slice(&value.to_le_bytes());
-            }
-            data[at + 6..at + 8].copy_from_slice(&(7 + i as u16).to_le_bytes());
-        }
-        data[200..206].copy_from_slice(&[0, 0, 1, 0, 2, 0]);
-        data[206] = 5;
-        data[207] = 0x02;
-        data[208..212].copy_from_slice(&228u32.to_le_bytes());
-        data[212..218].copy_from_slice(&[0, 0, 2, 0, 1, 0]);
-        data[220..224].copy_from_slice(&0x0011_2233u32.to_le_bytes());
-        data[228..244].copy_from_slice(&[0xAB; 16]);
-        bytes.extend_from_slice(&data);
-        bytes
+        synthetic_model()
     }
 
     #[test]
@@ -314,4 +510,97 @@ mod tests {
             Err(ObjectError::TableOutOfRange)
         );
     }
+
+    /// Minimal archive whose index entry carries `suffix` in its 4th dword.
+    fn archive(suffix: [u8; 4], payload: Vec<u8>) -> Vec<u8> {
+        let mut bytes = 1u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&20u32.to_le_bytes());
+        bytes.extend_from_slice(&suffix);
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    #[test]
+    fn triangle_mesh_widens_positions_and_keeps_each_first_triangle() {
+        let parsed = parse_object(&model()).expect("synthetic object must parse");
+        let (positions, indices) = triangle_mesh(&parsed);
+        assert_eq!(positions, vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]);
+        assert_eq!(indices, vec![0, 1, 2, 0, 2, 1]);
+    }
+
+    /// Unique vertices, unique faces and unique undirected edges after welding
+    /// coincident positions and collapsing double-sided duplicates.
+    fn welded_topology(positions: &[[f32; 3]], indices: &[u16]) -> (usize, usize, usize, usize) {
+        let mut welded = Vec::with_capacity(positions.len());
+        let mut seen: HashMap<[i32; 3], usize> = HashMap::new();
+        for position in positions {
+            let key = [position[0] as i32, position[1] as i32, position[2] as i32];
+            let next = seen.len();
+            welded.push(*seen.entry(key).or_insert(next));
+        }
+        let mut faces: BTreeSet<[usize; 3]> = BTreeSet::new();
+        let mut edges: HashMap<(usize, usize), u32> = HashMap::new();
+        let mut used: BTreeSet<usize> = BTreeSet::new();
+        for triangle in indices.chunks_exact(3) {
+            let mut corners = [
+                welded[triangle[0] as usize],
+                welded[triangle[1] as usize],
+                welded[triangle[2] as usize],
+            ];
+            corners.sort_unstable();
+            if corners[0] == corners[1] || corners[1] == corners[2] || !faces.insert(corners) {
+                continue;
+            }
+            used.extend(corners);
+            for (a, b) in [(corners[0], corners[1]), (corners[1], corners[2]), (corners[0], corners[2])] {
+                *edges.entry((a, b)).or_insert(0) += 1;
+            }
+        }
+        let nonmanifold = edges.values().filter(|&&count| count > 2).count();
+        (used.len(), edges.len(), faces.len(), nonmanifold)
+    }
+
+    #[test]
+    fn rest_pose_applies_bone_offsets_and_is_a_closed_euler_two_mesh() {
+        let parsed = parse_object(&synthetic_bone_model()).expect("bone model must parse");
+        assert_eq!(parsed.bones.len(), 2);
+        assert_eq!(parsed.bones[1].local, [0, 0, 10]);
+        let (positions, indices) = triangle_mesh(&parsed);
+        assert_eq!(
+            positions,
+            vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]]
+        );
+        assert_eq!(indices, vec![0, 2, 1, 0, 1, 3, 1, 2, 3, 2, 0, 3, 0, 1, 2]);
+        let (vertices, edges, faces, nonmanifold) = welded_topology(&positions, &indices);
+        assert_eq!((vertices, edges, faces), (4, 6, 4), "double-sided duplicate counts once");
+        assert_eq!(
+            vertices as isize - edges as isize + faces as isize,
+            2,
+            "a closed rest-pose mesh has Euler characteristic 2"
+        );
+        assert_eq!(nonmanifold, 0);
+    }
+
+    #[test]
+    fn rejects_a_bone_table_outside_the_payload() {
+        let mut bytes = synthetic_bone_model();
+        let model_at = level::data_base(1) + 120;
+        bytes[model_at + 0x18..model_at + 0x1C].copy_from_slice(&20u32.to_le_bytes());
+        assert_eq!(parse_object(&bytes), Err(ObjectError::BoneTableOutOfRange));
+    }
+
+    #[test]
+    fn resolver_keys_on_the_uppercase_suffix_then_verifies_the_name() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let path = tmp.path().join("BIGFILE.DAT");
+        std::fs::write(&path, archive(*b"ZIEL", model())).expect("synthetic archive");
+        let mut resolver = ModelResolver::load(&path).expect("index must load");
+        assert_eq!(resolver.mesh("raziel").map(|(v, i)| (v.len(), i.len())), Some((3, 6)));
+        assert_eq!(resolver.mesh("raziel").map(|(v, _)| v.len()), Some(3), "cached");
+        assert!(resolver.mesh("campath").is_none(), "suffix LOCK does not match ZIEL");
+        assert!(resolver.mesh("raz").is_none(), "names shorter than four characters do not map");
+    }
 }
+
