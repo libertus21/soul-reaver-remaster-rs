@@ -2,9 +2,9 @@
 //! vertex/polygon arrays and the 16-byte material records they reference.
 //! In-memory decode only: no rendering, bones, textures or world transform.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::bigfile;
 use crate::level;
@@ -206,6 +206,71 @@ pub fn read_entry(path: &Path, index: usize) -> Result<ObjectModel, ObjectError>
     parse_object(&bytes)
 }
 
+/// Model-space triangle mesh: `i16` positions widened 1:1 and the first
+/// three indices of every polygon.
+pub fn triangle_mesh(model: &ObjectModel) -> (Vec<[f32; 3]>, Vec<u16>) {
+    let positions = model.vertices.iter().map(|(p, _)| p.map(f32::from)).collect();
+    let indices = model
+        .polygons
+        .iter()
+        .flat_map(|(corners, _, _, _)| corners.iter().copied())
+        .collect();
+    (positions, indices)
+}
+
+/// The index dword echoes the last four characters of an asset name,
+/// uppercased; `None` for names shorter than four characters.
+fn suffix_key(name: &str) -> Option<[u8; 4]> {
+    let bytes = name.as_bytes();
+    let mut key = [0u8; 4];
+    key.copy_from_slice(bytes.get(bytes.len().checked_sub(4)?..)?);
+    key.make_ascii_uppercase();
+    Some(key)
+}
+
+/// Resolve placed-object names to archived models through the index suffix.
+/// The index is loaded once; resolved meshes are cached per placed name.
+pub struct ModelResolver {
+    path: PathBuf,
+    entries: Vec<bigfile::BigfileEntry>,
+    by_suffix: HashMap<[u8; 4], Vec<usize>>,
+    cache: HashMap<String, Option<(Vec<[f32; 3]>, Vec<u16>)>>,
+}
+
+impl ModelResolver {
+    pub fn load(path: &Path) -> Result<Self, ObjectError> {
+        let entries = bigfile::load_index(path)
+            .map_err(|error| ObjectError::ArchiveUnreadable(error.to_string()))?;
+        let mut by_suffix: HashMap<[u8; 4], Vec<usize>> = HashMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            by_suffix.entry(entry.suffix).or_default().push(index);
+        }
+        Ok(Self { path: path.to_path_buf(), entries, by_suffix, cache: HashMap::new() })
+    }
+
+    /// Model-space mesh for `name`, or `None` when no container matches.
+    pub fn mesh(&mut self, name: &str) -> Option<(Vec<[f32; 3]>, Vec<u16>)> {
+        if !self.cache.contains_key(name) {
+            let mesh = self.lookup(name).map(|model| triangle_mesh(&model));
+            self.cache.insert(name.to_string(), mesh);
+        }
+        self.cache.get(name).cloned().flatten()
+    }
+
+    fn lookup(&self, name: &str) -> Option<ObjectModel> {
+        for &index in self.by_suffix.get(&suffix_key(name)?)? {
+            let Some(entry) = self.entries.get(index) else { continue };
+            let Ok(bytes) = bigfile::read_entry(&self.path, entry) else { continue };
+            if let Ok(model) = parse_object(&bytes)
+                && model.name.eq_ignore_ascii_case(name)
+            {
+                return Some(model);
+            }
+        }
+        None
+    }
+}
+
 /// Lines for `--object-info`: counts, both boundary identities and the index
 /// scan. A violated boundary or a non-zero index count never reaches this call.
 pub fn info_lines(model: &ObjectModel) -> Vec<String> {
@@ -218,41 +283,47 @@ pub fn info_lines(model: &ObjectModel) -> Vec<String> {
     ]
 }
 
+/// Synthetic single-model container shared with the CLI tests: 3 vertices,
+/// 2 polygons, 1 material.
+#[cfg(test)]
+pub(crate) fn synthetic_model() -> Vec<u8> {
+    let mut bytes = 1u32.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&12u32.to_le_bytes());
+    bytes.resize(level::data_base(1), 0);
+    let mut data = vec![0u8; 0x100];
+    data[0x0C..0x10].copy_from_slice(&100u32.to_le_bytes());
+    data[0x4C..0x54].copy_from_slice(b"raziel__");
+    data[100..104].copy_from_slice(&120u32.to_le_bytes());
+    data[120..124].copy_from_slice(&3u32.to_le_bytes());
+    data[124..128].copy_from_slice(&176u32.to_le_bytes());
+    data[132..136].copy_from_slice(&224u32.to_le_bytes());
+    data[136..140].copy_from_slice(&2u32.to_le_bytes());
+    data[140..144].copy_from_slice(&200u32.to_le_bytes());
+    data[168..172].copy_from_slice(&228u32.to_le_bytes());
+    for (i, vertex) in [[1i16, 2, 3], [4, 5, 6], [7, 8, 9]].iter().enumerate() {
+        let at = 176 + i * 8;
+        for (j, value) in vertex.iter().enumerate() {
+            data[at + 2 * j..at + 2 * j + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        data[at + 6..at + 8].copy_from_slice(&(7 + i as u16).to_le_bytes());
+    }
+    data[200..206].copy_from_slice(&[0, 0, 1, 0, 2, 0]);
+    data[206] = 5;
+    data[207] = 0x02;
+    data[208..212].copy_from_slice(&228u32.to_le_bytes());
+    data[212..218].copy_from_slice(&[0, 0, 2, 0, 1, 0]);
+    data[220..224].copy_from_slice(&0x0011_2233u32.to_le_bytes());
+    data[228..244].copy_from_slice(&[0xAB; 16]);
+    bytes.extend_from_slice(&data);
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Synthetic single-model container: 3 vertices, 2 polygons, 1 material.
     fn model() -> Vec<u8> {
-        let mut bytes = 1u32.to_le_bytes().to_vec();
-        bytes.extend_from_slice(&12u32.to_le_bytes());
-        bytes.resize(level::data_base(1), 0);
-        let mut data = vec![0u8; 0x100];
-        data[0x0C..0x10].copy_from_slice(&100u32.to_le_bytes());
-        data[0x4C..0x54].copy_from_slice(b"raziel__");
-        data[100..104].copy_from_slice(&120u32.to_le_bytes());
-        data[120..124].copy_from_slice(&3u32.to_le_bytes());
-        data[124..128].copy_from_slice(&176u32.to_le_bytes());
-        data[132..136].copy_from_slice(&224u32.to_le_bytes());
-        data[136..140].copy_from_slice(&2u32.to_le_bytes());
-        data[140..144].copy_from_slice(&200u32.to_le_bytes());
-        data[168..172].copy_from_slice(&228u32.to_le_bytes());
-        for (i, vertex) in [[1i16, 2, 3], [4, 5, 6], [7, 8, 9]].iter().enumerate() {
-            let at = 176 + i * 8;
-            for (j, value) in vertex.iter().enumerate() {
-                data[at + 2 * j..at + 2 * j + 2].copy_from_slice(&value.to_le_bytes());
-            }
-            data[at + 6..at + 8].copy_from_slice(&(7 + i as u16).to_le_bytes());
-        }
-        data[200..206].copy_from_slice(&[0, 0, 1, 0, 2, 0]);
-        data[206] = 5;
-        data[207] = 0x02;
-        data[208..212].copy_from_slice(&228u32.to_le_bytes());
-        data[212..218].copy_from_slice(&[0, 0, 2, 0, 1, 0]);
-        data[220..224].copy_from_slice(&0x0011_2233u32.to_le_bytes());
-        data[228..244].copy_from_slice(&[0xAB; 16]);
-        bytes.extend_from_slice(&data);
-        bytes
+        synthetic_model()
     }
 
     #[test]
@@ -313,5 +384,36 @@ mod tests {
             parse_object(&bytes[..level::data_base(1) + 100]),
             Err(ObjectError::TableOutOfRange)
         );
+    }
+
+    /// Minimal archive whose index entry carries `suffix` in its 4th dword.
+    fn archive(suffix: [u8; 4], payload: Vec<u8>) -> Vec<u8> {
+        let mut bytes = 1u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&20u32.to_le_bytes());
+        bytes.extend_from_slice(&suffix);
+        bytes.extend_from_slice(&payload);
+        bytes
+    }
+
+    #[test]
+    fn triangle_mesh_widens_positions_and_keeps_each_first_triangle() {
+        let parsed = parse_object(&model()).expect("synthetic object must parse");
+        let (positions, indices) = triangle_mesh(&parsed);
+        assert_eq!(positions, vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]);
+        assert_eq!(indices, vec![0, 1, 2, 0, 2, 1]);
+    }
+
+    #[test]
+    fn resolver_keys_on_the_uppercase_suffix_then_verifies_the_name() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let path = tmp.path().join("BIGFILE.DAT");
+        std::fs::write(&path, archive(*b"ZIEL", model())).expect("synthetic archive");
+        let mut resolver = ModelResolver::load(&path).expect("index must load");
+        assert_eq!(resolver.mesh("raziel").map(|(v, i)| (v.len(), i.len())), Some((3, 6)));
+        assert_eq!(resolver.mesh("raziel").map(|(v, _)| v.len()), Some(3), "cached");
+        assert!(resolver.mesh("campath").is_none(), "suffix LOCK does not match ZIEL");
+        assert!(resolver.mesh("raz").is_none(), "names shorter than four characters do not map");
     }
 }

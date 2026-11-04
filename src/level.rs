@@ -123,6 +123,8 @@ pub struct GeometryReport {
 pub struct RoomMesh {
     pub vertices: Vec<[f32; 3]>,
     pub indices: Vec<u16>,
+    /// Placed-object render counts; zero unless `--objects` was requested.
+    pub objects: ObjectStats,
     /// First object named `raziel`, widened to world `f32`; the fly camera's
     /// optional start point. `None` when the room places no such record.
     pub spawn: Option<[f32; 3]>,
@@ -131,7 +133,7 @@ pub struct RoomMesh {
 /// One placed object behind header slot `0x00`. `object_type` is the high 16
 /// bits of the record's `+0x28` dword and `flags` is the raw `+0x2C` dword.
 /// The record carries no rotation.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ObjectRecord {
     pub name: String,
     pub position: [i16; 3],
@@ -148,6 +150,19 @@ pub struct ObjectReport {
     pub array_offset: u32,
     pub objects: Vec<ObjectRecord>,
 }
+
+/// How `--objects` rendered the placed records: total, real meshes and the
+/// cube fallbacks used for names with no archived model.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectStats {
+    pub total: u32,
+    pub meshes: u32,
+    pub markers: u32,
+}
+
+/// Resolves one placed-object name to a model-space triangle mesh.
+pub type ObjectModelSource<'a> =
+    &'a mut dyn FnMut(&str) -> Option<(Vec<[f32; 3]>, Vec<u16>)>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
@@ -561,6 +576,42 @@ fn append_markers(mesh: &mut RoomMesh, objects: &[ObjectRecord]) -> Result<(), L
     Ok(())
 }
 
+/// Append one real model per placed object and a cube for every name that does
+/// not resolve. Model vertices are translated by the record's world position;
+/// the record carries no rotation and no scale.
+fn append_objects(
+    mesh: &mut RoomMesh,
+    objects: &[ObjectRecord],
+    models: Option<ObjectModelSource<'_>>,
+) -> Result<(), LevelError> {
+    let Some(models) = models else {
+        append_markers(mesh, objects)?;
+        mesh.objects = ObjectStats { total: objects.len() as u32, markers: objects.len() as u32, ..ObjectStats::default() };
+        return Ok(());
+    };
+    let mut markers = Vec::new();
+    for object in objects {
+        let Some((vertices, indices)) = models(&object.name) else {
+            markers.push(object.clone());
+            continue;
+        };
+        if mesh.vertices.len() + vertices.len() > usize::from(u16::MAX) + 1 {
+            return Err(LevelError::RenderTooLarge);
+        }
+        let base = mesh.vertices.len() as u16;
+        let offset = object.position.map(f32::from);
+        mesh.vertices.extend(vertices.iter().map(|v| {
+            [v[0] + offset[0], v[1] + offset[1], v[2] + offset[2]]
+        }));
+        mesh.indices.extend(indices.iter().map(|&index| base + index));
+        mesh.objects.meshes += 1;
+    }
+    append_markers(mesh, &markers)?;
+    mesh.objects.total = objects.len() as u32;
+    mesh.objects.markers = markers.len() as u32;
+    Ok(())
+}
+
 /// One-unit reader for `--level-render`: a directory is refused because this
 /// slice renders exactly one `.PCM` file. An empty mesh is a distinct error so
 /// the window never opens on nothing.
@@ -577,16 +628,18 @@ pub fn read_room_mesh(
     let stem = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).ok_or(LevelError::Io)?;
     let bytes = std::fs::read(path).map_err(|_| LevelError::Io)?;
     let unit = parse_pcm(&bytes, &stem)?;
-    room_mesh_of(unit, &bytes, markers)
+    room_mesh_of(unit, &bytes, markers, None)
 }
 
 /// Shared mesh step for a parsed unit: the same bounds rule as
 /// [`read_room_mesh`], with an empty mesh refused so a window never opens on
-/// nothing. `markers` appends the object cubes to the same buffers.
+/// nothing. `markers` appends the object cubes to the same buffers; `models`
+/// replaces each cube with the real archived model when it resolves.
 fn room_mesh_of(
     unit: LevelUnit,
     bytes: &[u8],
     markers: bool,
+    models: Option<ObjectModelSource<'_>>,
 ) -> Result<(String, RoomMesh), LevelError> {
     let data = &bytes[unit.structure.data_base..];
     let mut mesh = room_mesh(data).map_err(|error| match error {
@@ -600,7 +653,7 @@ fn room_mesh_of(
     }
     mesh.spawn = spawn_position(data);
     if markers {
-        append_markers(&mut mesh, &object_report(data)?.objects)?;
+        append_objects(&mut mesh, &object_report(data)?.objects, models)?;
     }
     Ok((unit.name, mesh))
 }
@@ -636,9 +689,10 @@ pub fn read_entry_room_mesh(
     path: &Path,
     index: usize,
     markers: bool,
+    models: Option<ObjectModelSource<'_>>,
 ) -> Result<(String, RoomMesh), LevelError> {
     let (unit, bytes) = entry_unit(path, index)?;
-    room_mesh_of(unit, &bytes, markers)
+    room_mesh_of(unit, &bytes, markers, models)
 }
 
 /// `--level-objects <PATH>`: one loose `.PCM` unit's object array.
@@ -759,6 +813,7 @@ pub fn read_group_room_mesh(
     path: &Path,
     prefix: &str,
     markers: bool,
+    models: Option<ObjectModelSource<'_>>,
 ) -> Result<(String, RoomMesh), LevelError> {
     let mut merged = RoomMesh::default();
     let mut placed = Vec::new();
@@ -787,7 +842,7 @@ pub fn read_group_room_mesh(
         }
     }
     if markers {
-        append_markers(&mut merged, &placed)?;
+        append_objects(&mut merged, &placed, models)?;
     }
     Ok((format!("group {prefix}"), merged))
 }
@@ -1866,13 +1921,29 @@ mod tests {
     #[test]
     fn group_mesh_offsets_each_room_by_the_running_vertex_base() {
         let tmp = tempfile::tempdir().expect("tempdir must succeed");
-        let (name, mesh) = read_group_room_mesh(&group_archive(tmp.path()), "under", false)
+        let (name, mesh) = read_group_room_mesh(&group_archive(tmp.path()), "under", false, None)
             .expect("group must merge");
         assert_eq!(name, "group under");
         assert_eq!(mesh.vertices.len(), 6);
         assert_eq!(mesh.vertices[0], [0.0, 0.0, 0.0]);
         assert_eq!(mesh.vertices[3], [10.0, 0.0, 0.0], "world-space position is not transformed");
         assert_eq!(mesh.indices, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn objects_use_models_when_they_resolve_and_cubes_otherwise() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let pcm = object_pcm(&[("raziel", [5, 0, 0], 1), ("campath", [0, 0, 0], 1)]);
+        let path = tmp.path().join("BIGFILE.DAT");
+        std::fs::write(&path, archive(&[pcm])).expect("synthetic archive must be writable");
+        let triangle = || (vec![[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [0.0, 2.0, 0.0]], vec![0, 1, 2]);
+        let mut source = |name: &str| (name == "raziel").then(triangle);
+        let (_, mesh) = read_entry_room_mesh(&path, 0, true, Some(&mut source))
+            .expect("entry 0 must merge");
+        assert_eq!(mesh.objects, ObjectStats { total: 2, meshes: 1, markers: 1 });
+        assert_eq!(mesh.vertices.len(), 3 + 3 + 8, "room, one model, one cube");
+        assert_eq!(mesh.vertices[3], [5.0, 0.0, 0.0], "model follows the object position");
+        assert_eq!(mesh.indices.len(), 3 + 3 + 36);
     }
 
     #[test]
@@ -1911,7 +1982,7 @@ mod tests {
         let rows = read_entry_geometry(&path, 1).expect("entry 1 must read");
         assert_eq!(rows[0].0, "lair5");
         assert_eq!((rows[0].1.vertices, rows[0].1.faces), (3, 1));
-        let (name, mesh) = read_entry_room_mesh(&path, 1, false).expect("entry 1 must mesh");
+        let (name, mesh) = read_entry_room_mesh(&path, 1, false, None).expect("entry 1 must mesh");
         assert_eq!((name.as_str(), mesh.vertices.len(), mesh.indices.len()), ("lair5", 3, 3));
 
         assert!(matches!(
@@ -2042,8 +2113,8 @@ mod tests {
     fn group_markers_are_optional_and_absent_without_objects() {
         let tmp = tempfile::tempdir().expect("tempdir must succeed");
         let path = group_archive(tmp.path());
-        let (_, plain) = read_group_room_mesh(&path, "under", false).expect("plain merge");
-        let (_, marked) = read_group_room_mesh(&path, "under", true).expect("marked merge");
+        let (_, plain) = read_group_room_mesh(&path, "under", false, None).expect("plain merge");
+        let (_, marked) = read_group_room_mesh(&path, "under", true, None).expect("marked merge");
         assert_eq!(plain, marked, "zero-count rooms must add no marker");
     }
 

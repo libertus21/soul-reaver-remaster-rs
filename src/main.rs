@@ -167,6 +167,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--object-info") {
         return run_object_info(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--object-mesh") {
+        return run_object_mesh(&args[1..]);
+    }
     let Some(arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs <path-to-DDS | path-to-directory>");
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --list");
@@ -196,6 +199,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-objects --bigfile <BIGFILE.DAT> --group <PREFIX>");
         eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file> --objects");
         eprintln!("   or: soul-reaver-remaster-rs --object-info --bigfile <BIGFILE.DAT> --entry <INDEX>");
+        eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
@@ -1269,13 +1273,29 @@ fn run_level_objects(args: &[String]) -> ExitCode {
 fn run_level_render(args: &[String]) -> ExitCode {
     let usage = "expected --level-render <path> or --level-render --bigfile <DAT> --entry <INDEX> or --level-render --bigfile <DAT> --group <PREFIX>";
     let markers = args.iter().any(|arg| arg == "--objects");
-    let result = level_input(args, usage).and_then(|input| match input {
-        LevelInput::Path(path) => level::read_room_mesh(Path::new(path), markers),
-        LevelInput::Entry { dat, index } => {
-            level::read_entry_room_mesh(Path::new(dat), index, markers)
+    let input = level_input(args, usage);
+    let mut resolver = match &input {
+        Ok(LevelInput::Entry { dat, .. }) | Ok(LevelInput::Group { dat, .. }) if markers => {
+            match object::ModelResolver::load(Path::new(dat)) {
+                Ok(resolver) => Some(resolver),
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(error.exit_code());
+                }
+            }
         }
-        LevelInput::Group { dat, prefix } => {
-            level::read_group_room_mesh(Path::new(dat), prefix, markers)
+        _ => None,
+    };
+    let result = input.and_then(|input| {
+        let mut source = |name: &str| resolver.as_mut().and_then(|resolver| resolver.mesh(name));
+        match input {
+            LevelInput::Path(path) => level::read_room_mesh(Path::new(path), markers),
+            LevelInput::Entry { dat, index } => level::read_entry_room_mesh(
+                Path::new(dat), index, markers, Some(&mut source),
+            ),
+            LevelInput::Group { dat, prefix } => level::read_group_room_mesh(
+                Path::new(dat), prefix, markers, Some(&mut source),
+            ),
         }
     });
     let (name, mesh) = match result {
@@ -1285,6 +1305,12 @@ fn run_level_render(args: &[String]) -> ExitCode {
             return ExitCode::from(error.exit_code());
         }
     };
+    if markers {
+        outln!(
+            "objects {} ({} meshes, {} markers)",
+            mesh.objects.total, mesh.objects.meshes, mesh.objects.markers
+        );
+    }
     outln!(
         "level {name} vertices={} faces={} showing room geometry",
         mesh.vertices.len(), mesh.indices.len() / 3
@@ -1297,10 +1323,46 @@ fn run_level_render(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `--object-mesh` arm: one archived object container rendered through the
+/// existing mesh viewer. Refusals happen before any window is created.
+fn run_object_mesh(args: &[String]) -> ExitCode {
+    run_object_mesh_with(args, |positions, indices, title| {
+        render::show_mesh(positions, indices, title, None)
+    })
+}
+
+fn run_object_mesh_with(
+    args: &[String],
+    render: impl Fn(&[[f32; 3]], &[u16], &str) -> Result<(), String>,
+) -> ExitCode {
+    let usage = "expected --object-mesh --bigfile <DAT> --entry <INDEX>";
+    match object_input(args, usage).and_then(|(dat, index)| object::read_entry(Path::new(dat), index))
+    {
+        Ok(model) => {
+            let (positions, indices) = object::triangle_mesh(&model);
+            outln!("object {} vertices={} faces={}", model.name, positions.len(), indices.len() / 3);
+            let title = format!("object {}", model.name);
+            match render(&positions, &indices, &title) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
 /// Read-only `--object-info` arm: one archived object container, counts and
 /// validation only. No window, no mesh.
 fn run_object_info(args: &[String]) -> ExitCode {
-    match object_input(args).and_then(|(dat, index)| object::read_entry(Path::new(dat), index)) {
+    match object_input(args, object::USAGE)
+        .and_then(|(dat, index)| object::read_entry(Path::new(dat), index))
+    {
         Ok(model) => {
             for line in object::info_lines(&model) {
                 outln!("{line}");
@@ -1316,20 +1378,29 @@ fn run_object_info(args: &[String]) -> ExitCode {
 
 /// Exactly `--bigfile <DAT> --entry <INDEX>`, in either order. Any other shape
 /// is the arm's own usage error.
-fn object_input(args: &[String]) -> Result<(&str, usize), object::ObjectError> {
+fn object_input<'a>(
+    args: &'a [String],
+    usage: &'static str,
+) -> Result<(&'a str, usize), object::ObjectError> {
     let (mut dat, mut index) = (None, None);
     let mut at = 0;
     while at + 1 < args.len() {
         match args[at].as_str() {
             "--bigfile" => dat = Some(args[at + 1].as_str()),
-            "--entry" => index = Some(args[at + 1].parse().map_err(|_| object::ObjectError::Usage(object::USAGE))?),
-            _ => return Err(object::ObjectError::Usage(object::USAGE)),
+            "--entry" => {
+                index = Some(
+                    args[at + 1]
+                        .parse()
+                        .map_err(|_| object::ObjectError::Usage(usage))?,
+                )
+            }
+            _ => return Err(object::ObjectError::Usage(usage)),
         }
         at += 2;
     }
     match (dat, index, at == args.len()) {
         (Some(dat), Some(index), true) => Ok((dat, index)),
-        _ => Err(object::ObjectError::Usage(object::USAGE)),
+        _ => Err(object::ObjectError::Usage(usage)),
     }
 }
 
@@ -1360,7 +1431,7 @@ mod cli_tests {
         list_report, pose_mode_conflict, resolve_texture_name, run_audio, run_bigfile,
         dispatch, run_level_links, run_level_records, run_level_structure, run_mesh, run_mesh_all,
         run_level_geometry, run_level_objects, run_level_render, run_mesh_textured, run_mesh_with,
-        run_object_info, run_textures,
+        run_object_info, run_object_mesh, run_object_mesh_with, run_textures,
         strip_launcher_noops, tshow_suffix,
     };
     use std::process::ExitCode;
@@ -2083,6 +2154,37 @@ mod cli_tests {
         assert_eq!(run_object_info(&entry("9")), ExitCode::from(1));
         assert_eq!(run_object_info(&entry("0")), ExitCode::from(2));
         assert_eq!(run_object_info(&[]), ExitCode::from(1));
+    }
+
+    #[test]
+    fn object_mesh_reaches_render_with_polygon_triangles() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let dat = write_tmp(
+            &tmp,
+            "BIGFILE.DAT",
+            &synthetic_archive(&[crate::object::synthetic_model()]),
+        );
+        let reached = Rc::new(std::cell::Cell::new(false));
+        let sink = Rc::new(std::cell::RefCell::new(None));
+        let (seen, captured) = (Rc::clone(&reached), Rc::clone(&sink));
+        let args = vec![
+            "--bigfile".to_string(),
+            dat.clone(),
+            "--entry".to_string(),
+            "0".to_string(),
+        ];
+        let code = run_object_mesh_with(&args, move |positions, indices, title| {
+            seen.set(true);
+            *captured.borrow_mut() = Some((positions.to_vec(), indices.to_vec(), title.to_string()));
+            Ok(())
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
+        let (positions, indices, title) =
+            sink.borrow_mut().take().expect("render must be reached");
+        assert_eq!((positions.len(), indices.len(), title.as_str()), (3, 6, "object raziel"));
+        let missing = vec!["--bigfile".to_string(), dat, "--entry".to_string(), "9".to_string()];
+        assert_eq!(run_object_mesh(&missing), ExitCode::from(1));
+        assert_eq!(run_object_mesh(&[]), ExitCode::from(1));
     }
 
     #[test]
