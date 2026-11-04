@@ -190,15 +190,15 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-structure <.PCM file | room directory>");
         eprintln!("   or: soul-reaver-remaster-rs --level-links <.PCM file | room directory>");
         eprintln!("   or: soul-reaver-remaster-rs --level-geometry <.PCM file | room directory>");
-        eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file> [--textures <TEXTURES.BIG>]");
         eprintln!("   or: soul-reaver-remaster-rs --level-geometry --bigfile <BIGFILE.DAT> --entry <INDEX>");
-        eprintln!("   or: soul-reaver-remaster-rs --level-render --bigfile <BIGFILE.DAT> --entry <INDEX>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-render --bigfile <BIGFILE.DAT> --entry <INDEX> [--textures <TEXTURES.BIG>]");
         eprintln!("   or: soul-reaver-remaster-rs --level-geometry --bigfile <BIGFILE.DAT> --group <PREFIX>");
-        eprintln!("   or: soul-reaver-remaster-rs --level-render --bigfile <BIGFILE.DAT> --group <PREFIX>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-render --bigfile <BIGFILE.DAT> --group <PREFIX> [--textures <TEXTURES.BIG>]");
         eprintln!("   or: soul-reaver-remaster-rs --level-objects <.PCM file>");
         eprintln!("   or: soul-reaver-remaster-rs --level-objects --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --level-objects --bigfile <BIGFILE.DAT> --group <PREFIX>");
-        eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file> --objects");
+        eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file> --objects [--textures <TEXTURES.BIG>]");
         eprintln!("   or: soul-reaver-remaster-rs --object-info --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --textures <TEXTURES.BIG>");
@@ -1162,11 +1162,18 @@ fn level_input<'a>(
     usage: &'static str,
 ) -> Result<LevelInput<'a>, level::LevelError> {
     if !args.iter().any(|arg| arg == "--bigfile" || arg == "--entry" || arg == "--group") {
-        if args.iter().any(|arg| arg == "--textures") {
-            return Err(level::LevelError::Usage(usage));
+        let mut paths = Vec::new();
+        let mut at = 0;
+        while at < args.len() {
+            match args[at].as_str() {
+                "--objects" => at += 1,
+                "--textures" if at + 1 < args.len() => at += 2,
+                other => {
+                    paths.push(other);
+                    at += 1;
+                }
+            }
         }
-        let paths: Vec<&str> =
-            args.iter().filter(|arg| arg.as_str() != "--objects").map(String::as_str).collect();
         return match paths.as_slice() {
             [path] if !path.starts_with('-') => Ok(LevelInput::Path(path)),
             _ => Err(level::LevelError::Usage(usage)),
@@ -1339,33 +1346,27 @@ fn run_level_render(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// `--level-render --objects --textures`: room and markers keep flat material
-/// 1 while placed models are drawn with their bank pages.
+/// `--level-render --textures`: room geometry is drawn per face from the
+/// room's `+0x34` records, exactly like an object model. `--objects` also
+/// textures placed models; markers and unresolved room faces stay flat.
 fn run_level_render_textured(
     args: &[String],
     usage: &'static str,
     markers: bool,
     bank_path: &str,
 ) -> ExitCode {
-    if !markers {
-        eprintln!("error: --textures requires --objects (the room and markers stay flat)");
-        return ExitCode::from(1);
-    }
     let input = level_input(args, usage);
     let mut resolver = match &input {
-        Ok(LevelInput::Entry { dat, .. }) | Ok(LevelInput::Group { dat, .. }) => {
+        Ok(LevelInput::Entry { dat, .. }) | Ok(LevelInput::Group { dat, .. }) if markers => {
             match object::ModelResolver::load(Path::new(dat)) {
-                Ok(resolver) => resolver,
+                Ok(resolver) => Some(resolver),
                 Err(error) => {
                     eprintln!("error: {error}");
                     return ExitCode::from(error.exit_code());
                 }
             }
         }
-        _ => {
-            eprintln!("error: {usage}");
-            return ExitCode::from(1);
-        }
+        _ => None,
     };
     let bank = match object_texture::PageBank::open(Path::new(bank_path)) {
         Ok(bank) => bank,
@@ -1375,15 +1376,15 @@ fn run_level_render_textured(
         }
     };
     let result = input.and_then(|input| {
-        let mut source = |name: &str| resolver.textured(name);
+        let mut source = |name: &str| resolver.as_mut().and_then(|resolver| resolver.textured(name));
         match input {
-            LevelInput::Entry { dat, index } => {
-                level::read_entry_room_mesh_textured(Path::new(dat), index, &mut source)
-            }
-            LevelInput::Group { dat, prefix } => {
-                level::read_group_room_mesh_textured(Path::new(dat), prefix, &mut source)
-            }
-            LevelInput::Path(_) => Err(level::LevelError::Usage(usage)),
+            LevelInput::Path(path) => level::read_room_mesh_textured(Path::new(path), markers),
+            LevelInput::Entry { dat, index } => level::read_entry_room_mesh_textured(
+                Path::new(dat), index, markers, Some(&mut source),
+            ),
+            LevelInput::Group { dat, prefix } => level::read_group_room_mesh_textured(
+                Path::new(dat), prefix, markers, Some(&mut source),
+            ),
         }
     });
     let (name, mesh) = match result {
@@ -1400,13 +1401,20 @@ fn run_level_render_textured(
             return ExitCode::from(2);
         }
     };
+    if markers {
+        outln!(
+            "objects {} ({} meshes, {} markers)",
+            mesh.objects.total, mesh.objects.meshes, mesh.objects.markers
+        );
+    }
     outln!(
-        "objects {} ({} meshes, {} markers)",
-        mesh.objects.total, mesh.objects.meshes, mesh.objects.markers
-    );
-    outln!(
-        "level {name} vertices={} faces={} pages={} showing textured room and objects",
-        mesh.vertices.len(), mesh.indices.len() / 3, mesh.pages.len()
+        "level {name} vertices={} faces={} pages={} textured_faces={} unresolved_faces={} showing textured room{}",
+        mesh.vertices.len(),
+        mesh.indices.len() / 3,
+        mesh.pages.len(),
+        mesh.textured_faces,
+        mesh.unresolved_faces,
+        if markers { " and objects" } else { "" }
     );
     let title = format!("level {name}");
     if let Err(error) = render::show_mesh_textured(

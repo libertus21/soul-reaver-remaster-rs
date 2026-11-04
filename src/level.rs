@@ -133,6 +133,11 @@ pub struct RoomMesh {
     /// First object named `raziel`, widened to world `f32`; the fly camera's
     /// optional start point. `None` when the room places no such record.
     pub spawn: Option<[f32; 3]>,
+    /// Faces that resolved to a 12-byte texture record, and the tail faces
+    /// whose `+0x0A` offset was `0xFFFF` or not 12-aligned. Both are counted;
+    /// unresolved faces draw flat, never dropped.
+    pub textured_faces: u32,
+    pub unresolved_faces: u32,
 }
 
 /// One placed object behind header slot `0x00`. `object_type` is the high 16
@@ -215,6 +220,8 @@ pub enum LevelError {
     RelocationOutOfRange,
     GeometryRecordOutOfRange,
     GeometryArrayOutOfRange,
+    RoomTexturesMissing,
+    RoomTextureArrayOutOfRange,
     ObjectRecordOutOfRange,
     ObjectArrayOutOfRange,
     RenderDirectory,
@@ -284,6 +291,12 @@ impl fmt::Display for LevelError {
             }
             LevelError::GeometryArrayOutOfRange => {
                 "room geometry vertex or face array runs outside the level data"
+            }
+            LevelError::RoomTexturesMissing => {
+                "unit has no room texture record array (room record +0x34/+0x38 are empty)"
+            }
+            LevelError::RoomTextureArrayOutOfRange => {
+                "room texture record array runs outside the level data or is not 12-byte aligned"
             }
             LevelError::ObjectRecordOutOfRange => {
                 "room object record points outside the level data"
@@ -357,6 +370,12 @@ const ROOM_VERTEX_COUNT: usize = 0x10;
 const ROOM_FACE_COUNT: usize = 0x14;
 const ROOM_VERTEX_OFFSET: usize = 0x1C;
 const ROOM_FACE_OFFSET: usize = 0x20;
+/// Data-base-relative start/end of the per-room 12-byte texture record array.
+const ROOM_TEXTURE_START: usize = 0x34;
+const ROOM_TEXTURE_END: usize = 0x38;
+const TEXTURE_STRIDE: usize = 12;
+/// Face `+0x0A`: byte offset into the texture record array, or `0xFFFF`.
+const FACE_TEXTURE_OFFSET: usize = 0x0A;
 const VERTEX_STRIDE: usize = 12;
 const FACE_STRIDE: usize = 12;
 
@@ -480,6 +499,100 @@ fn room_mesh(data: &[u8]) -> Result<RoomMesh, LevelError> {
             mesh.indices.push(index);
         }
     }
+    Ok(mesh)
+}
+
+/// One decoded room face texture: the masked bank page and the three UV pairs
+/// of the 12-byte `TextureFT3`-lite record. Attributes stay unread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FaceTexture {
+    pub page: u16,
+    pub uvs: [[u8; 2]; 3],
+}
+
+/// Per-face resolution for one room. `unresolved` counts `0xFFFF` and
+/// non-12-aligned tails; those faces stay in the mesh with flat material 1.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RoomTextureFaces {
+    pub faces: Vec<Option<FaceTexture>>,
+    pub unresolved: u32,
+}
+
+/// Resolve every room face's `+0x0A` byte offset into the `+0x34` record array.
+/// The offset is relative to that array, not the data base; `0xFFFF` and
+/// non-12-aligned or out-of-span offsets are counted, never clamped.
+fn room_texture_faces(data: &[u8]) -> Result<RoomTextureFaces, LevelError> {
+    let room_offset =
+        read_u32(data, 4 * SLOT_ROOM_RECORD).ok_or(LevelError::GeometryRecordOutOfRange)?;
+    if room_offset == 0 {
+        return Err(LevelError::RoomTexturesMissing);
+    }
+    let record = room_offset as usize;
+    if record.checked_add(ROOM_TEXTURE_END + 4).is_none_or(|end| end > data.len()) {
+        return Err(LevelError::GeometryRecordOutOfRange);
+    }
+    let start = read_u32(data, record + ROOM_TEXTURE_START).unwrap_or(0) as usize;
+    let end = read_u32(data, record + ROOM_TEXTURE_END).unwrap_or(0) as usize;
+    if start == 0 && end == 0 {
+        return Err(LevelError::RoomTexturesMissing);
+    }
+    let span = end
+        .checked_sub(start)
+        .filter(|span| *span != 0 && *span % TEXTURE_STRIDE == 0 && end <= data.len())
+        .ok_or(LevelError::RoomTextureArrayOutOfRange)?;
+    let faces = read_u32(data, record + ROOM_FACE_COUNT).unwrap_or(0);
+    let face_offset = read_u32(data, record + ROOM_FACE_OFFSET).unwrap_or(0);
+    let (face_start, face_end) = array_range(data.len(), face_offset, faces, FACE_STRIDE)
+        .ok_or(LevelError::GeometryArrayOutOfRange)?;
+    let mut out =
+        RoomTextureFaces { faces: Vec::with_capacity(faces as usize), ..RoomTextureFaces::default() };
+    for at in (face_start..face_end).step_by(FACE_STRIDE) {
+        let offset = read_u16(data, at + FACE_TEXTURE_OFFSET)
+            .ok_or(LevelError::GeometryArrayOutOfRange)?;
+        let resolved = (offset != u16::MAX)
+            .then_some(offset as usize)
+            .filter(|offset| offset % TEXTURE_STRIDE == 0 && offset + TEXTURE_STRIDE <= span)
+            .map(|offset| start + offset);
+        let Some(record_at) = resolved else {
+            out.unresolved += 1;
+            out.faces.push(None);
+            continue;
+        };
+        let word = read_u16(data, record_at + 2).ok_or(LevelError::RoomTextureArrayOutOfRange)?;
+        out.faces.push(Some(FaceTexture {
+            page: word & crate::object::TEXTURE_PAGE_MASK,
+            uvs: [
+                [data[record_at], data[record_at + 1]],
+                [data[record_at + 4], data[record_at + 5]],
+                [data[record_at + 8], data[record_at + 9]],
+            ],
+        }));
+    }
+    Ok(out)
+}
+
+/// Per-face textured room mesh: every face contributes three unique vertices,
+/// exactly as the object path does. Material 1 is flat; used pages start at 2.
+fn textured_room_mesh(data: &[u8]) -> Result<RoomMesh, LevelError> {
+    let flat = room_mesh(data)?;
+    let textures = room_texture_faces(data)?;
+    let mut mesh = RoomMesh::default();
+    for (triangle, texture) in flat.indices.chunks_exact(3).zip(&textures.faces) {
+        if mesh.vertices.len().saturating_add(3) > usize::from(u16::MAX) + 1 {
+            return Err(LevelError::RenderTooLarge);
+        }
+        let base = mesh.vertices.len() as u16;
+        let material = texture
+            .map_or(1, |texture| crate::object::page_material(&mut mesh.pages, texture.page));
+        for (corner, &index) in triangle.iter().enumerate() {
+            mesh.vertices.push(flat.vertices[index as usize]);
+            mesh.uvs.push(texture.map_or([0, 0], |texture| texture.uvs[corner]));
+            mesh.material_indices.push(material);
+        }
+        mesh.indices.extend([base, base + 1, base + 2]);
+    }
+    mesh.textured_faces = textures.faces.len() as u32 - textures.unresolved;
+    mesh.unresolved_faces = textures.unresolved;
     Ok(mesh)
 }
 
@@ -680,19 +793,49 @@ fn append_objects_textured(
     Ok(())
 }
 
-/// Merge one or more units into a textured room scene: room and markers use
-/// flat material 1, placed models keep their per-face UVs and page materials.
+/// Append a textured room mesh onto the scene, remapping its local page
+/// materials into the scene-wide table (flat 1, then pages in first-use order).
+fn append_textured_mesh(merged: &mut RoomMesh, room: RoomMesh) {
+    let RoomMesh {
+        vertices,
+        uvs,
+        indices,
+        material_indices,
+        pages,
+        textured_faces,
+        unresolved_faces,
+        ..
+    } = room;
+    let base = merged.vertices.len() as u16;
+    for ((&uv, &material), position) in uvs.iter().zip(&material_indices).zip(vertices) {
+        merged.vertices.push(position);
+        merged.uvs.push(uv);
+        merged.material_indices.push(if material <= 1 {
+            1
+        } else {
+            crate::object::page_material(&mut merged.pages, pages[usize::from(material) - 2])
+        });
+    }
+    merged.indices.extend(indices.iter().map(|&index| base + index));
+    merged.textured_faces += textured_faces;
+    merged.unresolved_faces += unresolved_faces;
+}
+
+/// Merge one or more units into a textured room scene. Rooms and markers keep
+/// flat material 1 for unresolved faces; placed models keep their own UVs and
+/// page materials when `models` is supplied.
 fn textured_scene(
     rooms: Vec<(LevelUnit, Vec<u8>)>,
     prefix: Option<&str>,
-    models: TexturedObjectSource<'_>,
+    markers: bool,
+    models: Option<TexturedObjectSource<'_>>,
 ) -> Result<(String, RoomMesh), LevelError> {
     let mut merged = RoomMesh::default();
     let mut placed = Vec::new();
     let mut title = None;
     for (unit, bytes) in rooms {
         let data = &bytes[unit.structure.data_base..];
-        let mesh = room_mesh(data).map_err(|error| match error {
+        let mesh = textured_room_mesh(data).map_err(|error| match error {
             LevelError::GeometryRecordOutOfRange | LevelError::GeometryArrayOutOfRange => {
                 LevelError::RenderArrayOutOfRange
             }
@@ -704,39 +847,70 @@ fn textured_scene(
         if merged.vertices.len() + mesh.vertices.len() > usize::from(u16::MAX) + 1 {
             return Err(LevelError::GroupTooLarge);
         }
-        let base = merged.vertices.len() as u16;
-        let count = mesh.vertices.len();
-        merged.vertices.extend(mesh.vertices);
-        merged.uvs.extend(std::iter::repeat([0, 0]).take(count));
-        merged.material_indices.extend(std::iter::repeat(1).take(count));
-        merged.indices.extend(mesh.indices.iter().map(|&index| index + base));
+        append_textured_mesh(&mut merged, mesh);
         if merged.spawn.is_none() {
             merged.spawn = spawn_position(data);
         }
-        placed.extend(object_report(data)?.objects);
+        if markers {
+            placed.extend(object_report(data)?.objects);
+        }
         title.get_or_insert(unit.name);
     }
-    append_objects_textured(&mut merged, &placed, models)?;
+    if markers {
+        match models {
+            Some(models) => append_objects_textured(&mut merged, &placed, models)?,
+            None => append_markers_textured(&mut merged, &placed)?,
+        }
+    }
     let name = prefix.map_or_else(|| title.unwrap_or_default(), |p| format!("group {p}"));
     Ok((name, merged))
+}
+
+/// `--level-render <.PCM> --textures ...`: one loose unit, room textured.
+pub fn read_room_mesh_textured(
+    path: &Path,
+    markers: bool,
+) -> Result<(String, RoomMesh), LevelError> {
+    if path.is_dir() {
+        return Err(LevelError::RenderDirectory);
+    }
+    if !is_pcm(path) {
+        return Err(LevelError::RefusedPath);
+    }
+    let stem =
+        path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).ok_or(LevelError::Io)?;
+    let bytes = std::fs::read(path).map_err(|_| LevelError::Io)?;
+    let unit = parse_pcm(&bytes, &stem)?;
+    let data = &bytes[unit.structure.data_base..];
+    let mut mesh = textured_room_mesh(data)?;
+    if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+        return Err(LevelError::RenderEmpty);
+    }
+    mesh.spawn = spawn_position(data);
+    if markers {
+        append_markers_textured(&mut mesh, &object_report(data)?.objects)?;
+    }
+    Ok((unit.name, mesh))
 }
 
 /// `--level-render --bigfile ... --entry ... --textures ...`.
 pub fn read_entry_room_mesh_textured(
     path: &Path,
     index: usize,
-    models: TexturedObjectSource<'_>,
+    markers: bool,
+    models: Option<TexturedObjectSource<'_>>,
 ) -> Result<(String, RoomMesh), LevelError> {
-    textured_scene(vec![entry_unit(path, index)?], None, models)
+    textured_scene(vec![entry_unit(path, index)?], None, markers, models)
 }
 
 /// `--level-render --bigfile ... --group ... --textures ...`.
 pub fn read_group_room_mesh_textured(
     path: &Path,
     prefix: &str,
-    models: TexturedObjectSource<'_>,
+    markers: bool,
+    models: Option<TexturedObjectSource<'_>>,
 ) -> Result<(String, RoomMesh), LevelError> {
-    textured_scene(discover_group(path, prefix)?, Some(prefix), models)
+    textured_scene(discover_group(path, prefix)?, Some(prefix), markers, models)
 }
 
 /// One-unit reader for `--level-render`: a directory is refused because this
@@ -1928,7 +2102,7 @@ mod tests {
     /// unit name stays in the last six bytes behind header word `0x26`.
     fn geometry_pcm(vertices: &[[i16; 3]], faces: &[[u16; 3]]) -> Vec<u8> {
         let room = 16usize;
-        let face_at = room + 0x24;
+        let face_at = room + 0x3C;
         let vertex_at = face_at + faces.len() * FACE_STRIDE;
         let len = (vertex_at + vertices.len() * VERTEX_STRIDE + 6).max(0xA6);
         let name_at = len - 6;
@@ -1962,10 +2136,37 @@ mod tests {
         bytes
     }
 
+    /// `geometry_pcm` with the room's `+0x34` texture array appended. Each
+    /// record carries `words[i] & 0x07FF` as its page and fixed UVs; face i
+    /// gets `offsets[i]` at `+0x0A`.
+    fn textured_pcm(faces: &[[u16; 3]], offsets: &[u16], words: &[u16]) -> Vec<u8> {
+        let mut bytes = geometry_pcm(&[[0, 0, 0], [100, 0, 0], [0, 100, 0]], faces);
+        let (base, room) = (data_base(2), 16usize);
+        let array_start = (bytes.len() - base) as u32;
+        for &word in words {
+            let mut record = [0u8; TEXTURE_STRIDE];
+            record[2..4].copy_from_slice(&word.to_le_bytes());
+            record[0..2].copy_from_slice(&[1, 2]);
+            record[4..6].copy_from_slice(&[3, 4]);
+            record[8..10].copy_from_slice(&[5, 6]);
+            bytes.extend_from_slice(&record);
+        }
+        let at = base + room + ROOM_TEXTURE_START;
+        bytes[at..at + 4].copy_from_slice(&array_start.to_le_bytes());
+        let end = array_start + (words.len() * TEXTURE_STRIDE) as u32;
+        let at = base + room + ROOM_TEXTURE_END;
+        bytes[at..at + 4].copy_from_slice(&end.to_le_bytes());
+        for (index, &offset) in offsets.iter().enumerate() {
+            let face = base + room + 0x3C + index * FACE_STRIDE + FACE_TEXTURE_OFFSET;
+            bytes[face..face + 2].copy_from_slice(&offset.to_le_bytes());
+        }
+        bytes
+    }
+
     /// `geometry_pcm` with an object array appended after the room geometry;
     /// the array offset is data-base-relative, as in the real record.
     fn object_pcm(objects: &[(&str, [i16; 3], u16)]) -> Vec<u8> {
-        let mut bytes = geometry_pcm(&[[0, 0, 0], [100, 0, 0], [0, 100, 0]], &[[0, 1, 2]]);
+        let mut bytes = textured_pcm(&[[0, 1, 2]], &[0], &[7]);
         let base = data_base(2);
         let room = 16usize;
         let array = (bytes.len() - base) as u32;
@@ -2074,7 +2275,7 @@ mod tests {
     }
 
     #[test]
-    fn textured_entry_keeps_room_flat_and_maps_object_pages() {
+    fn textured_entry_expands_room_faces_and_maps_object_pages() {
         let tmp = tempfile::tempdir().expect("tempdir must succeed");
         let pcm = object_pcm(&[("raziel", [5, 0, 0], 1), ("campath", [0, 0, 0], 1)]);
         let path = tmp.path().join("BIGFILE.DAT");
@@ -2088,17 +2289,61 @@ mod tests {
                 pages: vec![9],
             })
         };
-        let (_, mesh) = read_entry_room_mesh_textured(&path, 0, &mut source)
+        let (_, mesh) = read_entry_room_mesh_textured(&path, 0, true, Some(&mut source))
             .expect("entry 0 must merge");
         assert_eq!(mesh.objects, ObjectStats { total: 2, meshes: 1, markers: 1 });
         assert_eq!(mesh.vertices.len(), 3 + 3 + 8, "room, one model, one cube");
         assert_eq!(mesh.uvs.len(), mesh.vertices.len());
         assert_eq!(mesh.material_indices.len(), mesh.vertices.len());
-        assert_eq!(&mesh.material_indices[..3], &[1, 1, 1], "room stays flat");
-        assert_eq!(&mesh.material_indices[3..6], &[2, 2, 2], "object page maps to 2");
-        assert_eq!(&mesh.uvs[3..6], &[[1, 2], [3, 4], [5, 6]]);
-        assert_eq!(mesh.pages, vec![9]);
+        assert_eq!(&mesh.material_indices[..3], &[2, 2, 2], "room page 7 maps to 2");
+        assert_eq!(&mesh.material_indices[3..6], &[3, 3, 3], "object page 9 maps to 3");
+        assert_eq!(&mesh.uvs[..3], &[[1, 2], [3, 4], [5, 6]], "room record UVs");
+        assert_eq!(mesh.pages, vec![7, 9]);
+        assert_eq!((mesh.textured_faces, mesh.unresolved_faces), (1, 0));
         assert_eq!(mesh.indices.len(), 3 + 3 + 36);
+    }
+
+    #[test]
+    fn room_texture_faces_resolve_offsets_mask_pages_and_count_the_tail() {
+        let bytes = textured_pcm(
+            &[[0, 1, 2], [0, 1, 2], [0, 1, 2]],
+            &[0, 0xFFFF, 6],
+            &[0x0181, 0x8000 | 0x0182],
+        );
+        let data = &bytes[data_base(2)..];
+        let faces = room_texture_faces(data).expect("must resolve");
+        assert_eq!(faces.faces.len(), 3);
+        assert_eq!(
+            faces.faces[0],
+            Some(FaceTexture { page: 385, uvs: [[1, 2], [3, 4], [5, 6]] })
+        );
+        assert_eq!(faces.faces[1], None, "0xFFFF tail");
+        assert_eq!(faces.faces[2], None, "6 is not 12-aligned");
+        assert_eq!(faces.unresolved, 2);
+        let mesh = textured_room_mesh(data).expect("must expand");
+        assert_eq!((mesh.textured_faces, mesh.unresolved_faces), (1, 2));
+        assert_eq!((mesh.vertices.len(), mesh.indices.len()), (9, 9));
+        assert_eq!(mesh.pages, vec![385]);
+        assert_eq!(&mesh.material_indices[..3], &[2, 2, 2]);
+        assert_eq!(&mesh.material_indices[3..6], &[1, 1, 1], "tail stays flat");
+        assert_eq!(mesh.uvs[0], [1, 2]);
+        assert_eq!(mesh.uvs[3], [0, 0]);
+    }
+
+    #[test]
+    fn room_texture_array_missing_or_out_of_range_fails_loud() {
+        let plain = geometry_pcm(&[[0, 0, 0], [1, 0, 0], [0, 1, 0]], &[[0, 1, 2]]);
+        assert_eq!(
+            room_texture_faces(&plain[data_base(2)..]).err(),
+            Some(LevelError::RoomTexturesMissing)
+        );
+        let mut bytes = textured_pcm(&[[0, 1, 2]], &[0], &[7]);
+        let at = data_base(2) + 16 + ROOM_TEXTURE_START;
+        bytes[at..at + 4].copy_from_slice(&2000u32.to_le_bytes());
+        assert_eq!(
+            room_texture_faces(&bytes[data_base(2)..]).err(),
+            Some(LevelError::RoomTextureArrayOutOfRange)
+        );
     }
 
     #[test]
