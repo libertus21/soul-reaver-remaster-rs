@@ -71,8 +71,10 @@ faster; `R` resets the camera; `Esc` exits.
   they are decoded one-shot; there is no `QSMa`/sequence playback, mixing or ADSR.
 - **Objects are real archived models, not markers.** `--level-render --objects`
   resolves 375/378 placed names to their `.PCM` OBJECT containers; only
-  `campath`, `marker` and `splob` keep a flat marker. Object `type` semantics and
-  the `TextureFT3` attribute and colour-blend meanings remain UNKNOWN.
+  `campath`, `marker` and `splob` keep a flat marker. Object `type` is authoring
+  metadata: the engine keys runtime behaviour on the object name, not on the
+  type or the `+0x26` code (see `docs/notes/object-behaviour.md`). The
+  `TextureFT3` attribute and colour-blend meanings remain UNKNOWN.
 - **Object records carry no orientation.** There is no rotation field; the
   `+0x18` triple is a cross-level offset, not angles.
 - **Room textures are implemented, with a small unresolved tail.** 99.76% of
