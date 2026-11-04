@@ -288,6 +288,22 @@ mod tests {
                     "--level-render", "--bigfile", "BIGFILE.DAT", "--group", "under",
                 ],
             ),
+            (
+                &["level", "links-entry", "--bigfile", "BIGFILE.DAT", "--entry", "115"],
+                &["--level-links", "--bigfile", "BIGFILE.DAT", "--entry", "115"],
+            ),
+            (
+                &["level", "links-group", "--bigfile", "BIGFILE.DAT", "--group", "under"],
+                &["--level-links", "--bigfile", "BIGFILE.DAT", "--group", "under"],
+            ),
+            (
+                &["level", "reach", "--bigfile", "BIGFILE.DAT", "--start", "under1"],
+                &["--level-reach", "--bigfile", "BIGFILE.DAT", "--start", "under1"],
+            ),
+            (
+                &["level", "reach", "--bigfile", "BIGFILE.DAT"],
+                &["--level-reach", "--bigfile", "BIGFILE.DAT"],
+            ),
         ];
         for (input, expected) in cases {
             assert_dispatch(input, expected);
