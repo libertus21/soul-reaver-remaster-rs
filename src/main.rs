@@ -52,6 +52,7 @@ mod gallery;
 mod level;
 mod menu;
 mod mesh_entry;
+mod object;
 // Pure one-bone pose math, wired into the `--mesh --pose` arm below.
 mod pose;
 mod render;
@@ -163,6 +164,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--level-render") {
         return run_level_render(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--object-info") {
+        return run_object_info(&args[1..]);
+    }
     let Some(arg) = args.first() else {
         eprintln!("usage: soul-reaver-remaster-rs <path-to-DDS | path-to-directory>");
         eprintln!("   or: soul-reaver-remaster-rs --bigfile <BIGFILE.DAT> --list");
@@ -191,6 +195,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-objects --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --level-objects --bigfile <BIGFILE.DAT> --group <PREFIX>");
         eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file> --objects");
+        eprintln!("   or: soul-reaver-remaster-rs --object-info --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
@@ -1292,6 +1297,42 @@ fn run_level_render(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Read-only `--object-info` arm: one archived object container, counts and
+/// validation only. No window, no mesh.
+fn run_object_info(args: &[String]) -> ExitCode {
+    match object_input(args).and_then(|(dat, index)| object::read_entry(Path::new(dat), index)) {
+        Ok(model) => {
+            for line in object::info_lines(&model) {
+                outln!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+/// Exactly `--bigfile <DAT> --entry <INDEX>`, in either order. Any other shape
+/// is the arm's own usage error.
+fn object_input(args: &[String]) -> Result<(&str, usize), object::ObjectError> {
+    let (mut dat, mut index) = (None, None);
+    let mut at = 0;
+    while at + 1 < args.len() {
+        match args[at].as_str() {
+            "--bigfile" => dat = Some(args[at + 1].as_str()),
+            "--entry" => index = Some(args[at + 1].parse().map_err(|_| object::ObjectError::Usage(object::USAGE))?),
+            _ => return Err(object::ObjectError::Usage(object::USAGE)),
+        }
+        at += 2;
+    }
+    match (dat, index, at == args.len()) {
+        (Some(dat), Some(index), true) => Ok((dat, index)),
+        _ => Err(object::ObjectError::Usage(object::USAGE)),
+    }
+}
+
 /// Track label for messages: the file stem, never an install path.
 fn track_name(path: &Path) -> String {
     path.file_stem()
@@ -1319,7 +1360,7 @@ mod cli_tests {
         list_report, pose_mode_conflict, resolve_texture_name, run_audio, run_bigfile,
         dispatch, run_level_links, run_level_records, run_level_structure, run_mesh, run_mesh_all,
         run_level_geometry, run_level_objects, run_level_render, run_mesh_textured, run_mesh_with,
-        run_textures,
+        run_object_info, run_textures,
         strip_launcher_noops, tshow_suffix,
     };
     use std::process::ExitCode;
@@ -2030,6 +2071,18 @@ mod cli_tests {
             run_level_geometry(&["--bigfile".to_string(), dat, "--entry".to_string(), "x".to_string()]),
             ExitCode::from(1)
         );
+    }
+
+    #[test]
+    fn object_info_archive_errors_are_loud_and_distinct() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let dat = write_tmp(&tmp, "BIGFILE.DAT", &synthetic_archive(&[b"not an object".to_vec()]));
+        let entry = |index: &str| {
+            vec!["--bigfile".to_string(), dat.clone(), "--entry".to_string(), index.to_string()]
+        };
+        assert_eq!(run_object_info(&entry("9")), ExitCode::from(1));
+        assert_eq!(run_object_info(&entry("0")), ExitCode::from(2));
+        assert_eq!(run_object_info(&[]), ExitCode::from(1));
     }
 
     #[test]

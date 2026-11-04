@@ -212,6 +212,10 @@ mod tests {
                 &["--mesh-all", "objdir", "--tex-dir", "tex"],
             ),
             (
+                &["mesh", "object-info", "--bigfile", "BIGFILE.DAT", "--entry", "66"],
+                &["--object-info", "--bigfile", "BIGFILE.DAT", "--entry", "66"],
+            ),
+            (
                 &["audio", "list", "bank.SND"],
                 &["--audio", "bank.SND", "--alist"],
             ),
