@@ -66,8 +66,10 @@ const SLOT_TABLE36_OFFSET: usize = 0x3B;
 
 /// Decoded link table: header slot `0x34` holds a data-base-relative offset and
 /// slot `0x35` its end; records are 40 bytes,
-/// `[5 x u32][12-byte name][2 x u32]`. The table ends at the first record whose
-/// name is not `<target>,<digits>`.
+/// `[5 x u32][12-byte name][2 x u32]`. A record is accepted only when its
+/// prelude matches the observed invariant and its name is
+/// `<identifier>,<digits>` in either case. The table ends at the first record
+/// that fails either test.
 const SLOT_LINK_TABLE: usize = 0x34;
 const SLOT_LINK_END: usize = 0x35;
 const LINK_RECORD_STRIDE: usize = 40;
@@ -1144,7 +1146,11 @@ pub fn scan_archive_levels(path: &Path) -> Result<ArchiveScan, LevelError> {
         match parse_pcm_bytes(&bytes) {
             Ok(mut unit) => {
                 resolve_unit_name(&mut unit, &entry.suffix);
-                let links = unit.link_table.iter().map(|link| link.target.clone()).collect();
+                // Unit names are lower-case here, so graph keys fold the
+                // mixed-case link targets. `LevelUnit` keeps the original case
+                // for `--level-links`.
+                let links =
+                    unit.link_table.iter().map(|link| link.target.to_ascii_lowercase()).collect();
                 scan.units.push(ArchivedUnit { name: unit.name, links });
             }
             Err(error) => scan.unparseable.push(format!(
@@ -1485,20 +1491,33 @@ fn table36_report(data: &[u8]) -> Table36Report {
     Table36Report { count, stride: TABLE36_STRIDE as u32, lengths }
 }
 
+/// Every observed record starts with `1`, repeats the related index in
+/// `prelude[1]` and `prelude[3]`, and holds `18` at `prelude[2]`. A four-byte
+/// shifted read turns those fields into `(index, 18, index, target_id, ...)`,
+/// so the gate rejects the shift before the name grammar can accept a truncated
+/// suffix such as `a1,50`.
+fn link_prelude_is_plausible(prelude: &[i32; 5]) -> bool {
+    prelude[0] == 1 && prelude[1] == prelude[3] && prelude[2] == 18
+}
+
 /// Decode the 40-byte link record at `at`, or `None` when it is not link-shaped.
 fn link_record_at(data: &[u8], at: usize) -> Option<TableLink> {
     let record = data.get(at..at.checked_add(LINK_RECORD_STRIDE)?)?;
-    let (target, index) = decode_link_name(&record[20..20 + LINK_NAME_LEN])?;
     let mut prelude = [0i32; 5];
     for (slot, value) in prelude.iter_mut().enumerate() {
         *value = read_u32(record, 4 * slot)? as i32;
     }
+    if !link_prelude_is_plausible(&prelude) {
+        return None;
+    }
+    let (target, index) = decode_link_name(&record[20..20 + LINK_NAME_LEN])?;
     Some(TableLink { target, index, target_id: prelude[4], prelude })
 }
 
 /// Walk the link table from header slot `0x34`, bounded by slot `0x35`. A short
 /// non-link prologue precedes the records in some archived units, so the first
-/// record-shaped entry wins; an invalid name then ends the walk without error.
+/// record-shaped entry wins; an invalid name or prelude then ends the walk
+/// without error.
 fn link_table(data: &[u8]) -> Vec<TableLink> {
     let Some(relative) = read_u32(data, 4 * SLOT_LINK_TABLE) else {
         return Vec::new();
@@ -1524,13 +1543,17 @@ fn link_table(data: &[u8]) -> Vec<TableLink> {
     links
 }
 
-/// `^[a-z][a-z0-9]*,[0-9]+$` inside one NUL-terminated 12-byte field.
+/// `<identifier>,<digits>` in one 12-byte field: a leading ASCII letter, then
+/// ASCII letters, digits or `_`, one comma, and one or more digits. Case is
+/// preserved; graph work folds the result. A full 12-byte field with no NUL is
+/// a name, not a malformed record.
 fn decode_link_name(field: &[u8]) -> Option<(String, u32)> {
-    let text = std::str::from_utf8(&field[..field.iter().position(|&byte| byte == 0)?]).ok()?;
+    let end = field.iter().position(|&byte| byte == 0).unwrap_or(field.len());
+    let text = std::str::from_utf8(&field[..end]).ok()?;
     let (target, digits) = text.split_once(',')?;
     let (first, rest) = target.as_bytes().split_first()?;
-    if !first.is_ascii_lowercase()
-        || !rest.iter().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    if !first.is_ascii_alphabetic()
+        || !rest.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
         || digits.is_empty()
         || !digits.bytes().all(|byte| byte.is_ascii_digit())
     {
@@ -2309,7 +2332,7 @@ mod tests {
 
     #[test]
     fn report_lines_shape() {
-        let bytes = link_pcm(&[([1, 2, 3, 4, 5], "lair6,8")], LINK_RECORD_STRIDE);
+        let bytes = link_pcm(&[([1, 8, 18, 8, 5], "lair6,8")], LINK_RECORD_STRIDE);
         let mut unit = parse_pcm(&bytes, "lair5").expect("must parse");
         assert_eq!(unit.names, vec!["lair6,8", "lair5"]);
         assert_eq!(
@@ -2949,10 +2972,47 @@ mod tests {
 
     #[test]
     fn a_record_that_leaves_the_data_region_ends_the_walk() {
-        let bytes = link_pcm(&[([1, 2, 3, 4, 5], "lair7,3")], LINK_RECORD_STRIDE + 20);
+        let bytes = link_pcm(&[([1, 7, 18, 7, 5], "lair7,3")], LINK_RECORD_STRIDE + 20);
         let links = links_of(&bytes);
         assert_eq!(links.len(), 1);
         assert_eq!((links[0].target.as_str(), links[0].index), ("lair7", 3));
+    }
+
+    #[test]
+    fn capitalised_targets_keep_their_case() {
+        let bytes = link_pcm(&[([1, 51, 18, 51, 21383], "Aluka1,50")], LINK_RECORD_STRIDE);
+        let links = links_of(&bytes);
+        assert_eq!(links.len(), 1);
+        assert_eq!((links[0].target.as_str(), links[0].index), ("Aluka1", 50));
+    }
+
+    #[test]
+    fn a_full_twelve_byte_name_needs_no_terminator() {
+        let bytes = link_pcm(&[([1, 99, 18, 99, -23377], "chrono19,100")], LINK_RECORD_STRIDE);
+        let links = links_of(&bytes);
+        assert_eq!((links[0].target.as_str(), links[0].index), ("chrono19", 100));
+    }
+
+    #[test]
+    fn prologue_scan_aligns_on_a_capitalised_first_record() {
+        let mut bytes =
+            link_pcm(&[([1, 51, 18, 51, 21383], "Aluka1,50")], LINK_RECORD_STRIDE + 40);
+        let base = data_base(2);
+        let record = bytes[base + 256..base + 296].to_vec();
+        bytes[base + 256..base + 296].fill(0);
+        bytes[base + 256..base + 262].copy_from_slice(b"lair5\0");
+        bytes[base + 292..base + 332].copy_from_slice(&record);
+        let unit = parse_pcm(&bytes, "lair5").expect("must parse");
+        assert_eq!(unit.link_table.len(), 1);
+        assert_eq!(unit.link_table[0].target, "Aluka1");
+    }
+
+    #[test]
+    fn garbage_records_are_rejected_by_shape_and_prelude() {
+        let bad_name = link_pcm(&[([1, 51, 18, 51, 21383], "Aluka1-50")], LINK_RECORD_STRIDE);
+        assert!(links_of(&bad_name).is_empty());
+        let bad_prelude = link_pcm(&[([2, 51, 18, 51, 21383], "Aluka1,50")], LINK_RECORD_STRIDE);
+        assert!(links_of(&bad_prelude).is_empty());
     }
 
     #[test]
@@ -3051,6 +3111,9 @@ mod tests {
         bytes[slot..slot + 4].copy_from_slice(&name_at.to_le_bytes());
         for (index, target) in links.iter().enumerate() {
             let at = base + offset + index * LINK_RECORD_STRIDE;
+            for (slot, value) in [1i32, 0, 18, 0, -(index as i32)].iter().enumerate() {
+                bytes[at + 4 * slot..at + 4 * slot + 4].copy_from_slice(&value.to_le_bytes());
+            }
             bytes[at + 20..at + 20 + target.len()].copy_from_slice(target.as_bytes());
         }
         bytes
@@ -3084,7 +3147,7 @@ mod tests {
     #[test]
     fn reach_bfs_reports_groups_orphans_and_unparseable_units() {
         let tmp = tempfile::tempdir().expect("tempdir must succeed");
-        let under1 = reach_pcm("under1", &["under2,1", "under3,1"]);
+        let under1 = reach_pcm("under1", &["Under2,1", "under3,1"]);
         let under2 = reach_pcm("under2", &["under1,1"]);
         let under3 = reach_pcm("under3", &[]);
         let city = reach_pcm("city1", &["lair9,1"]);
