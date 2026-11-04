@@ -156,6 +156,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--level-links") {
         return run_level_links(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--level-reach") {
+        return run_level_reach(&args[1..]);
+    }
     if args.first().is_some_and(|a| a == "--level-objects") {
         return run_level_objects(&args[1..]);
     }
@@ -189,6 +192,9 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-records <.PCM file | room directory>");
         eprintln!("   or: soul-reaver-remaster-rs --level-structure <.PCM file | room directory>");
         eprintln!("   or: soul-reaver-remaster-rs --level-links <.PCM file | room directory>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-links --bigfile <BIGFILE.DAT> --entry <INDEX>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-links --bigfile <BIGFILE.DAT> --group <PREFIX>");
+        eprintln!("   or: soul-reaver-remaster-rs --level-reach --bigfile <BIGFILE.DAT> [--start <UNIT>]");
         eprintln!("   or: soul-reaver-remaster-rs --level-geometry <.PCM file | room directory>");
         eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file> [--textures <TEXTURES.BIG>]");
         eprintln!("   or: soul-reaver-remaster-rs --level-geometry --bigfile <BIGFILE.DAT> --entry <INDEX>");
@@ -1132,10 +1138,12 @@ fn run_level_structure(args: &[String]) -> ExitCode {
 /// Read-only `--level-links` arm: per unit, the decoded link-table count and
 /// one line per record. Prelude values print raw; no field is interpreted.
 fn run_level_links(args: &[String]) -> ExitCode {
-    let result = match args {
-        [path] if !path.starts_with('-') => level::read_path(Path::new(path)),
-        _ => Err(level::LevelError::Usage("expected --level-links <path>")),
-    };
+    let usage = "expected --level-links <path> or --level-links --bigfile <DAT> --entry <INDEX> or --level-links --bigfile <DAT> --group <PREFIX>";
+    let result = level_input(args, usage).and_then(|input| match input {
+        LevelInput::Path(path) => level::read_path(Path::new(path)),
+        LevelInput::Entry { dat, index } => level::read_entry_links(Path::new(dat), index),
+        LevelInput::Group { dat, prefix } => level::read_group_links(Path::new(dat), prefix),
+    });
     let units = match result {
         Ok(units) => units,
         Err(error) => {
@@ -1147,6 +1155,41 @@ fn run_level_links(args: &[String]) -> ExitCode {
         outln!("{line}");
     }
     ExitCode::SUCCESS
+}
+
+/// Headless `--level-reach`: discover every archived `.PCM`, BFS the link graph
+/// from `--start` (default `under1`), and print both group sets.
+fn run_level_reach(args: &[String]) -> ExitCode {
+    let usage = "expected --level-reach --bigfile <DAT> [--start <UNIT>]";
+    let (mut dat, mut start) = (None, "under1".to_string());
+    let mut index = 0;
+    while index < args.len() {
+        match (args[index].as_str(), args.get(index + 1).map(String::as_str)) {
+            ("--bigfile", Some(value)) => dat = Some(value),
+            ("--start", Some(value)) => start = value.to_string(),
+            _ => {
+                eprintln!("error: {usage}");
+                return ExitCode::from(1);
+            }
+        }
+        index += 2;
+    }
+    let Some(dat) = dat else {
+        eprintln!("error: {usage}");
+        return ExitCode::from(1);
+    };
+    match level::read_reach(Path::new(dat), &start) {
+        Ok(report) => {
+            for line in level::reach_lines(&report, &start) {
+                outln!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
 }
 
 enum LevelInput<'a> {
