@@ -849,6 +849,7 @@ fn run_mesh_textured(args: &[String]) -> ExitCode {
         &entry.materials,
         &entry.textures,
         &entry.title,
+        None,
     ) {
         eprintln!("error: {}: {e}", srm_path.display());
         return ExitCode::from(1);
@@ -1425,6 +1426,7 @@ fn run_level_render_textured(
         &materials,
         &textures,
         &title,
+        mesh.spawn,
     ) {
         eprintln!("error: {error}");
         return ExitCode::from(1);
@@ -1566,6 +1568,7 @@ fn run_object_mesh_textured(args: &[String]) -> ExitCode {
         &materials,
         &textures,
         &title,
+        None,
     ) {
         eprintln!("error: {error}");
         return ExitCode::from(1);
