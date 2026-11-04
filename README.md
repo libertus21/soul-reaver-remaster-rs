@@ -30,8 +30,8 @@ your own install; nothing is bundled.
 | Level geometry | `cargo run -- --level-geometry <PATH>` | Prints vertex/face counts, both offsets, the position axis box and centre, and face-index validation. |
 | Level objects | `cargo run -- --level-objects <PATH>` | Prints each placed object's name, world position, type and flags. |
 | Archived object models | `cargo run -- --object-info --bigfile <BIGFILE.DAT> --entry 66` | Reads one object container in memory and prints vertex/polygon/material counts, both array-boundary identities and the out-of-range index count. Entry 66 is `raziel` (299 V / 640 P). No extraction. |
-| Object model render | `cargo run -- --object-mesh --bigfile <BIGFILE.DAT> --entry 66` | Parses the same container and draws its triangles through the flat-shaded viewer. Louder refusals happen before any window opens. |
-| `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` | Renders one unit's confirmed room geometry. Orbit as above; `F` enters a first-person fly camera. `--objects` adds placed objects. |
+| Object model render | `cargo run -- --object-mesh --bigfile <BIGFILE.DAT> --entry 66` | Parses the same container and draws its triangles through the flat-shaded viewer. `--textures <TEXTURES.BIG>` draws each face with its `TextureFT3` page. Louder refusals happen before any window opens. |
+| `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` | Renders one unit's confirmed room geometry. Orbit as above; `F` enters a first-person fly camera. `--objects` adds placed objects plus `--textures <TEXTURES.BIG>` to texture the models. |
 | Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 27 capabilities in five groups; grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
 
 `<PATH>` accepts a `.PCM` file or a room directory. The level arms also accept
@@ -45,12 +45,14 @@ not the loose `UNDRCT1.PCM`. Render the whole tutorial family with two commands:
 ```text
 cargo run -- --level-objects --bigfile <BIGFILE.DAT> --group under
 cargo run -- --level-render  --bigfile <BIGFILE.DAT> --group under --objects
+cargo run -- --level-render  --bigfile <BIGFILE.DAT> --group under --objects --textures <TEXTURES.BIG>
 ```
 
 The first prints the four rooms' object counts and placements; the second opens
 one window with the merged `under` geometry plus each object's real archived
-model at its world position. Names with no model (`campath`, `marker`, `splob`)
-keep a cube marker.
+model at its world position. The third also samples each object's legacy
+`TEXTURES.BIG` page; names with no model (`campath`, `marker`, `splob`) keep a
+flat cube marker.
 
 Fly camera keys: `F` toggles orbit/fly; `W`/`A`/`S`/`D` move relative to the
 view; the mouse looks around; `Space`/`E` rise; `C`/`Q` sink; `Shift` flies
@@ -60,9 +62,10 @@ faster; `R` resets the camera; `Esc` exits.
 
 - **No textures on level geometry.** UVs are unlocated (the trailing vertex
   triple is not the face normal), so `--level-render` is flat-shaded.
-- **Objects render as uniform markers.** Model files for placed objects are not
-  yet located, and the object `type` semantics are UNKNOWN; no per-type colour is
-  claimed.
+- **Objects are textured from `TEXTURES.BIG`.** Each textured face reads its
+  16-byte `TextureFT3` record: page = `textureWord & 0x07FF`, texel row = `v`.
+  The room and marker cubes stay flat material 1. Object `type` semantics and the
+  record's two attribute words and colour blend remain UNKNOWN.
 - **No animation.** `.SRA` is not parsed by this build (the loader callback is a
   `RET 0` stub) and `.SRM` has no hierarchy, so `--pose` is a local cluster
   rotation only and the mesh tears at cluster seams.

@@ -241,6 +241,20 @@ example `raziel_0004`). No such file exists in this install; the equivalent
 data is the bank page. That naming rule is therefore a description of the
 original PC install, not a path to use here.
 
+## 5.1 Reader mapping (implemented)
+
+| Fact | Code |
+|---|---|
+| 16-byte record, UV triples, raw words, `page = word & 0x07FF` | `src/object.rs` `TextureRef` |
+| Per-face expansion (three unique vertices per face, material 1 = flat fallback) | `src/object.rs` `textured_mesh` |
+| Page bounds + existing A1R5G5B5 slot decode | `src/object_texture.rs` `PageBank` |
+| Textured object render | `src/main.rs` `--object-mesh ... --textures` |
+| Textured placed objects, flat room and markers | `src/level.rs` `read_*_room_mesh_textured` |
+
+A page index at or past the header count is a loud `SlotIndexOutOfRange` naming
+both numbers; `empty`/`zero` slots stay refused. Without `--textures`, every
+existing arm keeps its prior output and exit code.
+
 ## 6. UNKNOWN (explicit)
 
 1. Meaning of texture-word bits 11..15. They are flags (T11), but which one is
