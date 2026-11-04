@@ -2,6 +2,7 @@
 //! the room-geometry summary. Read-only: no placement, transform, or audio
 //! decode.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -63,10 +64,12 @@ const TABLE36_STRIDE: usize = 0x24;
 const SLOT_TABLE36_COUNT: usize = 0x3A;
 const SLOT_TABLE36_OFFSET: usize = 0x3B;
 
-/// Decoded link table: header slot `0x34` holds a data-base-relative offset;
-/// records are 40 bytes, `[5 x u32][12-byte name][2 x u32]`. The table ends at
-/// the first record whose name is not `<target>,<digits>`.
+/// Decoded link table: header slot `0x34` holds a data-base-relative offset and
+/// slot `0x35` its end; records are 40 bytes,
+/// `[5 x u32][12-byte name][2 x u32]`. The table ends at the first record whose
+/// name is not `<target>,<digits>`.
 const SLOT_LINK_TABLE: usize = 0x34;
+const SLOT_LINK_END: usize = 0x35;
 const LINK_RECORD_STRIDE: usize = 40;
 const LINK_NAME_LEN: usize = 12;
 
@@ -242,6 +245,8 @@ pub enum LevelError {
     GroupParseFailed { name: String, detail: String },
     GroupWithoutArchive,
     GroupWithEntry,
+    NoArchivedLevels,
+    ReachStartMissing { name: String },
 }
 
 impl LevelError {
@@ -261,7 +266,9 @@ impl LevelError {
             | LevelError::GroupNoMatch { .. }
             | LevelError::GroupParseFailed { .. }
             | LevelError::GroupWithoutArchive
-            | LevelError::GroupWithEntry => 1,
+            | LevelError::GroupWithEntry
+            | LevelError::NoArchivedLevels
+            | LevelError::ReachStartMissing { .. } => 1,
             _ => 2,
         }
     }
@@ -336,6 +343,10 @@ impl fmt::Display for LevelError {
             }
             LevelError::GroupWithoutArchive => "--group requires --bigfile <DAT>",
             LevelError::GroupWithEntry => "--group cannot be combined with --entry",
+            LevelError::NoArchivedLevels => "archive has no level units that parse as .PCM",
+            LevelError::ReachStartMissing { name } => {
+                return write!(f, "start unit '{name}' is not in the archive");
+            }
         };
         f.write_str(message)
     }
@@ -1061,6 +1072,192 @@ fn discover_group(path: &Path, prefix: &str) -> Result<Vec<(LevelUnit, Vec<u8>)>
     Ok(rooms)
 }
 
+/// One archived level unit and its outgoing link-target names.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ArchivedUnit {
+    pub name: String,
+    pub links: Vec<String>,
+}
+
+/// Every level unit found in a BIGFILE, plus candidates that failed the parser.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ArchiveScan {
+    pub units: Vec<ArchivedUnit>,
+    pub unparseable: Vec<String>,
+}
+
+/// Cheap `.PCM` signature: sane count, offsets starting `0, 4`, strict ascent,
+/// data base inside the bytes. The full parser still runs after.
+fn pcm_candidate(bytes: &[u8]) -> bool {
+    let Some(records) = read_u32(bytes, 0) else { return false };
+    if !(2..=MAX_RECORDS).contains(&records) {
+        return false;
+    }
+    let Some(table_end) = 4usize.checked_add(4 * records as usize) else { return false };
+    let base = data_base(records);
+    if table_end > bytes.len() || base > bytes.len() {
+        return false;
+    }
+    let mut last = 0;
+    for index in 0..records as usize {
+        let Some(offset) = read_u32(bytes, 4 + 4 * index) else { return false };
+        if (index < 2 && offset != 4 * index as u32) || (index > 0 && offset <= last) {
+            return false;
+        }
+        last = offset;
+    }
+    base.checked_add(last as usize).is_some_and(|end| end <= bytes.len())
+}
+
+/// Keep the header name only when its last four characters match the BIGFILE
+/// suffix; otherwise use a scanned name that matches, since the index's fourth
+/// dword is the uppercase tail of the unit's own name.
+fn resolve_unit_name(unit: &mut LevelUnit, suffix: &[u8; 4]) {
+    let wanted = String::from_utf8_lossy(suffix).to_ascii_uppercase();
+    let matches = |name: &str| {
+        name.len() >= wanted.len()
+            && name[name.len() - wanted.len()..].to_ascii_uppercase() == wanted
+    };
+    if matches(&unit.name) {
+        return;
+    }
+    if let Some(name) = unit.names.iter().find(|name| matches(name)) {
+        unit.name = name.clone();
+    }
+}
+
+/// Scan every BIGFILE entry for `.PCM` units, one entry in memory at a time.
+pub fn scan_archive_levels(path: &Path) -> Result<ArchiveScan, LevelError> {
+    let entries = bigfile::load_index(path)
+        .map_err(|error| LevelError::ArchiveUnreadable { detail: error.to_string() })?;
+    let mut scan = ArchiveScan::default();
+    for (index, entry) in entries.iter().enumerate() {
+        let bytes = bigfile::read_entry(path, entry).map_err(|error| match error {
+            error @ bigfile::BigfileError::BadEntry(_) => {
+                LevelError::EntryOutsideFile { detail: error.to_string() }
+            }
+            error => LevelError::ArchiveUnreadable { detail: error.to_string() },
+        })?;
+        if !pcm_candidate(&bytes) {
+            continue;
+        }
+        match parse_pcm_bytes(&bytes) {
+            Ok(mut unit) => {
+                resolve_unit_name(&mut unit, &entry.suffix);
+                let links = unit.link_table.iter().map(|link| link.target.clone()).collect();
+                scan.units.push(ArchivedUnit { name: unit.name, links });
+            }
+            Err(error) => scan.unparseable.push(format!(
+                "entry {index} suffix {}: {error}",
+                String::from_utf8_lossy(&entry.suffix)
+            )),
+        }
+    }
+    if scan.units.is_empty() && scan.unparseable.is_empty() {
+        return Err(LevelError::NoArchivedLevels);
+    }
+    Ok(scan)
+}
+
+/// Reachability summary for one start unit.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReachReport {
+    pub discovered: usize,
+    pub reachable: Vec<String>,
+    pub unreachable: Vec<String>,
+    pub unparseable: Vec<String>,
+}
+
+impl ReachReport {
+    /// Every discovered unit that is not reachable, including unparseable ones.
+    pub fn unreachable_total(&self) -> usize {
+        self.unreachable.len() + self.unparseable.len()
+    }
+}
+
+/// Name prefix with digits stripped, e.g. `cathy62` -> `cathy`.
+fn name_group(name: &str) -> String {
+    name.chars().filter(|character| character.is_ascii_alphabetic()).collect()
+}
+
+fn group_counts(names: &[String]) -> Vec<(String, u32)> {
+    let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+    for name in names {
+        *counts.entry(name_group(name)).or_default() += 1;
+    }
+    counts.into_iter().collect()
+}
+
+/// BFS from `start` over outgoing link targets that name a discovered unit.
+pub fn read_reach(path: &Path, start: &str) -> Result<ReachReport, LevelError> {
+    let scan = scan_archive_levels(path)?;
+    let by_name: BTreeMap<&str, &ArchivedUnit> =
+        scan.units.iter().map(|unit| (unit.name.as_str(), unit)).collect();
+    if !by_name.contains_key(start) {
+        return Err(LevelError::ReachStartMissing { name: start.to_string() });
+    }
+    let mut queue = VecDeque::from([start.to_string()]);
+    let mut seen = BTreeSet::new();
+    while let Some(name) = queue.pop_front() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some(unit) = by_name.get(name.as_str()) {
+            for target in &unit.links {
+                if by_name.contains_key(target.as_str()) && !seen.contains(target) {
+                    queue.push_back(target.clone());
+                }
+            }
+        }
+    }
+    let reachable: Vec<String> = seen.into_iter().collect();
+    let unreachable = scan
+        .units
+        .iter()
+        .filter(|unit| !reachable.contains(&unit.name))
+        .map(|unit| unit.name.clone())
+        .collect();
+    Ok(ReachReport {
+        discovered: scan.units.len() + scan.unparseable.len(),
+        reachable,
+        unreachable,
+        unparseable: scan.unparseable,
+    })
+}
+
+/// `--level-reach` lines: totals, both group sets, then unparseable entries.
+pub fn reach_lines(report: &ReachReport, start: &str) -> Vec<String> {
+    let reachable_groups = group_counts(&report.reachable);
+    let unreachable_groups = group_counts(&report.unreachable);
+    let mut lines = vec![format!(
+        "reach start={start} discovered={} reachable={} unreachable={} unparseable={}",
+        report.discovered,
+        report.reachable.len(),
+        report.unreachable_total(),
+        report.unparseable.len()
+    )];
+    lines.push(format!("  reachable groups={}", reachable_groups.len()));
+    lines.extend(
+        reachable_groups.iter().map(|(group, count)| format!("  reachable {group} {count}")),
+    );
+    lines.push(format!("  unreachable groups={}", unreachable_groups.len()));
+    lines.extend(
+        unreachable_groups.iter().map(|(group, count)| format!("  unreachable {group} {count}")),
+    );
+    lines.extend(report.unparseable.iter().map(|label| format!("  unparseable {label}")));
+    lines
+}
+
+/// `--level-links --bigfile ... --entry ...`: one archive entry's links.
+pub fn read_entry_links(path: &Path, index: usize) -> Result<Vec<LevelUnit>, LevelError> {
+    entry_unit(path, index).map(|(unit, _)| vec![unit])
+}
+
+/// `--level-links --bigfile ... --group ...`: one unit per matching room.
+pub fn read_group_links(path: &Path, prefix: &str) -> Result<Vec<LevelUnit>, LevelError> {
+    discover_group(path, prefix).map(|rooms| rooms.into_iter().map(|(unit, _)| unit).collect())
+}
+
 /// `--level-geometry --bigfile ... --group ...`: one geometry report per
 /// matching room. A matched entry whose geometry fails to parse is loud.
 pub fn read_group_geometry(
@@ -1232,8 +1429,20 @@ fn table36_report(data: &[u8]) -> Table36Report {
     Table36Report { count, stride: TABLE36_STRIDE as u32, lengths }
 }
 
-/// Walk the link table from header slot `0x34`. A zero offset means no table;
-/// a record that would leave the data region ends the walk without an error.
+/// Decode the 40-byte link record at `at`, or `None` when it is not link-shaped.
+fn link_record_at(data: &[u8], at: usize) -> Option<TableLink> {
+    let record = data.get(at..at.checked_add(LINK_RECORD_STRIDE)?)?;
+    let (target, index) = decode_link_name(&record[20..20 + LINK_NAME_LEN])?;
+    let mut prelude = [0i32; 5];
+    for (slot, value) in prelude.iter_mut().enumerate() {
+        *value = read_u32(record, 4 * slot)? as i32;
+    }
+    Some(TableLink { target, index, target_id: prelude[4], prelude })
+}
+
+/// Walk the link table from header slot `0x34`, bounded by slot `0x35`. A short
+/// non-link prologue precedes the records in some archived units, so the first
+/// record-shaped entry wins; an invalid name then ends the walk without error.
 fn link_table(data: &[u8]) -> Vec<TableLink> {
     let Some(relative) = read_u32(data, 4 * SLOT_LINK_TABLE) else {
         return Vec::new();
@@ -1241,24 +1450,20 @@ fn link_table(data: &[u8]) -> Vec<TableLink> {
     if relative == 0 {
         return Vec::new();
     }
+    let start = relative as usize;
+    let end = read_u32(data, 4 * SLOT_LINK_END).map_or(data.len(), |value| value as usize);
+    let limit = if end > start && end <= data.len() { end } else { data.len() };
+    let mut at = start;
+    while at + LINK_RECORD_STRIDE <= limit && link_record_at(data, at).is_none() {
+        at += 4;
+    }
     let mut links = Vec::new();
-    let mut at = relative as usize;
-    loop {
-        let Some(end) = at.checked_add(LINK_RECORD_STRIDE) else {
+    while at + LINK_RECORD_STRIDE <= limit {
+        let Some(link) = link_record_at(data, at) else {
             break;
         };
-        let Some(record) = data.get(at..end) else {
-            break;
-        };
-        let Some((target, index)) = decode_link_name(&record[20..20 + LINK_NAME_LEN]) else {
-            break;
-        };
-        let mut prelude = [0i32; 5];
-        for (slot, value) in prelude.iter_mut().enumerate() {
-            *value = read_u32(record, 4 * slot).unwrap_or(0) as i32;
-        }
-        links.push(TableLink { target, index, target_id: prelude[4], prelude });
-        at = end;
+        links.push(link);
+        at += LINK_RECORD_STRIDE;
     }
     links
 }
@@ -2775,6 +2980,123 @@ mod tests {
                 "largest 1 72",
             ]
         );
+    }
+
+    /// Minimal unit with a header name, a link table, and the given targets.
+    fn reach_pcm(name: &str, links: &[&str]) -> Vec<u8> {
+        let offset = 256usize;
+        let tail = links.len() * LINK_RECORD_STRIDE;
+        let mut bytes = structure_pcm(&[0, 4], &[(SLOT_LINK_TABLE, offset as u32)], offset + tail);
+        let base = data_base(2);
+        let name_at = (bytes.len() - base) as u32;
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        let slot = base + 4 * SLOT_UNIT_NAME;
+        bytes[slot..slot + 4].copy_from_slice(&name_at.to_le_bytes());
+        for (index, target) in links.iter().enumerate() {
+            let at = base + offset + index * LINK_RECORD_STRIDE;
+            bytes[at + 20..at + 20 + target.len()].copy_from_slice(target.as_bytes());
+        }
+        bytes
+    }
+
+    fn archive_with_suffixes(units: &[(&[u8], [u8; 4])]) -> Vec<u8> {
+        let mut dat = (units.len() as u32).to_le_bytes().to_vec();
+        let mut offset = 4 + 16 * units.len();
+        for (index, (entry, suffix)) in units.iter().enumerate() {
+            dat.extend_from_slice(&(index as u32).to_le_bytes());
+            dat.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+            dat.extend_from_slice(&(offset as u32).to_le_bytes());
+            dat.extend_from_slice(suffix);
+            offset += entry.len();
+        }
+        for (entry, _) in units {
+            dat.extend_from_slice(entry);
+        }
+        dat
+    }
+
+    #[test]
+    fn suffix_resolves_the_unit_name_when_the_header_tail_disagrees() {
+        let bytes = reach_pcm("under1", &[]);
+        let mut unit = parse_pcm_bytes(&bytes).expect("must parse");
+        unit.name = "wrongname".into();
+        resolve_unit_name(&mut unit, b"DER1");
+        assert_eq!(unit.name, "under1", "the scanned suffix match wins");
+    }
+
+    #[test]
+    fn reach_bfs_reports_groups_orphans_and_unparseable_units() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let under1 = reach_pcm("under1", &["under2,1", "under3,1"]);
+        let under2 = reach_pcm("under2", &["under1,1"]);
+        let under3 = reach_pcm("under3", &[]);
+        let city = reach_pcm("city1", &[]);
+        let lair = reach_pcm("lair9", &[]);
+        let broken = structure_pcm(&[0, 4], &[], 40);
+        let dat = archive_with_suffixes(&[
+            (&under1, *b"DER1"),
+            (&under2, *b"DER2"),
+            (&under3, *b"DER3"),
+            (&city, *b"ITY1"),
+            (&lair, *b"AIR9"),
+            (&broken, *b"ROKN"),
+        ]);
+        let path = tmp.path().join("BIGFILE.DAT");
+        std::fs::write(&path, dat).expect("synthetic archive must be writable");
+        let report = read_reach(&path, "under1").expect("reach must scan");
+        assert_eq!(report.discovered, 6);
+        assert_eq!(report.reachable, vec!["under1", "under2", "under3"]);
+        assert_eq!(report.unreachable, vec!["city1", "lair9"]);
+        assert_eq!(report.unparseable.len(), 1);
+        assert_eq!(report.unreachable_total(), 3);
+        let lines = reach_lines(&report, "under1");
+        assert_eq!(
+            lines[0],
+            "reach start=under1 discovered=6 reachable=3 unreachable=3 unparseable=1"
+        );
+        assert!(lines.contains(&"  reachable under 3".to_string()));
+        assert!(lines.contains(&"  unreachable city 1".to_string()));
+        assert!(lines.contains(&"  unreachable lair 1".to_string()));
+        assert!(matches!(
+            read_reach(&path, "nope"),
+            Err(LevelError::ReachStartMissing { .. })
+        ));
+    }
+
+    #[test]
+    fn link_table_skips_a_short_prologue_and_stops_at_the_end_slot() {
+        let mut bytes = link_pcm(&[([1, 2, 18, 2, -9], "under2,2")], LINK_RECORD_STRIDE + 24);
+        let base = data_base(2);
+        let record = bytes[base + 256..base + 296].to_vec();
+        bytes[base + 256..base + 280].fill(0);
+        bytes[base + 256..base + 262].copy_from_slice(b"lair5\0");
+        bytes[base + 280..base + 320].copy_from_slice(&record);
+        let slot = base + 4 * SLOT_LINK_END;
+        bytes[slot..slot + 4].copy_from_slice(&320u32.to_le_bytes());
+        let unit = parse_pcm(&bytes, "lair5").expect("must parse");
+        assert_eq!(unit.link_table.len(), 1);
+        assert_eq!(unit.link_table[0].target, "under2");
+    }
+
+    #[test]
+    fn links_arms_accept_an_archive_entry_and_a_group() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let one = reach_pcm("under1", &["under2,1"]);
+        let two = reach_pcm("under2", &[]);
+        let noise = reach_pcm("city1", &[]);
+        let dat = archive_with_suffixes(&[
+            (&one, *b"DER1"),
+            (&two, *b"DER2"),
+            (&noise, *b"ITY1"),
+        ]);
+        let path = tmp.path().join("BIGFILE.DAT");
+        std::fs::write(&path, dat).expect("synthetic archive must be writable");
+        let entry = read_entry_links(&path, 0).expect("entry links must read");
+        assert_eq!(link_lines(&entry[0])[0], "links under1 count=1");
+        let group = read_group_links(&path, "under").expect("group links must read");
+        let names: Vec<&str> = group.iter().map(|unit| unit.name.as_str()).collect();
+        assert_eq!(names, vec!["under1", "under2"]);
     }
 
     #[test]
