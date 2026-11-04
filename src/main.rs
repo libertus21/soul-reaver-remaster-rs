@@ -52,6 +52,7 @@ mod gallery;
 mod level;
 mod menu;
 mod mesh_entry;
+mod object;
 // Pure one-bone pose math, wired into the `--mesh --pose` arm below.
 mod pose;
 mod render;
