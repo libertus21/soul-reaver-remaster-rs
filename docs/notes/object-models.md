@@ -287,7 +287,15 @@ port of that reader; no source code was copied.
    the level record has position only, and the model is in local space.
 10. Whether any non-type-1 path reads the auxiliary table.
 
-## 7. Legal
+## 7. Reader in this tree
+
+`--object-info --bigfile <DAT> --entry <I>` parses one single-model container in
+memory and prints the vertex/polygon counts, the count of distinct 16-byte
+material records referenced by textured polygons, both array-boundary identities,
+and the out-of-range polygon-index count. Multi-part containers are refused
+loudly. Rendering, bones, textures and world transforms are not decoded.
+
+## 8. Legal
 
 Behaviour and format facts only: entry indices, field offsets, counts, array
 strides and short asset names. No game bytes, no decompiled text, no listings,
