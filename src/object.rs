@@ -21,6 +21,36 @@ pub type Vertex = ([i16; 3], u16);
 /// `([v1, v2, v3], normal, flags, material offset or colour)`.
 pub type Polygon = ([u16; 3], u8, u8, u32);
 
+/// Low 11 bits of the texture word are the bank page; the upper five are
+/// UNKNOWN flags and must never leak into the page index.
+pub const TEXTURE_PAGE_MASK: u16 = 0x07FF;
+
+/// Decoded PC `TextureFT3` face record. The attribute words and colour stay
+/// raw and uninterpreted; only the UVs and the masked page are used.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TextureRef {
+    pub uvs: [[u8; 2]; 3],
+    pub texture_word: u16,
+    pub page: u16,
+    pub attributes_a: u16,
+    pub attributes: u16,
+    pub colour: u32,
+}
+
+impl TextureRef {
+    fn from_record(record: &[u8; MATERIAL_STRIDE]) -> Self {
+        let word = u16::from_le_bytes([record[2], record[3]]);
+        Self {
+            uvs: [[record[0], record[1]], [record[4], record[5]], [record[8], record[9]]],
+            texture_word: word,
+            page: word & TEXTURE_PAGE_MASK,
+            attributes_a: u16::from_le_bytes([record[6], record[7]]),
+            attributes: u16::from_le_bytes([record[10], record[11]]),
+            colour: u32::from_le_bytes([record[12], record[13], record[14], record[15]]),
+        }
+    }
+}
+
 /// One 24-byte bone record. Vertex positions stay in this bone's local frame
 /// until [`rest_positions`] adds the accumulated chain of `local` translations.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +76,9 @@ pub struct ObjectReport {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ObjectModel {
     pub name: String, pub vertices: Vec<Vertex>, pub polygons: Vec<Polygon>,
+    /// One entry per polygon: the decoded record for a textured face, else
+    /// `None`. `materials` still holds the distinct raw records.
+    pub textures: Vec<Option<TextureRef>>,
     pub materials: Vec<[u8; MATERIAL_STRIDE]>, pub bones: Vec<Bone>,
     pub counts: Counts, pub report: ObjectReport,
 }
@@ -188,6 +221,7 @@ pub fn parse_object(bytes: &[u8]) -> Result<ObjectModel, ObjectError> {
     }).collect();
     let mut offsets = BTreeSet::new();
     let mut polygons = Vec::with_capacity(polygon_count as usize);
+    let mut textures = Vec::with_capacity(polygon_count as usize);
     let mut out_of_range = 0;
     for (index, p) in data[polygon_start..polygon_end].chunks_exact(POLYGON_STRIDE).enumerate() {
         let indices = [u16::from_le_bytes([p[0], p[1]]), u16::from_le_bytes([p[2], p[3]]), u16::from_le_bytes([p[4], p[5]])];
@@ -195,14 +229,20 @@ pub fn parse_object(bytes: &[u8]) -> Result<ObjectModel, ObjectError> {
         if indices.iter().any(|&vertex| vertex as usize >= vertex_count as usize) {
             out_of_range += 1;
         }
-        if p[7] & 0x02 != 0 {
+        let texture = if p[7] & 0x02 != 0 {
             let offset = material as usize;
             let aligned = offset >= material_start && (offset - material_start) % MATERIAL_STRIDE == 0;
             if !aligned || offset + MATERIAL_STRIDE > data.len() {
                 return Err(ObjectError::MaterialOffsetInvalid { polygon: index as u32, offset: material });
             }
             offsets.insert(material);
-        }
+            let mut record = [0u8; MATERIAL_STRIDE];
+            record.copy_from_slice(&data[offset..offset + MATERIAL_STRIDE]);
+            Some(TextureRef::from_record(&record))
+        } else {
+            None
+        };
+        textures.push(texture);
         polygons.push((indices, p[6], p[7], material));
     }
     if out_of_range > 0 {
@@ -215,7 +255,7 @@ pub fn parse_object(bytes: &[u8]) -> Result<ObjectModel, ObjectError> {
         record
     }).collect();
     Ok(ObjectModel {
-        name, vertices, polygons, bones, materials,
+        name, vertices, polygons, textures, bones, materials,
         counts: Counts { vertices: vertex_count, polygons: polygon_count, materials: offsets.len() as u32 },
         report: ObjectReport {
             vertex_start, vertex_count, vertex_end, polygon_start, polygon_count,
@@ -301,6 +341,48 @@ pub fn triangle_mesh(model: &ObjectModel) -> (Vec<[f32; 3]>, Vec<u16>) {
     (positions, indices)
 }
 
+/// Rest-pose triangle mesh with per-face UVs: every polygon contributes three
+/// unique vertices so a face's three UVs never fight a shared corner. Material
+/// 1 is the flat fallback (untextured face); used pages start at material 2 in
+/// `pages` first-use order.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct TexturedMesh {
+    pub positions: Vec<[f32; 3]>,
+    pub uvs: Vec<[u8; 2]>,
+    pub indices: Vec<u16>,
+    pub material_indices: Vec<u8>,
+    pub pages: Vec<u16>,
+}
+
+/// 1-based material index for `page`: flat is 1, then a stable page list.
+pub(crate) fn page_material(pages: &mut Vec<u16>, page: u16) -> u8 {
+    match pages.iter().position(|&known| known == page) {
+        Some(index) => index as u8 + 2,
+        None => {
+            pages.push(page);
+            pages.len() as u8 + 1
+        }
+    }
+}
+
+/// Per-face textured mesh in rest pose. Untextured faces stay as flat
+/// material 1 so no geometry is dropped.
+pub fn textured_mesh(model: &ObjectModel) -> TexturedMesh {
+    let positions = rest_positions(model);
+    let mut out = TexturedMesh::default();
+    for ((corners, _, _, _), texture) in model.polygons.iter().zip(&model.textures) {
+        let base = out.positions.len() as u16;
+        let material = texture.map_or(1, |record| page_material(&mut out.pages, record.page));
+        for (corner, &vertex) in corners.iter().enumerate() {
+            out.positions.push(positions[vertex as usize]);
+            out.uvs.push(texture.map_or([0, 0], |record| record.uvs[corner]));
+            out.material_indices.push(material);
+        }
+        out.indices.extend([base, base + 1, base + 2]);
+    }
+    out
+}
+
 /// The index dword echoes the last four characters of an asset name,
 /// uppercased; `None` for names shorter than four characters.
 fn suffix_key(name: &str) -> Option<[u8; 4]> {
@@ -318,6 +400,7 @@ pub struct ModelResolver {
     entries: Vec<bigfile::BigfileEntry>,
     by_suffix: HashMap<[u8; 4], Vec<usize>>,
     cache: HashMap<String, Option<(Vec<[f32; 3]>, Vec<u16>)>>,
+    textured_cache: HashMap<String, Option<TexturedMesh>>,
 }
 
 impl ModelResolver {
@@ -328,7 +411,7 @@ impl ModelResolver {
         for (index, entry) in entries.iter().enumerate() {
             by_suffix.entry(entry.suffix).or_default().push(index);
         }
-        Ok(Self { path: path.to_path_buf(), entries, by_suffix, cache: HashMap::new() })
+        Ok(Self { path: path.to_path_buf(), entries, by_suffix, cache: HashMap::new(), textured_cache: HashMap::new() })
     }
 
     /// Model-space mesh for `name`, or `None` when no container matches.
@@ -338,6 +421,15 @@ impl ModelResolver {
             self.cache.insert(name.to_string(), mesh);
         }
         self.cache.get(name).cloned().flatten()
+    }
+
+    /// Per-face textured mesh for `name`, cached separately from the flat mesh.
+    pub fn textured(&mut self, name: &str) -> Option<TexturedMesh> {
+        if !self.textured_cache.contains_key(name) {
+            let mesh = self.lookup(name).map(|model| textured_mesh(&model));
+            self.textured_cache.insert(name.to_string(), mesh);
+        }
+        self.textured_cache.get(name).cloned().flatten()
     }
 
     fn lookup(&self, name: &str) -> Option<ObjectModel> {
@@ -601,6 +693,42 @@ mod tests {
         assert_eq!(resolver.mesh("raziel").map(|(v, _)| v.len()), Some(3), "cached");
         assert!(resolver.mesh("campath").is_none(), "suffix LOCK does not match ZIEL");
         assert!(resolver.mesh("raz").is_none(), "names shorter than four characters do not map");
+    }
+
+    #[test]
+    fn exposes_face_records_and_masks_the_page() {
+        let mut bytes = model();
+        let record = level::data_base(1) + 228;
+        let raw = [40, 134, 0x04, 0x08, 22, 134, 0x08, 0x01, 41, 128, 0, 0, 0x80, 0x80, 0x80, 0x34];
+        bytes[record..record + 16].copy_from_slice(&raw);
+        let parsed = parse_object(&bytes).expect("synthetic object must parse");
+        let texture = parsed.textures[0].expect("first face is textured");
+        assert_eq!(texture.uvs, [[40, 134], [22, 134], [41, 128]]);
+        assert_eq!(texture.texture_word, 0x0804, "the raw word keeps its flags");
+        assert_eq!(texture.page, 4, "the page is the low 11 bits only");
+        assert_eq!(
+            (texture.attributes_a, texture.attributes, texture.colour),
+            (0x0108, 0x0000, 0x3480_8080)
+        );
+        assert_eq!(parsed.textures[1], None, "the untextured face has no record");
+        assert_eq!(&parsed.materials[0][0..4], &raw[0..4], "raw records stay exposed");
+    }
+
+    #[test]
+    fn textured_mesh_expands_faces_and_keeps_flat_fallback() {
+        let mut bytes = model();
+        let record = level::data_base(1) + 228;
+        bytes[record + 2..record + 4].copy_from_slice(&4u16.to_le_bytes());
+        let parsed = parse_object(&bytes).expect("synthetic object must parse");
+        let mesh = textured_mesh(&parsed);
+        assert_eq!(mesh.pages, vec![4]);
+        assert_eq!(mesh.positions.len(), 6);
+        assert_eq!(mesh.indices, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(mesh.material_indices, vec![2, 2, 2, 1, 1, 1]);
+        assert_eq!(&mesh.uvs[..3], &[[0xAB, 0xAB]; 3]);
+        assert_eq!(&mesh.uvs[3..], &[[0, 0]; 3], "the untextured face samples flat");
+        assert_eq!(mesh.positions[3], [1.0, 2.0, 3.0]);
+        assert_eq!(mesh.positions[5], [4.0, 5.0, 6.0]);
     }
 }
 
