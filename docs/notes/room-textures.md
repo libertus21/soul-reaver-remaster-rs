@@ -284,6 +284,21 @@ record +0/+1,+4/+5,+8/+9 -> three u8 UV pairs
 `B` is the only new indirection. It is relative to the record array, not the
 data base, and it is not a face index.
 
+### 7.1 Reader mapping (implemented)
+
+| Fact | Code |
+|---|---|
+| `+0x34`/`+0x38` array, 12-byte records, `page = word & 0x07FF`, three `u8` UV pairs | `src/level.rs` `room_texture_faces` |
+| Face `+0x0A` byte offset into that array | `src/level.rs` `room_texture_faces` |
+| Per-face vertex expansion (three unique vertices, material 1 = flat) | `src/level.rs` `textured_room_mesh` |
+| Same bank decode, page bounds and loud `SlotIndexOutOfRange` as objects | `src/object_texture.rs` `PageBank` / `scene` |
+| Textured room, optional textured objects, flat markers | `src/main.rs` `--level-render ... --textures` |
+
+`0xFFFF` and non-12-aligned `+0x0A` tails are counted as unresolved faces and
+drawn flat; they are never dropped or clamped. A missing array or a record
+array outside the data region is a distinct loud error. Without `--textures`,
+the mesh path is unchanged.
+
 ## 8. UNKNOWN (explicit)
 
 1. Role of face `+0x08` (`A`). Refuted as page/texture id; signed, symmetric,

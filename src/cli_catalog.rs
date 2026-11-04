@@ -58,7 +58,7 @@ pub const CAPABILITIES: [Capability; 27] = [
     Capability { group: "level", name: "links", legacy: "--level-links <PATH>", summary: "Print the decoded link table.", window: false },
     Capability { group: "level", name: "geometry", legacy: "--level-geometry <PATH>", summary: "Print room vertex and face counts with a box.", window: false },
     Capability { group: "level", name: "objects", legacy: "--level-objects <PATH>", summary: "Print one unit's placed objects: name, position, type and flags.", window: false },
-    Capability { group: "level", name: "render", legacy: "--level-render <PATH>", summary: "Show one unit's room geometry as a flat-shaded solid.", window: true },
+    Capability { group: "level", name: "render", legacy: "--level-render <PATH> [--textures <BIG>]", summary: "Show one unit's room geometry, flat or textured.", window: true },
     Capability { group: "level", name: "render-objects", legacy: "--level-render <PATH> --objects [--textures <BIG>]", summary: "Show one unit's room geometry plus one cube per object.", window: true },
     Capability { group: "level", name: "geometry-entry", legacy: "--level-geometry --bigfile <DAT> --entry <INDEX>", summary: "Print one archive entry's room vertex and face counts.", window: false },
     Capability { group: "level", name: "objects-entry", legacy: "--level-objects --bigfile <DAT> --entry <INDEX>", summary: "Print one archive entry's placed objects.", window: false },
