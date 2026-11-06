@@ -445,7 +445,7 @@ fn remap_mesh(
 
 #[cfg(test)]
 mod tests {
-    use super::{CameraView, MeshHandle, SceneAssets, SourceMesh};
+    use super::{CameraView, MeshHandle, RenderScene, SceneAssets, SourceMesh};
     use crate::engine::class::{RenderClass, classify};
     use crate::engine::live::{LiveArena, LiveObject};
 
@@ -583,4 +583,34 @@ mod tests {
         assert!(scene.mesh(MeshHandle(1)).expect("handle exists").positions.is_empty());
     }
 
+    fn scene_snapshot(scene: &RenderScene) -> (Vec<(u32, [i32; 3], bool)>, Vec<Vec<u16>>, Vec<Option<u16>>) {
+        (
+            scene
+                .items
+                .iter()
+                .map(|item| (item.mesh.index(), item.world, item.visible))
+                .collect(),
+            scene
+                .meshes
+                .iter()
+                .map(|mesh| mesh.material_indices.clone())
+                .collect(),
+            scene.material_pages.clone(),
+        )
+    }
+
+    #[test]
+    fn the_same_live_state_builds_the_same_scene_twice() {
+        let live = arena();
+        let mut assets = assets();
+        let first = assets.build(&live, CameraView::identity());
+        let second = assets.build(&live, CameraView::identity());
+
+        assert_eq!(first, second, "the whole scene must replay byte for byte");
+        assert_eq!(scene_snapshot(&first), scene_snapshot(&second));
+        assert_eq!(
+            first.items.iter().map(|item| item.mesh).collect::<Vec<_>>(),
+            second.items.iter().map(|item| item.mesh).collect::<Vec<_>>()
+        );
+    }
 }

@@ -68,6 +68,12 @@ slice, not part of this gate.
   run is replayed twice comparing the stage trace and the per-tick world hash;
   `GOLDEN_FRAME_STATE_HASH` pins the final state. It lives in
   `src/engine/determinism.rs` tests.
+- T9 (render scene + backend): the scene is a CPU snapshot of the existing live
+  order and does not write `WorldState`, so **all seven existing goldens are
+  untouched**. A separate scene replay builds the same live state twice and
+  compares the whole `RenderScene` (draw order, handles, meshes and material
+  table); making the live walk unordered fails it. See
+  `docs/notes/engine-render.md`.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.
