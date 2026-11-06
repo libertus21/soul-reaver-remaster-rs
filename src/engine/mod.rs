@@ -2,4 +2,6 @@
 //! layer. This slice only wires the `--play` option facade; the world model,
 //! clock, tracker, hooks and renderer arrive in later slices.
 
+#[allow(dead_code)]
+pub mod determinism;
 pub mod play;
