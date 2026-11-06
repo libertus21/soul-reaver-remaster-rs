@@ -8,6 +8,8 @@ use std::fmt;
 use crate::engine::state::{GameState, StateEvent};
 
 #[allow(dead_code)]
+pub mod class;
+#[allow(dead_code)]
 pub mod clock;
 #[allow(dead_code)]
 pub mod determinism;

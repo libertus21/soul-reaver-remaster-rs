@@ -15,6 +15,8 @@
 
 use std::fmt;
 
+use crate::engine::class::RenderClass;
+
 /// Stable identity of a live object.
 ///
 /// `index` addresses the slot; `generation` distinguishes objects that reused
@@ -36,6 +38,7 @@ pub struct LiveId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveObject {
     pub name: String,
+    pub class: RenderClass,
     pub position: [i32; 3],
     pub visible: bool,
     pub slot: Option<usize>,
@@ -197,10 +200,12 @@ impl LiveArena {
 #[cfg(test)]
 mod tests {
     use super::{LiveArena, LiveArenaError, LiveId, LiveObject};
+    use crate::engine::class::RenderClass;
 
     fn object(name: &str) -> LiveObject {
         LiveObject {
             name: name.to_string(),
+            class: RenderClass::Unclassified,
             position: [0, 0, 0],
             visible: true,
             slot: None,
@@ -315,6 +320,19 @@ mod tests {
         assert_eq!(entry.position, [3, 4, 5]);
         assert!(!entry.visible);
         assert_eq!(ids(&arena), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn live_object_keeps_its_render_class() {
+        let mut arena = LiveArena::new();
+        let id = arena.spawn(LiveObject {
+            class: RenderClass::Monster,
+            ..object("monster_wallcr")
+        });
+        assert_eq!(
+            arena.get(id).expect("live id").class,
+            RenderClass::Monster
+        );
     }
 
     #[test]
