@@ -8,6 +8,10 @@ use std::fmt;
 use crate::engine::state::{GameState, StateEvent};
 
 #[allow(dead_code)]
+pub mod actor;
+#[allow(dead_code)]
+pub mod assets;
+#[allow(dead_code)]
 pub mod class;
 #[allow(dead_code)]
 pub mod clock;

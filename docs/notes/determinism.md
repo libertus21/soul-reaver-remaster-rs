@@ -54,6 +54,13 @@ slice, not part of this gate.
   `GOLDEN_CLASSIFICATION_HASH`, pins every name in the five lists in documented
   order: list id, exact count, name bytes, admission, load role and asset tree.
   Renaming, removing, adding or reordering an entry breaks it.
+- T7 (asset source + actor profile): no tick, no `WorldState` write and no
+  frame pipeline, so all five existing goldens stay unchanged. A sixth,
+  independent gate, `GOLDEN_ACTOR_RUNTIME_HASH`, pins the initial
+  `ActorRuntime` derived from an `ActorProfile`: profile kind, the eight trios,
+  the entry-array kind and the entry ids, then the numeric relation, state,
+  target and flags. The profile has no name field, so renaming a model does not
+  move the fold. It lives in `src/engine/determinism.rs` tests.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.
@@ -73,6 +80,7 @@ questions:
 | `world_state_hash` | tick count, live-list order, per-entry class, position, visible | **Canonical state gate**: the simulation contract from `spec.md`. Independent of the options fold. |
 | `tracker_hash` | each slot in index order: index, state code, name | **Tracker gate**: acquisition, duplicate-name sharing and lowest-free reuse. Independent of both folds above. |
 | `classification_hash` | the five name lists in documented order: list id, exact count, then per name the name bytes, admission code, load-role code and asset-tree code | **Name-table gate**: the exact membership and roles of the spawn policy. Independent of every fold above; lives in `src/engine/spawn.rs` tests. |
+| `actor_runtime_hash` | profile kind, the eight trios, entry-array kind, entry ids; then relation, state, target and flags | **Actor-runtime gate**: the data-keyed AI initial state. No name is folded. Independent of every fold above; lives in `src/engine/determinism.rs` tests. |
 
 `tracker_hash` folds all 48 slots, empty ones included, so a release is
 observable and a name's slot index is part of the contract, not just its
@@ -122,6 +130,30 @@ Replaying the same spawn/remove sequence twice therefore yields byte-identical
 `(slot index, generation)` tuples in the same order. T5 does not feed this arena
 into `WorldState.live`, so the canonical world golden does not move; the replay
 is a separate gate in `src/engine/determinism.rs`.
+
+## Actor runtime (T7)
+
+The actor seam is data-keyed, not name-keyed. `ActorProfile` copies the kind,
+the eight state trios, the behaviour-entry ids and the entry-array kind from the
+shipped per-model block through the existing `actor::parse_actor_block`; it has
+no name field. `ActorRuntime` embeds the profile and adds only numeric state:
+relation and action state (raw bytes, no invented enum), an optional live target
+and a flag word.
+
+The initial state is derived from the profile alone, so two models with
+byte-identical actor blocks start in equal runtime state even when their asset
+names differ. `actor_runtime_hash` folds the profile data first, then the
+numeric runtime fields, in a fixed order. `GOLDEN_ACTOR_RUNTIME_HASH` pins that
+byte stream; it is a sixth, independent gate and moves none of the five existing
+goldens. A deliberate change to the initial action state (0 -> 1) moves the hash
+from `0xe169_695d_0eda_ec99` to `0x04d3_052a_20e9_2660`, which is the evidence
+that the gate bites.
+
+The asset source is synchronous in this milestone (`ImmediateSource` resolves a
+name through the bigfile index with the existing container and actor parsers and
+reuses the existing textured-mesh builder). `LoadQueue` is only a deterministic
+FIFO shape for a later asynchronous source; it adds no thread, runtime or
+dependency, and a missing model is `Unresolved`, never a panic.
 
 ## Clock: rational step, no drift
 
