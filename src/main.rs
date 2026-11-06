@@ -49,6 +49,7 @@ mod cli_out;
 #[allow(dead_code)]
 mod launcher_cli;
 mod dds;
+mod engine;
 mod gallery;
 mod level;
 mod menu;
@@ -124,6 +125,9 @@ fn run_help(group: Option<&str>) -> ExitCode {
 
 /// The existing linear dispatch chain, moved here verbatim.
 fn dispatch(args: &[String]) -> ExitCode {
+    if args.first().is_some_and(|a| a == "--play") {
+        return run_play(&args[1..]);
+    }
     if let Some(message) = pose_mode_conflict(args) {
         eprintln!("{message}");
         return ExitCode::from(1);
@@ -256,6 +260,25 @@ fn dispatch(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+/// `--play [options]`: parse the engine options, then run the engine.
+/// T1 only parses; `engine::play::run` is a loud typed error until T9/T10.
+fn run_play(args: &[String]) -> ExitCode {
+    let options = match engine::play::PlayOptions::parse(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match engine::play::run(&options) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// Render one decoded texture through the EXISTING window (CPU BC7 or

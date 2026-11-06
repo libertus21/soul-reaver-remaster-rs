@@ -14,3 +14,6 @@
 # Build output is never committed (later rules win over the *.rs
 # re-allow above, so generated sources under target/ stay ignored).
 /target/
+
+# Local CodeGraph index (per-machine analysis data, never source).
+/.codegraph/
