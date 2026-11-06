@@ -40,6 +40,7 @@
 //! maps to a clear stderr message + `ExitCode(1)`; closing the window
 //! exits `0`.
 
+mod actor;
 mod bigfile;
 mod cli_argv;
 mod cli_catalog;
@@ -68,8 +69,9 @@ mod textures;
 mod textures_object;
 mod wav;
 
+use std::collections::BTreeSet;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use cli_out::outln;
@@ -168,6 +170,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--level-render") {
         return run_level_render(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--actor-census") {
+        return run_actor_census(&args[1..]);
+    }
     if args.first().is_some_and(|a| a == "--object-info") {
         return run_object_info(&args[1..]);
     }
@@ -205,7 +210,8 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-objects --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --level-objects --bigfile <BIGFILE.DAT> --group <PREFIX>");
         eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file> --objects [--textures <TEXTURES.BIG>]");
-        eprintln!("   or: soul-reaver-remaster-rs --object-info --bigfile <BIGFILE.DAT> --entry <INDEX>");
+        eprintln!("   or: soul-reaver-remaster-rs --actor-census --bigfile <BIGFILE.DAT> [--objects-dir <DIR>]");
+        eprintln!("   or: soul-reaver-remaster-rs --object-info --bigfile <BIGFILE.DAT> --entry <INDEX> [--actors]");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --textures <TEXTURES.BIG>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
@@ -1625,15 +1631,111 @@ fn run_object_mesh_textured(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Read-only `--object-info` arm: one archived object container, counts and
-/// validation only. No window, no mesh.
+fn run_actor_census(args: &[String]) -> ExitCode {
+    let usage = "expected --actor-census --bigfile <DAT> [--objects-dir <DIR>]";
+    let (dat, directory) = match actor_census_input(args, usage) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let mut rows: Vec<Row> = Vec::new();
+    let outcome = census_bigfile(dat, &mut rows)
+        .and_then(|()| directory.map_or(Ok(()), |directory| census_directory(directory, &mut rows)));
+    if let Err(error) = outcome {
+        eprintln!("error: {error}");
+        let code = if matches!(error, object::ObjectError::ArchiveUnreadable(_)) { 3 } else { error.exit_code() };
+        return ExitCode::from(code);
+    }
+    rows.sort_by(|left, right| match (left.0, right.0) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.1.cmp(&right.1),
+    });
+    let (mut distinct, mut entries) = (BTreeSet::new(), 0);
+    for (index, name, block) in &rows {
+        outln!("{}", actor::census_line(name, *index, block));
+        if block.entry_array == actor::EntryArrayKind::Clean {
+            entries += block.entries.len();
+            distinct.extend(block.entries.iter().map(|entry| entry.id));
+        }
+    }
+    outln!("{}", actor::census_summary(rows.len(), entries, distinct.len()));
+    ExitCode::SUCCESS
+}
+
+type Row = (Option<usize>, String, actor::ActorBlock);
+
+fn push_actor(bytes: &[u8], index: Option<usize>, rows: &mut Vec<Row>) -> Result<(), object::ObjectError> {
+    let Some(block) = actor::parse_actor_block(bytes)? else { return Ok(()) };
+    if block.kind != actor::ActorKind::Monster {
+        return Ok(());
+    }
+    let model = object::parse_object(bytes)?;
+    rows.push((index, model.name, block));
+    Ok(())
+}
+
+fn census_bigfile(dat: &str, rows: &mut Vec<Row>) -> Result<(), object::ObjectError> {
+    let entries = bigfile::load_index(Path::new(dat)).map_err(|error| object::ObjectError::ArchiveUnreadable(error.to_string()))?;
+    for index in 0..entries.len() {
+        push_actor(&object::read_entry_bytes(Path::new(dat), index)?, Some(index), rows)?;
+    }
+    Ok(())
+}
+
+fn census_directory(directory: &str, rows: &mut Vec<Row>) -> Result<(), object::ObjectError> {
+    let mut files = Vec::new();
+    let mut stack = vec![PathBuf::from(directory)];
+    while let Some(current) = stack.pop() {
+        for entry in std::fs::read_dir(&current).map_err(|error| object::ObjectError::ArchiveUnreadable(error.to_string()))? {
+            let path = entry.map_err(|error| object::ObjectError::ArchiveUnreadable(error.to_string()))?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("pcm")) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    for path in files {
+        push_actor(&std::fs::read(&path).map_err(|error| object::ObjectError::ArchiveUnreadable(error.to_string()))?, None, rows)?;
+    }
+    Ok(())
+}
+
+fn actor_census_input<'a>(args: &'a [String], usage: &'static str) -> Result<(&'a str, Option<&'a str>), object::ObjectError> {
+    let (mut dat, mut directory) = (None, None);
+    let mut at = 0;
+    while at < args.len() {
+        let value = || args.get(at + 1).map(String::as_str).ok_or(object::ObjectError::Usage(usage));
+        match args[at].as_str() {
+            "--bigfile" => dat = Some(value()?),
+            "--objects-dir" => directory = Some(value()?),
+            _ => return Err(object::ObjectError::Usage(usage)),
+        }
+        at += 2;
+    }
+    dat.map(|dat| (dat, directory)).ok_or(object::ObjectError::Usage(usage))
+}
+
 fn run_object_info(args: &[String]) -> ExitCode {
-    match object_input(args, object::USAGE)
-        .and_then(|(dat, index)| object::read_entry(Path::new(dat), index))
-    {
-        Ok(model) => {
+    match object_info_input(args, object::USAGE).and_then(|(dat, index, actors)| {
+        let bytes = object::read_entry_bytes(Path::new(dat), index)?;
+        let model = object::parse_object(&bytes)?;
+        let block = if actors { actor::parse_actor_block(&bytes)? } else { None };
+        Ok((model, block, actors))
+    }) {
+        Ok((model, block, actors)) => {
             for line in object::info_lines(&model) {
                 outln!("{line}");
+            }
+            if actors {
+                for line in actor::object_lines(block.as_ref()) {
+                    outln!("{line}");
+                }
             }
             ExitCode::SUCCESS
         }
@@ -1642,6 +1744,26 @@ fn run_object_info(args: &[String]) -> ExitCode {
             ExitCode::from(error.exit_code())
         }
     }
+}
+
+fn object_info_input<'a>(args: &'a [String], usage: &'static str) -> Result<(&'a str, usize, bool), object::ObjectError> {
+    let (mut dat, mut index, mut actors) = (None, None, false);
+    let mut at = 0;
+    while at < args.len() {
+        if args[at] == "--actors" {
+            actors = true;
+            at += 1;
+            continue;
+        }
+        let value = args.get(at + 1).map(String::as_str).ok_or(object::ObjectError::Usage(usage))?;
+        match args[at].as_str() {
+            "--bigfile" => dat = Some(value),
+            "--entry" => index = Some(value.parse().map_err(|_| object::ObjectError::Usage(usage))?),
+            _ => return Err(object::ObjectError::Usage(usage)),
+        }
+        at += 2;
+    }
+    dat.zip(index).map(|(dat, index)| (dat, index, actors)).ok_or(object::ObjectError::Usage(usage))
 }
 
 /// Exactly `--bigfile <DAT> --entry <INDEX>`, in either order. Any other shape
@@ -1696,7 +1818,7 @@ fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
 mod cli_tests {
     use super::run_level_info;
     use super::{
-        list_report, pose_mode_conflict, resolve_texture_name, run_audio, run_bigfile,
+        list_report, pose_mode_conflict, resolve_texture_name, run_actor_census, run_audio, run_bigfile,
         dispatch, run_level_links, run_level_records, run_level_structure, run_mesh, run_mesh_all,
         run_level_geometry, run_level_objects, run_level_render, run_mesh_textured, run_mesh_with,
         run_object_info, run_object_mesh, run_object_mesh_with, run_textures,
@@ -2433,6 +2555,48 @@ mod cli_tests {
         assert_eq!(run_object_info(&entry("9")), ExitCode::from(1));
         assert_eq!(run_object_info(&entry("0")), ExitCode::from(2));
         assert_eq!(run_object_info(&[]), ExitCode::from(1));
+    }
+
+    #[test]
+    fn actor_census_and_actor_info_read_synthetic_actor_blocks() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let trios = [[0u8; 3]; 8];
+        let actor = crate::actor::synthetic_actor("skinner", &[0x25, 0x26], trios);
+        let dat = write_tmp(
+            &tmp,
+            "BIGFILE.DAT",
+            &synthetic_archive(&[actor.clone(), crate::object::synthetic_model()]),
+        );
+        assert_eq!(run_actor_census(&["--bigfile".to_string(), dat.clone()]), ExitCode::SUCCESS);
+        assert_eq!(run_actor_census(&[]), ExitCode::from(1));
+        assert_eq!(run_actor_census(&["--objects-dir".to_string(), tmp.path().to_string_lossy().into_owned()]), ExitCode::from(1));
+        let entry = |extra: &[&str]| {
+            let mut args = vec!["--bigfile".to_string(), dat.clone(), "--entry".to_string(), "0".to_string()];
+            args.extend(extra.iter().map(|token| token.to_string()));
+            args
+        };
+        assert_eq!(run_object_info(&entry(&[])), ExitCode::SUCCESS);
+        assert_eq!(run_object_info(&entry(&["--actors"])), ExitCode::SUCCESS);
+        assert_eq!(run_object_info(&entry(&["--bogus"])), ExitCode::from(1));
+
+        let directory = tmp.path().join("OBJECT");
+        std::fs::create_dir(&directory).expect("OBJECT must be creatable");
+        std::fs::write(directory.join("SKINNER.PCM"), actor).expect("synthetic PCM must be writable");
+        let with_dir = vec![
+            "--bigfile".to_string(),
+            dat.clone(),
+            "--objects-dir".to_string(),
+            directory.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run_actor_census(&with_dir), ExitCode::SUCCESS);
+        let missing = tmp.path().join("MISSING");
+        let missing = vec![
+            "--bigfile".to_string(),
+            dat,
+            "--objects-dir".to_string(),
+            missing.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run_actor_census(&missing), ExitCode::from(3));
     }
 
     #[test]

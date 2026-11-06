@@ -402,3 +402,19 @@ asset names and small ids only; no game bytes, no decoded imagery, no
 disassembly, no absolute install paths. The archives were never copied into the
 repository. `cargo test` was left at its starting baseline (321 green); no
 production code was touched in this change.
+
+## 11. Reader
+
+`--actor-census --bigfile <BIGFILE.DAT> [--objects-dir <DIR>]` reproduces the
+census above with synthetic-only unit tests. It reuses the `.PCM` object reader,
+reads the `+0x1C` pointer, classifies the block signature (actor vs player),
+prints the 24-byte table at `+0x18` as eight trios and detects the 0x20 entry
+array through the `+0x30` pointer list. `--object-info --bigfile <DAT> --entry
+<INDEX> --actors` appends the same block for one entry.
+
+Reproduced on the shipped corpus: **21 actor containers, 75 entries, 37
+distinct ids** with the 14 clean actors in section 4.1. Seven actors have no
+clean 0x20 array: `soul`, `vlgra`, `vlgrb`, `vlgrc` and `priests` report
+`none`; `walbosb` and `kain` report `variant` because their entry-like records
+fail the 0x20 sentinel test. Neither kind contributes to the totals. `raziel`
+is the distinct player family and is excluded from the monster census.

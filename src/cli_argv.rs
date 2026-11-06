@@ -216,6 +216,18 @@ mod tests {
                 &["--object-info", "--bigfile", "BIGFILE.DAT", "--entry", "66"],
             ),
             (
+                &["mesh", "object-info-actors", "--bigfile", "BIGFILE.DAT", "--entry", "66"],
+                &["--object-info", "--bigfile", "BIGFILE.DAT", "--entry", "66", "--actors"],
+            ),
+            (
+                &["mesh", "actor-census", "--bigfile", "BIGFILE.DAT"],
+                &["--actor-census", "--bigfile", "BIGFILE.DAT"],
+            ),
+            (
+                &["mesh", "actor-census", "--bigfile", "BIGFILE.DAT", "--objects-dir", "OBJECT"],
+                &["--actor-census", "--bigfile", "BIGFILE.DAT", "--objects-dir", "OBJECT"],
+            ),
+            (
                 &["audio", "list", "bank.SND"],
                 &["--audio", "bank.SND", "--alist"],
             ),
