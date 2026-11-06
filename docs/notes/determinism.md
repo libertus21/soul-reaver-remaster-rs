@@ -48,9 +48,33 @@ slice, not part of this gate.
   `docs/changes/engine-skeleton/spec.md`; the harness lives in
   `src/engine/determinism.rs`.
 
-T1 ships the harness and the pattern only: there is no world or tick loop yet,
-so `state_hash` folds the parsed `PlayOptions` and typed error text, and the
-tests prove equal input yields an equal hash while different input does not.
-Golden constants in the same module pin the exact byte stream, so a change to
-the fold order, the field set or the FNV constants cannot pass unnoticed; the
-`Ok` golden is expected to change in T2 and must be updated deliberately.
+## Two-golden model
+
+The harness keeps two independent folds, because "how the engine was launched"
+and "what the simulation is" are different questions:
+
+| Golden | Fold | Guards |
+|---|---|---|
+| `options_hash` / `error_hash` | parsed `PlayOptions`, typed error text | **Regression gate**: argv parsing, fold order, field set, error tags. No simulation state. |
+| `world_state_hash` | tick count, live-list order, per-entry class, position, visible | **Canonical state gate**: the simulation contract from `spec.md`. Independent of the options fold. |
+
+T1 shipped a single `state_hash` that mixed the options fold with the notion of
+state. That was a tripwire, not a gate: changing the argv could move the "state"
+golden even though no state existed. T2 **retires** it instead of re-pinning it
+to a new number.
+
+The canonical world fold, in order: `tick` as `u64`, then for each live entry in
+**live-list order** (spawn order, survivors keep relative order after removals)
+`class` as `u8`, `position.x/y/z` as `i32`, `visible` as `u8`. `GOLDEN_WORLD_STATE_HASH`
+pins that exact byte stream. T3+ extends the fold and the constant deliberately,
+in the same PR that updates `spec.md`; it is never "fixed" to go green.
+
+## Clock: rational step, no drift
+
+Time is a fixed rational step (`ObjectTick { num: 1, den: 60 }`), never `f32`.
+`SimClock` accumulates elapsed time in thirds of a nanosecond so the `1/60 s`
+step is an exact integer; no float touches time. One `advance` emits at most
+`MAX_CATCH_UP` (5) ticks and keeps the unconsumed remainder in the accumulator.
+A 10 s advance therefore emits 5 ticks and keeps `10 s - 5 * (1/60 s)`, and later
+frames pay the rest back: the cap delays ticks, it never loses them. Ticks are
+integer-indexed and monotonic.

@@ -46,11 +46,27 @@ original. See `docs/notes/determinism.md` and the harness in
   `Logos`, `Loading { unit }`, `InGame`, `Shutdown`; explicit transition
   function; unsupported states return `EngineError::UnsupportedState`.
 - Acceptance: 1/60 rational step; a 10 s advance yields at most 5 ticks and
-  keeps the remainder; `Boot -> Loading -> InGame` only when loads are done.
+  keeps the remainder (the remainder is paid back, never lost); ticks are
+  integer-indexed and monotonic; `Boot -> Loading -> InGame` only when loads are
+  done (only via the explicit `LoadsComplete` event).
 - Gate: the determinism test (N ticks -> identical state hash) passes; T2 does
   not merge without it.
-- Files: `src/engine/clock.rs`, `src/engine/state.rs`.
-- PR: C.
+- **Condition 1 - retire, do not fix, the T1 golden.** `GOLDEN_STATE_HASH` and
+  `state_hash` are retired, not re-pinned. A separate `world_state_hash` with
+  its own `GOLDEN_WORLD_STATE_HASH` pins exactly tick count, live-list order,
+  per-entry class, position and visible, independent of the options fold. The
+  `WorldState { tick, live: Vec<WorldEntry> }` fold shape is the T3+ contract.
+- **Condition 2 - the determinism test lands first.** In the first commit:
+  advance a synthetic clock through the same sequence twice, fold the resulting
+  `WorldState`, assert identical hash and equality with the hand-written golden;
+  a perturbed world (different position, reordered live list, different
+  visibility) produces a different hash.
+- Evidence: dropping the `visible` byte from the fold moves the hash from
+  `0x82fe_8a38_1b9d_2a6d` to a different value and fails the golden; reverted.
+- Files: `src/engine/clock.rs`, `src/engine/state.rs`,
+  `src/engine/determinism.rs`, `src/engine/mod.rs`.
+- PR: C (split into a stack when the 400-line rule fires: T2a clock + golden,
+  T2b state machine).
 
 ### T3 - World and placed-object database
 
