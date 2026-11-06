@@ -215,4 +215,72 @@ mod tests {
         assert_ne!(options_hash(&base), options_hash(&other));
         assert_ne!(state_hash(&Ok(base)), state_hash(&Ok(other)));
     }
+
+    // Golden values pin the exact byte stream. The tests above compare the
+    // harness against itself, so they pass even if the fold order, the field
+    // set, the FNV constants or an error tag change. These constants do not.
+    // A change here must be deliberate and reviewed.
+
+    // Guards the `write_options` fold order and field set, the FNV-1a offset
+    // basis and prime, the length prefix in `write_bytes`, and the little-endian
+    // `to_le_bytes` of `--ticks 120`.
+    const GOLDEN_OPTIONS_HASH: u64 = 0x27e6_be15_9907_b55c;
+
+    // Guards the error variant tag (`InvalidCamera` = 5), the exact message
+    // text and the same FNV constants.
+    const GOLDEN_ERROR_HASH: u64 = 0xf7df_8b2c_3041_7acf;
+
+    // Guards the `Ok` discriminant prefix and the T1 options fold.
+    //
+    // T2 replaces the `Ok` arm with the world-state fold, so this constant WILL
+    // change then. Updating it in T2 must be deliberate and reviewed together
+    // with `spec.md`; it must never be "fixed" to make a test go green.
+    const GOLDEN_STATE_HASH: u64 = 0x25f6_bc90_9245_6692;
+
+    #[test]
+    fn options_hash_matches_the_golden_value() {
+        let options = parse(&[
+            "--bigfile",
+            "BIGFILE.DAT",
+            "--unit",
+            "under1",
+            "--ticks",
+            "120",
+        ])
+        .expect("golden argv must parse");
+        assert_eq!(
+            options_hash(&options),
+            GOLDEN_OPTIONS_HASH,
+            "options hash moved: fold order, field set, FNV constants or endianness changed"
+        );
+    }
+
+    #[test]
+    fn error_hash_matches_the_golden_value() {
+        let error = parse(&["--bigfile", "B", "--camera", "top"])
+            .expect_err("golden argv must be an error");
+        assert_eq!(
+            error_hash(&error),
+            GOLDEN_ERROR_HASH,
+            "error hash moved: variant tag, message text or FNV constants changed"
+        );
+    }
+
+    #[test]
+    fn state_hash_matches_the_golden_value() {
+        let options = parse(&[
+            "--bigfile",
+            "BIGFILE.DAT",
+            "--unit",
+            "under1",
+            "--ticks",
+            "120",
+        ])
+        .expect("golden argv must parse");
+        assert_eq!(
+            state_hash(&Ok(options)),
+            GOLDEN_STATE_HASH,
+            "state hash moved before T2: the T1 options fold changed"
+        );
+    }
 }
