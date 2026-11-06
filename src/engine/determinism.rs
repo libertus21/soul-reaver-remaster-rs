@@ -6,7 +6,7 @@
 //! The policy lives in `docs/notes/determinism.md`; the gate is stated in
 //! `docs/changes/engine-skeleton/tasks.md`.
 //!
-//! Two independent golden models live here:
+//! Three independent golden models live here:
 //!
 //! - `options_hash` / `error_hash` are **regression gates** over the `--play`
 //!   options fold and the typed error text. They never include simulation
@@ -14,6 +14,9 @@
 //! - [`world_state_hash`] is the **canonical state gate**: FNV-1a 64 over the
 //!   tick count, live-list order, per-entry class, position and visibility.
 //!   It is independent of the options fold.
+//! - [`tracker_hash`] is the **tracker gate**: slot index, state and name in
+//!   slot order. It pins acquisition, duplicate-name sharing and lowest-free
+//!   reuse without entering the world-state digest.
 //!
 //! T1's `state_hash` mixed the options fold with the notion of state; that was
 //! a tripwire, not a gate, so T2 retires it instead of re-pinning it.
@@ -21,6 +24,7 @@
 use std::path::Path;
 
 use crate::engine::play::{PlayError, PlayOptions};
+use crate::engine::tracker::ObjectTracker;
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -176,13 +180,30 @@ pub fn world_state_hash(state: &WorldState) -> u64 {
     hasher.finish()
 }
 
+/// Hash the tracker table: for every slot in index order, the slot index as
+/// `u32`, the state code as `u8` (`0` empty, `1` loading, `2` ready) and the
+/// name as length-prefixed bytes. Empty slots are folded too, so a release is
+/// observable and the hash depends on *where* a name sits. Separate from
+/// [`world_state_hash`]: tracker allocation is not world state.
+pub fn tracker_hash(tracker: &ObjectTracker) -> u64 {
+    let mut hasher = StateHasher::new();
+    for (index, slot) in tracker.slots().iter().enumerate() {
+        hasher.write_u32(index as u32);
+        hasher.write_u8(slot.state().code());
+        hasher.write_bytes(slot.name().unwrap_or("").as_bytes());
+    }
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        error_hash, options_hash, world_state_hash, StateHasher, WorldEntry, WorldState,
+        StateHasher, WorldEntry, WorldState, error_hash, options_hash, tracker_hash,
+        world_state_hash,
     };
     use crate::engine::clock::SimClock;
     use crate::engine::play::{PlayError, PlayOptions};
+    use crate::engine::tracker::ObjectTracker;
     use std::time::Duration;
 
     fn parse(input: &[&str]) -> Result<PlayOptions, PlayError> {
@@ -366,5 +387,74 @@ mod tests {
         let mut hidden = base.clone();
         hidden.live[0].visible = false;
         assert_ne!(world_state_hash(&base), world_state_hash(&hidden));
+    }
+
+    // Guards the tracker fold: for each of the 48 slots in index order, the
+    // slot index, the state code and the length-prefixed name, plus the FNV-1a
+    // constants. It is independent of the options and world-state goldens.
+    const GOLDEN_TRACKER_HASH: u64 = 0x4fb9_0f56_bbe9_c0f9;
+
+    /// Final table: slot 0 `raziel`, slot 1 `paths` (released slot reused) and
+    /// slot 2 `particle`, all ready; the rest empty.
+    fn tracker_run() -> ObjectTracker {
+        let mut tracker = ObjectTracker::new();
+        tracker.acquire("raziel").expect("slot 0");
+        tracker.complete(0).expect("raziel ready");
+        tracker.acquire("soul").expect("slot 1");
+        tracker.acquire("raziel").expect("raziel shares slot 0");
+        tracker.acquire("particle").expect("slot 2");
+        tracker.complete(2).expect("particle ready");
+        tracker.release(1).expect("free slot 1");
+        tracker.acquire("paths").expect("reuse slot 1");
+        tracker.complete(1).expect("paths ready");
+        tracker
+    }
+
+    #[test]
+    fn tracker_sequence_replays_to_the_same_golden_hash() {
+        let first = tracker_run();
+        let second = tracker_run();
+        assert_eq!(
+            first, second,
+            "same call sequence must build the same table"
+        );
+        assert_eq!(tracker_hash(&first), tracker_hash(&second));
+        assert_eq!(
+            tracker_hash(&first),
+            GOLDEN_TRACKER_HASH,
+            "tracker hash moved: slot order, state code, name bytes, FNV or endianness changed"
+        );
+    }
+
+    fn reused(free: usize) -> ObjectTracker {
+        let mut tracker = ObjectTracker::new();
+        for name in ["a", "b", "c"] {
+            tracker.acquire(name).expect("acquire");
+        }
+        tracker.release(free).expect("free");
+        tracker.acquire("d").expect("reuse");
+        tracker
+    }
+
+    #[test]
+    fn tracker_hash_is_assignment_and_state_sensitive() {
+        let middle = reused(1);
+        let first = reused(0);
+        assert_eq!((middle.find("d"), first.find("d")), (Some(1), Some(0)));
+        assert_ne!(
+            tracker_hash(&middle),
+            tracker_hash(&first),
+            "a different slot assignment must change the hash"
+        );
+
+        let mut loading = ObjectTracker::new();
+        loading.acquire("a").expect("acquire");
+        let mut ready = loading.clone();
+        ready.complete(0).expect("complete");
+        assert_ne!(
+            tracker_hash(&loading),
+            tracker_hash(&ready),
+            "the state code must be part of the fold"
+        );
     }
 }
