@@ -3,5 +3,7 @@
 //! clock, tracker, hooks and renderer arrive in later slices.
 
 #[allow(dead_code)]
+pub mod clock;
+#[allow(dead_code)]
 pub mod determinism;
 pub mod play;
