@@ -51,15 +51,22 @@ slice, not part of this gate.
   `docs/changes/engine-skeleton/spec.md`; the harness lives in
   `src/engine/determinism.rs`.
 
-## Two-golden model
+## Golden model
 
-The harness keeps two independent folds, because "how the engine was launched"
-and "what the simulation is" are different questions:
+The harness keeps independent folds, because "how the engine was launched",
+"what the simulation is" and "how the tracker allocated slots" are different
+questions:
 
 | Golden | Fold | Guards |
 |---|---|---|
 | `options_hash` / `error_hash` | parsed `PlayOptions`, typed error text | **Regression gate**: argv parsing, fold order, field set, error tags. No simulation state. |
 | `world_state_hash` | tick count, live-list order, per-entry class, position, visible | **Canonical state gate**: the simulation contract from `spec.md`. Independent of the options fold. |
+| `tracker_hash` | each slot in index order: index, state code, name | **Tracker gate**: acquisition, duplicate-name sharing and lowest-free reuse. Independent of both folds above. |
+
+`tracker_hash` folds all 48 slots, empty ones included, so a release is
+observable and a name's slot index is part of the contract, not just its
+presence. `GOLDEN_TRACKER_HASH` pins that byte stream; it is a new constant and
+does not move the three existing goldens.
 
 T1 shipped a single `state_hash` that mixed the options fold with the notion of
 state. That was a tripwire, not a gate: changing the argv could move the "state"
