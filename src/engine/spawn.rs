@@ -25,6 +25,17 @@
 //! `Admission::Inert` is part of the documented admission vocabulary but no T6
 //! list produces it; every name outside the five lists is a
 //! [`Admission::PlacedModel`].
+//!
+//! [`SpawnPolicy`] is the seam. It answers three questions only: admission,
+//! load-complete role and asset paths. It exposes no actor method and performs
+//! no asset loading; the tracker and the AI module never call it.
+//!
+//! The four exact load-complete literals (`MORLOCK`, `RONINBSS`, `ALUKABSS`,
+//! `SKINBOS`) are compared **including case**, because the evidence records
+//! `MORLOCK` as exact upper-case. This is deliberately narrower than the
+//! case-insensitive membership of the five lists: `morlock` (the roster
+//! spelling) takes the generic load path, while `MORLOCK` takes the actor-flag
+//! role.
 
 use crate::engine::placed::PlacedObject;
 
@@ -58,6 +69,14 @@ const E3_OVERRIDES: [&str; 22] = [
 /// Names with no model container. They are deliberately not tracked.
 const MARKER_ONLY: [&str; 3] = ["campath", "marker", "splob"];
 
+/// Load-complete special: sets the actor flag and adjusts the spawn counter.
+/// Compared exactly, including case.
+const LOAD_ACTOR_FLAG: [&str; 1] = ["MORLOCK"];
+
+/// Load-complete specials that adjust the same spawn counter. Compared exactly,
+/// including case.
+const LOAD_SPAWN_COUNTER: [&str; 3] = ["RONINBSS", "ALUKABSS", "SKINBOS"];
+
 /// What to do with one placed name.
 ///
 /// The discriminants are stable bytes for the classification-table gate. Never
@@ -84,6 +103,114 @@ impl Admission {
     /// Stable byte used by the classification-table gate.
     pub const fn code(self) -> u8 {
         self as u8
+    }
+}
+
+/// What the load-complete callback does with a name.
+///
+/// This is an engine role, not an AI hook: it only records which counter or
+/// flag the original adjusts when a model finishes loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum LoadRole {
+    /// Model + skeleton + optional sound + animation.
+    Generic = 0,
+    /// Adjust the spawn counter (`RONINBSS`, `ALUKABSS`, `SKINBOS`).
+    SpawnCounter = 1,
+    /// Set the actor flag and adjust the spawn counter (`MORLOCK`).
+    ActorFlag = 2,
+    /// Set the special flag (boss/special list).
+    SpecialFlag = 3,
+}
+
+impl LoadRole {
+    /// Stable byte used by the classification-table gate.
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Which object tree the asset paths come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum AssetTree {
+    /// `\kain2\object`.
+    Standard = 0,
+    /// `\kain2\object_e3`, used by the 22-name override list.
+    E3 = 1,
+}
+
+/// The three paths the generic loader builds from a name.
+///
+/// `tree: None` means the name has no model container (the marker-only list).
+/// The name is echoed exactly as supplied; case normalisation belongs to the
+/// archive layer, not to the policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetPaths {
+    pub name: String,
+    pub tree: Option<AssetTree>,
+}
+
+impl AssetPaths {
+    /// Paths in the standard object tree.
+    pub fn standard(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            tree: Some(AssetTree::Standard),
+        }
+    }
+
+    /// Paths in the E3 override tree.
+    pub fn e3(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            tree: Some(AssetTree::E3),
+        }
+    }
+
+    /// No container: the marker-only names.
+    pub fn none(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            tree: None,
+        }
+    }
+
+    /// Whether this name has any model container.
+    pub fn has_model_container(&self) -> bool {
+        self.tree.is_some()
+    }
+
+    fn root(&self) -> Option<&'static str> {
+        match self.tree {
+            Some(AssetTree::Standard) => Some(r"\kain2\object"),
+            Some(AssetTree::E3) => Some(r"\kain2\object_e3"),
+            None => None,
+        }
+    }
+
+    /// `\kain2\object\<name>.sra`.
+    pub fn skeleton(&self) -> Option<String> {
+        self.root().map(|root| {
+            let name = &self.name;
+            format!(r"{root}\{name}.sra")
+        })
+    }
+
+    /// `\kain2\object\<name>\<name>.crm`.
+    pub fn mesh(&self) -> Option<String> {
+        self.root().map(|root| {
+            let name = &self.name;
+            format!(r"{root}\{name}\{name}.crm")
+        })
+    }
+
+    /// `\kain2\object\<name>\<name>.pcm`.
+    pub fn model(&self) -> Option<String> {
+        self.root().map(|root| {
+            let name = &self.name;
+            format!(r"{root}\{name}\{name}.pcm")
+        })
     }
 }
 
@@ -157,6 +284,65 @@ impl EngineNameTable {
     pub fn admit(&self, placed: &PlacedObject) -> Admission {
         self.admission_for_name(&placed.name)
     }
+
+    /// Load-complete role for a name.
+    ///
+    /// The four exact literals are checked first and case-sensitively. The
+    /// boss/special list is then checked case-insensitively; every other name
+    /// takes the generic path.
+    pub fn load_role_for_name(&self, name: &str) -> LoadRole {
+        if contains_exact(&LOAD_ACTOR_FLAG, name) {
+            LoadRole::ActorFlag
+        } else if contains_exact(&LOAD_SPAWN_COUNTER, name) {
+            LoadRole::SpawnCounter
+        } else if contains_ignore_ascii_case(self.boss_special, name) {
+            LoadRole::SpecialFlag
+        } else {
+            LoadRole::Generic
+        }
+    }
+
+    /// Asset paths for a name.
+    ///
+    /// Marker-only names have no container. The 22 E3 names switch tree and
+    /// keep their normal admission; every other name uses the standard tree.
+    pub fn asset_paths_for_name(&self, name: &str) -> AssetPaths {
+        if contains_ignore_ascii_case(self.marker_only, name) {
+            AssetPaths::none(name)
+        } else if contains_ignore_ascii_case(self.e3_overrides, name) {
+            AssetPaths::e3(name)
+        } else {
+            AssetPaths::standard(name)
+        }
+    }
+}
+
+/// The name-keyed spawn seam.
+///
+/// Exactly three questions. No actor method, no AI, no state, no animation and
+/// no asset loading. The implementation is [`EngineNameTable`]; the tracker and
+/// the AI module never call this trait.
+pub trait SpawnPolicy {
+    /// What to do with one placed record.
+    fn admit(&self, placed: &PlacedObject) -> Admission;
+    /// What the load-complete callback does with a name.
+    fn load_complete(&self, name: &str) -> LoadRole;
+    /// The three asset paths the loader builds from a name.
+    fn asset_paths(&self, name: &str) -> AssetPaths;
+}
+
+impl SpawnPolicy for EngineNameTable {
+    fn admit(&self, placed: &PlacedObject) -> Admission {
+        self.admission_for_name(&placed.name)
+    }
+
+    fn load_complete(&self, name: &str) -> LoadRole {
+        self.load_role_for_name(name)
+    }
+
+    fn asset_paths(&self, name: &str) -> AssetPaths {
+        self.asset_paths_for_name(name)
+    }
 }
 
 impl Default for EngineNameTable {
@@ -170,11 +356,16 @@ fn contains_ignore_ascii_case(list: &[&str], name: &str) -> bool {
         .any(|candidate| candidate.eq_ignore_ascii_case(name))
 }
 
+fn contains_exact(list: &[&str], name: &str) -> bool {
+    list.iter().any(|candidate| *candidate == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTOR_ROSTER, ALWAYS_SPAWN, Admission, BOSS_SPECIAL, E3_OVERRIDES, EngineNameTable,
-        MARKER_ONLY, NameCounts,
+        ACTOR_ROSTER, ALWAYS_SPAWN, Admission, AssetTree, BOSS_SPECIAL, E3_OVERRIDES,
+        EngineNameTable, LOAD_ACTOR_FLAG, LOAD_SPAWN_COUNTER, LoadRole, MARKER_ONLY, NameCounts,
+        SpawnPolicy,
     };
     use crate::engine::placed::PlacedObject;
 
@@ -323,5 +514,123 @@ mod tests {
             table.admission_for_name("no-such-name"),
             Admission::PlacedModel
         );
+    }
+
+    #[test]
+    fn load_complete_roles_follow_the_documented_partition() {
+        assert_eq!(LOAD_ACTOR_FLAG, ["MORLOCK"]);
+        assert_eq!(LOAD_SPAWN_COUNTER, ["RONINBSS", "ALUKABSS", "SKINBOS"]);
+
+        let table = EngineNameTable::documented();
+        assert_eq!(table.load_role_for_name("MORLOCK"), LoadRole::ActorFlag);
+        for name in LOAD_SPAWN_COUNTER {
+            assert_eq!(
+                table.load_role_for_name(name),
+                LoadRole::SpawnCounter,
+                "{name}"
+            );
+        }
+        for name in BOSS_SPECIAL {
+            assert_eq!(
+                table.load_role_for_name(name),
+                LoadRole::SpecialFlag,
+                "{name}"
+            );
+        }
+        for name in ["raziel", "skinner", "campath", "tripod", "under1"] {
+            assert_eq!(table.load_role_for_name(name), LoadRole::Generic, "{name}");
+        }
+    }
+
+    #[test]
+    fn load_complete_exact_literals_are_case_sensitive() {
+        let table = EngineNameTable::documented();
+        assert_eq!(table.load_complete("MORLOCK"), LoadRole::ActorFlag);
+        assert_eq!(table.load_complete("morlock"), LoadRole::Generic);
+        assert_eq!(table.load_complete("RONINBSS"), LoadRole::SpawnCounter);
+        assert_eq!(table.load_complete("roninbss"), LoadRole::Generic);
+        assert_eq!(table.load_complete("ALUKABSS"), LoadRole::SpawnCounter);
+        assert_eq!(table.load_complete("alukabss"), LoadRole::Generic);
+        assert_eq!(table.load_complete("SKINBOS"), LoadRole::SpawnCounter);
+        assert_eq!(table.load_complete("skinbos"), LoadRole::Generic);
+        // The boss/special list is case-insensitive, unlike the exact literals.
+        assert_eq!(table.load_complete("WALLCR"), LoadRole::SpecialFlag);
+    }
+
+    #[test]
+    fn asset_paths_match_the_documented_layout() {
+        let table = EngineNameTable::documented();
+
+        let raziel = table.asset_paths("raziel");
+        assert_eq!(raziel.tree, Some(AssetTree::Standard));
+        assert_eq!(
+            raziel.skeleton().as_deref(),
+            Some(r"\kain2\object\raziel.sra")
+        );
+        assert_eq!(
+            raziel.mesh().as_deref(),
+            Some(r"\kain2\object\raziel\raziel.crm")
+        );
+        assert_eq!(
+            raziel.model().as_deref(),
+            Some(r"\kain2\object\raziel\raziel.pcm")
+        );
+        assert!(raziel.has_model_container());
+
+        let tripod = table.asset_paths("tripod");
+        assert_eq!(tripod.tree, Some(AssetTree::E3));
+        assert_eq!(
+            tripod.skeleton().as_deref(),
+            Some(r"\kain2\object_e3\tripod.sra")
+        );
+        assert_eq!(
+            tripod.mesh().as_deref(),
+            Some(r"\kain2\object_e3\tripod\tripod.crm")
+        );
+        assert_eq!(
+            tripod.model().as_deref(),
+            Some(r"\kain2\object_e3\tripod\tripod.pcm")
+        );
+
+        let marker = table.asset_paths("marker");
+        assert_eq!(marker.tree, None);
+        assert_eq!(marker.skeleton(), None);
+        assert_eq!(marker.mesh(), None);
+        assert_eq!(marker.model(), None);
+        assert!(!marker.has_model_container());
+
+        let unknown = table.asset_paths("under1");
+        assert_eq!(unknown.tree, Some(AssetTree::Standard));
+    }
+
+    #[test]
+    fn asset_paths_switch_tree_case_insensitively_and_echo_the_name() {
+        let table = EngineNameTable::documented();
+
+        let e3 = table.asset_paths("TRIPOD");
+        assert_eq!(e3.tree, Some(AssetTree::E3));
+        assert_eq!(
+            e3.model().as_deref(),
+            Some(r"\kain2\object_e3\TRIPOD\TRIPOD.pcm")
+        );
+
+        let standard = table.asset_paths("Raziel");
+        assert_eq!(standard.tree, Some(AssetTree::Standard));
+        assert_eq!(
+            standard.model().as_deref(),
+            Some(r"\kain2\object\Raziel\Raziel.pcm")
+        );
+
+        let marker = table.asset_paths("CAMpaTH");
+        assert_eq!(marker.tree, None);
+    }
+
+    #[test]
+    fn trait_object_answers_the_three_seam_questions() {
+        let policy: &dyn SpawnPolicy = &EngineNameTable::documented();
+        assert_eq!(policy.admit(&placed("raziel")), Admission::System);
+        assert_eq!(policy.load_complete("MORLOCK"), LoadRole::ActorFlag);
+        assert_eq!(policy.asset_paths("tripod").tree, Some(AssetTree::E3));
+        assert_eq!(policy.asset_paths("marker").tree, None);
     }
 }
