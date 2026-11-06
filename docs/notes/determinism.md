@@ -41,6 +41,9 @@ slice, not part of this gate.
 
 - T2 (first tick loop): **hard gate**. A test must run N ticks twice and assert
   an identical state hash. T2 must not merge without it.
+- T3 (placed database + world construction): no tick loop and no
+  `WorldState.live` write, so the canonical fold and
+  `GOLDEN_WORLD_STATE_HASH` stay unchanged.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.

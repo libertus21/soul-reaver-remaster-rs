@@ -11,9 +11,13 @@ use crate::engine::state::{GameState, StateEvent};
 pub mod clock;
 #[allow(dead_code)]
 pub mod determinism;
+#[allow(dead_code)]
+pub mod placed;
 pub mod play;
 #[allow(dead_code)]
 pub mod state;
+#[allow(dead_code)]
+pub mod world;
 
 /// Typed engine failures.
 ///

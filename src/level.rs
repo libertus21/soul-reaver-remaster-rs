@@ -146,13 +146,16 @@ pub struct RoomMesh {
 }
 
 /// One placed object behind header slot `0x00`. `object_type` is the high 16
-/// bits of the record's `+0x28` dword and `flags` is the raw `+0x2C` dword.
+/// bits of the record's `+0x28` dword, `instance_id` is its low 16 bits,
+/// `archetype` is the `u16` at `+0x26`, and `flags` is the raw `+0x2C` dword.
 /// The record carries no rotation.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ObjectRecord {
     pub name: String,
     pub position: [i16; 3],
     pub object_type: u16,
+    pub archetype: u16,
+    pub instance_id: u16,
     pub flags: u32,
 }
 
@@ -390,6 +393,7 @@ const OBJECT_OFFSET: usize = 0x0C;
 const OBJECT_STRIDE: usize = 0x4C;
 const OBJECT_NAME_LEN: usize = 12;
 const OBJECT_X: usize = 0x20;
+const OBJECT_ARCHETYPE: usize = 0x26;
 const OBJECT_TYPE: usize = 0x28;
 const OBJECT_FLAGS: usize = 0x2C;
 
@@ -630,6 +634,9 @@ fn object_report(data: &[u8]) -> Result<ObjectReport, LevelError> {
                 read_i16(data, at + OBJECT_X + 4).ok_or(LevelError::ObjectArrayOutOfRange)?,
             ],
             object_type: (type_word >> 16) as u16,
+            archetype: read_u16(data, at + OBJECT_ARCHETYPE)
+                .ok_or(LevelError::ObjectArrayOutOfRange)?,
+            instance_id: (type_word & 0xFFFF) as u16,
             flags: read_u32(data, at + OBJECT_FLAGS).ok_or(LevelError::ObjectArrayOutOfRange)?,
         });
     }
@@ -1074,10 +1081,14 @@ fn discover_group(path: &Path, prefix: &str) -> Result<Vec<(LevelUnit, Vec<u8>)>
     Ok(rooms)
 }
 
-/// One archived level unit and its outgoing link-target names.
+/// One archived level unit, the BIGFILE entry it came from, and its outgoing
+/// link-target names.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ArchivedUnit {
     pub name: String,
+    /// Archive entry index, so a caller can reload the unit without scanning
+    /// by name again.
+    pub entry: usize,
     pub links: Vec<String>,
 }
 
@@ -1151,7 +1162,7 @@ pub fn scan_archive_levels(path: &Path) -> Result<ArchiveScan, LevelError> {
                 // for `--level-links`.
                 let links =
                     unit.link_table.iter().map(|link| link.target.to_ascii_lowercase()).collect();
-                scan.units.push(ArchivedUnit { name: unit.name, links });
+                scan.units.push(ArchivedUnit { name: unit.name, entry: index, links });
             }
             Err(error) => scan.unparseable.push(format!(
                 "entry {index} suffix {}: {error}",
@@ -1163,6 +1174,20 @@ pub fn scan_archive_levels(path: &Path) -> Result<ArchiveScan, LevelError> {
         return Err(LevelError::NoArchivedLevels);
     }
     Ok(scan)
+}
+
+/// Resolve a unit name to its BIGFILE entry index.
+///
+/// Reuses [`scan_archive_levels`] so the name rules (header name plus the
+/// BIGFILE suffix fallback) stay in one place. The match is case-insensitive;
+/// `None` means no entry carries that name.
+pub fn resolve_unit_entry(path: &Path, name: &str) -> Option<usize> {
+    scan_archive_levels(path)
+        .ok()?
+        .units
+        .into_iter()
+        .find(|unit| unit.name.eq_ignore_ascii_case(name))
+        .map(|unit| unit.entry)
 }
 
 /// Reachability summary for one start unit.
@@ -2764,6 +2789,28 @@ mod tests {
     }
 
     #[test]
+    fn object_array_decodes_archetype_and_instance_id_without_changing_lines() {
+        let mut bytes = object_pcm(&[("marker", [1, 2, 3], 4)]);
+        let base = data_base(2);
+        let offset = object_report(&bytes[base..]).expect("must decode").array_offset as usize;
+        let at = base + offset;
+        bytes[at + OBJECT_ARCHETYPE..at + OBJECT_ARCHETYPE + 2]
+            .copy_from_slice(&7u16.to_le_bytes());
+        bytes[at + OBJECT_TYPE..at + OBJECT_TYPE + 2].copy_from_slice(&9u16.to_le_bytes());
+        let report = object_report(&bytes[base..]).expect("must decode");
+        let object = &report.objects[0];
+        assert_eq!(
+            (object.archetype, object.instance_id, object.object_type),
+            (7, 9, 4)
+        );
+        assert_eq!(
+            object_lines("under1", &report)[1],
+            "  object marker pos=1,2,3 type=4 flags=0",
+            "new record fields must not change the printed line"
+        );
+    }
+
+    #[test]
     fn markers_add_one_cube_per_object_into_the_same_buffers() {
         let bytes = object_pcm(&[("a", [0, 0, 0], 0), ("b", [100, 0, 0], 0)]);
         let data = &bytes[data_base(2)..];
@@ -3142,6 +3189,28 @@ mod tests {
         unit.name = "wrongname".into();
         resolve_unit_name(&mut unit, b"DER1");
         assert_eq!(unit.name, "under1", "the scanned suffix match wins");
+    }
+
+    #[test]
+    fn resolve_unit_entry_returns_the_archive_index() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let under2 = reach_pcm("under2", &[]);
+        let under1 = reach_pcm("under1", &[]);
+        let dat = archive_with_suffixes(&[(&under2, *b"DER2"), (&under1, *b"DER1")]);
+        let path = tmp.path().join("BIGFILE.DAT");
+        std::fs::write(&path, dat).expect("synthetic archive must be writable");
+
+        assert_eq!(resolve_unit_entry(&path, "under1"), Some(1));
+        assert_eq!(resolve_unit_entry(&path, "UNDER2"), Some(0));
+        assert_eq!(resolve_unit_entry(&path, "missing"), None);
+        let scan = scan_archive_levels(&path).expect("scan must succeed");
+        assert_eq!(
+            scan.units
+                .iter()
+                .map(|unit| (unit.name.as_str(), unit.entry))
+                .collect::<Vec<_>>(),
+            vec![("under2", 0), ("under1", 1)]
+        );
     }
 
     #[test]
