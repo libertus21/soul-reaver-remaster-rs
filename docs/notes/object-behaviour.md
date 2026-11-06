@@ -189,6 +189,19 @@ sfxwood, torchd, coffin, cptrcha, sfxrush
 (CONFIRMED role as build-variant path; behaviour of the individual names
 UNKNOWN.)
 
+### Case rule in the engine skeleton (implementation decision)
+
+The five name lists are matched ASCII case-insensitively. This follows the
+level name resolver (`resolve_unit_entry`, `spawn_position`), which already
+compares unit and object names without case. The four load-complete literals
+(`MORLOCK`, `RONINBSS`, `ALUKABSS`, `SKINBOS`) are compared exactly, including
+case, because the note records `MORLOCK` as exact upper-case.
+
+The consequence is deliberate and tested: `MORLOCK` takes the actor-flag role,
+while `morlock` (the roster spelling) takes the generic load path. This is an
+implementation decision for the name-keyed spawn policy, not new evidence about
+the original. See `src/engine/spawn.rs`.
+
 ## 4. Behaviour table by key
 
 Legend: the key is the **name**, because that is the only runtime selector

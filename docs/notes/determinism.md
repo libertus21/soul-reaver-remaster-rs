@@ -49,6 +49,11 @@ slice, not part of this gate.
   T5 adds a separate live-order replay (`src/engine/determinism.rs`) that pins
   slot index, generation and order across two identical spawn/remove runs; it
   is an independent observation, not part of the world golden.
+- T6 (name-keyed spawn policy): no tick and no `WorldState` write, so the four
+  existing goldens do not move. A fifth, independent gate,
+  `GOLDEN_CLASSIFICATION_HASH`, pins every name in the five lists in documented
+  order: list id, exact count, name bytes, admission, load role and asset tree.
+  Renaming, removing, adding or reordering an entry breaks it.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.
@@ -67,6 +72,7 @@ questions:
 | `options_hash` / `error_hash` | parsed `PlayOptions`, typed error text | **Regression gate**: argv parsing, fold order, field set, error tags. No simulation state. |
 | `world_state_hash` | tick count, live-list order, per-entry class, position, visible | **Canonical state gate**: the simulation contract from `spec.md`. Independent of the options fold. |
 | `tracker_hash` | each slot in index order: index, state code, name | **Tracker gate**: acquisition, duplicate-name sharing and lowest-free reuse. Independent of both folds above. |
+| `classification_hash` | the five name lists in documented order: list id, exact count, then per name the name bytes, admission code, load-role code and asset-tree code | **Name-table gate**: the exact membership and roles of the spawn policy. Independent of every fold above; lives in `src/engine/spawn.rs` tests. |
 
 `tracker_hash` folds all 48 slots, empty ones included, so a release is
 observable and a name's slot index is part of the contract, not just its
@@ -83,6 +89,22 @@ The canonical world fold, in order: `tick` as `u64`, then for each live entry in
 `class` as `u8`, `position.x/y/z` as `i32`, `visible` as `u8`. `GOLDEN_WORLD_STATE_HASH`
 pins that exact byte stream. T3+ extends the fold and the constant deliberately,
 in the same PR that updates `spec.md`; it is never "fixed" to go green.
+
+## Name-table classification (T6)
+
+`EngineNameTable` owns the always-spawn (10), actor roster (10), boss/special
+(8), E3 override (22) and marker-only (3) lists. Membership is ASCII
+case-insensitive, matching the level name resolver. The four load-complete
+literals (`MORLOCK`, `RONINBSS`, `ALUKABSS`, `SKINBOS`) are exact, including
+case, because the evidence records `MORLOCK` as exact upper-case.
+`SpawnPolicy` exposes only admission, load role and asset paths; it has no
+actor method and loads nothing.
+
+`GOLDEN_CLASSIFICATION_HASH` lives in `src/engine/spawn.rs` tests. It folds, for
+each list in documented order, the list id and exact count, then per name the
+name bytes, the `Admission` code, the `LoadRole` code and the asset-tree code.
+It does not read the canonical world state and does not move any existing
+golden.
 
 ## Live order (T5)
 

@@ -367,6 +367,7 @@ mod tests {
         EngineNameTable, LOAD_ACTOR_FLAG, LOAD_SPAWN_COUNTER, LoadRole, MARKER_ONLY, NameCounts,
         SpawnPolicy,
     };
+    use crate::engine::determinism::StateHasher;
     use crate::engine::placed::PlacedObject;
 
     fn placed(name: &str) -> PlacedObject {
@@ -632,5 +633,51 @@ mod tests {
         assert_eq!(policy.load_complete("MORLOCK"), LoadRole::ActorFlag);
         assert_eq!(policy.asset_paths("tripod").tree, Some(AssetTree::E3));
         assert_eq!(policy.asset_paths("marker").tree, None);
+    }
+
+    // Guards the classification table itself: for each of the five lists in
+    // documented order, the list id, its exact count, and per name the name
+    // bytes, the admission code, the load-role code and the asset-tree code.
+    // Renaming, removing, adding or reordering any entry moves the digest.
+    const GOLDEN_CLASSIFICATION_HASH: u64 = 0x9bec_a441_2d97_8281;
+
+    fn asset_tree_code(tree: Option<AssetTree>) -> u8 {
+        match tree {
+            Some(AssetTree::Standard) => 0,
+            Some(AssetTree::E3) => 1,
+            None => 2,
+        }
+    }
+
+    fn classification_digest() -> u64 {
+        let table = EngineNameTable::documented();
+        let lists: [(u8, &'static [&'static str]); 5] = [
+            (0, &ALWAYS_SPAWN),
+            (1, &ACTOR_ROSTER),
+            (2, &BOSS_SPECIAL),
+            (3, &E3_OVERRIDES),
+            (4, &MARKER_ONLY),
+        ];
+        let mut hasher = StateHasher::new();
+        for (list_id, names) in lists {
+            hasher.write_u8(list_id);
+            hasher.write_u32(names.len() as u32);
+            for name in names {
+                hasher.write_bytes(name.as_bytes());
+                hasher.write_u8(table.admission_for_name(name).code());
+                hasher.write_u8(table.load_role_for_name(name).code());
+                hasher.write_u8(asset_tree_code(table.asset_paths_for_name(name).tree));
+            }
+        }
+        hasher.finish()
+    }
+
+    #[test]
+    fn classification_table_matches_the_golden() {
+        let observed = classification_digest();
+        assert_eq!(
+            observed, GOLDEN_CLASSIFICATION_HASH,
+            "name-table classification moved: list order, count, name bytes, admission, load role or asset tree changed (observed {observed:#018x})"
+        );
     }
 }
