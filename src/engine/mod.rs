@@ -18,6 +18,10 @@ pub mod clock;
 #[allow(dead_code)]
 pub mod determinism;
 #[allow(dead_code)]
+pub mod frame;
+#[allow(dead_code)]
+pub mod input;
+#[allow(dead_code)]
 pub mod live;
 #[allow(dead_code)]
 pub mod placed;

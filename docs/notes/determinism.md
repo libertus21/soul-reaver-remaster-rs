@@ -61,6 +61,13 @@ slice, not part of this gate.
   the entry-array kind and the entry ids, then the numeric relation, state,
   target and flags. The profile has no name field, so renaming a model does not
   move the fold. It lives in `src/engine/determinism.rs` tests.
+- T8 (18-stage frame pipeline): the frame driver consumes the existing fold and
+  does not change it, and there is still no CLI digest, so **all six existing
+  goldens are untouched**. T8 adds a seventh, independent gate: the 18 stage
+  numbers and names are pinned by `GOLDEN_FRAME_STAGES`, and a scripted 40-tick
+  run is replayed twice comparing the stage trace and the per-tick world hash;
+  `GOLDEN_FRAME_STATE_HASH` pins the final state. It lives in
+  `src/engine/determinism.rs` tests.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.
@@ -154,6 +161,32 @@ name through the bigfile index with the existing container and actor parsers and
 reuses the existing textured-mesh builder). `LoadQueue` is only a deterministic
 FIFO shape for a later asynchronous source; it adds no thread, runtime or
 dependency, and a missing model is `Unresolved`, never a panic.
+
+## Frame pipeline (T8)
+
+The frame pipeline is where determinism actually breaks in practice: the same
+input can look stable while the stage order, the input sampling point or the
+double player update silently changed. `engine/frame.rs` therefore has one
+ordered definition, `STAGE_ORDER`, and one driver, `FrameState::run_tick`.
+
+- Stages 3, 4, 5, 7, 10, 11, 13, 14, 16 and 17 are named no-ops. Stage 8 is a
+  named no-op too: the original four-step move/collide/commit solver is out of
+  scope and direct input translation lives in stage 9.
+- Input is sampled once per tick boundary, inside stage 1. The clock is fed by
+  the caller and never reads input, so 1 and 100 queued events inside the same
+  wall-time window execute the same number of ticks.
+- The player is updated twice: directly by stage 9 and again as an ordinary
+  live object in the stage 12 generic pass. This is the documented original
+  double update and the gate must preserve it.
+
+`GOLDEN_FRAME_STAGES` pins the 18 `(code, name)` pairs in order; swapping any
+two stages fails `frame_stage_order_matches_the_golden_table`. The scripted
+replay in `frame_pipeline_replays_stage_order_and_state_identically` runs the
+same input script over the same tick sequence twice and compares, per tick, the
+full stage trace and the canonical world hash, then pins the last hash with
+`GOLDEN_FRAME_STATE_HASH`. `FrameState::world_state()` reuses
+`world_state_hash` as a pure function; neither the fold nor any existing
+constant moves.
 
 ## Clock: rational step, no drift
 
