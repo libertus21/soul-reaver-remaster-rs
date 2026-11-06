@@ -74,6 +74,13 @@ slice, not part of this gate.
   compares the whole `RenderScene` (draw order, handles, meshes and material
   table); making the live walk unordered fails it. See
   `docs/notes/engine-render.md`.
+- T10 (headless acceptance): the canonical fold becomes the REAL production
+  digest. `--play --headless` prints one line over the real `FrameState` live
+  world and `GOLDEN_WORLD_STATE_HASH` is re-pinned deliberately from the T2
+  synthetic vector to an end-to-end real-world run. A second, CLI-path golden
+  (`GOLDEN_HEADLESS_DIGEST`) pins a synthetic-archive acceptance run. The
+  options, error, tracker, classification, actor-runtime, stage-order and
+  frame-state goldens do not move. See "Headless acceptance (T10)" below.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.
@@ -90,7 +97,7 @@ questions:
 | Golden | Fold | Guards |
 |---|---|---|
 | `options_hash` / `error_hash` | parsed `PlayOptions`, typed error text | **Regression gate**: argv parsing, fold order, field set, error tags. No simulation state. |
-| `world_state_hash` | tick count, live-list order, per-entry class, position, visible | **Canonical state gate**: the simulation contract from `spec.md`. Independent of the options fold. |
+| `world_state_hash` | tick count, live-list order, per-entry class, position, visible | **Canonical state gate** and the production `--play --headless` digest: the simulation contract from `spec.md`. Independent of the options fold. |
 | `tracker_hash` | each slot in index order: index, state code, name | **Tracker gate**: acquisition, duplicate-name sharing and lowest-free reuse. Independent of both folds above. |
 | `classification_hash` | the five name lists in documented order: list id, exact count, then per name the name bytes, admission code, load-role code and asset-tree code | **Name-table gate**: the exact membership and roles of the spawn policy. Independent of every fold above; lives in `src/engine/spawn.rs` tests. |
 | `actor_runtime_hash` | profile kind, the eight trios, entry-array kind, entry ids; then relation, state, target and flags | **Actor-runtime gate**: the data-keyed AI initial state. No name is folded. Independent of every fold above; lives in `src/engine/determinism.rs` tests. |
@@ -203,3 +210,48 @@ step is an exact integer; no float touches time. One `advance` emits at most
 A 10 s advance therefore emits 5 ticks and keeps `10 s - 5 * (1/60 s)`, and later
 frames pay the rest back: the cap delays ticks, it never loses them. Ticks are
 integer-indexed and monotonic.
+
+## Headless acceptance and the production digest (T10)
+
+T10 closes the milestone by making the canonical fold the **real end-to-end
+gate**. `--play --headless --ticks N` prints exactly one line on stdout and
+exits 0:
+
+```text
+engine unit=<name> rooms=<R> placed=<P> admitted=<A> tracked=<T> skipped_markers=<M> inert=<I> unresolved=<U> live=<L> ticks=<N> digest=<16-lowercase-hex>
+```
+
+`digest` is `world_state_hash(&frame.world_state())`: FNV-1a 64 over the tick
+count and, in live-list order, each entry's class, integer position and visible
+byte. There is no second hashing scheme. The tracker slot is deliberately not
+part of this fold; `tracker_hash` owns slot allocation independently.
+
+The boot pass walks the authored placements exactly once
+(`PlacedDb::records_for_boot`, never from the tick loop), classifies them with
+`EngineNameTable`, skips marker-only names, counts inert and unresolved names,
+and defers resolved spawns to stage 18. Marker names never reach the tracker.
+The 48-slot cap is therefore reachable end-to-end: a 49th distinct live name
+returns `FrameError::Tracker`, which maps to exit code 4 and prints no partial
+success line.
+
+Goldens:
+
+- `GOLDEN_WORLD_STATE_HASH` moved deliberately from the retired T2 synthetic
+  vector `0x82fe_8a38_1b9d_2a6d` to the real `FrameState` end-to-end run
+  `0xb5bb_59fd_97b9_50b1`. It now covers a real live world with a culled
+  object, so dropping the `visible` byte fails the gate: the perturbed digest is
+  `0xe34dc760aae69953`.
+- `GOLDEN_HEADLESS_DIGEST` (`0x8dd6_3315_4e26_f1c4`) pins the full CLI-path
+  run over a synthetic archive; dropping `visible` moves it to
+  `0x6094208b15fb134e`.
+- The options, error, tracker, classification, actor-runtime, stage-order and
+  frame-state goldens did not move: none of their fold inputs changed.
+
+Wall-clock independence is proved twice. The simulation sources (`clock`,
+`frame`, `world`, `placed`, `live`, `class`, `input`, `tracker`, `spawn`,
+`assets`, `actor`, `state`) must not name `Instant` or `SystemTime`;
+`simulation_path_never_names_a_wall_clock` enforces that. The frame loop in
+`play.rs` may read time only to decide how many ticks are owed, never to compute
+state. `equal_tick_counts_ignore_the_wall_clock_schedule` reaches the same
+120-tick state through 120 exact `1/60 s` frames and through one 2 s advance
+plus capped drains.
