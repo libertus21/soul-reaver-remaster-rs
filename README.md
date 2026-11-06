@@ -20,7 +20,7 @@ your own install; nothing is bundled.
 | `.BIG` container textures | `cargo run -- --textures <TEXTURES.BIG> --tlist` / `--tshow <SEL>` | Validates the 512-byte header and fixed 131072-byte slots; `--tshow` decodes one 256×256 A1R5G5B5 slot. Works on `TEXTURES.BIG`, `MOVIES.BIG`, `BONUS.BIG`, `E3.BIG`. |
 | `.BIG` texture names | `cargo run -- --textures <TEXTURES.BIG> --tlist --map <TEX_HD.MAP>` / `--tshow <NAME> --map <TEX_HD.MAP>` | Decodes the engine alias matrix (1287/1287 `TEXTURES.BIG` slots named). `--tshow` accepts `<id>_<sub>`, `M\<id>_<sub>`, `B\<id>_<sub>`; shared names are refused. |
 | `.SRM` meshes | `cargo run -- --mesh <FILE.SRM>` | Parses one loose mesh (positions + triangle indices) and draws a flat-shaded auto-rotating solid. Left-drag orbit, wheel zoom, right/middle-drag pan, `R` reset, `F` fly. |
-| One-bone pose | `cargo run -- --mesh <FILE.SRM> --pose <BONE>:<DEG>` | Rotates exactly one decoded weighted bone slot (`0..=127`, `|deg| <= 360`) and shows the deformed mesh. A local cluster rotation, not a full pose. |
+| One-bone pose | `cargo run -- --mesh <FILE.SRM> --pose <BONE>:<DEG>` | Rotates exactly one decoded weighted bone slot (`0..=127`, `\|deg\| <= 360`) and shows the deformed mesh. A local cluster rotation, not a full pose. |
 | Textured meshes + mesh gallery | `cargo run -- --mesh-textured <FILE.SRM> --tex-dir <DIR>` / `cargo run -- --mesh-all <OBJECT_DIR> --tex-dir <DIR>` | Loads UVs, material indices and the three DDS textures per material; renders lit. `--mesh-all` browses a directory (`←`/`→`, Esc). |
 | `.SND`/`.SMP` audio → WAV | `cargo run -- --audio <FILE.SND> --alist` / `cargo run -- --audio <FILE.SND> --wave <N> --out <FILE.wav>` | Lists each wave's offset, bytes, frames, duration and loop span; decodes one wave as Sony 4-bit ADPCM to a canonical PCM16 mono WAV (44100 Hz chosen). The writer refuses paths inside a git work tree. |
 | `BIGFILE.DAT` index | `cargo run -- --bigfile <BIGFILE.DAT> --list` / `--show <SEL>` | Prints `index hash offset length` per entry; `--show` reads one entry in memory and shows it if it is a DDS. |
@@ -34,7 +34,8 @@ your own install; nothing is bundled.
 | Actor behaviour census | `cargo run -- --actor-census --bigfile <BIGFILE.DAT> [--objects-dir <DIR>]` / `cargo run -- --object-info --bigfile <BIGFILE.DAT> --entry 129 --actors` | Reads the object-header `+0x1C` actor block, prints each actor's 0x20-byte entry count, entry ids (hex) and the eight 8x3 state trios, then a corpus summary. Partial actors report `variant`/`none` and never contribute to the totals. Real corpus: 21 actors / 75 entries / 37 distinct ids (19 archive + `morboss`/`priests` loose). |
 | `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --entry <INDEX>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --group under [--objects] [--textures <TEXTURES.BIG>]` | Renders room geometry, flat or textured from `TEXTURES.BIG`. Orbit, wheel zoom, pan, `R` reset; `F` enters a first-person fly camera. `--objects` adds each placed object's real archived model at its world position; `--textures` textures both rooms and models. |
 | Level reachability | `cargo run -- --level-reach --bigfile <BIGFILE.DAT> [--start <UNIT>] [--names]` | BFS from `under1` over the decoded link graph, then groups reachable, in-degree islands and inbound-but-unreachable units. `--names` lists each island unit. Corrected reader: 372 discovered / 334 reachable / 38 unreachable / 1 island (`push1`). |
-| Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 32 capabilities in five groups; grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
+| Engine play mode | `cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG>` / `cargo run -- --play --headless --bigfile <BIGFILE.DAT> --ticks <N>` | Opens a deterministic engine window (orbit, fly or player camera; `Esc` exits 0), or prints one headless acceptance line with the FNV-1a 64 state digest. Fixed 60 Hz clock, 48-slot tracker, name-keyed spawning, 18-stage frame loop. Still no AI, animation or collision. |
+| Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 33 capabilities in six groups; grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
 
 `<PATH>` accepts a `.PCM` file or a room directory. The level arms also accept
 `--bigfile <DAT> --entry <INDEX>` or `--bigfile <DAT> --group <PREFIX>`.
@@ -62,12 +63,49 @@ Fly camera keys: `F` toggles orbit/fly; `W`/`A`/`S`/`D` move relative to the
 view; the mouse looks around; `Space`/`E` rise; `C`/`Q` sink; `Shift` flies
 faster; `R` resets the camera; `Esc` exits.
 
+## Play mode (engine skeleton)
+
+`--play` runs the deterministic engine skeleton on one archive unit. It is a
+skeleton, not a playable game: actor AI, animation, collision, scripts, audio,
+streaming, particles, menus, warps and save are absent. The close-out is in
+`docs/changes/engine-skeleton/milestone-report.md`.
+
+Windowed mode needs `--textures` and a display:
+
+```text
+cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG>
+cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG> --camera player
+```
+
+The window draws the unit's room geometry and the player's live model. The
+authored placed-object seeding pass runs only in headless mode in this
+milestone, so other placements are not spawned in the window. Camera mode is
+set with `--camera`: `fly` is the default, `orbit` circles the unit, and
+`player` follows `raziel`. `Esc` exits 0. A missing texture page fails loud
+before the window opens.
+
+Headless mode runs the fixed 60 Hz clock without a window and prints exactly one
+line, then exits 0:
+
+```text
+engine unit=<name> rooms=<R> placed=<P> admitted=<A> tracked=<T> skipped_markers=<M> inert=<I> unresolved=<U> live=<L> ticks=<N> digest=<16-lowercase-hex>
+```
+
+`digest` is FNV-1a 64 over the tick count and, in live-list order, each live
+object's class byte, integer position and visible byte. It does not include the
+tracker slot, wall-clock time, GPU state or hash-map order. It is a
+same-platform, same-build gate: the path fold uses the OS-native encoding, so
+non-ASCII paths are out of scope across platforms. `--unit` defaults to
+`under1`; `--ticks` defaults to 60 in headless mode.
+
 ## What's missing / known limits
 
 - **No animation.** `.SRA` is not parsed by this build (the loader callback is a
   `RET 0` stub) and `.SRM` has no hierarchy, so `--pose` is a local cluster
   rotation only and the mesh tears at cluster seams.
-- **No game logic.** This is a viewer/analysis tool, not a playable engine.
+- **No game logic.** `--play` is a deterministic skeleton: no actor AI,
+  animation, collision, scripts, audio, streaming, particles, menus, warps or
+  save. This is not a playable engine.
 - **No sound sequences.** `.SND` waves export to WAV and loops are reported, but
   they are decoded one-shot; there is no `QSMa`/sequence playback, mixing or ADSR.
 - **Objects are real archived models, not markers.** `--level-render --objects`
@@ -122,7 +160,7 @@ faster; `R` resets the camera; `Esc` exits.
 | Game data | Read-only at runtime from the user's install; paths via CLI args/env only, never committed. |
 | Legal guardrails | Whitelist `.gitignore` verified every commit; single-player/offline owned copy only; community work credited in `THIRD-PARTY-NOTICES.md` once reuse starts. |
 | Process | Small chained slices (≤400 changed lines each); proposal → spec → tasks → code → playtest report. |
-| Tests | `cargo test` — 321 tests on synthetic bytes only; no game files in the suite. |
+| Tests | `cargo test` — 451 tests on synthetic bytes only; no game files in the suite. |
 
 ## Further reading
 
