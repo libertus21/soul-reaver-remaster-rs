@@ -796,7 +796,7 @@ impl OrbitCamera {
     }
 
     /// Near/far scale with distance, so interior geometry survives any zoom.
-    fn mvp(&self, aspect: f32) -> [[f32; 4]; 4] {
+    pub(crate) fn mvp(&self, aspect: f32) -> [[f32; 4]; 4] {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
         let eye = [
@@ -811,7 +811,7 @@ impl OrbitCamera {
 }
 
 /// Shared view/projection: `right`/`up` are unit, `forward` is the view direction.
-fn view_proj(
+pub(crate) fn view_proj(
     eye: [f32; 3],
     (right, up): ([f32; 3], [f32; 3]),
     forward: [f32; 3],
@@ -904,7 +904,7 @@ impl FlyCamera {
         ([-cp * sy, -sp, -cp * cy], [cy, 0.0, -sy], [-sy * sp, cp, -cy * sp])
     }
 
-    fn mvp(&self, aspect: f32) -> [[f32; 4]; 4] {
+    pub(crate) fn mvp(&self, aspect: f32) -> [[f32; 4]; 4] {
         let (forward, right, up) = self.basis();
         view_proj(self.position, (right, up), forward, FLY_NEAR, FLY_FAR, aspect)
     }
@@ -976,7 +976,7 @@ fn next_fly_mvp(
     mat_bytes(&fly.mvp(aspect))
 }
 
-fn set_fly_cursor(window: &Window, fly: bool) {
+pub(crate) fn set_fly_cursor(window: &Window, fly: bool) {
     let grab = if fly {
         window
             .set_cursor_grab(CursorGrabMode::Locked)

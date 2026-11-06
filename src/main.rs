@@ -263,7 +263,7 @@ fn dispatch(args: &[String]) -> ExitCode {
 }
 
 /// `--play [options]`: parse the engine options, then run the engine.
-/// T1 only parses; `engine::play::run` is a loud typed error until T9/T10.
+/// Texture-page failures fail fast with exit code 2 before a window opens.
 fn run_play(args: &[String]) -> ExitCode {
     let options = match engine::play::PlayOptions::parse(args) {
         Ok(options) => options,
@@ -276,7 +276,7 @@ fn run_play(args: &[String]) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("error: {error}");
-            ExitCode::from(1)
+            ExitCode::from(error.exit_code())
         }
     }
 }
