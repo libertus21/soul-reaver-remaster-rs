@@ -8,11 +8,15 @@ use std::fmt;
 use std::path::PathBuf;
 
 /// Camera modes accepted by `--camera`.
+///
+/// The discriminants are explicit and `#[repr(u8)]` so the value hashed by
+/// `determinism::write_options` cannot drift when a variant is added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum CameraMode {
-    Orbit,
-    Fly,
-    Player,
+    Orbit = 0,
+    Fly = 1,
+    Player = 2,
 }
 
 impl CameraMode {
