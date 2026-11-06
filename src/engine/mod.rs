@@ -17,6 +17,8 @@ pub mod play;
 #[allow(dead_code)]
 pub mod state;
 #[allow(dead_code)]
+pub mod tracker;
+#[allow(dead_code)]
 pub mod world;
 
 /// Typed engine failures.
