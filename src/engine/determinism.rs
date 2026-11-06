@@ -6,12 +6,17 @@
 //! The policy lives in `docs/notes/determinism.md`; the gate is stated in
 //! `docs/changes/engine-skeleton/tasks.md`.
 //!
-//! T1 has no world and no tick loop, so [`state_hash`] folds only what exists
-//! today: the parsed [`PlayOptions`] or the typed error text. T2 grows this
-//! module to fold the world state (tick count, live order, class, position,
-//! visible) into the canonical FNV-1a 64 digest from `spec.md`. The hasher and
-//! the "same input, same bytes" tests are the pattern that must survive that
-//! growth unchanged.
+//! Two independent golden models live here:
+//!
+//! - `options_hash` / `error_hash` are **regression gates** over the `--play`
+//!   options fold and the typed error text. They never include simulation
+//!   state.
+//! - [`world_state_hash`] is the **canonical state gate**: FNV-1a 64 over the
+//!   tick count, live-list order, per-entry class, position and visibility.
+//!   It is independent of the options fold.
+//!
+//! T1's `state_hash` mixed the options fold with the notion of state; that was
+//! a tripwire, not a gate, so T2 retires it instead of re-pinning it.
 
 use std::path::Path;
 
@@ -56,6 +61,10 @@ impl StateHasher {
     }
 
     pub fn write_u32(&mut self, value: u32) {
+        self.write(&value.to_le_bytes());
+    }
+
+    pub fn write_i32(&mut self, value: i32) {
         self.write(&value.to_le_bytes());
     }
 
@@ -126,30 +135,55 @@ pub fn error_hash(error: &PlayError) -> u64 {
     hasher.finish()
 }
 
-/// Hash the observable result of one setup step.
+/// Canonical fold shape for the simulation state.
 ///
-/// T2 replaces the `Ok` arm with the world-state fold and keeps this signature,
-/// so the gate test grows from "same argv" to "N ticks" without changing shape.
-pub fn state_hash(result: &Result<PlayOptions, PlayError>) -> u64 {
+/// T3+ fills `live` from the live arena. The contract is fixed now so the
+/// determinism gate can land before any world code:
+///
+/// - `tick` is the number of simulation ticks executed.
+/// - `live` is **live-list order**: spawn order, with removals preserving the
+///   relative order of survivors. This order is canonical; it is not sorted and
+///   never depends on allocation or hash order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorldState {
+    pub tick: u64,
+    pub live: Vec<WorldEntry>,
+}
+
+/// One live object in the canonical fold. `class` is the render class as `u8`,
+/// `position` is integer world units and `visible` is the render flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorldEntry {
+    pub class: u8,
+    pub position: [i32; 3],
+    pub visible: bool,
+}
+
+/// Hash the canonical world state: tick count, live-list order, then per entry
+/// `class`, `position.x/y/z` and `visible`, all little-endian and fixed width.
+///
+/// Independent of [`options_hash`]: how the engine was launched is not state.
+pub fn world_state_hash(state: &WorldState) -> u64 {
     let mut hasher = StateHasher::new();
-    match result {
-        Ok(options) => {
-            hasher.write_u8(0);
-            write_options(&mut hasher, options);
-        }
-        Err(error) => {
-            hasher.write_u8(1);
-            hasher.write_u8(error_tag(error));
-            hasher.write_bytes(error.to_string().as_bytes());
-        }
+    hasher.write_u64(state.tick);
+    for entry in &state.live {
+        hasher.write_u8(entry.class);
+        hasher.write_i32(entry.position[0]);
+        hasher.write_i32(entry.position[1]);
+        hasher.write_i32(entry.position[2]);
+        hasher.write_u8(u8::from(entry.visible));
     }
     hasher.finish()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{error_hash, options_hash, state_hash, StateHasher};
+    use super::{
+        error_hash, options_hash, world_state_hash, StateHasher, WorldEntry, WorldState,
+    };
+    use crate::engine::clock::SimClock;
     use crate::engine::play::{PlayError, PlayOptions};
+    use std::time::Duration;
 
     fn parse(input: &[&str]) -> Result<PlayOptions, PlayError> {
         let argv: Vec<String> = input.iter().map(|token| token.to_string()).collect();
@@ -193,7 +227,6 @@ mod tests {
         let second = parse(&input).expect("second parse");
         assert_eq!(first, second);
         assert_eq!(options_hash(&first), options_hash(&second));
-        assert_eq!(state_hash(&Ok(first)), state_hash(&Ok(second)));
     }
 
     #[test]
@@ -204,7 +237,6 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.to_string(), second.to_string());
         assert_eq!(error_hash(&first), error_hash(&second));
-        assert_eq!(state_hash(&Err(first)), state_hash(&Err(second)));
     }
 
     #[test]
@@ -213,7 +245,6 @@ mod tests {
         let other = parse(&["--bigfile", "B", "--unit", "under2"]).expect("other parse");
         assert_ne!(base, other);
         assert_ne!(options_hash(&base), options_hash(&other));
-        assert_ne!(state_hash(&Ok(base)), state_hash(&Ok(other)));
     }
 
     // Golden values pin the exact byte stream. The tests above compare the
@@ -229,13 +260,6 @@ mod tests {
     // Guards the error variant tag (`InvalidCamera` = 5), the exact message
     // text and the same FNV constants.
     const GOLDEN_ERROR_HASH: u64 = 0xf7df_8b2c_3041_7acf;
-
-    // Guards the `Ok` discriminant prefix and the T1 options fold.
-    //
-    // T2 replaces the `Ok` arm with the world-state fold, so this constant WILL
-    // change then. Updating it in T2 must be deliberate and reviewed together
-    // with `spec.md`; it must never be "fixed" to make a test go green.
-    const GOLDEN_STATE_HASH: u64 = 0x25f6_bc90_9245_6692;
 
     #[test]
     fn options_hash_matches_the_golden_value() {
@@ -266,21 +290,81 @@ mod tests {
         );
     }
 
+    // Guards the canonical world-state fold: the tick count, the live-list
+    // order, and per entry the class, position x/y/z and visible byte, plus the
+    // FNV-1a constants and little-endian encoding. It is independent of the
+    // options fold above.
+    //
+    // T3+ MUST extend the fold and this constant deliberately, in the same PR
+    // that updates `docs/changes/engine-skeleton/spec.md`; it must never be
+    // "fixed" to make a test go green.
+    const GOLDEN_WORLD_STATE_HASH: u64 = 0x82fe_8a38_1b9d_2a6d;
+
+    /// Synthetic, game-free run: advance a fixed clock over `advances` and fold
+    /// the resulting world. One entry moves one unit on x per tick so the hash
+    /// depends on the tick count, not only on the seed.
+    fn synthetic_run(advances: &[Duration]) -> WorldState {
+        let mut clock = SimClock::new();
+        let mut state = WorldState {
+            tick: 0,
+            live: vec![
+                WorldEntry {
+                    class: 1,
+                    position: [0, 0, 0],
+                    visible: true,
+                },
+                WorldEntry {
+                    class: 2,
+                    position: [10, 0, 0],
+                    visible: false,
+                },
+            ],
+        };
+        for delta in advances {
+            for _tick in clock.advance(*delta).ticks() {
+                state.tick += 1;
+                state.live[0].position[0] += 1;
+            }
+        }
+        state
+    }
+
     #[test]
-    fn state_hash_matches_the_golden_value() {
-        let options = parse(&[
-            "--bigfile",
-            "BIGFILE.DAT",
-            "--unit",
-            "under1",
-            "--ticks",
-            "120",
-        ])
-        .expect("golden argv must parse");
+    fn n_ticks_twice_produce_identical_world_hash() {
+        let advances = [Duration::from_millis(16); 120];
+        let first = synthetic_run(&advances);
+        let second = synthetic_run(&advances);
+        assert_eq!(first, second, "same tick sequence must fold identically");
+        assert_eq!(world_state_hash(&first), world_state_hash(&second));
         assert_eq!(
-            state_hash(&Ok(options)),
-            GOLDEN_STATE_HASH,
-            "state hash moved before T2: the T1 options fold changed"
+            world_state_hash(&first),
+            GOLDEN_WORLD_STATE_HASH,
+            "world state hash moved: fold order, field set, live order, FNV or endianness changed"
         );
+    }
+
+    #[test]
+    fn world_hash_is_value_and_order_sensitive() {
+        let base = synthetic_run(&[Duration::from_secs(1)]);
+
+        let mut moved = base.clone();
+        moved.live[0].position[0] += 1;
+        assert_ne!(
+            world_state_hash(&base),
+            world_state_hash(&moved),
+            "a different position must change the hash"
+        );
+
+        let mut reordered = base.clone();
+        reordered.live.reverse();
+        assert_ne!(
+            world_state_hash(&base),
+            world_state_hash(&reordered),
+            "a different live order must change the hash"
+        );
+
+        let mut hidden = base.clone();
+        hidden.live[0].visible = false;
+        assert_ne!(world_state_hash(&base), world_state_hash(&hidden));
     }
 }
