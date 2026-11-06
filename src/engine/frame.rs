@@ -1,0 +1,935 @@
+//! Ordered 18-stage frame pipeline.
+//!
+//! The original in-game frame coordinator runs a fixed list of subsystems in a
+//! documented order (`docs/notes/actor-ai.md`, section 1). That order is
+//! behaviour: reordering two stages can change the observable state of the same
+//! inputs. [`STAGE_ORDER`] is therefore the single ordered definition, and
+//! [`FrameState::run_tick`] is the only driver.
+//!
+//! Stages 1, 2, 6, 9, 12, 15 and 18 are implemented for this milestone. The
+//! remaining stages are **named no-ops** with the documented name, never
+//! `todo!()`: adding AI, animation, contact or streaming later is filling a body,
+//! not editing the loop.
+//!
+//! Stage 8 (the four-step player move/collide/commit solver) is deliberately a
+//! named no-op. This milestone has no collision, and the only movement is the
+//! direct input translation in stage 9. A stub solver would be invented
+//! behaviour.
+//!
+//! The player is updated twice per tick, exactly as documented: first by the
+//! direct player path (stage 9) and again as an ordinary live object in the
+//! generic per-object pass (stage 12). The double update is original behaviour
+//! and must not be "fixed" here.
+
+use std::fmt;
+use std::time::Duration;
+
+use crate::engine::class::{CLASS_TABLE, Hooks, Query, RenderClass, classify};
+use crate::engine::clock::{ObjectTick, SimClock};
+use crate::engine::determinism::{WorldEntry, WorldState};
+use crate::engine::input::{InputEvent, InputFrame, InputQueue};
+use crate::engine::live::{LiveArena, LiveId, LiveObject};
+use crate::engine::tracker::{ObjectTracker, TrackerError};
+use crate::engine::world::World;
+
+/// The player's authored placed name. The spawn policy binds this record.
+pub const PLAYER_NAME: &str = "raziel";
+
+/// Direct translation speed in integer world units per tick.
+///
+/// There is no collision in this milestone, so the delta is applied directly.
+/// `1/60 s` times this constant is the whole movement contract until the
+/// original solver arrives.
+pub const PLAYER_SPEED_UNITS_PER_TICK: i32 = 4;
+
+/// Default cull radius, in integer world units.
+pub const DEFAULT_CULL_RADIUS: i32 = 4096;
+
+/// One stage of the documented frame coordinator.
+///
+/// The discriminants are the documented stage numbers and are part of the
+/// determinism gate; never renumber or reorder them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Stage {
+    /// 1. Frame delta / fixed-point timestep and tick-boundary input sampling.
+    Clock = 1,
+    /// 2. Per-frame scratch reset (contact lists, accumulators).
+    ScratchReset = 2,
+    /// 3. Script/event unit execution (16 units).
+    ScriptUnits = 3,
+    /// 4. Per-unit audio emitters.
+    AudioEmitters = 4,
+    /// 5. Clock / time-of-day.
+    TimeOfDay = 5,
+    /// 6. Object activation and distance culling (query hook).
+    ActivationCull = 6,
+    /// 7. Per-unit animation/timer advance.
+    AnimationTimers = 7,
+    /// 8. Player movement solver. Documented no-op: direct translation only.
+    PlayerSolver = 8,
+    /// 9. Player input to movement (direct translation).
+    PlayerMovement = 9,
+    /// 10. Pairwise contact broad phase and resolver.
+    PairwiseContact = 10,
+    /// 11. Hit-record pass per object.
+    HitList = 11,
+    /// 12. Per-object tick (`+0x1A8`).
+    PerObjectTick = 12,
+    /// 13. Area/trigger query pass.
+    TriggerQuery = 13,
+    /// 14. Moving-object world/contact pass.
+    MovingContact = 14,
+    /// 15. Render submission (CPU scene snapshot).
+    RenderSubmission = 15,
+    /// 16. Streaming / prefetch.
+    Streaming = 16,
+    /// 17. Particles.
+    Particles = 17,
+    /// 18. Post-frame spawn/despawn and object-tracker recompute.
+    PostFrameChanges = 18,
+}
+
+impl Stage {
+    /// Documented stage number. Never renumber.
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// Stable stage name used by the determinism golden table.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Clock => "clock",
+            Self::ScratchReset => "scratch-reset",
+            Self::ScriptUnits => "script-units",
+            Self::AudioEmitters => "audio-emitters",
+            Self::TimeOfDay => "time-of-day",
+            Self::ActivationCull => "activation-cull",
+            Self::AnimationTimers => "animation-timers",
+            Self::PlayerSolver => "player-solver",
+            Self::PlayerMovement => "player-movement",
+            Self::PairwiseContact => "pairwise-contact",
+            Self::HitList => "hit-list",
+            Self::PerObjectTick => "per-object-tick",
+            Self::TriggerQuery => "trigger-query",
+            Self::MovingContact => "moving-contact",
+            Self::RenderSubmission => "render-submission",
+            Self::Streaming => "streaming",
+            Self::Particles => "particles",
+            Self::PostFrameChanges => "post-frame-changes",
+        }
+    }
+}
+
+/// The 18 documented stages, in documented order.
+///
+/// This array is the single ordered definition. The determinism gate pins it
+/// with a golden table, so a reorder fails a test instead of silently changing
+/// behaviour.
+pub const STAGE_ORDER: [Stage; 18] = [
+    Stage::Clock,
+    Stage::ScratchReset,
+    Stage::ScriptUnits,
+    Stage::AudioEmitters,
+    Stage::TimeOfDay,
+    Stage::ActivationCull,
+    Stage::AnimationTimers,
+    Stage::PlayerSolver,
+    Stage::PlayerMovement,
+    Stage::PairwiseContact,
+    Stage::HitList,
+    Stage::PerObjectTick,
+    Stage::TriggerQuery,
+    Stage::MovingContact,
+    Stage::RenderSubmission,
+    Stage::Streaming,
+    Stage::Particles,
+    Stage::PostFrameChanges,
+];
+
+/// Integer camera view used by stage 6 distance culling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CullView {
+    pub eye: [i32; 3],
+    pub radius: i32,
+}
+
+impl Default for CullView {
+    fn default() -> Self {
+        Self {
+            eye: [0, 0, 0],
+            radius: DEFAULT_CULL_RADIUS,
+        }
+    }
+}
+
+/// One item of the CPU render snapshot produced by stage 15.
+///
+/// This is a data snapshot, not a renderer and not a mesh: the renderer slice
+/// maps it to draw items later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderItem {
+    pub id: LiveId,
+    pub class: u8,
+    pub position: [i32; 3],
+    pub visible: bool,
+}
+
+/// Per-tick scratch state, reset by stage 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameScratch {
+    activated: usize,
+    culled: usize,
+}
+
+impl FrameScratch {
+    pub const fn activated(self) -> usize {
+        self.activated
+    }
+
+    pub const fn culled(self) -> usize {
+        self.culled
+    }
+}
+
+/// Deterministic counters for the frame driver.
+///
+/// These are diagnostics, not simulation state: they do not enter the canonical
+/// digest. They make the documented double player update observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FrameStats {
+    pub ticks: u64,
+    pub direct_player_ticks: u64,
+    pub generic_ticks: u64,
+    pub generic_player_ticks: u64,
+    pub hooked_ticks: u64,
+    pub hooked_player_ticks: u64,
+    pub spawned: u64,
+    pub despawned: u64,
+}
+
+/// A spawn deferred to the post-frame stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeferredSpawn {
+    pub name: String,
+    pub position: [i32; 3],
+}
+
+/// What the frame driver can fail on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameError {
+    Tracker(TrackerError),
+}
+
+impl fmt::Display for FrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tracker(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+/// Milestone simulation state: authored world, live objects, tracker, clock and
+/// the input edge queue.
+///
+/// The clock is fed by the caller; [`FrameState::frame`] converts wall time into
+/// fixed ticks and runs [`FrameState::run_tick`] for each one. Input never
+/// advances the clock.
+pub struct FrameState {
+    world: World,
+    live: LiveArena,
+    tracker: ObjectTracker,
+    clock: SimClock,
+    input_queue: InputQueue,
+    current_input: InputFrame,
+    player: Option<LiveId>,
+    view: CullView,
+    stats: FrameStats,
+    scratch: FrameScratch,
+    spawn_queue: Vec<DeferredSpawn>,
+    despawn_queue: Vec<LiveId>,
+    scene: Vec<RenderItem>,
+    ticks: u64,
+    tick_index: u64,
+    stage_trace: Vec<Stage>,
+}
+
+impl FrameState {
+    /// Build the frame state from a loaded world.
+    ///
+    /// The player is bound immediately from the placed `raziel` record, exactly
+    /// like the original player spawn path. When the unit has no `raziel`
+    /// record the state stays playerless instead of panicking.
+    pub fn new(world: World) -> Self {
+        let mut state = Self {
+            world,
+            live: LiveArena::new(),
+            tracker: ObjectTracker::new(),
+            clock: SimClock::new(),
+            input_queue: InputQueue::new(),
+            current_input: InputFrame::NONE,
+            player: None,
+            view: CullView::default(),
+            stats: FrameStats::default(),
+            scratch: FrameScratch::default(),
+            spawn_queue: Vec::new(),
+            despawn_queue: Vec::new(),
+            scene: Vec::new(),
+            ticks: 0,
+            tick_index: 0,
+            stage_trace: Vec::with_capacity(STAGE_ORDER.len()),
+        };
+        state.bind_player();
+        state
+    }
+
+    fn bind_player(&mut self) {
+        let Some(slot) = self.world.placed.by_name(PLAYER_NAME).first().copied() else {
+            return;
+        };
+        let Some(record) = self.world.placed.record(slot) else {
+            return;
+        };
+        let position = [
+            i32::from(record.position[0]),
+            i32::from(record.position[1]),
+            i32::from(record.position[2]),
+        ];
+        let object = LiveObject {
+            name: PLAYER_NAME.to_string(),
+            class: RenderClass::Raziel,
+            position,
+            visible: true,
+            slot: None,
+            anim_index: 0,
+        };
+        self.player = Some(self.live.spawn(object));
+    }
+
+    pub fn world(&self) -> &World {
+        &self.world
+    }
+
+    pub fn live(&self) -> &LiveArena {
+        &self.live
+    }
+
+    pub fn tracker(&self) -> &ObjectTracker {
+        &self.tracker
+    }
+
+    pub fn clock(&self) -> &SimClock {
+        &self.clock
+    }
+
+    pub fn player(&self) -> Option<LiveId> {
+        self.player
+    }
+
+    pub fn player_position(&self) -> Option<[i32; 3]> {
+        self.player
+            .and_then(|id| self.live.get(id).ok())
+            .map(|object| object.position)
+    }
+
+    pub fn stats(&self) -> FrameStats {
+        self.stats
+    }
+
+    pub fn scratch(&self) -> FrameScratch {
+        self.scratch
+    }
+
+    pub fn scene(&self) -> &[RenderItem] {
+        &self.scene
+    }
+
+    pub fn ticks(&self) -> u64 {
+        self.ticks
+    }
+
+    pub fn tick_index(&self) -> u64 {
+        self.tick_index
+    }
+
+    pub fn current_input(&self) -> InputFrame {
+        self.current_input
+    }
+
+    /// Stage trace of the last [`FrameState::run_tick`] call.
+    pub fn stage_trace(&self) -> &[Stage] {
+        &self.stage_trace
+    }
+
+    pub fn set_view(&mut self, view: CullView) {
+        self.view = view;
+    }
+
+    pub fn queue_input(&mut self, event: InputEvent) {
+        self.input_queue.push(event);
+    }
+
+    pub fn queued_input_len(&self) -> usize {
+        self.input_queue.pending_len()
+    }
+
+    /// Defer a spawn to stage 18 of the next tick.
+    ///
+    /// A spawn queued during a frame is therefore not visible to stages 6-15 of
+    /// that frame: it lands in the post-frame bookkeeping pass, exactly like an
+    /// asynchronous load completion.
+    pub fn queue_spawn(&mut self, name: impl Into<String>, position: [i32; 3]) {
+        self.spawn_queue.push(DeferredSpawn {
+            name: name.into(),
+            position,
+        });
+    }
+
+    /// Defer a despawn to stage 18 of the next tick.
+    pub fn queue_despawn(&mut self, id: LiveId) {
+        self.despawn_queue.push(id);
+    }
+
+    pub fn pending_changes(&self) -> (usize, usize) {
+        (self.spawn_queue.len(), self.despawn_queue.len())
+    }
+
+    /// Canonical world state in the existing determinism fold shape.
+    ///
+    /// T8 does not change the fold: it reuses [`WorldState`] and
+    /// `world_state_hash` as a pure function. T10 owns the CLI digest.
+    pub fn world_state(&self) -> WorldState {
+        WorldState {
+            tick: self.ticks,
+            live: self
+                .live
+                .iter()
+                .map(|(_, object)| WorldEntry {
+                    class: object.class.code(),
+                    position: object.position,
+                    visible: object.visible,
+                })
+                .collect(),
+        }
+    }
+
+    /// Advance the fixed clock by `delta` and run every due tick.
+    ///
+    /// The return value is the number of ticks executed. The count comes from
+    /// [`SimClock`] alone; queued input cannot change it.
+    pub fn frame(&mut self, delta: Duration) -> Result<usize, FrameError> {
+        let batch = self.clock.advance(delta);
+        let count = batch.len();
+        for tick in batch.ticks() {
+            self.run_tick(*tick)?;
+        }
+        Ok(count)
+    }
+
+    /// Run the 18 stages once, in documented order, for one fixed tick.
+    ///
+    /// Input is sampled exactly once here, at the tick boundary (stage 1).
+    pub fn run_tick(&mut self, tick: ObjectTick) -> Result<(), FrameError> {
+        self.stage_trace.clear();
+        for stage in STAGE_ORDER {
+            self.stage_trace.push(stage);
+            match stage {
+                Stage::Clock => self.stage_clock(tick),
+                Stage::ScratchReset => self.stage_scratch_reset(),
+                Stage::ScriptUnits => self.stage_script_units(),
+                Stage::AudioEmitters => self.stage_audio_emitters(),
+                Stage::TimeOfDay => self.stage_time_of_day(),
+                Stage::ActivationCull => self.stage_activation_cull(),
+                Stage::AnimationTimers => self.stage_animation_timers(),
+                Stage::PlayerSolver => self.stage_player_solver(),
+                Stage::PlayerMovement => self.stage_player_movement(),
+                Stage::PairwiseContact => self.stage_pairwise_contact(),
+                Stage::HitList => self.stage_hit_list(),
+                Stage::PerObjectTick => self.stage_per_object_tick(),
+                Stage::TriggerQuery => self.stage_trigger_query(),
+                Stage::MovingContact => self.stage_moving_contact(),
+                Stage::RenderSubmission => self.stage_render_submission(),
+                Stage::Streaming => self.stage_streaming(),
+                Stage::Particles => self.stage_particles(),
+                Stage::PostFrameChanges => self.stage_post_frame_changes()?,
+            }
+        }
+        self.ticks = self.ticks.saturating_add(1);
+        self.stats.ticks = self.ticks;
+        Ok(())
+    }
+
+    /// Stage 1 - fixed step: record the tick and sample input at the boundary.
+    fn stage_clock(&mut self, tick: ObjectTick) {
+        self.tick_index = tick.index;
+        self.current_input = self.input_queue.sample();
+    }
+
+    /// Stage 2 - clear the per-frame scratch block.
+    fn stage_scratch_reset(&mut self) {
+        self.scratch = FrameScratch::default();
+    }
+
+    /// Stage 3 - script/event unit execution. Documented no-op until the script
+    /// slice.
+    fn stage_script_units(&mut self) {}
+
+    /// Stage 4 - per-unit audio emitters. Documented no-op until the audio slice.
+    fn stage_audio_emitters(&mut self) {}
+
+    /// Stage 5 - clock / time-of-day. Documented no-op until the time-of-day
+    /// table is wired.
+    fn stage_time_of_day(&mut self) {}
+
+    /// Stage 6 - activation and distance culling.
+    ///
+    /// Walks the live list in order, compares integer squared distance against
+    /// the view radius, writes the `visible` flag and calls the class query hook
+    /// when one is installed. A null query hook is the documented opt-out.
+    fn stage_activation_cull(&mut self) {
+        let view = self.view;
+        for id in self.live.order().to_vec() {
+            let Ok(position) = self.live.get(id).map(|object| object.position) else {
+                continue;
+            };
+            let visible = within_radius(view.eye, position, view.radius);
+            if let Ok(object) = self.live.get_mut(id) {
+                object.visible = visible;
+            }
+            if visible {
+                self.scratch.activated += 1;
+            } else {
+                self.scratch.culled += 1;
+            }
+
+            let hook = self
+                .live
+                .get(id)
+                .ok()
+                .and_then(|object| hooks_for_class(object.class).query);
+            if let Some(hook) = hook {
+                let _answer = hook(&self.world, id, Query);
+            }
+        }
+    }
+
+    /// Stage 7 - per-unit animation/timer advance. Documented no-op until the
+    /// animation slice.
+    fn stage_animation_timers(&mut self) {}
+
+    /// Stage 8 - player movement solver. Documented no-op.
+    ///
+    /// The original runs a four-step sequential move/collide/commit solver from
+    /// the frame tick. This milestone has no collision and no solver, and the
+    /// direct input translation lives in stage 9, so the stage stays a named
+    /// no-op instead of inventing a partial solver.
+    fn stage_player_solver(&mut self) {}
+
+    /// Stage 9 - player input to movement by direct translation.
+    ///
+    /// The sampled input is applied directly to the player live object. There is
+    /// no collision and no four-step commit; this is the documented stage-8
+    /// simplification, not the original solver.
+    fn stage_player_movement(&mut self) {
+        let Some(player) = self.player else {
+            return;
+        };
+        self.stats.direct_player_ticks = self.stats.direct_player_ticks.saturating_add(1);
+        let [x, y] = self.current_input.move_axis();
+        let Ok(object) = self.live.get_mut(player) else {
+            return;
+        };
+        object.position[0] = object.position[0]
+            .saturating_add(x.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK));
+        object.position[2] = object.position[2]
+            .saturating_add(y.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK));
+    }
+
+    /// Stage 10 - pairwise contact broad phase and resolver. Documented no-op
+    /// until the contact slice.
+    fn stage_pairwise_contact(&mut self) {}
+
+    /// Stage 11 - hit-record pass per object. Documented no-op until the hit
+    /// slice.
+    fn stage_hit_list(&mut self) {}
+
+    /// Stage 12 - generic per-object tick.
+    ///
+    /// Walks the live list in live order and calls the class tick hook when one
+    /// is installed. The player is in this list too, so it is updated a second
+    /// time after stage 9; that double update is documented original behaviour.
+    fn stage_per_object_tick(&mut self) {
+        let tick = ObjectTick::step(self.tick_index);
+        for id in self.live.order().to_vec() {
+            self.stats.generic_ticks = self.stats.generic_ticks.saturating_add(1);
+            if self.player == Some(id) {
+                self.stats.generic_player_ticks = self.stats.generic_player_ticks.saturating_add(1);
+            }
+            let hook = self
+                .live
+                .get(id)
+                .ok()
+                .and_then(|object| hooks_for_class(object.class).tick);
+            if let Some(hook) = hook {
+                self.stats.hooked_ticks = self.stats.hooked_ticks.saturating_add(1);
+                if self.player == Some(id) {
+                    self.stats.hooked_player_ticks =
+                        self.stats.hooked_player_ticks.saturating_add(1);
+                }
+                hook(&mut self.world, id, tick);
+            }
+        }
+    }
+
+    /// Stage 13 - area/trigger query pass. Documented no-op until the trigger
+    /// slice.
+    fn stage_trigger_query(&mut self) {}
+
+    /// Stage 14 - moving-object world/contact pass. Documented no-op until the
+    /// contact slice.
+    fn stage_moving_contact(&mut self) {}
+
+    /// Stage 15 - render submission as a CPU snapshot.
+    ///
+    /// Items are emitted in live order, so the snapshot is deterministic. No
+    /// mesh is built and no backend is called.
+    fn stage_render_submission(&mut self) {
+        self.scene.clear();
+        for (id, object) in self.live.iter() {
+            self.scene.push(RenderItem {
+                id,
+                class: object.class.code(),
+                position: object.position,
+                visible: object.visible,
+            });
+        }
+    }
+
+    /// Stage 16 - streaming / prefetch. Documented no-op until the streaming
+    /// slice.
+    fn stage_streaming(&mut self) {}
+
+    /// Stage 17 - particles. Documented no-op until the particle slice.
+    fn stage_particles(&mut self) {}
+
+    /// Stage 18 - post-frame spawn/despawn bookkeeping and tracker recompute.
+    ///
+    /// Despawns are applied first, then spawns, then the tracker is reconciled
+    /// against the live names: every live name owns a ready slot (duplicates
+    /// share one) and a slot whose name has no live object is released.
+    fn stage_post_frame_changes(&mut self) -> Result<(), FrameError> {
+        for id in std::mem::take(&mut self.despawn_queue) {
+            if self.live.despawn(id).is_ok() {
+                if self.player == Some(id) {
+                    self.player = None;
+                }
+                self.stats.despawned = self.stats.despawned.saturating_add(1);
+            }
+        }
+
+        for spawn in std::mem::take(&mut self.spawn_queue) {
+            let object = LiveObject {
+                class: classify(&spawn.name),
+                name: spawn.name,
+                position: spawn.position,
+                visible: true,
+                slot: None,
+                anim_index: 0,
+            };
+            self.live.spawn(object);
+            self.stats.spawned = self.stats.spawned.saturating_add(1);
+        }
+
+        self.recompute_tracker()
+    }
+
+    fn recompute_tracker(&mut self) -> Result<(), FrameError> {
+        for id in self.live.order().to_vec() {
+            let name = match self.live.get(id) {
+                Ok(object) => object.name.clone(),
+                Err(_) => continue,
+            };
+            let slot = self
+                .tracker
+                .acquire(&name)
+                .map_err(FrameError::Tracker)?;
+            self.tracker
+                .complete(slot)
+                .map_err(FrameError::Tracker)?;
+            if let Ok(object) = self.live.get_mut(id) {
+                object.slot = Some(slot);
+            }
+        }
+
+        let mut live_names: Vec<String> = Vec::with_capacity(self.live.len());
+        for id in self.live.order() {
+            if let Ok(object) = self.live.get(*id) {
+                live_names.push(object.name.clone());
+            }
+        }
+        let stale: Vec<usize> = self
+            .tracker
+            .slots()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, slot)| match slot.name() {
+                Some(name) if !live_names.iter().any(|live| live.as_str() == name) => Some(index),
+                _ => None,
+            })
+            .collect();
+        for slot in stale {
+            self.tracker.release(slot).map_err(FrameError::Tracker)?;
+        }
+        Ok(())
+    }
+}
+
+fn within_radius(eye: [i32; 3], point: [i32; 3], radius: i32) -> bool {
+    let dx = i64::from(point[0]) - i64::from(eye[0]);
+    let dy = i64::from(point[1]) - i64::from(eye[1]);
+    let dz = i64::from(point[2]) - i64::from(eye[2]);
+    let radius = i64::from(radius);
+    dx * dx + dy * dy + dz * dz <= radius * radius
+}
+
+fn hooks_for_class(class: RenderClass) -> Hooks {
+    CLASS_TABLE
+        .iter()
+        .find(|entry| entry.class == class)
+        .map_or(Hooks::NONE, |entry| entry.hooks)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CullView, FrameState, PLAYER_SPEED_UNITS_PER_TICK, STAGE_ORDER, Stage,
+    };
+    use crate::engine::determinism::world_state_hash;
+    use crate::engine::input::{InputButton, InputEvent};
+    use crate::engine::clock::ObjectTick;
+    use crate::engine::world::World;
+    use crate::level::{ObjectRecord, ObjectReport};
+    use std::time::Duration;
+
+    fn record(name: &str, position: [i16; 3]) -> ObjectRecord {
+        ObjectRecord {
+            name: name.to_string(),
+            position,
+            object_type: 4,
+            archetype: 7,
+            instance_id: 1,
+            flags: 0,
+        }
+    }
+
+    fn world_with_raziel() -> World {
+        let report = ObjectReport {
+            room_offset: 0,
+            count: 1,
+            array_offset: 0,
+            objects: vec![record("raziel", [0, 0, 0])],
+        };
+        World::from_report("test".to_string(), 1, &report)
+    }
+
+    fn frame() -> FrameState {
+        FrameState::new(world_with_raziel())
+    }
+
+    fn tick(frame: &mut FrameState, index: u64) {
+        frame
+            .run_tick(ObjectTick::step(index))
+            .expect("the synthetic frame must tick");
+    }
+
+    #[test]
+    fn the_driver_invokes_the_eighteen_stages_in_order() {
+        let mut frame = frame();
+        tick(&mut frame, 0);
+        assert_eq!(frame.stage_trace(), STAGE_ORDER);
+        assert_eq!(frame.stage_trace().len(), 18);
+        assert_eq!(frame.ticks(), 1);
+    }
+
+    #[test]
+    fn the_player_is_ticked_directly_and_again_in_the_generic_pass() {
+        let mut frame = frame();
+        tick(&mut frame, 0);
+
+        let stats = frame.stats();
+        assert_eq!(stats.direct_player_ticks, 1, "stage 9 updates the player");
+        assert_eq!(
+            stats.generic_player_ticks, 1,
+            "the player is also an ordinary live object in stage 12"
+        );
+        assert_eq!(
+            stats.hooked_player_ticks, 1,
+            "the Raziel class installs the non-null tick hook"
+        );
+        assert_eq!(stats.generic_ticks, frame.live().len() as u64);
+        assert_eq!(
+            stats.hooked_ticks, stats.generic_ticks,
+            "every synthetic live object carries a tick hook in this fixture"
+        );
+
+        tick(&mut frame, 1);
+        let stats = frame.stats();
+        assert_eq!((stats.direct_player_ticks, stats.generic_player_ticks), (2, 2));
+    }
+
+    #[test]
+    fn zero_input_leaves_the_player_position_unchanged() {
+        let mut frame = frame();
+        let before = frame.player_position().expect("the player is bound");
+        for index in 0..60 {
+            tick(&mut frame, index);
+        }
+        assert_eq!(frame.queued_input_len(), 0);
+        assert_eq!(frame.player_position(), Some(before));
+        assert_eq!(frame.ticks(), 60);
+    }
+
+    #[test]
+    fn forward_input_moves_the_player_by_the_expected_integer_delta() {
+        let mut frame = frame();
+        let before = frame.player_position().expect("the player is bound");
+        let before_hash = world_state_hash(&frame.world_state());
+
+        frame.queue_input(InputEvent::press(InputButton::Forward));
+        for index in 0..60 {
+            tick(&mut frame, index);
+        }
+
+        let after = frame.player_position().expect("the player is bound");
+        assert_eq!(after[0], before[0]);
+        assert_eq!(after[2], before[2] + 60 * PLAYER_SPEED_UNITS_PER_TICK);
+        assert_ne!(
+            world_state_hash(&frame.world_state()),
+            before_hash,
+            "moving the player must change the canonical state"
+        );
+    }
+
+    #[test]
+    fn tick_count_is_independent_of_the_event_burst_size() {
+        fn run(burst: usize) -> u64 {
+            let mut frame = frame();
+            for _ in 0..burst {
+                frame.queue_input(InputEvent::press(InputButton::Forward));
+            }
+            // Same wall-time window: one second, in ten 100 ms deliverables,
+            // then drain the capped remainder.
+            for _ in 0..10 {
+                frame.frame(Duration::from_millis(100)).expect("frame");
+            }
+            loop {
+                let executed = frame.frame(Duration::ZERO).expect("drain");
+                if executed == 0 {
+                    break;
+                }
+            }
+            frame.stats().ticks
+        }
+
+        let single = run(1);
+        let burst = run(100);
+        assert_eq!(single, burst, "input must never drive simulation stepping");
+        assert_eq!(single, 60, "one second at 60 Hz is sixty ticks");
+    }
+
+    #[test]
+    fn stage_two_resets_the_scratch_block_every_tick() {
+        let mut frame = frame();
+        frame.set_view(CullView {
+            eye: [10_000, 0, 0],
+            radius: 10,
+        });
+        tick(&mut frame, 0);
+        assert_eq!(frame.scratch().culled(), 1);
+        assert_eq!(frame.scratch().activated(), 0);
+        let player = frame.player().expect("the player is bound");
+        assert!(!frame.live().get(player).expect("live player").visible);
+
+        tick(&mut frame, 1);
+        assert_eq!(
+            frame.scratch().culled(),
+            1,
+            "stage 2 clears the accumulation; it must not grow to 2"
+        );
+    }
+
+    #[test]
+    fn stage_fifteen_snapshots_live_order_before_post_frame_spawns() {
+        let mut frame = frame();
+        frame.queue_spawn("monster_wallcr", [10, 0, 0]);
+        tick(&mut frame, 0);
+
+        assert_eq!(frame.live().len(), 2, "stage 18 applied the deferred spawn");
+        assert_eq!(
+            frame.scene().len(),
+            1,
+            "stage 15 ran before stage 18, so the snapshot has only the player"
+        );
+        assert_eq!(frame.scene()[0].id, frame.player().expect("player"));
+
+        tick(&mut frame, 1);
+        assert_eq!(frame.scene().len(), 2);
+        let scene_ids: Vec<_> = frame.scene().iter().map(|item| item.id).collect();
+        let live_ids: Vec<_> = frame.live().order().to_vec();
+        assert_eq!(scene_ids, live_ids, "the render snapshot follows live order");
+        assert_eq!(
+            frame.scene()[1].class,
+            crate::engine::class::RenderClass::Monster.code()
+        );
+    }
+
+    #[test]
+    fn stage_eighteen_recomputes_the_tracker_for_spawns_and_despawns() {
+        let mut frame = frame();
+        frame.queue_spawn("monster_wallcr", [10, 0, 0]);
+        tick(&mut frame, 0);
+
+        assert_eq!(frame.tracker().find("raziel"), Some(0));
+        assert_eq!(frame.tracker().find("monster_wallcr"), Some(1));
+        for slot in [0usize, 1] {
+            assert_eq!(
+                frame.tracker().slots()[slot].state(),
+                crate::engine::tracker::SlotState::Ready
+            );
+        }
+        let player = frame.player().expect("the player is bound");
+        assert_eq!(frame.live().get(player).expect("player").slot, Some(0));
+
+        frame.queue_despawn(player);
+        tick(&mut frame, 1);
+        assert_eq!(frame.player(), None, "the despawned player is unbound");
+        assert_eq!(frame.live().len(), 1);
+        assert_eq!(frame.tracker().find("raziel"), None, "the slot is released");
+        assert_eq!(frame.tracker().find("monster_wallcr"), Some(1));
+        assert_eq!(frame.stats().despawned, 1);
+    }
+
+    #[test]
+    fn despawn_of_an_unknown_id_is_a_no_op_not_a_panic() {
+        let mut frame = frame();
+        let stale = crate::engine::live::LiveId {
+            index: 99,
+            generation: 0,
+        };
+        frame.queue_despawn(stale);
+        tick(&mut frame, 0);
+        assert_eq!(frame.stats().despawned, 0);
+        assert_eq!(frame.live().len(), 1);
+    }
+
+    #[test]
+    fn stage_names_come_from_the_ordered_definition() {
+        let codes: Vec<u8> = STAGE_ORDER.iter().map(|stage| stage.code()).collect();
+        assert_eq!(codes, (1..=18u8).collect::<Vec<_>>());
+        assert_eq!(STAGE_ORDER[0], Stage::Clock);
+        assert_eq!(STAGE_ORDER[17], Stage::PostFrameChanges);
+        assert_eq!(STAGE_ORDER[17].name(), "post-frame-changes");
+    }
+}
