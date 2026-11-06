@@ -1181,7 +1181,6 @@ pub fn scan_archive_levels(path: &Path) -> Result<ArchiveScan, LevelError> {
 /// Reuses [`scan_archive_levels`] so the name rules (header name plus the
 /// BIGFILE suffix fallback) stay in one place. The match is case-insensitive;
 /// `None` means no entry carries that name.
-#[allow(dead_code)] // consumed by engine::world in the next commit
 pub fn resolve_unit_entry(path: &Path, name: &str) -> Option<usize> {
     scan_archive_levels(path)
         .ok()?
