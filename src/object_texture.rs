@@ -51,6 +51,16 @@ fn flat(rgba: [u8; 4]) -> DecodedImage {
     DecodedImage { width: 1, height: 1, rgba8: rgba.to_vec() }
 }
 
+/// Flat fallback textures used by material 1. Shared by the legacy scene
+/// builder and the engine backend.
+pub fn flat_textures() -> MaterialTextures {
+    MaterialTextures {
+        diffuse: flat(FLAT_RGBA),
+        normal: flat(FLAT_NORMAL),
+        specular: flat(BLACK),
+    }
+}
+
 /// Material table for a scene: slot 0 (material 1) is the flat fallback, then
 /// one material per page in `pages` order. Legacy object faces carry no
 /// normal or specular map, so both stay neutral.
@@ -58,9 +68,7 @@ pub fn scene(
     bank: &PageBank,
     pages: &[u16],
 ) -> Result<(Vec<Material>, Vec<MaterialTextures>), TexturesError> {
-    let mut textures = vec![MaterialTextures {
-        diffuse: flat(FLAT_RGBA), normal: flat(FLAT_NORMAL), specular: flat(BLACK),
-    }];
+    let mut textures = vec![flat_textures()];
     let mut materials = vec![Material { name: "flat".to_string(), flags: 1 }];
     for &page in pages {
         textures.push(MaterialTextures {

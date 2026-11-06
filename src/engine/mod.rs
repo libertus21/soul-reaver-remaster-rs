@@ -12,6 +12,8 @@ pub mod actor;
 #[allow(dead_code)]
 pub mod assets;
 #[allow(dead_code)]
+pub mod backend_wgpu;
+#[allow(dead_code)]
 pub mod class;
 #[allow(dead_code)]
 pub mod clock;
@@ -26,6 +28,10 @@ pub mod live;
 #[allow(dead_code)]
 pub mod placed;
 pub mod play;
+#[allow(dead_code)]
+pub mod render_backend;
+#[allow(dead_code)]
+pub mod scene;
 #[allow(dead_code)]
 pub mod spawn;
 #[allow(dead_code)]

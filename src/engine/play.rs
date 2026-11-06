@@ -1,11 +1,35 @@
 //! `--play` option parsing and the engine entry point.
 //!
 //! Parsing is pure: it never touches the filesystem and never constructs an
-//! engine. This slice stops at the facade; [`run`] reports a typed
-//! "not implemented" error until T9 (windowed) and T10 (headless) land.
+//! engine. [`run`] loads the world and the static scene first, then either
+//! drives a headless fixed-tick loop through [`NullBackend`] or opens a winit
+//! window with the wgpu backend.
+//!
+//! Texture pages are validated before the event loop is created, so a missing
+//! page is a fail-fast exit 2 instead of a half-open window.
 
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use winit::application::ApplicationHandler;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key, NamedKey};
+use winit::window::{Window, WindowId};
+
+use crate::cli_out::outln;
+use crate::engine::backend_wgpu::WgpuBackend;
+use crate::engine::clock::ObjectTick;
+use crate::engine::frame::FrameState;
+use crate::engine::input::{InputButton, InputEvent};
+use crate::engine::render_backend::{NullBackend, RenderBackend};
+use crate::engine::scene::{CameraView, SceneAssets};
+use crate::engine::world::{World, WorldError};
+use crate::object_texture::PageBank;
+use crate::render::{self, FlyCamera, OrbitCamera};
 
 /// Camera modes accepted by `--camera`.
 ///
@@ -28,14 +52,22 @@ impl CameraMode {
             _ => None,
         }
     }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Orbit => Self::Fly,
+            Self::Fly => Self::Player,
+            Self::Player => Self::Orbit,
+        }
+    }
 }
 
 /// Parsed `--play` options.
 ///
 /// `ticks` is resolved during parsing: headless defaults to 60, while `None`
-/// in windowed mode means no frame cap. The fields are consumed by the
-/// world, clock and renderer slices; T1 only parses them.
-#[allow(dead_code)]
+/// in windowed mode means no frame cap. Windowed runs require `--textures`;
+/// that is a runtime check so the parser stays pure and the T1 error surface is
+/// unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayOptions {
     pub bigfile: PathBuf,
@@ -128,7 +160,6 @@ pub enum PlayError {
     InvalidTicks(String),
     ZeroTicksHeadless,
     InvalidCamera(String),
-    NotImplemented,
 }
 
 impl fmt::Display for PlayError {
@@ -149,27 +180,468 @@ impl fmt::Display for PlayError {
                 f,
                 "invalid value '{value}' for --camera: expected orbit, fly or player"
             ),
-            Self::NotImplemented => write!(
-                f,
-                "--play is not implemented until T9 (windowed) and T10 (headless)"
-            ),
         }
     }
 }
 
 impl std::error::Error for PlayError {}
 
+/// Runtime failure of a real run. `exit_code` is the process code `main` uses.
+#[derive(Debug)]
+pub enum RunError {
+    MissingTextures,
+    World(WorldError),
+    Scene(String),
+    /// A missing or undecodable texture page: fail fast with exit code 2.
+    Texture(String),
+    Window(String),
+    Render(String),
+    Frame(String),
+}
+
+impl RunError {
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Texture(_) => 2,
+            _ => 1,
+        }
+    }
+
+    fn scene(error: crate::engine::scene::SceneError) -> Self {
+        if error.is_texture() {
+            Self::Texture(error.to_string())
+        } else {
+            Self::Scene(error.to_string())
+        }
+    }
+}
+
+impl fmt::Display for RunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingTextures => write!(
+                f,
+                "--play without --headless requires --textures <TEXTURES.BIG>"
+            ),
+            Self::World(error) => write!(f, "{error}"),
+            Self::Scene(detail) => write!(f, "cannot build the render scene: {detail}"),
+            Self::Texture(detail) => write!(f, "cannot decode texture page: {detail}"),
+            Self::Window(detail) => write!(f, "cannot open the play window: {detail}"),
+            Self::Render(detail) => write!(f, "render failed: {detail}"),
+            Self::Frame(detail) => write!(f, "simulation tick failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for RunError {}
+
 /// Engine entry point.
 ///
-/// T1 has no world, clock or renderer, so this is a loud typed error; it must
-/// never turn into a silent success.
-pub fn run(_options: &PlayOptions) -> Result<(), PlayError> {
-    Err(PlayError::NotImplemented)
+/// The world and the static scene are loaded before a window exists. Headless
+/// runs use [`NullBackend`] and a fixed tick sequence; windowed runs validate
+/// every texture page used by the initial scene and only then create the winit
+/// event loop.
+pub fn run(options: &PlayOptions) -> Result<(), RunError> {
+    if !options.headless && options.textures.is_none() {
+        return Err(RunError::MissingTextures);
+    }
+
+    let world = World::load(&options.bigfile, &options.unit).map_err(RunError::World)?;
+    let textures = if options.headless {
+        None
+    } else {
+        options.textures.as_deref()
+    };
+    let (assets, bank) =
+        SceneAssets::load(&options.bigfile, world.level.entry, textures).map_err(RunError::scene)?;
+    let frame = FrameState::new(world);
+
+    if options.headless {
+        return run_headless(frame, assets, options.ticks.unwrap_or(60));
+    }
+
+    run_windowed(
+        frame,
+        assets,
+        bank.expect("windowed mode requested textures"),
+        options.camera,
+        &options.unit,
+    )
+}
+
+fn run_headless(
+    mut frame: FrameState,
+    mut assets: SceneAssets,
+    ticks: u32,
+) -> Result<(), RunError> {
+    let mut backend = NullBackend::new();
+    let camera = CameraView::identity();
+    for index in 0..u64::from(ticks) {
+        frame
+            .run_tick(ObjectTick::step(index))
+            .map_err(|error| RunError::Frame(error.to_string()))?;
+        let scene = assets.build(frame.live(), camera);
+        backend
+            .draw(&scene)
+            .map_err(|error| RunError::Render(error.to_string()))?;
+    }
+    outln!(
+        "engine headless unit={} ticks={} draws={}",
+        frame.world().level.name,
+        ticks,
+        backend.draws()
+    );
+    Ok(())
+}
+
+fn run_windowed(
+    frame: FrameState,
+    mut assets: SceneAssets,
+    bank: PageBank,
+    mode: CameraMode,
+    unit: &str,
+) -> Result<(), RunError> {
+    // The initial scene is the complete set of pages the first frame draws.
+    // Decoding them here keeps a bad page strictly before the window.
+    {
+        let initial = assets.build(frame.live(), CameraView::identity());
+        for page in initial.material_pages.iter().flatten() {
+            bank.decode_page(*page)
+                .map_err(|error| RunError::Texture(error.to_string()))?;
+        }
+    }
+
+    let start = match assets.render_spawn() {
+        Some(spawn) => FlyCamera::looking_at(spawn, [0.0; 3]),
+        None => FlyCamera::new([0.0; 3]),
+    };
+    let event_loop =
+        EventLoop::new().map_err(|error| RunError::Window(format!("event loop: {error}")))?;
+    let mut app = PlayApp {
+        frame,
+        assets,
+        bank: Some(bank),
+        backend: None,
+        window: None,
+        mode,
+        orbit: OrbitCamera::new(),
+        fly: start,
+        start,
+        keys: CameraKeys::default(),
+        mouse_last: None,
+        drag: None,
+        last_frame: Instant::now(),
+        last_dt: 0.0,
+        init_error: None,
+        title: format!("soul reaver - {unit}"),
+    };
+    event_loop
+        .run_app(&mut app)
+        .map_err(|error| RunError::Window(format!("event loop: {error}")))?;
+    match app.init_error {
+        Some(detail) => Err(RunError::Window(detail)),
+        None => Ok(()),
+    }
+}
+
+/// Held camera keys, mirroring the legacy viewer's WASD/QE/Space/Shift map.
+#[derive(Default)]
+struct CameraKeys {
+    forward: bool,
+    back: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    fast: bool,
+}
+
+impl CameraKeys {
+    fn update(&mut self, event: &KeyEvent) {
+        let held = event.state == ElementState::Pressed;
+        match &event.logical_key {
+            Key::Character(text) => match text.to_ascii_lowercase().as_str() {
+                "w" => self.forward = held,
+                "s" => self.back = held,
+                "a" => self.left = held,
+                "d" => self.right = held,
+                "e" => self.up = held,
+                "c" | "q" => self.down = held,
+                _ => {}
+            },
+            Key::Named(NamedKey::Space) => self.up = held,
+            Key::Named(NamedKey::Shift) => self.fast = held,
+            _ => {}
+        }
+    }
+
+    fn axes(&self) -> (f32, f32, f32) {
+        let axis = |on: bool, off: bool| f32::from(on as u8) - f32::from(off as u8);
+        (
+            axis(self.forward, self.back),
+            axis(self.right, self.left),
+            axis(self.up, self.down),
+        )
+    }
+}
+
+fn player_button(key: &Key) -> Option<InputButton> {
+    match key {
+        Key::Character(text) => match text.to_ascii_lowercase().as_str() {
+            "w" => Some(InputButton::Forward),
+            "s" => Some(InputButton::Back),
+            "a" => Some(InputButton::Left),
+            "d" => Some(InputButton::Right),
+            _ => None,
+        },
+        Key::Named(NamedKey::Space) => Some(InputButton::Action),
+        _ => None,
+    }
+}
+
+struct PlayApp {
+    frame: FrameState,
+    assets: SceneAssets,
+    bank: Option<PageBank>,
+    backend: Option<WgpuBackend>,
+    window: Option<Arc<Window>>,
+    mode: CameraMode,
+    orbit: OrbitCamera,
+    fly: FlyCamera,
+    start: FlyCamera,
+    keys: CameraKeys,
+    mouse_last: Option<PhysicalPosition<f64>>,
+    drag: Option<MouseButton>,
+    last_frame: Instant,
+    last_dt: f32,
+    init_error: Option<String>,
+    title: String,
+}
+
+impl PlayApp {
+    fn aspect(&self) -> f32 {
+        self.backend
+            .as_ref()
+            .map(|backend| backend.aspect())
+            .unwrap_or(1.0)
+    }
+
+    fn camera_view(&mut self, aspect: f32) -> CameraView {
+        match self.mode {
+            CameraMode::Orbit => {
+                self.orbit.tick(self.last_dt);
+                CameraView {
+                    mvp: self.orbit.mvp(aspect),
+                }
+            }
+            CameraMode::Fly => {
+                let (forward, strafe, rise) = self.keys.axes();
+                self.fly
+                    .fly(forward, strafe, rise, self.last_dt, self.keys.fast);
+                CameraView {
+                    mvp: self.fly.mvp(aspect),
+                }
+            }
+            CameraMode::Player => {
+                let target = self
+                    .frame
+                    .player_position()
+                    .map(|position| {
+                        self.assets.transform().apply([
+                            position[0] as f32,
+                            position[1] as f32,
+                            position[2] as f32,
+                        ])
+                    })
+                    .unwrap_or([0.0; 3]);
+                let eye = [target[0], target[1] + 0.35, target[2] + 1.2];
+                let camera = FlyCamera::looking_at(eye, target);
+                CameraView {
+                    mvp: camera.mvp(aspect),
+                }
+            }
+        }
+    }
+
+    fn set_mode(&mut self, window: &Window, mode: CameraMode) {
+        self.mode = mode;
+        for button in InputButton::ALL {
+            self.frame.queue_input(InputEvent::release(button));
+        }
+        render::set_fly_cursor(window, mode == CameraMode::Fly);
+    }
+
+    /// Track held keys, cycle camera mode with `F`, move the player in player
+    /// mode, and exit on `Esc`.
+    fn handle_key(&mut self, window: &Window, event: &KeyEvent) -> bool {
+        self.keys.update(event);
+        if event.state == ElementState::Pressed && !event.repeat {
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => return true,
+                Key::Character(text) if text.eq_ignore_ascii_case("f") => {
+                    self.set_mode(window, self.mode.next());
+                }
+                Key::Character(text) if text.eq_ignore_ascii_case("r") => {
+                    self.orbit.reset();
+                    self.fly = self.start;
+                }
+                _ => {}
+            }
+        }
+        if self.mode == CameraMode::Player && !event.repeat {
+            if let Some(button) = player_button(&event.logical_key) {
+                let input = if event.state == ElementState::Pressed {
+                    InputEvent::press(button)
+                } else {
+                    InputEvent::release(button)
+                };
+                self.frame.queue_input(input);
+            }
+        }
+        false
+    }
+
+    /// Mouse orbit/pan/zoom in orbit mode and look in fly mode.
+    fn handle_mouse(&mut self, event: &WindowEvent) -> bool {
+        match event {
+            WindowEvent::MouseInput { state, button, .. } => {
+                if self.mode == CameraMode::Orbit {
+                    if *state == ElementState::Pressed {
+                        self.drag = Some(*button);
+                    } else if self.drag == Some(*button) {
+                        self.drag = None;
+                    }
+                }
+                true
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(previous) = self.mouse_last {
+                    let dx = (position.x - previous.x) as f32;
+                    let dy = (position.y - previous.y) as f32;
+                    match self.mode {
+                        CameraMode::Fly => self.fly.look(dx, dy),
+                        CameraMode::Orbit => match self.drag {
+                            Some(MouseButton::Left) => self.orbit.apply_orbit(dx, dy),
+                            Some(MouseButton::Right) => self.orbit.apply_pan(dx, dy),
+                            _ => {}
+                        },
+                        CameraMode::Player => {}
+                    }
+                }
+                self.mouse_last = Some(*position);
+                true
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.mode == CameraMode::Orbit {
+                    let notches = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => *y,
+                        MouseScrollDelta::PixelDelta(pixel) => (pixel.y / 50.0) as f32,
+                    };
+                    self.orbit.apply_zoom(notches);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl ApplicationHandler for PlayApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.set_control_flow(ControlFlow::Poll);
+        let window = match event_loop.create_window(
+            Window::default_attributes()
+                .with_title(&self.title)
+                .with_inner_size(PhysicalSize::new(800, 600)),
+        ) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                self.init_error = Some(format!("cannot create window: {error}"));
+                event_loop.exit();
+                return;
+            }
+        };
+        let Some(bank) = self.bank.take() else {
+            self.init_error = Some("texture bank missing".to_string());
+            event_loop.exit();
+            return;
+        };
+        match WgpuBackend::new(window.clone(), bank) {
+            Ok(backend) => {
+                render::set_fly_cursor(&window, self.mode == CameraMode::Fly);
+                self.backend = Some(backend);
+                self.window = Some(window);
+            }
+            Err(error) => {
+                self.init_error = Some(error.to_string());
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        if window_id != window.id() {
+            return;
+        }
+        if self.handle_mouse(&event) {
+            return;
+        }
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(size) => {
+                if let Some(backend) = &mut self.backend {
+                    backend.resize(size.width, size.height);
+                }
+                window.request_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                let aspect = self.aspect();
+                let camera = self.camera_view(aspect);
+                let scene = self.assets.build(self.frame.live(), camera);
+                if let Some(backend) = &mut self.backend {
+                    if let Err(error) = backend.draw(&scene) {
+                        self.init_error = Some(error.to_string());
+                        event_loop.exit();
+                    }
+                }
+            }
+            WindowEvent::Focused(false) => self.keys = CameraKeys::default(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if self.handle_key(&window, &event) {
+                    event_loop.exit();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
+        self.last_frame = now;
+        self.last_dt = dt;
+        if let Err(error) = self.frame.frame(Duration::from_secs_f32(dt)) {
+            self.init_error = Some(format!("simulation tick failed: {error}"));
+            event_loop.exit();
+            return;
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{run, CameraMode, PlayError, PlayOptions};
+    use super::{CameraMode, PlayError, PlayOptions, RunError};
     use std::path::PathBuf;
 
     fn argv(input: &[&str]) -> Vec<String> {
@@ -285,11 +757,20 @@ mod tests {
     }
 
     #[test]
-    fn run_is_loud_until_t9_t10() {
-        let options = parse(&["--bigfile", "B"]).expect("minimal argv must parse");
-        assert_eq!(run(&options), Err(PlayError::NotImplemented));
-        let message = PlayError::NotImplemented.to_string();
-        assert!(message.contains("T9"), "{message}");
-        assert!(message.contains("T10"), "{message}");
+    fn windowed_runs_require_textures_before_any_file_read() {
+        let options = parse(&["--bigfile", "definitely-not-a-file.dat"])
+            .expect("the parser stays pure");
+        let error = super::run(&options).expect_err("windowed play needs textures");
+        assert!(matches!(error, RunError::MissingTextures));
+        assert_eq!(error.exit_code(), 1);
+        assert!(error.to_string().contains("--textures"));
+    }
+
+    #[test]
+    fn texture_failures_are_exit_two_and_other_failures_exit_one() {
+        assert_eq!(RunError::Texture("missing page".to_string()).exit_code(), 2);
+        assert_eq!(RunError::Scene("bad scene".to_string()).exit_code(), 1);
+        assert_eq!(RunError::MissingTextures.exit_code(), 1);
+        assert_eq!(RunError::Window("no window".to_string()).exit_code(), 1);
     }
 }

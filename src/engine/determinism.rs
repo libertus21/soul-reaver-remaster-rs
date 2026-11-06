@@ -124,7 +124,6 @@ fn error_tag(error: &PlayError) -> u8 {
         PlayError::InvalidTicks(_) => 3,
         PlayError::ZeroTicksHeadless => 4,
         PlayError::InvalidCamera(_) => 5,
-        PlayError::NotImplemented => 6,
     }
 }
 
