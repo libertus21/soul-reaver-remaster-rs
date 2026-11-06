@@ -260,10 +260,14 @@ mod tests {
     use crate::actor::{ActorBlock, ActorKind, BehaviourEntry, EntryArrayKind};
     use crate::engine::actor::{ActorProfile, ActorRuntime};
     use crate::engine::class::RenderClass;
-    use crate::engine::clock::SimClock;
+    use crate::engine::clock::{ObjectTick, SimClock};
+    use crate::engine::frame::{FrameState, STAGE_ORDER, Stage};
+    use crate::engine::input::{InputButton, InputEvent};
     use crate::engine::live::{LiveArena, LiveId, LiveObject};
     use crate::engine::play::{PlayError, PlayOptions};
     use crate::engine::tracker::ObjectTracker;
+    use crate::engine::world::World;
+    use crate::level::{ObjectRecord, ObjectReport};
     use std::time::Duration;
 
     fn parse(input: &[&str]) -> Result<PlayOptions, PlayError> {
@@ -662,6 +666,142 @@ mod tests {
             baseline,
             actor_runtime_hash(&other_profile),
             "the profile entries must be folded"
+        );
+    }
+
+    // T8 frame pipeline gate. The stage order is behaviour, not documentation:
+    // this golden table pins the exact 18 stage numbers and names so swapping
+    // two stages fails the gate instead of silently changing the simulation.
+    const GOLDEN_FRAME_STAGES: [(u8, &str); 18] = [
+        (1, "clock"),
+        (2, "scratch-reset"),
+        (3, "script-units"),
+        (4, "audio-emitters"),
+        (5, "time-of-day"),
+        (6, "activation-cull"),
+        (7, "animation-timers"),
+        (8, "player-solver"),
+        (9, "player-movement"),
+        (10, "pairwise-contact"),
+        (11, "hit-list"),
+        (12, "per-object-tick"),
+        (13, "trigger-query"),
+        (14, "moving-contact"),
+        (15, "render-submission"),
+        (16, "streaming"),
+        (17, "particles"),
+        (18, "post-frame-changes"),
+    ];
+
+    #[test]
+    fn frame_stage_order_matches_the_golden_table() {
+        assert_eq!(STAGE_ORDER.len(), GOLDEN_FRAME_STAGES.len());
+        for (index, stage) in STAGE_ORDER.iter().enumerate() {
+            let (code, name) = GOLDEN_FRAME_STAGES[index];
+            assert_eq!(
+                stage.code(),
+                code,
+                "stage {} code moved; observed {} ({})",
+                index + 1,
+                stage.code(),
+                stage.name()
+            );
+            assert_eq!(
+                stage.name(),
+                name,
+                "stage {} name moved; observed {}",
+                index + 1,
+                stage.name()
+            );
+        }
+    }
+
+    // Final canonical state of the 40-tick scripted replay below. This is a
+    // seventh, independent gate: it pins the per-tick stage order, input
+    // sampling, direct player translation, culling, render snapshot and
+    // post-frame bookkeeping together. It does not move any existing golden.
+    const GOLDEN_FRAME_STATE_HASH: u64 = 0x7b7f_16bc_a6af_b9b2;
+
+    fn frame_record(name: &str, position: [i16; 3]) -> ObjectRecord {
+        ObjectRecord {
+            name: name.to_string(),
+            position,
+            object_type: 4,
+            archetype: 7,
+            instance_id: 1,
+            flags: 0,
+        }
+    }
+
+    fn frame_world() -> World {
+        let report = ObjectReport {
+            room_offset: 0,
+            count: 1,
+            array_offset: 0,
+            objects: vec![frame_record("raziel", [0, 0, 0])],
+        };
+        World::from_report("test".to_string(), 1, &report)
+    }
+
+    /// Same input script and tick sequence, replayed per tick: stage trace, the
+    /// canonical world hash and the player position after each tick.
+    fn scripted_frame_run() -> Vec<(Vec<Stage>, u64, [i32; 3])> {
+        let mut frame = FrameState::new(frame_world());
+        let mut observed = Vec::new();
+        for index in 0..40u64 {
+            match index {
+                0 => frame.queue_input(InputEvent::press(InputButton::Forward)),
+                10 => frame.queue_input(InputEvent::press(InputButton::Right)),
+                20 => {
+                    frame.queue_input(InputEvent::release(InputButton::Forward));
+                    frame.queue_input(InputEvent::release(InputButton::Right));
+                }
+                30 => frame.queue_input(InputEvent::press(InputButton::Back)),
+                _ => {}
+            }
+            frame
+                .run_tick(ObjectTick::step(index))
+                .expect("the scripted frame must tick");
+            observed.push((
+                frame.stage_trace().to_vec(),
+                world_state_hash(&frame.world_state()),
+                frame.player_position().expect("the player is bound"),
+            ));
+        }
+        observed
+    }
+
+    #[test]
+    fn frame_pipeline_replays_stage_order_and_state_identically() {
+        let first = scripted_frame_run();
+        let second = scripted_frame_run();
+        assert_eq!(
+            first, second,
+            "the same input script and tick sequence must replay byte for byte"
+        );
+        assert_eq!(first.len(), 40);
+
+        let golden_stages = STAGE_ORDER.to_vec();
+        for (trace, _, _) in &first {
+            assert_eq!(
+                trace, &golden_stages,
+                "every tick must invoke the 18 stages in the golden order"
+            );
+        }
+
+        assert_eq!(first[0].2, [0, 0, 4], "forward moves +Z directly");
+        assert_eq!(first[19].2, [40, 0, 80], "right moves +X while forward holds");
+        assert_eq!(
+            first[20].2, first[19].2,
+            "the release is sampled at the tick boundary and stops movement"
+        );
+        assert_eq!(first[39].2, [40, 0, 40], "back subtracts from the same axis");
+        assert_ne!(first[0].1, first[39].1, "the state stream must move");
+
+        let last = first[39].1;
+        assert_eq!(
+            last, GOLDEN_FRAME_STATE_HASH,
+            "frame state hash moved: stage order, input sampling, translation, culling or bookkeeping changed (observed {last:#018x})"
         );
     }
 }
