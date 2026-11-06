@@ -27,11 +27,13 @@ impl Capability {
             );
         }
         matches!(token, "--map" | "--pose" | "--tex-dir" | "--out")
-            || ((self.name.ends_with("-entry") || self.name == "object-info" || self.name == "object-mesh")
+            || ((self.name.ends_with("-entry")
+                || matches!(self.name, "object-info" | "object-info-actors" | "object-mesh"))
                 && matches!(token, "--bigfile" | "--entry"))
             || (self.name.ends_with("-group")
                 && matches!(token, "--bigfile" | "--group"))
             || (self.name == "reach" && matches!(token, "--bigfile" | "--start"))
+            || (self.name == "actor-census" && matches!(token, "--bigfile" | "--objects-dir"))
     }
 }
 
@@ -39,7 +41,7 @@ impl Capability {
 pub const GROUPS: [&str; 5] = ["texture", "archive", "mesh", "audio", "level"];
 
 /// Every existing mode, exactly once. This is the single source for help.
-pub const CAPABILITIES: [Capability; 30] = [
+pub const CAPABILITIES: [Capability; 32] = [
     Capability { group: "texture", name: "list", legacy: "--textures <BIG> --tlist [--map <MAP>]", summary: "List the remaster .BIG header and slot classes.", window: false },
     Capability { group: "texture", name: "show", legacy: "--textures <BIG> --tshow <SEL> [--map <MAP>]", summary: "Show one slot as its raw 256x256 image.", window: true },
     Capability { group: "texture", name: "file", legacy: "<FILE.DDS>", summary: "Show one .DDS texture file.", window: true },
@@ -51,6 +53,8 @@ pub const CAPABILITIES: [Capability; 30] = [
     Capability { group: "mesh", name: "gallery", legacy: "--mesh-all <DIR> --tex-dir <TEX>", summary: "Browse a directory of .SRM meshes.", window: true },
     Capability { group: "mesh", name: "object-info", legacy: "--object-info --bigfile <DAT> --entry <INDEX>", summary: "Print one archived object container's counts and validation.", window: false },
     Capability { group: "mesh", name: "object-mesh", legacy: "--object-mesh --bigfile <DAT> --entry <INDEX> [--textures <BIG>]", summary: "Show one archived object container's model.", window: true },
+    Capability { group: "mesh", name: "object-info-actors", legacy: "--object-info --bigfile <DAT> --entry <INDEX> --actors", summary: "Print one object container's counts and actor block.", window: false },
+    Capability { group: "mesh", name: "actor-census", legacy: "--actor-census --bigfile <DAT> [--objects-dir <DIR>]", summary: "Print every actor container's entries, ids and state trios.", window: false },
     Capability { group: "audio", name: "list", legacy: "--audio <SND> --alist", summary: "List the waves in a .SND bank.", window: false },
     Capability { group: "audio", name: "wave", legacy: "--audio <SND> --wave <N> --out <OUT>", summary: "Write one .SND wave to a .wav file.", window: false },
     Capability { group: "level", name: "info", legacy: "--level-info <PATH>", summary: "Print the level header summary.", window: false },
@@ -117,7 +121,7 @@ pub fn render_help(group: Option<&str>) -> String {
 mod tests {
     use super::{catalog, is_known_group, render_help, GROUPS};
 
-    const EXPECTED: [(&str, &str); 30] = [
+    const EXPECTED: [(&str, &str); 32] = [
         ("texture", "list"),
         ("texture", "show"),
         ("texture", "file"),
@@ -129,6 +133,8 @@ mod tests {
         ("mesh", "gallery"),
         ("mesh", "object-info"),
         ("mesh", "object-mesh"),
+        ("mesh", "object-info-actors"),
+        ("mesh", "actor-census"),
         ("audio", "list"),
         ("audio", "wave"),
         ("level", "info"),
