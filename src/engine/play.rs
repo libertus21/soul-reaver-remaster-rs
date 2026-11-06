@@ -932,3 +932,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "play_acceptance.rs"]
+mod acceptance;
