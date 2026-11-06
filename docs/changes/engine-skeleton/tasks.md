@@ -9,6 +9,17 @@ Planning change only. No production code lands in `docs/engine-skeleton`.
 `docs` = authored Markdown lines in that PR. `TOTAL` = production + tests +
 docs. Every production PR is forecast under 400 authored lines.
 
+## Determinism gate (policy, not optional)
+
+**A determinism test (N ticks -> identical state hash) is a HARD ACCEPTANCE GATE
+for T2. T2 must NOT be merged without it, and every later slice re-runs it.**
+
+Why: determinism is the premise of the design (fixed 60 Hz rational tick, plain
+structs + ordered arenas, fixed 48-slot tracker, live-list order). It fails
+silently — the game still runs — and is only visible when comparing against the
+original. See `docs/notes/determinism.md` and the harness in
+`src/engine/determinism.rs`.
+
 ## Ordered tasks
 
 ### T1 - Play-mode facade and catalog entry
@@ -36,6 +47,8 @@ docs. Every production PR is forecast under 400 authored lines.
   function; unsupported states return `EngineError::UnsupportedState`.
 - Acceptance: 1/60 rational step; a 10 s advance yields at most 5 ticks and
   keeps the remainder; `Boot -> Loading -> InGame` only when loads are done.
+- Gate: the determinism test (N ticks -> identical state hash) passes; T2 does
+  not merge without it.
 - Files: `src/engine/clock.rs`, `src/engine/state.rs`.
 - PR: C.
 
