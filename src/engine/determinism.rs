@@ -6,7 +6,7 @@
 //! The policy lives in `docs/notes/determinism.md`; the gate is stated in
 //! `docs/changes/engine-skeleton/tasks.md`.
 //!
-//! Three independent golden models live here:
+//! Four independent golden models live here:
 //!
 //! - `options_hash` / `error_hash` are **regression gates** over the `--play`
 //!   options fold and the typed error text. They never include simulation
@@ -17,12 +17,16 @@
 //! - [`tracker_hash`] is the **tracker gate**: slot index, state and name in
 //!   slot order. It pins acquisition, duplicate-name sharing and lowest-free
 //!   reuse without entering the world-state digest.
+//! - [`actor_runtime_hash`] is the **actor-runtime gate**: the data-keyed
+//!   initial state derived from an `ActorProfile`, with no name in the fold.
 //!
 //! T1's `state_hash` mixed the options fold with the notion of state; that was
 //! a tripwire, not a gate, so T2 retires it instead of re-pinning it.
 
 use std::path::Path;
 
+use crate::actor::{ActorKind, EntryArrayKind};
+use crate::engine::actor::ActorRuntime;
 use crate::engine::play::{PlayError, PlayOptions};
 use crate::engine::tracker::ObjectTracker;
 
@@ -180,6 +184,58 @@ pub fn world_state_hash(state: &WorldState) -> u64 {
     hasher.finish()
 }
 
+/// Hash an actor's initial runtime state.
+///
+/// The fold is data-keyed: it includes the profile's kind, the eight state
+/// trios, the entry-array kind and the entry ids, then the numeric runtime
+/// fields (relation, state, target presence and id, flags). It is a separate,
+/// independent gate; it does not enter [`world_state_hash`] and it does not
+/// move the options, error, world-state, tracker or classification goldens.
+pub fn actor_runtime_hash(runtime: &ActorRuntime) -> u64 {
+    let mut hasher = StateHasher::new();
+    let profile = runtime.profile();
+
+    hasher.write_u8(actor_kind_code(profile.kind));
+    for row in &profile.trios {
+        for id in row {
+            hasher.write_u8(*id);
+        }
+    }
+    hasher.write_u8(entry_array_code(profile.entry_array));
+    hasher.write_u32(profile.entries.len() as u32);
+    for entry in &profile.entries {
+        hasher.write_u8(entry.id);
+    }
+
+    hasher.write_u8(runtime.relation());
+    hasher.write_u8(runtime.state());
+    match runtime.target() {
+        Some(id) => {
+            hasher.write_u8(1);
+            hasher.write_u32(id.index);
+            hasher.write_u32(id.generation);
+        }
+        None => hasher.write_u8(0),
+    }
+    hasher.write_u32(runtime.flags());
+    hasher.finish()
+}
+
+fn actor_kind_code(kind: ActorKind) -> u8 {
+    match kind {
+        ActorKind::Monster => 0,
+        ActorKind::Player => 1,
+    }
+}
+
+fn entry_array_code(kind: EntryArrayKind) -> u8 {
+    match kind {
+        EntryArrayKind::Clean => 0,
+        EntryArrayKind::Variant => 1,
+        EntryArrayKind::None => 2,
+    }
+}
+
 /// Hash the tracker table: for every slot in index order, the slot index as
 /// `u32`, the state code as `u8` (`0` empty, `1` loading, `2` ready) and the
 /// name as length-prefixed bytes. Empty slots are folded too, so a release is
@@ -198,12 +254,14 @@ pub fn tracker_hash(tracker: &ObjectTracker) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        StateHasher, WorldEntry, WorldState, error_hash, options_hash, tracker_hash,
-        world_state_hash,
+        StateHasher, WorldEntry, WorldState, actor_runtime_hash, error_hash, options_hash,
+        tracker_hash, world_state_hash,
     };
-    use crate::engine::clock::SimClock;
+    use crate::actor::{ActorBlock, ActorKind, BehaviourEntry, EntryArrayKind};
+    use crate::engine::actor::{ActorProfile, ActorRuntime};
     use crate::engine::class::RenderClass;
-    use crate::engine::live::{LiveArena, LiveObject};
+    use crate::engine::clock::SimClock;
+    use crate::engine::live::{LiveArena, LiveId, LiveObject};
     use crate::engine::play::{PlayError, PlayOptions};
     use crate::engine::tracker::ObjectTracker;
     use std::time::Duration;
@@ -520,6 +578,90 @@ mod tests {
             observed,
             vec![(2, 0), (1, 1)],
             "removals keep spawn order and reuse bumps the reused slot generation"
+        );
+    }
+
+    // Guards the initial actor-runtime fold: profile kind, the eight trios, the
+    // entry-array kind, the entry ids, then relation, state, target and flags.
+    // It is a sixth, independent gate; it does not move the options, error,
+    // world-state, tracker or classification goldens.
+    const GOLDEN_ACTOR_RUNTIME_HASH: u64 = 0xe169_695d_0eda_ec99;
+
+    fn synthetic_profile(ids: &[u8]) -> ActorProfile {
+        ActorProfile::from_block(&ActorBlock {
+            kind: ActorKind::Monster,
+            offset: 0x100,
+            length: 0x300,
+            trios: [
+                [13, 31, 31],
+                [25, 16, 12],
+                [9, 5, 11],
+                [7, 13, 27],
+                [19, 2, 11],
+                [20, 3, 2],
+                [9, 0, 55],
+                [19, 8, 1],
+            ],
+            entries: ids.iter().map(|&id| BehaviourEntry { id }).collect(),
+            entry_array: EntryArrayKind::Clean,
+        })
+    }
+
+    fn synthetic_runtime(ids: &[u8]) -> ActorRuntime {
+        ActorRuntime::initial(synthetic_profile(ids))
+    }
+
+    #[test]
+    fn actor_runtime_replay_matches_the_golden() {
+        let first = synthetic_runtime(&[0x18, 0x25, 0x26, 0x27, 0x28]);
+        let second = synthetic_runtime(&[0x18, 0x25, 0x26, 0x27, 0x28]);
+        assert_eq!(first, second, "equal profiles must start identically");
+
+        let observed = actor_runtime_hash(&first);
+        assert_eq!(
+            observed,
+            GOLDEN_ACTOR_RUNTIME_HASH,
+            "actor runtime hash moved: profile fold order, runtime init values, FNV or endianness changed (observed {observed:#018x})"
+        );
+    }
+
+    #[test]
+    fn actor_runtime_hash_is_value_and_profile_sensitive() {
+        let base = synthetic_runtime(&[0x18, 0x25]);
+        let baseline = actor_runtime_hash(&base);
+
+        let mut state = base.clone();
+        state.set_state(1);
+        assert_ne!(baseline, actor_runtime_hash(&state), "state must be folded");
+
+        let mut relation = base.clone();
+        relation.set_relation(1);
+        assert_ne!(
+            baseline,
+            actor_runtime_hash(&relation),
+            "relation must be folded"
+        );
+
+        let mut flags = base.clone();
+        flags.set_flags(1);
+        assert_ne!(baseline, actor_runtime_hash(&flags), "flags must be folded");
+
+        let mut target = base.clone();
+        target.set_target(Some(LiveId {
+            index: 2,
+            generation: 1,
+        }));
+        assert_ne!(
+            baseline,
+            actor_runtime_hash(&target),
+            "the target must be folded"
+        );
+
+        let other_profile = synthetic_runtime(&[0x25, 0x26]);
+        assert_ne!(
+            baseline,
+            actor_runtime_hash(&other_profile),
+            "the profile entries must be folded"
         );
     }
 }
