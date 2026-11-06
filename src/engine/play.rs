@@ -8,8 +8,9 @@
 //! Texture pages are validated before the event loop is created, so a missing
 //! page is a fail-fast exit 2 instead of a half-open window.
 
+use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,12 +22,15 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::cli_out::outln;
+use crate::engine::assets::{AssetRequest, AssetStore, ImmediateSource};
 use crate::engine::backend_wgpu::WgpuBackend;
 use crate::engine::clock::ObjectTick;
-use crate::engine::frame::FrameState;
+use crate::engine::determinism::world_state_hash;
+use crate::engine::frame::{FrameError, FrameState, PLAYER_NAME};
 use crate::engine::input::{InputButton, InputEvent};
-use crate::engine::render_backend::{NullBackend, RenderBackend};
+use crate::engine::render_backend::RenderBackend;
 use crate::engine::scene::{CameraView, SceneAssets};
+use crate::engine::spawn::{Admission, EngineNameTable};
 use crate::engine::world::{World, WorldError};
 use crate::object_texture::PageBank;
 use crate::render::{self, FlyCamera, OrbitCamera};
@@ -194,15 +198,19 @@ pub enum RunError {
     Scene(String),
     /// A missing or undecodable texture page: fail fast with exit code 2.
     Texture(String),
+    /// An unreadable asset archive during headless boot: fail with exit code 2.
+    Asset(String),
     Window(String),
-    Render(String),
-    Frame(String),
+    /// Engine invariant violated (tracker full, corrupt arena, impossible
+    /// state). Exit code 4.
+    Invariant(String),
 }
 
 impl RunError {
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Texture(_) => 2,
+            Self::Texture(_) | Self::Asset(_) => 2,
+            Self::Invariant(_) => 4,
             _ => 1,
         }
     }
@@ -212,6 +220,16 @@ impl RunError {
             Self::Texture(error.to_string())
         } else {
             Self::Scene(error.to_string())
+        }
+    }
+
+    /// Map a frame-driver failure to its process exit class.
+    ///
+    /// T8 left this pending: a full tracker is an engine invariant (exit 4),
+    /// never a generic runtime failure.
+    fn engine(error: FrameError) -> Self {
+        match error {
+            FrameError::Tracker(inner) => Self::Invariant(inner.to_string()),
         }
     }
 }
@@ -226,9 +244,9 @@ impl fmt::Display for RunError {
             Self::World(error) => write!(f, "{error}"),
             Self::Scene(detail) => write!(f, "cannot build the render scene: {detail}"),
             Self::Texture(detail) => write!(f, "cannot decode texture page: {detail}"),
+            Self::Asset(detail) => write!(f, "cannot read the asset archive: {detail}"),
             Self::Window(detail) => write!(f, "cannot open the play window: {detail}"),
-            Self::Render(detail) => write!(f, "render failed: {detail}"),
-            Self::Frame(detail) => write!(f, "simulation tick failed: {detail}"),
+            Self::Invariant(detail) => write!(f, "engine invariant failed: {detail}"),
         }
     }
 }
@@ -257,7 +275,7 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
     let frame = FrameState::new(world);
 
     if options.headless {
-        return run_headless(frame, assets, options.ticks.unwrap_or(60));
+        return run_headless(frame, options.ticks.unwrap_or(60), &options.bigfile);
     }
 
     run_windowed(
@@ -269,28 +287,163 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
     )
 }
 
-fn run_headless(
-    mut frame: FrameState,
-    mut assets: SceneAssets,
+/// The stable one-line headless acceptance contract.
+///
+/// The field order is part of the contract: `spec.md` states the same line and
+/// the integration tests parse it. `digest` is the canonical FNV-1a 64 fold of
+/// tick count plus the live-list order, class, position and visibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadlessReport {
+    pub unit: String,
+    pub rooms: usize,
+    pub placed: usize,
+    pub admitted: usize,
+    pub tracked: usize,
+    pub skipped_markers: usize,
+    pub inert: usize,
+    pub unresolved: usize,
+    pub live: usize,
+    pub ticks: u64,
+    pub digest: u64,
+}
+
+impl HeadlessReport {
+    /// Render the exact contract line, digest as 16 lowercase hex digits.
+    pub fn line(&self) -> String {
+        format!(
+            "engine unit={} rooms={} placed={} admitted={} tracked={} skipped_markers={} inert={} unresolved={} live={} ticks={} digest={:016x}",
+            self.unit,
+            self.rooms,
+            self.placed,
+            self.admitted,
+            self.tracked,
+            self.skipped_markers,
+            self.inert,
+            self.unresolved,
+            self.live,
+            self.ticks,
+            self.digest,
+        )
+    }
+}
+
+/// One-time placed-database counts produced by the headless boot pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SeedCounts {
+    placed: usize,
+    admitted: usize,
+    skipped_markers: usize,
+    inert: usize,
+    unresolved: usize,
+}
+
+/// Seed the live world from the authored placed records.
+///
+/// The spawn policy decides admission; markers never enter the tracker, inert
+/// names are only counted, and an unresolved model is counted rather than
+/// spawned. The player is already bound by [`FrameState::new`], so its record is
+/// not spawned a second time. Registry order is the placed-array order, which is
+/// deterministic.
+fn seed_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunError> {
+    let table = EngineNameTable::documented();
+    let source = ImmediateSource::open(bigfile)
+        .map_err(|error| RunError::Asset(error.to_string()))?;
+    let mut assets = AssetStore::new(source);
+
+    let player_bound = frame.player().is_some();
+    let mut counts = SeedCounts::default();
+    let mut resolved: BTreeMap<String, bool> = BTreeMap::new();
+    let mut spawns: Vec<(String, [i32; 3])> = Vec::new();
+
+    let records = frame.world().placed.records_for_boot();
+    counts.placed = records.len();
+    for record in records {
+        match table.admit(record) {
+            Admission::MarkerOnly => {
+                counts.skipped_markers += 1;
+                continue;
+            }
+            Admission::Inert => {
+                counts.inert += 1;
+                continue;
+            }
+            Admission::System | Admission::Actor | Admission::BossSpecial | Admission::PlacedModel => {
+                counts.admitted += 1;
+            }
+        }
+
+        let name = &record.name;
+        if player_bound && name.eq_ignore_ascii_case(PLAYER_NAME) {
+            // `FrameState::new` already bound the player live object.
+            continue;
+        }
+
+        let loaded = match resolved.get(name) {
+            Some(&loaded) => loaded,
+            None => {
+                let completion = assets
+                    .load(AssetRequest::for_name(name))
+                    .map_err(|error| RunError::Asset(error.to_string()))?;
+                let loaded = completion.is_loaded();
+                if !loaded {
+                    counts.unresolved += 1;
+                }
+                resolved.insert(name.clone(), loaded);
+                loaded
+            }
+        };
+        if loaded {
+            spawns.push((
+                name.clone(),
+                [
+                    i32::from(record.position[0]),
+                    i32::from(record.position[1]),
+                    i32::from(record.position[2]),
+                ],
+            ));
+        }
+    }
+
+    for (name, position) in spawns {
+        frame.queue_spawn(name, position);
+    }
+    Ok(counts)
+}
+
+/// Run the fixed tick sequence and build the acceptance report.
+///
+/// This is the production headless path: the digest is computed with the same
+/// [`world_state_hash`] the determinism gate pins. Any tracker overflow becomes
+/// [`RunError::Invariant`] (exit 4).
+fn headless_run(
+    frame: &mut FrameState,
+    bigfile: &Path,
     ticks: u32,
-) -> Result<(), RunError> {
-    let mut backend = NullBackend::new();
-    let camera = CameraView::identity();
+) -> Result<HeadlessReport, RunError> {
+    let counts = seed_world(frame, bigfile)?;
     for index in 0..u64::from(ticks) {
         frame
             .run_tick(ObjectTick::step(index))
-            .map_err(|error| RunError::Frame(error.to_string()))?;
-        let scene = assets.build(frame.live(), camera);
-        backend
-            .draw(&scene)
-            .map_err(|error| RunError::Render(error.to_string()))?;
+            .map_err(RunError::engine)?;
     }
-    outln!(
-        "engine headless unit={} ticks={} draws={}",
-        frame.world().level.name,
-        ticks,
-        backend.draws()
-    );
+    Ok(HeadlessReport {
+        unit: frame.world().level.name.clone(),
+        rooms: frame.world().level.rooms,
+        placed: counts.placed,
+        admitted: counts.admitted,
+        tracked: frame.tracker().ready_slots().count(),
+        skipped_markers: counts.skipped_markers,
+        inert: counts.inert,
+        unresolved: counts.unresolved,
+        live: frame.live().len(),
+        ticks: frame.ticks(),
+        digest: world_state_hash(&frame.world_state()),
+    })
+}
+
+fn run_headless(mut frame: FrameState, ticks: u32, bigfile: &Path) -> Result<(), RunError> {
+    let report = headless_run(&mut frame, bigfile, ticks)?;
+    outln!("{}", report.line());
     Ok(())
 }
 
@@ -769,8 +922,17 @@ mod tests {
     #[test]
     fn texture_failures_are_exit_two_and_other_failures_exit_one() {
         assert_eq!(RunError::Texture("missing page".to_string()).exit_code(), 2);
+        assert_eq!(RunError::Asset("bad archive".to_string()).exit_code(), 2);
         assert_eq!(RunError::Scene("bad scene".to_string()).exit_code(), 1);
         assert_eq!(RunError::MissingTextures.exit_code(), 1);
         assert_eq!(RunError::Window("no window".to_string()).exit_code(), 1);
+        assert_eq!(
+            RunError::Invariant("full tracker".to_string()).exit_code(),
+            4
+        );
     }
 }
+
+#[cfg(test)]
+#[path = "play_acceptance.rs"]
+mod acceptance;

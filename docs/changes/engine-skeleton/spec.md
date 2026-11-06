@@ -47,18 +47,22 @@ engine unit=<name> rooms=<R> placed=<P> admitted=<A> tracked=<T> skipped_markers
 Canonical digest stream (little-endian, no padding):
 
 1. `ticks` as `u64`.
-2. For each live object in live-list order: `slot` as `u32`, `class` as `u8`,
+2. For each live object in live-list order: `class` as `u8`,
    `position.x/y/z` as `i32`, `visible` as `u8`.
 
 The digest depends only on the tick count, the loaded world and the input
 sequence. It must not depend on wall-clock time, hash-map iteration order or
 GPU state.
 
-The 48-slot tracker has its own independent fold (`tracker_hash`): for each
-slot in index order, the slot index as `u32`, the state as `u8` (`0` empty,
-`1` loading, `2` ready) and the name as length-prefixed bytes (empty for an
-empty slot). It pins acquisition, duplicate-name sharing and lowest-free reuse;
-it does not enter the world-state digest.
+T10 makes this the production digest: `--play --headless` computes it with
+`engine::determinism::world_state_hash` over the real `FrameState` live world
+and prints it as the `digest` field. There is no second hashing scheme. The
+tracker slot is deliberately **not** in this stream; the 48-slot tracker has
+its own independent fold (`tracker_hash`): for each slot in index order, the
+slot index as `u32`, the state as `u8` (`0` empty, `1` loading, `2` ready) and
+the name as length-prefixed bytes (empty for an empty slot). It pins
+acquisition, duplicate-name sharing and lowest-free reuse; it does not enter
+the world-state digest.
 
 ## Acceptance scenarios
 

@@ -92,6 +92,17 @@ impl PlacedDb {
     pub fn contains_name(&self, name: &str) -> bool {
         self.by_name.contains_key(name)
     }
+
+    /// Every placement, for the one-time boot pass.
+    ///
+    /// The headless acceptance driver walks the authored records exactly once
+    /// to classify, count and seed them; the tick loop must keep using the
+    /// name/id indexes and never call this. It exists as a named method rather
+    /// than an iterator so the "query, never iterate per frame" rule stays
+    /// visible in the call site.
+    pub fn records_for_boot(&self) -> &[PlacedObject] {
+        &self.records
+    }
 }
 
 #[cfg(test)]

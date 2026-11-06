@@ -76,7 +76,7 @@ pub const CAPABILITIES: [Capability; 33] = [
     Capability { group: "level", name: "links-entry", legacy: "--level-links --bigfile <DAT> --entry <INDEX>", summary: "Print one archive entry's decoded link table.", window: false },
     Capability { group: "level", name: "links-group", legacy: "--level-links --bigfile <DAT> --group <PREFIX>", summary: "Print every archive level family member's link table.", window: false },
     Capability { group: "level", name: "reach", legacy: "--level-reach --bigfile <DAT> [--start <UNIT>]", summary: "BFS the archived level graph, then group reachable, island and inbound-but-unreachable units.", window: false },
-    Capability { group: "game", name: "play", legacy: "--play --bigfile <DAT> [--textures <BIG>] [--unit <NAME>] [--ticks <N>] [--camera <MODE>]", summary: "Run the engine on an archive (windowed by default; not implemented until T9/T10).", window: true },
+        Capability { group: "game", name: "play", legacy: "--play --bigfile <DAT> [--textures <BIG>] [--unit <NAME>] [--ticks <N>] [--camera <MODE>]", summary: "Run the engine on an archive: a deterministic headless acceptance line with --headless, or a textured window.", window: true },
 ];
 
 /// The capability table.
