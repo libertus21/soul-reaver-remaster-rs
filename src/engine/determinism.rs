@@ -13,7 +13,9 @@
 //!   state.
 //! - [`world_state_hash`] is the **canonical state gate**: FNV-1a 64 over the
 //!   tick count, live-list order, per-entry class, position and visibility.
-//!   It is independent of the options fold.
+//!   Since T10 it is also the **production digest** printed by
+//!   `--play --headless`, computed over the real `FrameState` live world rather
+//!   than a hand-built vector. It is independent of the options fold.
 //! - [`tracker_hash`] is the **tracker gate**: slot index, state and name in
 //!   slot order. It pins acquisition, duplicate-name sharing and lowest-free
 //!   reuse without entering the world-state digest.
@@ -169,7 +171,10 @@ pub struct WorldEntry {
 /// Hash the canonical world state: tick count, live-list order, then per entry
 /// `class`, `position.x/y/z` and `visible`, all little-endian and fixed width.
 ///
-/// Independent of [`options_hash`]: how the engine was launched is not state.
+/// This is the **production digest**: `--play --headless` folds the real
+/// `FrameState` live world through this function and prints the result. It is
+/// also the canonical determinism gate. Independent of [`options_hash`]: how
+/// the engine was launched is not state.
 pub fn world_state_hash(state: &WorldState) -> u64 {
     let mut hasher = StateHasher::new();
     hasher.write_u64(state.tick);
@@ -379,19 +384,37 @@ mod tests {
     // FNV-1a constants and little-endian encoding. It is independent of the
     // options fold above.
     //
-    // T5 adds the live arena and the class hooks but does NOT write
-    // `WorldState.live`, so this fold and this constant stay unchanged. The
-    // live-order replay below is a separate observation, not part of the
-    // canonical world golden.
-    //
-    // T3+ MUST extend the fold and this constant deliberately, in the same PR
-    // that updates `docs/changes/engine-skeleton/spec.md`; it must never be
-    // "fixed" to make a test go green.
-    const GOLDEN_WORLD_STATE_HASH: u64 = 0x82fe_8a38_1b9d_2a6d;
+    // T10 makes this the PRODUCTION digest: `--play --headless` folds the real
+    // `FrameState` live world through `world_state_hash`. The constant was
+    // re-pinned deliberately from the retired T2 synthetic vector
+    // `0x82fe_8a38_1b9d_2a6d` to the end-to-end real-world run below
+    // (`0xb5bb_59fd_97b9_50b1`); the headless CLI gate adds
+    // `GOLDEN_HEADLESS_DIGEST` in `src/engine/play.rs`. This is the update the
+    // design anticipated; it is never "fixed" to make a test green.
+    const GOLDEN_WORLD_STATE_HASH: u64 = 0xb5bb_59fd_97b9_50b1;
 
-    /// Synthetic, game-free run: advance a fixed clock over `advances` and fold
-    /// the resulting world. One entry moves one unit on x per tick so the hash
-    /// depends on the tick count, not only on the seed.
+    /// A real `FrameState` world: the player plus two deferred spawns, one of
+    /// them outside the cull radius so the fold observes a `visible` change.
+    fn real_world_seed() -> FrameState {
+        let mut frame = FrameState::new(frame_world());
+        frame.queue_spawn("monster_wallcr", [10, 0, 0]);
+        frame.queue_spawn("particle_dust", [5000, 0, 0]);
+        frame
+    }
+
+    /// Run a real live world for `ticks` fixed steps.
+    fn real_world_run(ticks: u64) -> FrameState {
+        let mut frame = real_world_seed();
+        for index in 0..ticks {
+            frame
+                .run_tick(ObjectTick::step(index))
+                .expect("the real frame world must tick");
+        }
+        frame
+    }
+
+    /// Synthetic, game-free vector used only by the value/order sensitivity
+    /// test. The canonical golden no longer reads it; it is a pure fold input.
     fn synthetic_run(advances: &[Duration]) -> WorldState {
         let mut clock = SimClock::new();
         let mut state = WorldState {
@@ -419,14 +442,20 @@ mod tests {
     }
 
     #[test]
-    fn n_ticks_twice_produce_identical_world_hash() {
-        let advances = [Duration::from_millis(16); 120];
-        let first = synthetic_run(&advances);
-        let second = synthetic_run(&advances);
-        assert_eq!(first, second, "same tick sequence must fold identically");
-        assert_eq!(world_state_hash(&first), world_state_hash(&second));
+    fn real_world_n_ticks_twice_produce_identical_world_hash() {
+        let first = real_world_run(60);
+        let second = real_world_run(60);
         assert_eq!(
-            world_state_hash(&first),
+            first.world_state(),
+            second.world_state(),
+            "the same tick sequence must fold the real live world identically"
+        );
+        assert_eq!(
+            world_state_hash(&first.world_state()),
+            world_state_hash(&second.world_state())
+        );
+        assert_eq!(
+            world_state_hash(&first.world_state()),
             GOLDEN_WORLD_STATE_HASH,
             "world state hash moved: fold order, field set, live order, FNV or endianness changed"
         );
@@ -801,6 +830,69 @@ mod tests {
         assert_eq!(
             last, GOLDEN_FRAME_STATE_HASH,
             "frame state hash moved: stage order, input sampling, translation, culling or bookkeeping changed (observed {last:#018x})"
+        );
+    }
+
+    // T10 wall-clock independence. The simulation never reads a clock; the
+    // caller only decides how many fixed ticks are owed. No simulation module
+    // may name a clock type, and two different wall-clock schedules that reach
+    // the same tick count must fold the same state.
+    const SIMULATION_SOURCES: [(&str, &str); 12] = [
+        ("clock.rs", include_str!("clock.rs")),
+        ("frame.rs", include_str!("frame.rs")),
+        ("world.rs", include_str!("world.rs")),
+        ("placed.rs", include_str!("placed.rs")),
+        ("live.rs", include_str!("live.rs")),
+        ("class.rs", include_str!("class.rs")),
+        ("input.rs", include_str!("input.rs")),
+        ("tracker.rs", include_str!("tracker.rs")),
+        ("spawn.rs", include_str!("spawn.rs")),
+        ("assets.rs", include_str!("assets.rs")),
+        ("actor.rs", include_str!("actor.rs")),
+        ("state.rs", include_str!("state.rs")),
+    ];
+
+    #[test]
+    fn simulation_path_never_names_a_wall_clock() {
+        for (name, source) in SIMULATION_SOURCES {
+            assert!(
+                !source.contains("Instant"),
+                "{name} must not read or name Instant (wall clock)"
+            );
+            assert!(
+                !source.contains("SystemTime"),
+                "{name} must not read or name SystemTime (wall clock)"
+            );
+        }
+    }
+
+    #[test]
+    fn equal_tick_counts_ignore_the_wall_clock_schedule() {
+        let mut stepped = real_world_seed();
+        for _ in 0..120 {
+            assert_eq!(
+                stepped.frame(Duration::new(0, 16_666_667)).expect("frame"),
+                1,
+                "one exact 1/60 s step per frame"
+            );
+        }
+
+        let mut drained = real_world_seed();
+        let mut ticks = drained.frame(Duration::from_secs(2)).expect("frame");
+        while ticks < 120 {
+            ticks += drained.frame(Duration::ZERO).expect("drain");
+        }
+
+        assert_eq!(stepped.ticks(), 120);
+        assert_eq!(drained.ticks(), 120);
+        assert_eq!(
+            stepped.world_state(),
+            drained.world_state(),
+            "the same tick count reached through different wall-clock schedules must be identical"
+        );
+        assert_eq!(
+            world_state_hash(&stepped.world_state()),
+            world_state_hash(&drained.world_state())
         );
     }
 }
