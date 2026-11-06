@@ -49,6 +49,10 @@ mod cli_out;
 #[allow(dead_code)]
 mod launcher_cli;
 mod dds;
+// Transitional: the next commit wires `--play` into dispatch; until then the
+// facade is test-only so dead-code warnings are allowed here, nowhere else.
+#[allow(dead_code)]
+mod engine;
 mod gallery;
 mod level;
 mod menu;
