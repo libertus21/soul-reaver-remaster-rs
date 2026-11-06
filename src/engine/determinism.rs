@@ -202,6 +202,8 @@ mod tests {
         world_state_hash,
     };
     use crate::engine::clock::SimClock;
+    use crate::engine::class::RenderClass;
+    use crate::engine::live::{LiveArena, LiveObject};
     use crate::engine::play::{PlayError, PlayOptions};
     use crate::engine::tracker::ObjectTracker;
     use std::time::Duration;
@@ -315,6 +317,11 @@ mod tests {
     // order, and per entry the class, position x/y/z and visible byte, plus the
     // FNV-1a constants and little-endian encoding. It is independent of the
     // options fold above.
+    //
+    // T5 adds the live arena and the class hooks but does NOT write
+    // `WorldState.live`, so this fold and this constant stay unchanged. The
+    // live-order replay below is a separate observation, not part of the
+    // canonical world golden.
     //
     // T3+ MUST extend the fold and this constant deliberately, in the same PR
     // that updates `docs/changes/engine-skeleton/spec.md`; it must never be
@@ -455,6 +462,64 @@ mod tests {
             tracker_hash(&loading),
             tracker_hash(&ready),
             "the state code must be part of the fold"
+        );
+    }
+
+    // T5 makes the live order observable, but the arena is not wired into
+    // `WorldState.live` yet, so this replay is an independent observation and
+    // does not touch `GOLDEN_WORLD_STATE_HASH`.
+    fn live_object(name: &str) -> LiveObject {
+        LiveObject {
+            name: name.to_string(),
+            class: RenderClass::Unclassified,
+            position: [0, 0, 0],
+            visible: true,
+            slot: None,
+            anim_index: 0,
+        }
+    }
+
+    /// Little-endian bytes for every live id in order: slot index then
+    /// generation. The order is the arena's spawn order, never the slot order.
+    fn live_order_bytes(arena: &LiveArena) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for id in arena.order() {
+            bytes.extend_from_slice(&id.index.to_le_bytes());
+            bytes.extend_from_slice(&id.generation.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn replay_live() -> LiveArena {
+        let mut arena = LiveArena::new();
+        let a = arena.spawn(live_object("raziel__"));
+        let b = arena.spawn(live_object("monster_wallcr"));
+        arena.spawn(live_object("particle"));
+        arena.despawn(b).expect("remove the middle object");
+        arena.spawn(live_object("sreavr__"));
+        arena.despawn(a).expect("remove the first object");
+        arena
+    }
+
+    #[test]
+    fn live_order_replays_byte_identical() {
+        let first = replay_live();
+        let second = replay_live();
+        assert_eq!(
+            live_order_bytes(&first),
+            live_order_bytes(&second),
+            "the same spawn/remove sequence must fold identically"
+        );
+
+        let observed: Vec<(u32, u32)> = first
+            .order()
+            .iter()
+            .map(|id| (id.index, id.generation))
+            .collect();
+        assert_eq!(
+            observed,
+            vec![(2, 0), (1, 1)],
+            "removals keep spawn order and reuse bumps the reused slot generation"
         );
     }
 }
