@@ -27,6 +27,10 @@ pub mod live;
 pub mod placed;
 pub mod play;
 #[allow(dead_code)]
+pub mod render_backend;
+#[allow(dead_code)]
+pub mod scene;
+#[allow(dead_code)]
 pub mod spawn;
 #[allow(dead_code)]
 pub mod state;

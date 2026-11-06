@@ -653,7 +653,7 @@ fn fs(in: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-fn fit_bounds(positions: &[[f32; 3]]) -> Result<([f32; 3], f32), String> {
+pub(crate) fn fit_bounds(positions: &[[f32; 3]]) -> Result<([f32; 3], f32), String> {
     if positions.is_empty() {
         return Err("cannot frame an empty mesh (0 vertices)".to_string());
     }
