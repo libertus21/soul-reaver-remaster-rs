@@ -44,6 +44,11 @@ slice, not part of this gate.
 - T3 (placed database + world construction): no tick loop and no
   `WorldState.live` write, so the canonical fold and
   `GOLDEN_WORLD_STATE_HASH` stay unchanged.
+- T5 (live arena + class hooks): the arena is not wired into `WorldState.live`
+  yet, so the canonical fold and `GOLDEN_WORLD_STATE_HASH` stay unchanged too.
+  T5 adds a separate live-order replay (`src/engine/determinism.rs`) that pins
+  slot index, generation and order across two identical spawn/remove runs; it
+  is an independent observation, not part of the world golden.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.
@@ -78,6 +83,23 @@ The canonical world fold, in order: `tick` as `u64`, then for each live entry in
 `class` as `u8`, `position.x/y/z` as `i32`, `visible` as `u8`. `GOLDEN_WORLD_STATE_HASH`
 pins that exact byte stream. T3+ extends the fold and the constant deliberately,
 in the same PR that updates `spec.md`; it is never "fixed" to go green.
+
+## Live order (T5)
+
+The live arena keeps three things separate: the generational slot array, the
+free list, and an explicit `order: Vec<LiveId>`. Iteration follows `order`, so:
+
+- the live order is spawn order, and removing an object never reorders the
+  survivors;
+- a reused slot bumps its generation, so an old [`LiveId`] is rejected as stale
+  instead of silently pointing at the new occupant;
+- a free-list reuse appends the new object at the end of the live order even
+  when its slot index is in the middle of the array.
+
+Replaying the same spawn/remove sequence twice therefore yields byte-identical
+`(slot index, generation)` tuples in the same order. T5 does not feed this arena
+into `WorldState.live`, so the canonical world golden does not move; the replay
+is a separate gate in `src/engine/determinism.rs`.
 
 ## Clock: rational step, no drift
 
