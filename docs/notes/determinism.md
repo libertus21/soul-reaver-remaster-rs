@@ -23,6 +23,20 @@ the first slice with a tick loop.
    `Vec` ordering that depends on allocation or hash order. The caller feeds the
    clock; the state stream is written in live-list order.
 
+## Cross-platform path caveat
+
+`write_path` hashes `Path::as_os_str().as_encoded_bytes()`, which is the
+OS-native encoding: raw bytes on Unix (locale dependent) and WTF-8 on Windows.
+FNV-1a itself is byte-exact on every platform, but the input bytes are not, so
+the same non-ASCII path can hash differently across operating systems.
+
+The determinism gate is therefore **same-platform, same-build**. Comparing
+digests of non-ASCII paths across platforms is **out of scope**. That is
+acceptable because the original is a Windows game and the gate runs against it
+on Windows; ASCII paths, which the CLI contract uses, are byte-identical
+everywhere. Normalizing the path encoding is a design decision for a later
+slice, not part of this gate.
+
 ## Gate policy per slice
 
 - T2 (first tick loop): **hard gate**. A test must run N ticks twice and assert
@@ -37,3 +51,6 @@ the first slice with a tick loop.
 T1 ships the harness and the pattern only: there is no world or tick loop yet,
 so `state_hash` folds the parsed `PlayOptions` and typed error text, and the
 tests prove equal input yields an equal hash while different input does not.
+Golden constants in the same module pin the exact byte stream, so a change to
+the fold order, the field set or the FNV constants cannot pass unnoticed; the
+`Ok` golden is expected to change in T2 and must be updated deliberately.
