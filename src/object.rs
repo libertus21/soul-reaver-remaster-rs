@@ -264,18 +264,35 @@ pub fn parse_object(bytes: &[u8]) -> Result<ObjectModel, ObjectError> {
     })
 }
 
-/// Read and parse one archive entry. The bytes stay in memory; nothing is
-/// extracted or written.
-pub fn read_entry(path: &Path, index: usize) -> Result<ObjectModel, ObjectError> {
+/// The object header and data region, without decoding the model arrays.
+/// `None` means the entry is not an object container (levels, textures, ...).
+pub(crate) fn object_view(bytes: &[u8]) -> Option<(&[u8], String)> {
+    let records = read_u32(bytes, 0)?;
+    if !(1..=MAX_RELOCATIONS).contains(&records) || 4 + 4 * records as usize > bytes.len() {
+        return None;
+    }
+    let base = level::data_base(records);
+    let data = bytes.get(base..)?;
+    let name = object_name(data.get(..0x64)?)?;
+    Some((data, name))
+}
+
+/// Read one archive entry's raw bytes. Nothing is extracted or written.
+pub(crate) fn read_entry_bytes(path: &Path, index: usize) -> Result<Vec<u8>, ObjectError> {
     let entries = bigfile::load_index(path)
         .map_err(|error| ObjectError::ArchiveUnreadable(error.to_string()))?;
     let entry = entries.get(index)
         .ok_or(ObjectError::EntryIndexOutOfRange { index, entries: entries.len() })?;
-    let bytes = bigfile::read_entry(path, entry).map_err(|error| match error {
+    bigfile::read_entry(path, entry).map_err(|error| match error {
         error @ bigfile::BigfileError::BadEntry(_) => ObjectError::EntryOutsideFile(error.to_string()),
         error => ObjectError::ArchiveUnreadable(error.to_string()),
-    })?;
-    parse_object(&bytes)
+    })
+}
+
+/// Read and parse one archive entry. The bytes stay in memory; nothing is
+/// extracted or written.
+pub fn read_entry(path: &Path, index: usize) -> Result<ObjectModel, ObjectError> {
+    parse_object(&read_entry_bytes(path, index)?)
 }
 
 /// Accumulated bone translation for each bone: its own `local` offset plus
