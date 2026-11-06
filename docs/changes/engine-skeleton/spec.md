@@ -54,6 +54,12 @@ The digest depends only on the tick count, the loaded world and the input
 sequence. It must not depend on wall-clock time, hash-map iteration order or
 GPU state.
 
+The 48-slot tracker has its own independent fold (`tracker_hash`): for each
+slot in index order, the slot index as `u32`, the state as `u8` (`0` empty,
+`1` loading, `2` ready) and the name as length-prefixed bytes (empty for an
+empty slot). It pins acquisition, duplicate-name sharing and lowest-free reuse;
+it does not enter the world-state digest.
+
 ## Acceptance scenarios
 
 ### S1 - Headless load of `under1`
