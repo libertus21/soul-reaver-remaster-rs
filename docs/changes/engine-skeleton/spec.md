@@ -48,7 +48,17 @@ Canonical digest stream (little-endian, no padding):
 
 1. `ticks` as `u64`.
 2. For each live object in live-list order: `class` as `u8`,
-   `position.x/y/z` as `i32`, `visible` as `u8`.
+   `position.x/y/z` as `i32`, `visible` as `u8`, actor presence as `u8`,
+   actor `relation` as `u8` and actor action `state` as `u8`.
+
+The actor-presence byte is `1` only when the live object carries an
+`ActorRuntime`, that is, when the loaded model supplied an actor block. When it
+is `0`, `relation` and `state` are written as the neutral `0`; the presence byte
+is what distinguishes "no carrier" from "carrier in its initial state". The
+`engine-actor-tick` slice added these three bytes and re-pinned
+`GOLDEN_WORLD_STATE_HASH`, `GOLDEN_FRAME_STATE_HASH` and
+`GOLDEN_HEADLESS_DIGEST` in the same PR. No state names or action meanings are
+implied by the fold; the bytes are numeric model-relative values.
 
 The digest depends only on the tick count, the loaded world and the input
 sequence. It must not depend on wall-clock time, hash-map iteration order or
