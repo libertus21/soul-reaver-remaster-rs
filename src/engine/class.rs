@@ -1,15 +1,15 @@
 //! Render class table and the three per-object behaviour hooks.
 //!
 //! The class is a renderer/prototype category, not a spawn rule: it is selected
-//! from the prototype-name prefix and installs up to three function pointers on
-//! the live object (event, per-frame tick, query). A missing slot (`None`) is a
-//! first-class opt-out, exactly like the original's null hook, and never an
-//! error.
+//! from the loaded model's class-flags word and prototype name and installs up
+//! to three function pointers on the live object (event, per-frame tick, query).
+//! A missing slot (`None`) is a first-class opt-out, exactly like the original's
+//! null hook, and never an error.
 //!
-//! The table is data: [`CLASS_TABLE`] is a constant array and [`classify`] is a
-//! linear prefix lookup, so adding a class is a row, not another match arm.
+//! The table is data: [`CLASS_TABLE`] is a constant array. [`classify_loaded`]
+//! reads the forced bits first and only then compares the prototype name
+//! exactly, so adding a class is still a row, not another match arm.
 
-use crate::actor::ActorKind;
 use crate::engine::clock::ObjectTick;
 use crate::engine::live::{LiveArena, LiveId};
 use crate::engine::world::World;
@@ -178,44 +178,49 @@ pub fn classify_entry(name: &str) -> Option<ClassEntry> {
         .find(|entry| name.starts_with(entry.prefix))
 }
 
-/// Render class for a prototype name; an unknown prefix is
-/// [`RenderClass::Unclassified`], never a panic.
+/// Forced `physical` class bit in the loaded object's class-flags word.
+pub const CLASS_FLAG_PHYSICAL: u32 = 0x0004_0000;
+/// Forced `monster_` class bit in the loaded object's class-flags word.
+pub const CLASS_FLAG_MONSTER: u32 = 0x0008_0000;
+
+/// The class for a synthetic/instance name: a linear prefix lookup.
+///
+/// This is the fallback for spawns that carry no loaded model. The real path is
+/// [`classify_loaded`].
 pub fn classify(name: &str) -> RenderClass {
     classify_entry(name).map_or(RenderClass::Unclassified, |entry| entry.class)
 }
 
-/// The class-row prefix for one class, read from [`CLASS_TABLE`].
-fn class_prefix(class: RenderClass) -> &'static str {
+/// The class of a loaded model, from the exact evidence order.
+///
+/// 1. Bit 18 in the class-flags word forces [`RenderClass::Physical`].
+/// 2. Otherwise bit 19 forces [`RenderClass::Monster`]. The physical test runs
+///    first, so a word with both bits classifies as physical.
+/// 3. Otherwise the padded prototype name is compared **exactly** against the
+///    six-row table. No match is [`RenderClass::Unclassified`].
+///
+/// The flags word must be captured at load-complete, before actor initialisation
+/// reuses that slot as the parameter-program pointer. [`crate::object`] captures
+/// it while parsing the container, and [`crate::engine::assets`] classifies from
+/// that captured word before it parses the actor profile.
+pub fn classify_loaded(class_flags: u32, prototype: &str) -> RenderClass {
+    if class_flags & CLASS_FLAG_PHYSICAL != 0 {
+        return RenderClass::Physical;
+    }
+    if class_flags & CLASS_FLAG_MONSTER != 0 {
+        return RenderClass::Monster;
+    }
     CLASS_TABLE
         .iter()
-        .find(|entry| entry.class == class)
-        .map_or("", |entry| entry.prefix)
-}
-
-/// The prototype key the six-row table is applied to.
-///
-/// The original classifies the **loaded model**, not the placed instance: it
-/// compares the model container's prototype name against this table and ORs in a
-/// forced monster class flag for the actor family (`object-types` section 2.2,
-/// `object-prototype`). Shipped containers carry bare names padded with `_` to
-/// eight characters (`raziel__`, `skinner_`), so the key is the padded model
-/// name. No shipped actor name starts with `monster_`, so an actor-family block
-/// supplies that row directly; the exact forced-flag bit is UNKNOWN, but the
-/// actor-block signature is the established model identity.
-pub fn prototype_key(model_name: &str, actor_kind: Option<ActorKind>) -> String {
-    if actor_kind == Some(ActorKind::Monster) {
-        return class_prefix(RenderClass::Monster).to_owned();
-    }
-    let mut key = model_name.to_owned();
-    while key.len() < 8 {
-        key.push('_');
-    }
-    key
+        .find(|entry| entry.prefix == prototype)
+        .map_or(RenderClass::Unclassified, |entry| entry.class)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CLASS_TABLE, ClassEntry, RenderClass, classify, classify_entry};
+    use super::{
+        CLASS_TABLE, ClassEntry, RenderClass, classify, classify_entry, classify_loaded,
+    };
 
     #[test]
     fn class_table_covers_every_prefix_and_declares_every_slot() {
@@ -314,27 +319,72 @@ mod tests {
     }
 
     #[test]
-    fn prototype_key_resolves_the_model_not_the_instance() {
-        let cases: [(&str, Option<crate::actor::ActorKind>, RenderClass); 8] = [
-            ("raziel", Some(crate::actor::ActorKind::Player), RenderClass::Raziel),
-            ("skinner", Some(crate::actor::ActorKind::Monster), RenderClass::Monster),
-            ("sluagh", Some(crate::actor::ActorKind::Monster), RenderClass::Monster),
-            ("sreavr", None, RenderClass::Sreavr),
-            ("glphicon", None, RenderClass::GlyphIcon),
-            ("physical", None, RenderClass::Physical),
-            ("particle", None, RenderClass::Particle),
-            ("hint", None, RenderClass::Unclassified),
+    fn forced_bits_win_in_physical_then_monster_order() {
+        assert_eq!(
+            classify_loaded(super::CLASS_FLAG_PHYSICAL, "raziel__"),
+            RenderClass::Physical,
+            "bit 18 forces physical over the prototype name"
+        );
+        assert_eq!(
+            classify_loaded(super::CLASS_FLAG_MONSTER, "raziel__"),
+            RenderClass::Monster,
+            "bit 19 forces monster over the prototype name"
+        );
+        assert_eq!(
+            classify_loaded(
+                super::CLASS_FLAG_PHYSICAL | super::CLASS_FLAG_MONSTER,
+                "raziel__"
+            ),
+            RenderClass::Physical,
+            "the physical test runs first, so both bits classify physical"
+        );
+    }
+
+    #[test]
+    fn neither_bit_falls_back_to_an_exact_prototype_name() {
+        let cases = [
+            ("raziel__", RenderClass::Raziel),
+            ("sreavr__", RenderClass::Sreavr),
+            ("glphicon", RenderClass::GlyphIcon),
+            ("physical", RenderClass::Physical),
+            ("monster_", RenderClass::Monster),
+            ("particle", RenderClass::Particle),
         ];
-        for (model, kind, expected) in cases {
-            let key = super::prototype_key(model, kind);
-            assert_eq!(classify(&key), expected, "model '{model}' key '{key}'");
+        for (prototype, expected) in cases {
+            assert_eq!(
+                classify_loaded(0, prototype),
+                expected,
+                "exact prototype '{prototype}'"
+            );
         }
     }
 
     #[test]
-    fn the_bare_monster_instance_name_alone_stays_unclassified() {
-        assert_eq!(classify("skinner"), RenderClass::Unclassified);
-        let key = super::prototype_key("skinner", Some(crate::actor::ActorKind::Monster));
-        assert_eq!(classify(&key), RenderClass::Monster);
+    fn neither_bit_and_no_exact_match_is_unclassified() {
+        assert_eq!(classify_loaded(0, "skinner_"), RenderClass::Unclassified);
+        assert_eq!(classify_loaded(0, "under1"), RenderClass::Unclassified);
+        assert_eq!(
+            classify_loaded(0, "raziel"),
+            RenderClass::Unclassified,
+            "the fallback is exact, not a prefix match"
+        );
+        assert_eq!(
+            classify_loaded(0, "raziel__player"),
+            RenderClass::Unclassified,
+            "a longer name is not an exact row"
+        );
+    }
+
+    #[test]
+    fn a_real_shaped_skinner_classifies_monster_by_bit_19_not_by_name() {
+        assert_eq!(
+            classify_loaded(super::CLASS_FLAG_MONSTER, "skinner_"),
+            RenderClass::Monster
+        );
+        assert_eq!(
+            classify_loaded(0, "skinner_"),
+            RenderClass::Unclassified,
+            "without the bit the padded actor name never matches the table"
+        );
     }
 }

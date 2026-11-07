@@ -73,9 +73,16 @@ pub struct ObjectReport {
 /// One parsed model. `materials` holds the distinct 16-byte records that
 /// textured polygons reference, in ascending offset order. `bones` is the raw
 /// bone table; `vertices` keep their on-disk bone-local coordinates.
+///
+/// `prototype` is the padded model name as stored in the container, which is the
+/// exact string the six-row class table compares. `name` is the same field with
+/// trailing `_` padding removed, used for placement lookup. `class_flags` is the
+/// class-flags word captured from the header at load-complete, before actor
+/// initialisation reuses that slot as the parameter-program pointer.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ObjectModel {
-    pub name: String, pub vertices: Vec<Vertex>, pub polygons: Vec<Polygon>,
+    pub name: String, pub prototype: String, pub class_flags: u32,
+    pub vertices: Vec<Vertex>, pub polygons: Vec<Polygon>,
     /// One entry per polygon: the decoded record for a textured face, else
     /// `None`. `materials` still holds the distinct raw records.
     pub textures: Vec<Option<TextureRef>>,
@@ -142,13 +149,27 @@ fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
 }
 
 /// First 12-byte object name, terminated by NUL or the `0xCD` filler.
-fn object_name(header: &[u8]) -> Option<String> {
+///
+/// Returns the padded **prototype** exactly as stored and the display name with
+/// trailing `_` removed. The prototype is what the class table compares; the
+/// display name is what placement lookup uses.
+fn object_name_parts(header: &[u8]) -> Option<(String, String)> {
     let field = header.get(0x4C..0x58)?;
     let end = field.iter().position(|&byte| byte == 0 || byte == 0xCD)?;
-    let name = std::str::from_utf8(&field[..end]).ok()?.trim_end_matches('_');
+    let prototype = std::str::from_utf8(&field[..end]).ok()?;
+    let name = prototype.trim_end_matches('_');
     let valid = !name.is_empty()
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-    valid.then(|| name.to_string())
+    valid.then(|| (prototype.to_string(), name.to_string()))
+}
+
+/// The class-flags word lives in the object header; it is only valid before the
+/// slot is reused as the actor parameter-program pointer.
+const CLASS_FLAGS_AT: usize = 0x2C;
+
+/// First 12-byte object name, terminated by NUL or the `0xCD` filler.
+fn object_name(header: &[u8]) -> Option<String> {
+    object_name_parts(header).map(|(_, name)| name)
 }
 
 /// Parse one single-model object container. `N` inflates the relocation
@@ -168,7 +189,8 @@ pub fn parse_object(bytes: &[u8]) -> Result<ObjectModel, ObjectError> {
     }
     let data = &bytes[base..];
     let header = data.get(..0x64).ok_or(ObjectError::HeaderTruncated)?;
-    let name = object_name(header).ok_or(ObjectError::NotObjectContainer)?;
+    let (prototype, name) = object_name_parts(header).ok_or(ObjectError::NotObjectContainer)?;
+    let class_flags = read_u32(header, CLASS_FLAGS_AT).ok_or(ObjectError::HeaderTruncated)?;
     let table_at = read_u32(header, 0x0C).ok_or(ObjectError::HeaderTruncated)? as usize;
     let table_len = usize::from(read_u16(header, 0x0A).ok_or(ObjectError::HeaderTruncated)?) + 1;
     let table_end = table_at.checked_add(4 * table_len).ok_or(ObjectError::TableOutOfRange)?;
@@ -255,7 +277,7 @@ pub fn parse_object(bytes: &[u8]) -> Result<ObjectModel, ObjectError> {
         record
     }).collect();
     Ok(ObjectModel {
-        name, vertices, polygons, textures, bones, materials,
+        name, prototype, class_flags, vertices, polygons, textures, bones, materials,
         counts: Counts { vertices: vertex_count, polygons: polygon_count, materials: offsets.len() as u32 },
         report: ObjectReport {
             vertex_start, vertex_count, vertex_end, polygon_start, polygon_count,
@@ -570,6 +592,17 @@ mod tests {
         assert_eq!(parsed.materials[0], [0xAB; 16]);
         assert_eq!((parsed.report.vertex_end, parsed.report.polygon_end), (200, 224));
         assert_eq!(parsed.report.out_of_range, 0);
+    }
+
+    #[test]
+    fn exposes_the_padded_prototype_and_the_load_time_class_flags() {
+        let mut bytes = model();
+        let base = level::data_base(1);
+        bytes[base + 0x2C..base + 0x30].copy_from_slice(&0x0004_0000u32.to_le_bytes());
+        let parsed = parse_object(&bytes).expect("synthetic object must parse");
+        assert_eq!(parsed.prototype, "raziel__", "the padded field, not the trimmed name");
+        assert_eq!(parsed.name, "raziel");
+        assert_eq!(parsed.class_flags, 0x0004_0000);
     }
 
     #[test]
