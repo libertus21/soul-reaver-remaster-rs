@@ -316,7 +316,11 @@ fn boot_carries_a_loaded_actor_profile_into_the_live_object() {
         [19, 8, 1],
     ];
     let room = pcm_room("under1", &[("monster_wal", [0, 0, 0])]);
-    let model = crate::actor::synthetic_actor("monster_wal", &[0x18, 0x25], trios);
+    let mut model = crate::actor::synthetic_actor("monster_wal", &[0x18, 0x25], trios);
+    // Real data marks the actor family with bit 19 of the class-flags word; the
+    // classifier reads that word at load-complete, not the actor block.
+    let base = crate::level::data_base(1);
+    model[base + 0x2C..base + 0x30].copy_from_slice(&0x0008_0000u32.to_le_bytes());
 
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("BIGFILE.DAT");
@@ -344,6 +348,11 @@ fn boot_carries_a_loaded_actor_profile_into_the_live_object() {
         .actor
         .as_ref()
         .expect("boot must carry the loaded actor profile");
+    assert_eq!(
+        object.class,
+        crate::engine::class::RenderClass::Monster,
+        "bit 19 of the load-time flags word selects the monster row"
+    );
     assert_eq!(actor.profile().trios, trios);
     assert_eq!(
         actor

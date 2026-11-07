@@ -175,3 +175,13 @@ a change of the table, the hooks, the fold fields or the simulation.
 
 No game bytes, decompiled listings, binary addresses or absolute install paths
 are recorded here.
+
+## 10. Addendum (2026-11-07) - the forced bits are now exact
+
+`actor-state-writer` section 2 resolved the storage this note listed as UNKNOWN:
+the class comes from a 32-bit class-flags word captured at load-complete, and
+the bits are **18 for `physical`** and **19 for `monster_`**, physical first.
+The engine now classifies the loaded model with that exact rule; it no longer
+uses the actor-family kind as a proxy. The padded prototype string is only the
+fallback when neither bit is set, and that comparison is exact, not a prefix.
+
