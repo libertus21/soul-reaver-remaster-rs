@@ -299,6 +299,13 @@ only real actor that reaches `advance()` is the player, plus synthetic names in
 tests. The synthetic tests use `monster_wallcr` / `monster_wal`, which is why the
 gap stayed invisible.
 
+**Resolution (2026-11-06).** `object-prototype` established that the placed
+record carries no prototype: the placed name is the model-container lookup key,
+and the class comes from the loaded model's prototype plus the actor-family
+identity. The dispatch key now uses the model prototype, so real monsters
+classify `monster_` and reach `advance()`. See
+`docs/notes/object-prototype.md` and the `engine-prototype-class` change.
+
 ## 10. What this does NOT establish
 
 - The row selector for the 8x3 trio table.
