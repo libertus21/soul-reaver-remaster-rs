@@ -28,7 +28,7 @@ the user's own copy.
 - A CPU render scene and a wgpu backend, plus `--play` as a new top-level mode
   beside the 32 legacy capabilities. The legacy arms are unchanged. The windowed
   path renders the room and the player; the authored placed-object seed pass is
-  headless-only in this milestone (see the gap table).
+  shared by both modes (see the gap table for the original milestone state).
 - A production digest: `--play --headless` prints one line and exits 0. The
   digest is the canonical world-state fold, not a second hashing scheme.
 - A determinism gate with eight numeric goldens plus the stage-order table.
@@ -82,7 +82,7 @@ end-to-end, not only in the unit test.
 | Digest repeatability | The two 60-tick runs printed the same digest. | Observed |
 | Tick count is part of the digest | 60 and 120 ticks printed different digests. | Observed |
 | Marker and admission counters | The real `under1` counters match the partition, and synthetic acceptance tests pin the same fields. | Observed and tested |
-| Windowed textured `under1` | The user visually confirmed the window with a screenshot during the T9 playtest. The code path renders the room mesh plus the player live object; it does not call the headless seed pass. This agent did not re-open a window in T11. | User-observed |
+| Windowed textured `under1` | The user visually confirmed the window with a screenshot during the T9 playtest. At that milestone the code path rendered the room mesh plus the player live object without the seed pass; `fix/engine-windowed-seed` now shares the seed pass and pins it with the parity test. This agent did not re-open a window in T11. | User-observed |
 | Windowed camera modes, keys and `Esc` exit 0 | Manual playtest only; the window loop is not exercised in CI. | User-observed, not agent-observed |
 | One-line contract format | Integration test parses the exact line; real runs match it. | Tested and observed |
 | 49th distinct name exits 4 | Synthetic archive only; not reachable on the `under1`/`under3` runs. | Tested only |
@@ -144,14 +144,14 @@ Implemented: 1, 2, 6, 9, 12, 15, 18. Named no-ops: 3, 4, 5, 7, 8, 10, 11,
 
 | Gap | Detail | Disposition |
 |---|---|---|
-| `RunError::World` exit code | A world load/parse failure maps to `RunError::World`, whose `exit_code` falls through to 1. The spec says asset, archive, parse or load errors exit 2. | Fix in a later slice with a test that pins the code. |
+| `RunError::World` exit code | A world load/parse failure mapped to `RunError::World`, whose `exit_code` fell through to 1, while the spec says asset, archive, parse or load errors exit 2. | Closed in `fix/engine-windowed-seed`: `World` maps to 2 and the exit-code test pins it. |
 | Window title mismatch | The spec asks for a title containing `engine under1`; the implementation opens `soul reaver - under1`. | Align spec and code in a later docs/UI slice. |
 | Digest scope | The gate is same-platform, same-build. FNV-1a is byte-exact, but `write_path` hashes `Path::as_os_str().as_encoded_bytes()`, which is OS-native. | ASCII paths are identical everywhere; cross-platform non-ASCII comparison is out of scope. |
 | Non-ASCII paths | The same non-ASCII path can hash differently on Windows and Unix. | Normalize or document at the CLI boundary in a later slice. |
 | LIFO free list | `LiveArena` uses `free.pop()` and `free.push(index)`, so slot reuse is LIFO. Live order is preserved, but the original allocator's reuse order is unproven. | Mark UNKNOWN against the original; revisit with evidence. |
 | `state = 0` placeholder | `ActorRuntime::initial` starts relation and state at neutral 0. The shipped action ids are model-relative; no action is selected. | Not proof of the original initial state. Replace when AI semantics land. |
 | Tracker cap proof | The 48-slot cap is proven with a synthetic 49-name level, not on a real unit (real units are far below the cap). | Keep the synthetic gate; add a real corpus census when one exists. |
-| Windowed seed gap | `run_windowed` receives the frame built by `FrameState::new`, which binds only the player. `seed_world` runs only in the headless path, so the window shows the room and `raziel` but not the other authored placements. | Wire the seed pass into windowed boot so the demo matches the headless world. |
+| Windowed seed gap | `run_windowed` received the frame built by `FrameState::new`, which binds only the player, so `seed_world` ran only in the headless path and the window showed the room and `raziel` but not the other authored placements. | Closed in `fix/engine-windowed-seed`: `boot_world` is shared, runs before the event loop, and a parity test pins the same live count and digest as headless. |
 | Single-unit load | `--play` has no `--group` mode, so `rooms` is always 1. | Group play is future work. |
 | No input script | Headless runs use zero input. Windowed input is keyboard-only and not reproducible in CI. | Add a deterministic input script if replay capture becomes necessary. |
 | Render runtime not in CI | The wgpu/winit path is manual. The headless path is the only automated end-to-end boundary. | Accept for the milestone; add a smoke harness later if the CI image supports it. |
