@@ -15,9 +15,10 @@
 //! `docs/notes/actor-behaviour-data.md` and
 //! `docs/notes/actor-transition-table.md` section 1.
 //!
-//! The four state bytes are carried now, but no transition rule runs yet. The
-//! eleven writer bodies remain UNKNOWN
-//! (`docs/notes/actor-transition-table.md` section 6).
+//! Only one state transition is CONFIRMED: the behaviour-set refresh
+//! ([`refresh`]). It is frozen here as a pure function and is deliberately not
+//! called by [`ActorRuntime::advance`]. The eleven writer bodies remain
+//! UNKNOWN (`docs/notes/actor-transition-table.md` section 6).
 
 use crate::actor::{self as parser, ActorBlock, ActorKind, BehaviourEntry, EntryArrayKind};
 use crate::engine::clock::ObjectTick;
@@ -66,6 +67,45 @@ impl ActorProfile {
     }
 }
 
+/// The post-action state value.
+///
+/// CONFIRMED by the shipped behaviour-set refresh: when the current state is
+/// this value, the refresh substitutes the pending alternate or queued state.
+/// It is a raw byte, not an enum member: no other state value has an
+/// established name (`docs/notes/actor-transition-table.md` sections 1 and 6).
+pub const POST_ACTION_STATE: u8 = 8;
+
+/// Apply the one CONFIRMED actor-state transition rule.
+///
+/// ```text
+/// refresh(current, queued, alternate):
+///     if current != 8: next = current
+///     else:            next = alternate if set, else queued
+/// ```
+///
+/// This is the behaviour-set refresh (`docs/notes/actor-transition-table.md`
+/// section 2, step 4). The rule is pure: it reads no world state, mutates
+/// nothing and returns the next value. It is intentionally **unwired**:
+/// [`ActorRuntime::advance`] does not call it, because the activation program,
+/// the event layer and the engagement/target data that populate `queued` and
+/// `alternate` are not modelled yet (same note, section 6).
+///
+/// # `alternate` and its UNKNOWN sentinel
+///
+/// The note records only that "alternate is set" means "any value other than
+/// the not-set sentinel", and that the concrete sentinel value is **UNKNOWN**
+/// (it was observed as the all-ones byte in one shipped path, not proven as a
+/// general sentinel). `Option<u8>` is therefore a Rust representation choice,
+/// **not** an evidence claim about the on-disk byte: `None` models "not set"
+/// without inventing a sentinel constant, and `Some(value)` models "set to
+/// `value`", including `Some(0)` if a shipped path ever sets zero.
+pub fn refresh(current: u8, queued: u8, alternate: Option<u8>) -> u8 {
+    if current != POST_ACTION_STATE {
+        return current;
+    }
+    alternate.unwrap_or(queued)
+}
+
 /// Outcome of one actor transition step.
 ///
 /// The decision body is not implemented, so the only outcome this slice can
@@ -99,7 +139,7 @@ pub enum ActorTransition {
 ///
 /// `alternate` is `Option<u8>` because the note establishes only that "set"
 /// means "not the not-set sentinel" and leaves the concrete sentinel UNKNOWN
-/// (see the transition-table note).
+/// (see [`refresh`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorRuntime {
     profile: ActorProfile,
@@ -208,9 +248,11 @@ impl ActorRuntime {
     /// `docs/notes/actor-behaviour-data.md` section 7). The step therefore
     /// leaves every field untouched regardless of what `events` contains, and
     /// returns an explicit [`ActorTransition::NotInterpreted`] instead of
-    /// inventing a transition. In particular it applies no transition rule.
-    /// Damage, health, knockback and combat resolution are out of scope and are
-    /// not read here.
+    /// inventing a transition. In particular it does **not** apply [`refresh`]:
+    /// that rule is frozen as a pure function and stays unwired until the
+    /// activation and event inputs exist (`docs/notes/actor-transition-table.md`
+    /// section 6). Damage, health, knockback and combat resolution are out of
+    /// scope and are not read here.
     ///
     /// Later evidence-backed slices replace this body; the dispatch, the carrier,
     /// the event plumbing and the determinism fold do not need to change for
@@ -232,7 +274,7 @@ impl ActorRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActorProfile, ActorRuntime};
+    use super::{ActorProfile, ActorRuntime, POST_ACTION_STATE, refresh};
     use crate::actor::{ActorKind, EntryArrayKind};
     use crate::engine::live::LiveId;
 
@@ -301,6 +343,65 @@ mod tests {
     }
 
     #[test]
+    fn refresh_keeps_a_non_post_action_current_unchanged() {
+        for current in [0, 1, 7, 9, 0x25, u8::MAX] {
+            for alternate in [None, Some(0), Some(3)] {
+                assert_eq!(
+                    refresh(current, 4, alternate),
+                    current,
+                    "current {current} is not the post-action value, so nothing may substitute it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_selects_alternate_at_the_post_action_value() {
+        assert_eq!(refresh(POST_ACTION_STATE, 4, Some(7)), 7);
+        assert_eq!(
+            refresh(POST_ACTION_STATE, 4, Some(0)),
+            0,
+            "Some(0) is set, so it wins over queued; only None is not-set"
+        );
+    }
+
+    #[test]
+    fn refresh_falls_back_to_the_queued_state_when_alternate_is_not_set() {
+        assert_eq!(refresh(POST_ACTION_STATE, 4, None), 4);
+        assert_eq!(refresh(POST_ACTION_STATE, 0, None), 0);
+        assert_eq!(refresh(POST_ACTION_STATE, u8::MAX, None), u8::MAX);
+    }
+
+    #[test]
+    fn refresh_is_pure_repeatable_and_does_not_mutate_the_carrier() {
+        let mut runtime = ActorRuntime::initial(profile("skinner", &[0x18, 0x25]));
+        runtime.set_current(POST_ACTION_STATE);
+        runtime.set_queued(4);
+        runtime.set_alternate(Some(7));
+        runtime.set_entry_action(2);
+        let before = runtime.clone();
+
+        let first = refresh(runtime.current(), runtime.queued(), runtime.alternate());
+        let second = refresh(runtime.current(), runtime.queued(), runtime.alternate());
+
+        assert_eq!(first, second, "same inputs must produce the same output");
+        assert_eq!(first, 7);
+        assert_eq!(
+            runtime, before,
+            "refresh takes values, not the carrier, and must not mutate it"
+        );
+        assert_eq!(
+            (
+                runtime.current(),
+                runtime.queued(),
+                runtime.alternate(),
+                runtime.entry_action()
+            ),
+            (POST_ACTION_STATE, 4, Some(7), 2)
+        );
+    }
+
+    #[test]
     fn advance_receives_events_and_still_selects_nothing() {
         use crate::engine::events::{ContactRecord, EngineEvent, HitRecord, Message};
 
@@ -354,6 +455,43 @@ mod tests {
                 runtime.entry_action()
             ),
             (0, 0, 0, None, 0)
+        );
+    }
+
+    #[test]
+    fn advance_does_not_apply_the_confirmed_refresh_rule() {
+        use crate::engine::actor::ActorTransition;
+        use crate::engine::events::{EngineEvent, Message};
+
+        let mut runtime = ActorRuntime::initial(profile("skinner", &[0x18, 0x25]));
+        runtime.set_current(POST_ACTION_STATE);
+        runtime.set_queued(4);
+        runtime.set_alternate(Some(7));
+        runtime.set_entry_action(2);
+        let before = runtime.clone();
+
+        let events = [EngineEvent::Message(Message {
+            target: LiveId {
+                index: 2,
+                generation: 0,
+            },
+            code: 7,
+        })];
+        let outcome = runtime.advance(crate::engine::clock::ObjectTick::step(1), &events);
+
+        assert_eq!(outcome, ActorTransition::NotInterpreted);
+        assert_eq!(
+            runtime, before,
+            "advance must not call refresh: current stays 8 even though the pure rule would select 7"
+        );
+        assert_eq!(
+            (
+                runtime.current(),
+                runtime.queued(),
+                runtime.alternate(),
+                runtime.entry_action()
+            ),
+            (POST_ACTION_STATE, 4, Some(7), 2)
         );
     }
 
