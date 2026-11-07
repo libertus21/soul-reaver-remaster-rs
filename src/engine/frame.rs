@@ -218,6 +218,11 @@ pub struct FrameStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredSpawn {
     pub name: String,
+    /// The loaded model's prototype key, when the spawn came from a resolved
+    /// model. The class table is applied to this key, not to the placed instance
+    /// name (`object-prototype`). `None` is the synthetic/no-model fallback: the
+    /// instance name is the only key available.
+    pub prototype: Option<String>,
     pub position: [i32; 3],
     /// The actor profile the loaded model carried, if any. It is copied from
     /// `ModelAsset::actor`; the spawner never parses data itself.
@@ -405,8 +410,25 @@ impl FrameState {
         position: [i32; 3],
         actor: Option<ActorProfile>,
     ) {
+        self.queue_spawn_with_prototype(name, None, position, actor);
+    }
+
+    /// Defer a spawn keyed by the loaded model's prototype.
+    ///
+    /// The class table is applied to `prototype`, not to the placed instance
+    /// name. The boot pass derives this key from the loaded model (padded model
+    /// name plus the actor-family kind); a resolved real monster therefore gets
+    /// the `monster_` row even though its instance name is bare.
+    pub fn queue_spawn_with_prototype(
+        &mut self,
+        name: impl Into<String>,
+        prototype: Option<String>,
+        position: [i32; 3],
+        actor: Option<ActorProfile>,
+    ) {
         self.spawn_queue.push(DeferredSpawn {
             name: name.into(),
+            prototype,
             position,
             actor,
         });
@@ -680,7 +702,7 @@ impl FrameState {
 
         for spawn in std::mem::take(&mut self.spawn_queue) {
             let object = LiveObject {
-                class: classify(&spawn.name),
+                class: classify(spawn.prototype.as_deref().unwrap_or(&spawn.name)),
                 name: spawn.name,
                 position: spawn.position,
                 visible: true,
@@ -951,6 +973,79 @@ mod tests {
         let stats = frame.stats();
         assert_eq!(stats.generic_ticks, 10 * 4);
         assert_eq!(stats.hooked_ticks, 0, "no non-tick class may run a tick body");
+        assert_eq!(stats.actor_ticks, 0);
+    }
+
+    #[test]
+    fn a_monster_instance_is_classified_from_its_prototype_not_its_name() {
+        let mut frame = FrameState::new(empty_world());
+        let profile = actor_profile(&[0x18, 0x25]);
+
+        // Real-data shape: the placed instance is bare `skinner`; the loaded
+        // model supplies the monster row. Contrast: the same bare name with no
+        // model key stays unclassified.
+        frame.queue_spawn_with_prototype(
+            "skinner",
+            Some("monster_".to_string()),
+            [0, 0, 0],
+            Some(profile),
+        );
+        frame.queue_spawn("skinner", [1, 0, 0]);
+
+        // Stage 18 of tick 0 applies the spawns; stage 12 of tick 1 sees them.
+        tick(&mut frame, 0);
+        tick(&mut frame, 1);
+
+        let live: Vec<_> = frame.live().iter().map(|(_, object)| object).collect();
+        assert_eq!(live.len(), 2);
+        let keyed = live
+            .iter()
+            .find(|object| object.position == [0, 0, 0])
+            .expect("prototype-keyed spawn");
+        let bare = live
+            .iter()
+            .find(|object| object.position == [1, 0, 0])
+            .expect("bare spawn");
+        assert_eq!(
+            keyed.class,
+            crate::engine::class::RenderClass::Monster,
+            "the prototype key must select the monster row"
+        );
+        assert!(keyed.actor.is_some(), "the monster carrier is attached");
+        assert_eq!(
+            bare.class,
+            crate::engine::class::RenderClass::Unclassified,
+            "the bare instance name must not be the class key"
+        );
+        assert!(bare.actor.is_none());
+
+        let stats = frame.stats();
+        assert_eq!(stats.hooked_ticks, 1, "only the prototype-keyed monster ticks");
+        assert_eq!(stats.actor_ticks, 1, "and its carrier is advanced");
+    }
+
+    #[test]
+    fn prototype_keys_for_the_four_non_tick_classes_install_no_hook() {
+        let mut frame = FrameState::new(empty_world());
+        for prototype in ["sreavr__", "glphicon", "physical", "particle"] {
+            frame.queue_spawn_with_prototype(
+                prototype,
+                Some(prototype.to_string()),
+                [0, 0, 0],
+                None,
+            );
+        }
+        tick(&mut frame, 0);
+        for index in 1..6 {
+            tick(&mut frame, index);
+        }
+
+        let stats = frame.stats();
+        assert_eq!(stats.generic_ticks, 5 * 4);
+        assert_eq!(
+            stats.hooked_ticks, 0,
+            "no non-tick prototype may install a hook"
+        );
         assert_eq!(stats.actor_ticks, 0);
     }
 

@@ -27,6 +27,7 @@ use crate::cli_out::outln;
 use crate::engine::actor::ActorProfile;
 use crate::engine::assets::{AssetRequest, AssetStore, ImmediateSource};
 use crate::engine::backend_wgpu::WgpuBackend;
+use crate::engine::class::prototype_key;
 use crate::engine::clock::ObjectTick;
 use crate::engine::determinism::world_state_hash;
 use crate::engine::frame::{FrameError, FrameState, PLAYER_NAME};
@@ -364,8 +365,8 @@ fn boot_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunE
     let player = frame.player();
     let mut player_profile: Option<ActorProfile> = None;
     let mut counts = SeedCounts::default();
-    let mut resolved: BTreeMap<String, (bool, Option<ActorProfile>)> = BTreeMap::new();
-    let mut spawns: Vec<(String, [i32; 3], Option<ActorProfile>)> = Vec::new();
+    let mut resolved: BTreeMap<String, (bool, Option<ActorProfile>, String)> = BTreeMap::new();
+    let mut spawns: Vec<(String, String, [i32; 3], Option<ActorProfile>)> = Vec::new();
 
     let records = frame.world().placed.records_for_boot();
     counts.placed = records.len();
@@ -398,24 +399,40 @@ fn boot_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunE
             continue;
         }
 
-        let (loaded, actor) = match resolved.get(name) {
-            Some((loaded, actor)) => (*loaded, actor.clone()),
+        let (loaded, actor, prototype) = match resolved.get(name) {
+            Some((loaded, actor, prototype)) => {
+                (*loaded, actor.clone(), prototype.clone())
+            }
             None => {
                 let completion = assets
                     .load(AssetRequest::for_name(name))
                     .map_err(|error| RunError::Asset(error.to_string()))?;
                 let loaded = completion.is_loaded();
-                let actor = completion.asset().and_then(|asset| asset.actor.clone());
+                let asset = completion.asset();
+                let actor = asset.and_then(|asset| asset.actor.clone());
+                // The class key comes from the loaded model, never from the
+                // placed instance name: the padded prototype name plus the
+                // actor-family kind (`object-prototype`).
+                let prototype = asset.map_or_else(
+                    || prototype_key(name, None),
+                    |asset| {
+                        prototype_key(
+                            &asset.model.name,
+                            asset.actor.as_ref().map(|profile| profile.kind),
+                        )
+                    },
+                );
                 if !loaded {
                     counts.unresolved += 1;
                 }
-                resolved.insert(name.clone(), (loaded, actor.clone()));
-                (loaded, actor)
+                resolved.insert(name.clone(), (loaded, actor.clone(), prototype.clone()));
+                (loaded, actor, prototype)
             }
         };
         if loaded {
             spawns.push((
                 name.clone(),
+                prototype,
                 [
                     i32::from(record.position[0]),
                     i32::from(record.position[1]),
@@ -426,8 +443,8 @@ fn boot_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunE
         }
     }
 
-    for (name, position, actor) in spawns {
-        frame.queue_spawn_loaded(name, position, actor);
+    for (name, prototype, position, actor) in spawns {
+        frame.queue_spawn_with_prototype(name, Some(prototype), position, actor);
     }
     if let (Some(player), Some(profile)) = (player, player_profile) {
         let _attached = frame.attach_actor(player, profile);
