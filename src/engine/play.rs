@@ -196,6 +196,7 @@ impl std::error::Error for PlayError {}
 #[derive(Debug)]
 pub enum RunError {
     MissingTextures,
+    /// A world load or parse failure: fail with exit code 2.
     World(WorldError),
     Scene(String),
     /// A missing or undecodable texture page: fail fast with exit code 2.
@@ -211,7 +212,7 @@ pub enum RunError {
 impl RunError {
     pub fn exit_code(&self) -> u8 {
         match self {
-            Self::Texture(_) | Self::Asset(_) => 2,
+            Self::World(_) | Self::Texture(_) | Self::Asset(_) => 2,
             Self::Invariant(_) => 4,
             _ => 1,
         }
@@ -958,9 +959,16 @@ mod tests {
     }
 
     #[test]
-    fn texture_failures_are_exit_two_and_other_failures_exit_one() {
+    fn archive_world_and_texture_failures_are_exit_two() {
+        use crate::engine::world::WorldError;
+
         assert_eq!(RunError::Texture("missing page".to_string()).exit_code(), 2);
         assert_eq!(RunError::Asset("bad archive".to_string()).exit_code(), 2);
+        assert_eq!(
+            RunError::World(WorldError::EmptyReport).exit_code(),
+            2,
+            "world load/parse errors are archive errors"
+        );
         assert_eq!(RunError::Scene("bad scene".to_string()).exit_code(), 1);
         assert_eq!(RunError::MissingTextures.exit_code(), 1);
         assert_eq!(RunError::Window("no window".to_string()).exit_code(), 1);
