@@ -308,3 +308,35 @@ archive index and the loose object containers. No game process was launched.
 No addresses, field offsets, disassembly listings, game bytes or absolute install
 paths are recorded here. `cargo test` stayed at its 463-green baseline; no
 production code was changed and no golden was moved.
+
+## 13. Implementation (2026-11-07)
+
+The exact classifier from section 2 is now the production dispatch key; the
+inferred prototype-key heuristic is gone.
+
+- The object parser captures the header class-flags word at load-complete and
+  stores it on the loaded model together with the padded prototype string.
+- The asset loader resolves the class **before** it parses the actor profile:
+  bit 18 -> `physical`, else bit 19 -> `monster_`, else the exact padded
+  prototype is compared against the six-row table. The physical test runs first.
+- The deferred spawn carries the resolved class; stage 18 initialises the actor
+  carrier from the profile but never feeds it back into the class. Unit tests
+  cover the bit priority, the exact-name fallback, the no-match sentinel, and
+  that a matching flag word is read before actor initialisation.
+- The six-row table, the hook set, `ActorRuntime` (`NotInterpreted`) and the
+  digest fields are unchanged. `cargo test` is 469 green.
+
+Real data (runtime only, nothing committed):
+
+| unit | before | after | why |
+|---|---|---|---|
+| `skinnr1` | `0730d5c40f97d622` | `ab4048e4183a00a6` | five actors stay `monster_` via bit 19; 25 fire/effect models now classify `physical` via bit 18 |
+| `under1` | `3ac33bf08aab697d` | `b0d675df0f56e371` | `hint` carries bit 18 and now classifies `physical` |
+
+The earlier expectation that `under1` would not move was wrong: the unit places
+`hint`, a bit-18 container. The move is the dispatch-key correction, not a
+simulation change; no synthetic golden moved. `skinnr1` live classes are
+`physical` 25, `monster_` 5, `raziel__` 1, unclassified 10. The loose `mfire`
+and `spout` containers also carry bit 18, but they are not BIGFILE entries, so
+this engine reports them unresolved rather than spawning them.
+

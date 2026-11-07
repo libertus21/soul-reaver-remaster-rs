@@ -198,17 +198,20 @@ The actor carrier is now part of the frame loop, still without AI semantics.
   object's render class. `raziel__` and `monster_` install one; `sreavr__`,
   `glphicon`, `physical` and `particle` leave it null. A null tick is the
   documented opt-out and makes zero calls.
-- **The dispatch key is the loaded model, not the placed instance name.** The
-  class table is unchanged, but it is now applied to the resolved model's
-  prototype (padded model name plus the actor-family kind), not to the placed
-  instance name (`object-prototype`). A real `skinner` instance is therefore
-  `monster_` and installs the tick hook. The canonical fold fields did not move:
-  only the per-object class byte changes for real models. A 60-tick `skinnr1`
-  run moved from `0x5aef_a6d0_f462_7f69` to `0x0730_d5c4_0f97_d622` with the
-  same counts (5 monster carriers plus the player tick; `hooked = actor_ticks =
-  355`); `under1` stayed byte-identical at `0x3ac3_3bf0_8aab_697d` (player
-  only). No synthetic golden moved: their fixtures already classify their spawn
-  names, or carry no model.
+- **The dispatch key is the loaded model's class flags, then its prototype.**
+  The class table is unchanged, but the class is now resolved from the model's
+  class-flags word captured at load-complete: bit 18 forces `physical`, else bit
+  19 forces `monster_`, else the padded prototype is compared exactly
+  (`object-prototype`, `actor-state-writer` section 13). The key is no longer the
+  placed instance name and no longer the actor-family kind. The canonical fold
+  fields did not move: only the per-object class byte changes for real models. A
+  60-tick `skinnr1` run moved from `0x0730_d5c4_0f97_d622` to
+  `0xab40_48e4_183a_00a6` (five actors keep `monster_` via bit 19; 25 fire/effect
+  models become `physical` via bit 18). `under1` moved from
+  `0x3ac3_3bf0_8aab_697d` to `0xb0d6_75df_0f56_e371` because it places `hint`,
+  which carries bit 18. That is the dispatch-key correction, not a simulation
+  change. No synthetic golden moved: their fixtures carry no class bits and their
+  names do not match an exact row.
 - **Carriage is data-keyed.** A live object owns `Option<ActorRuntime>`, filled
   only from the loaded model's actor block (`ModelAsset::actor`). The bound
   player receives its profile in the shared boot pass. A model without an actor
