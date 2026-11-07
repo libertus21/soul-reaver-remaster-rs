@@ -6,7 +6,9 @@
 //! window with the wgpu backend.
 //!
 //! Texture pages are validated before the event loop is created, so a missing
-//! page is a fail-fast exit 2 instead of a half-open window.
+//! page is a fail-fast exit 2 instead of a half-open window. The authored
+//! placed-object seed pass is shared by both modes and always runs before a
+//! window exists, so the window shows the same live world as the headless run.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -284,6 +286,7 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
         bank.expect("windowed mode requested textures"),
         options.camera,
         &options.unit,
+        &options.bigfile,
     )
 }
 
@@ -337,14 +340,19 @@ struct SeedCounts {
     unresolved: usize,
 }
 
-/// Seed the live world from the authored placed records.
+/// Shared boot path: seed the live world from the authored placed records.
+///
+/// Both the headless and the windowed mode call this single function, so the
+/// simulated live set and the rendered live set cannot drift. In windowed mode
+/// it runs before the initial page check and before [`EventLoop::new`], which
+/// means a seed failure is raised while no window or event loop exists.
 ///
 /// The spawn policy decides admission; markers never enter the tracker, inert
 /// names are only counted, and an unresolved model is counted rather than
 /// spawned. The player is already bound by [`FrameState::new`], so its record is
 /// not spawned a second time. Registry order is the placed-array order, which is
 /// deterministic.
-fn seed_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunError> {
+fn boot_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunError> {
     let table = EngineNameTable::documented();
     let source = ImmediateSource::open(bigfile)
         .map_err(|error| RunError::Asset(error.to_string()))?;
@@ -420,7 +428,7 @@ fn headless_run(
     bigfile: &Path,
     ticks: u32,
 ) -> Result<HeadlessReport, RunError> {
-    let counts = seed_world(frame, bigfile)?;
+    let counts = boot_world(frame, bigfile)?;
     for index in 0..u64::from(ticks) {
         frame
             .run_tick(ObjectTick::step(index))
@@ -448,6 +456,36 @@ fn run_headless(mut frame: FrameState, ticks: u32, bigfile: &Path) -> Result<(),
 }
 
 fn run_windowed(
+    frame: FrameState,
+    assets: SceneAssets,
+    bank: PageBank,
+    mode: CameraMode,
+    unit: &str,
+    bigfile: &Path,
+) -> Result<(), RunError> {
+    boot_before_window(frame, bigfile, |frame| {
+        open_window(frame, assets, bank, mode, unit)
+    })
+}
+
+/// Run the shared boot pass, then hand the booted frame to `windowed`.
+///
+/// The continuation is the only route to [`PlayApp`] and, through it, to
+/// [`EventLoop::new`]. Because [`boot_world`] runs first and `?` returns on
+/// failure, a seeding error is raised while no window or event loop exists.
+/// The continuation is a closure so the ordering is testable without a
+/// graphics stack.
+fn boot_before_window<F>(mut frame: FrameState, bigfile: &Path, windowed: F) -> Result<(), RunError>
+where
+    F: FnOnce(FrameState) -> Result<(), RunError>,
+{
+    boot_world(&mut frame, bigfile)?;
+    windowed(frame)
+}
+
+/// Windowed continuation: validate the initial pages, build the app and drive
+/// the event loop. Reached only after [`boot_world`] succeeded.
+fn open_window(
     frame: FrameState,
     mut assets: SceneAssets,
     bank: PageBank,
@@ -929,6 +967,43 @@ mod tests {
         assert_eq!(
             RunError::Invariant("full tracker".to_string()).exit_code(),
             4
+        );
+    }
+
+    #[test]
+    fn windowed_seed_failure_returns_before_the_window_continuation() {
+        use super::{FrameState, boot_before_window};
+        use crate::engine::world::World;
+        use crate::level::ObjectReport;
+        use std::path::Path;
+
+        let world = World::from_report(
+            "under1".to_string(),
+            1,
+            &ObjectReport {
+                room_offset: 0,
+                count: 0,
+                array_offset: 0,
+                objects: Vec::new(),
+            },
+        );
+        let frame = FrameState::new(world);
+        let mut continuation_ran = false;
+        let error = boot_before_window(
+            frame,
+            Path::new("definitely-not-an-archive.dat"),
+            |_frame| {
+                continuation_ran = true;
+                Ok(())
+            },
+        )
+        .expect_err("a missing archive must fail the boot pass");
+
+        assert!(matches!(error, RunError::Asset(_)), "got {error:?}");
+        assert_eq!(error.exit_code(), 2);
+        assert!(
+            !continuation_ran,
+            "the window continuation ran after a seed failure; the window would exist"
         );
     }
 }

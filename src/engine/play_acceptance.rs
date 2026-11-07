@@ -4,7 +4,7 @@
 //! room plus synthetic model containers) and runs the production
 //! `headless_run` path. No game bytes are read or written.
 
-use super::{HeadlessReport, RunError, headless_run};
+use super::{HeadlessReport, RunError, boot_world, headless_run};
 use crate::engine::clock::MAX_CATCH_UP;
 use crate::engine::frame::FrameState;
 use crate::engine::world::World;
@@ -115,6 +115,51 @@ fn run_report(path: &Path, ticks: u32) -> HeadlessReport {
 }
 
 const GOLDEN_HEADLESS_DIGEST: u64 = 0x8dd6_3315_4e26_f1c4;
+
+#[test]
+fn windowed_boot_matches_the_headless_live_count_and_digest() {
+    let (_dir, path) = fixture(
+        &[
+            ("raziel", [0, 0, 0]),
+            ("capsule0", [10, 0, 0]),
+            ("capsule1", [5000, 0, 0]),
+            ("marker", [1, 0, 0]),
+            ("ghost1", [4, 0, 0]),
+        ],
+        &["capsule0", "capsule1"],
+    );
+
+    // Headless reference: the production run seeds and ticks this input.
+    let world = World::load(&path, "under1").expect("the synthetic world must load");
+    let mut headless = FrameState::new(world);
+    let report = headless_run(&mut headless, &path, 60).expect("headless run");
+
+    // Windowed boot: the same shared boot function, then the same tick order.
+    let world = World::load(&path, "under1").expect("the synthetic world must load");
+    let mut windowed = FrameState::new(world);
+    let counts = boot_world(&mut windowed, &path).expect("windowed boot");
+    for index in 0..60u64 {
+        windowed
+            .run_tick(crate::engine::clock::ObjectTick::step(index))
+            .expect("windowed tick");
+    }
+
+    assert_eq!(counts.placed, report.placed);
+    assert_eq!(counts.admitted, report.admitted);
+    assert_eq!(counts.skipped_markers, report.skipped_markers);
+    assert_eq!(counts.inert, report.inert);
+    assert_eq!(counts.unresolved, report.unresolved);
+    assert_eq!(
+        windowed.live().len(),
+        report.live,
+        "windowed boot must produce the same live count as headless"
+    );
+    assert_eq!(
+        crate::engine::determinism::world_state_hash(&windowed.world_state()),
+        report.digest,
+        "windowed boot must produce the same canonical digest as headless"
+    );
+}
 
 #[test]
 fn headless_line_has_the_documented_contract_and_counts() {
