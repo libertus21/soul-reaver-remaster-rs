@@ -343,3 +343,23 @@ actors=21 entries=75 distinct_ids=37
 
 `cargo test` was 481 green before and after this docs-only change. No production
 code was changed and no golden was moved.
+
+## 12. Implementation (2026-11-07)
+
+The pure refresh from section 6 is now frozen as `engine::actor::refresh` with
+`POST_ACTION_STATE = 8`. `ActorRuntime` now carries the four state bytes:
+`current`, `queued`, `alternate` (`Option<u8>`, because the not-set sentinel is
+UNKNOWN; section 9, item 7) and `entry_action`. No writer body is implemented:
+`ActorRuntime::advance` still returns `NotInterpreted`, and a regression test
+proves it does not call the rule.
+
+The canonical fold was extended deliberately to cover all four bytes, so the
+world-state, frame-state, headless and actor-runtime digests moved; the exact
+old and new values are in `docs/changes/engine-actor-refresh/proposal.md`.
+Section 6 expected the pure function to "not touch the fold or any golden"; that
+holds for adding the function alone, but representing its inputs on the carrier
+extends the fold, and that extension is the only reason the digests moved.
+
+`cargo test` is 486 green (baseline 481; +5 tests). Section 9 remains the
+UNKNOWN list, and section 6's verdict still stands: `advance` needs the input
+layer.

@@ -163,11 +163,16 @@ pub struct WorldState {
 /// `position` is integer world units and `visible` is the render flag.
 ///
 /// `actor` is `1` when the live object carries an [`ActorRuntime`] and `0`
-/// otherwise. When it is `1`, `relation` and `state` are the carrier's numeric
-/// values; when it is `0`, both are the neutral `0` and the `actor` byte already
-/// says the fields are absent. The presence byte keeps "no carrier" distinct
-/// from "carrier in its neutral state" without inventing an actor state for
+/// otherwise. When it is `1`, `relation`, `current`, `queued`, `alternate` and
+/// `entry_action` are the carrier's numeric values; when it is `0`, the numeric
+/// fields are the neutral `0`/`None` and the `actor` byte already says the
+/// fields are absent. The presence byte keeps "no carrier" distinct from
+/// "carrier in its neutral state" without inventing an actor state for
 /// non-actors.
+///
+/// `alternate` is `Option<u8>` because the on-disk not-set sentinel is UNKNOWN
+/// (`docs/notes/actor-transition-table.md` section 9, item 7); the fold records
+/// presence plus value, never an invented sentinel byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorldEntry {
     pub class: u8,
@@ -175,13 +180,30 @@ pub struct WorldEntry {
     pub visible: bool,
     pub actor: u8,
     pub relation: u8,
-    pub state: u8,
+    pub current: u8,
+    pub queued: u8,
+    pub alternate: Option<u8>,
+    pub entry_action: u8,
+}
+
+/// Fold an optional alternate state as a presence byte plus, when present, the
+/// value. `None` and `Some(0)` are therefore distinct observations without
+/// committing to the UNKNOWN on-disk sentinel.
+fn write_alternate(hasher: &mut StateHasher, alternate: Option<u8>) {
+    match alternate {
+        Some(value) => {
+            hasher.write_u8(1);
+            hasher.write_u8(value);
+        }
+        None => hasher.write_u8(0),
+    }
 }
 
 /// Hash the canonical world state: tick count, live-list order, then per entry
 /// `class`, `position.x/y/z`, `visible`, the actor-presence byte and, when a
-/// carrier exists, the actor `relation` and action `state` bytes, all
-/// little-endian and fixed width.
+/// carrier exists, the actor `relation` plus all four state bytes (`current`,
+/// `queued`, `alternate` as presence+value, `entry_action`), all little-endian
+/// and fixed width.
 ///
 /// This is the **production digest**: `--play --headless` folds the real
 /// `FrameState` live world through this function and prints the result. It is
@@ -198,7 +220,10 @@ pub fn world_state_hash(state: &WorldState) -> u64 {
         hasher.write_u8(u8::from(entry.visible));
         hasher.write_u8(entry.actor);
         hasher.write_u8(entry.relation);
-        hasher.write_u8(entry.state);
+        hasher.write_u8(entry.current);
+        hasher.write_u8(entry.queued);
+        write_alternate(&mut hasher, entry.alternate);
+        hasher.write_u8(entry.entry_action);
     }
     hasher.finish()
 }
@@ -207,9 +232,10 @@ pub fn world_state_hash(state: &WorldState) -> u64 {
 ///
 /// The fold is data-keyed: it includes the profile's kind, the eight state
 /// trios, the entry-array kind and the entry ids, then the numeric runtime
-/// fields (relation, state, target presence and id, flags). It is a separate,
-/// independent gate; it does not enter [`world_state_hash`] and it does not
-/// move the options, error, world-state, tracker or classification goldens.
+/// fields (relation, the four state bytes, target presence and id, flags). It is
+/// a separate, independent gate; it does not enter [`world_state_hash`] and it
+/// does not move the options, error, world-state, tracker or classification
+/// goldens.
 pub fn actor_runtime_hash(runtime: &ActorRuntime) -> u64 {
     let mut hasher = StateHasher::new();
     let profile = runtime.profile();
@@ -227,7 +253,10 @@ pub fn actor_runtime_hash(runtime: &ActorRuntime) -> u64 {
     }
 
     hasher.write_u8(runtime.relation());
-    hasher.write_u8(runtime.state());
+    hasher.write_u8(runtime.current());
+    hasher.write_u8(runtime.queued());
+    write_alternate(&mut hasher, runtime.alternate());
+    hasher.write_u8(runtime.entry_action());
     match runtime.target() {
         Some(id) => {
             hasher.write_u8(1);
@@ -406,9 +435,12 @@ mod tests {
     // `0x82fe_8a38_1b9d_2a6d` to the end-to-end real-world run below. The
     // engine-actor-tick slice then moved it from `0xb5bb_59fd_97b9_50b1` to
     // `0x2c8e_61aa_2f02_31b0` when the actor carrier entered the fold; the
-    // headless CLI gate moved in the same PR. This is a deliberate spec change,
-    // never a fix to make a test green.
-    const GOLDEN_WORLD_STATE_HASH: u64 = 0x2c8e_61aa_2f02_31b0;
+    // headless CLI gate moved in the same PR. The engine-actor-refresh slice
+    // moved it from `0x2c8e_61aa_2f02_31b0` to `0x043f_f933_4dfe_3b58` because
+    // the single folded actor `state` byte was replaced by all four state bytes
+    // (`current`, `queued`, `alternate` as presence+value, `entry_action`).
+    // This is a deliberate spec change, never a fix to make a test green.
+    const GOLDEN_WORLD_STATE_HASH: u64 = 0x043f_f933_4dfe_3b58;
 
     /// A real `FrameState` world: the player plus two deferred spawns, one of
     /// them outside the cull radius so the fold observes a `visible` change.
@@ -449,7 +481,10 @@ mod tests {
                     visible: true,
                     actor: 0,
                     relation: 0,
-                    state: 0,
+                    current: 0,
+                    queued: 0,
+                    alternate: None,
+                    entry_action: 0,
                 },
                 WorldEntry {
                     class: 2,
@@ -457,7 +492,10 @@ mod tests {
                     visible: false,
                     actor: 1,
                     relation: 2,
-                    state: 0x25,
+                    current: 0x25,
+                    queued: 0x26,
+                    alternate: Some(0x27),
+                    entry_action: 0x28,
                 },
             ],
         };
@@ -530,12 +568,44 @@ mod tests {
             "the actor relation must be folded"
         );
 
-        let mut action = base.clone();
-        action.live[1].state = 0x18;
+        let mut current = base.clone();
+        current.live[1].current = 0x18;
         assert_ne!(
             world_state_hash(&base),
-            world_state_hash(&action),
-            "the actor action state must be folded"
+            world_state_hash(&current),
+            "the actor current state must be folded"
+        );
+
+        let mut queued = base.clone();
+        queued.live[1].queued = 0x19;
+        assert_ne!(
+            world_state_hash(&base),
+            world_state_hash(&queued),
+            "the actor queued state must be folded"
+        );
+
+        let mut alternate_value = base.clone();
+        alternate_value.live[1].alternate = Some(0x1a);
+        assert_ne!(
+            world_state_hash(&base),
+            world_state_hash(&alternate_value),
+            "the actor alternate value must be folded"
+        );
+
+        let mut alternate_presence = base.clone();
+        alternate_presence.live[1].alternate = None;
+        assert_ne!(
+            world_state_hash(&base),
+            world_state_hash(&alternate_presence),
+            "alternate presence must be folded, so None differs from Some(value)"
+        );
+
+        let mut entry_action = base.clone();
+        entry_action.live[1].entry_action = 0x1b;
+        assert_ne!(
+            world_state_hash(&base),
+            world_state_hash(&entry_action),
+            "the actor entry/action byte must be folded"
         );
     }
 
@@ -668,10 +738,14 @@ mod tests {
     }
 
     // Guards the initial actor-runtime fold: profile kind, the eight trios, the
-    // entry-array kind, the entry ids, then relation, state, target and flags.
-    // It is a sixth, independent gate; it does not move the options, error,
-    // world-state, tracker or classification goldens.
-    const GOLDEN_ACTOR_RUNTIME_HASH: u64 = 0xe169_695d_0eda_ec99;
+    // entry-array kind, the entry ids, then relation, the four state bytes,
+    // target and flags. It is a sixth, independent gate; it does not move the
+    // options, error, world-state, tracker or classification goldens.
+    //
+    // engine-actor-refresh moved it from `0xe169_695d_0eda_ec99` to
+    // `0xd7d6_0c24_050a_d833` because one `state` byte became
+    // `current + queued + alternate (presence+value) + entry_action`.
+    const GOLDEN_ACTOR_RUNTIME_HASH: u64 = 0xd7d6_0c24_050a_d833;
 
     fn synthetic_profile(ids: &[u8]) -> ActorProfile {
         ActorProfile::from_block(&ActorBlock {
@@ -716,9 +790,45 @@ mod tests {
         let base = synthetic_runtime(&[0x18, 0x25]);
         let baseline = actor_runtime_hash(&base);
 
-        let mut state = base.clone();
-        state.set_state(1);
-        assert_ne!(baseline, actor_runtime_hash(&state), "state must be folded");
+        let mut current = base.clone();
+        current.set_current(1);
+        assert_ne!(
+            baseline,
+            actor_runtime_hash(&current),
+            "current must be folded"
+        );
+
+        let mut queued = base.clone();
+        queued.set_queued(1);
+        assert_ne!(
+            baseline,
+            actor_runtime_hash(&queued),
+            "queued must be folded"
+        );
+
+        let mut alternate = base.clone();
+        alternate.set_alternate(Some(1));
+        assert_ne!(
+            baseline,
+            actor_runtime_hash(&alternate),
+            "the alternate value must be folded"
+        );
+
+        let mut alternate_zero = base.clone();
+        alternate_zero.set_alternate(Some(0));
+        assert_ne!(
+            baseline,
+            actor_runtime_hash(&alternate_zero),
+            "Some(0) must differ from the not-set None"
+        );
+
+        let mut entry_action = base.clone();
+        entry_action.set_entry_action(1);
+        assert_ne!(
+            baseline,
+            actor_runtime_hash(&entry_action),
+            "entry/action must be folded"
+        );
 
         let mut relation = base.clone();
         relation.set_relation(1);
@@ -803,8 +913,11 @@ mod tests {
     // sampling, direct player translation, culling, render snapshot and
     // post-frame bookkeeping together. Because it pins the canonical world fold,
     // the engine-actor-tick slice moved it from `0x7b7f_16bc_a6af_b9b2` to
-    // `0xa203_0add_093d_a5e6` with the same fold extension.
-    const GOLDEN_FRAME_STATE_HASH: u64 = 0xa203_0add_093d_a5e6;
+    // `0xa203_0add_093d_a5e6` with the same fold extension. The
+    // engine-actor-refresh slice moved it from `0xa203_0add_093d_a5e6` to
+    // `0xd1f3_6008_a152_04a2` because the four state bytes replaced the single
+    // `state` byte in the same fold.
+    const GOLDEN_FRAME_STATE_HASH: u64 = 0xd1f3_6008_a152_04a2;
 
     fn frame_record(name: &str, position: [i16; 3]) -> ObjectRecord {
         ObjectRecord {

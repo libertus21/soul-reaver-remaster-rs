@@ -98,6 +98,12 @@ slice, not part of this gate.
   the engine has no animation timeline and no pinned trigger extent, so **all
   goldens are untouched**. `events.rs` joins the wall-clock guard. See
   `docs/changes/engine-events/proposal.md`.
+- engine-actor-refresh (four state bytes + pure refresh): the actor carrier
+  replaces the single `state` byte with `current`, `queued`, `alternate`
+  (`Option<u8>`) and `entry_action`, and the canonical fold covers all four. The
+  rule itself is unwired, so no simulation value changes; **the four digests
+  below move only because the fold extends**. See
+  `docs/changes/engine-actor-refresh/proposal.md`.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.
@@ -114,10 +120,10 @@ questions:
 | Golden | Fold | Guards |
 |---|---|---|
 | `options_hash` / `error_hash` | parsed `PlayOptions`, typed error text | **Regression gate**: argv parsing, fold order, field set, error tags. No simulation state. |
-| `world_state_hash` | tick count, live-list order, per-entry class, position, visible, actor presence, actor relation and actor state | **Canonical state gate** and the production `--play --headless` digest: the simulation contract from `spec.md`. Independent of the options fold. |
+| `world_state_hash` | tick count, live-list order, per-entry class, position, visible, actor presence, actor relation and the four actor state bytes (`current`, `queued`, `alternate` presence+value, `entry_action`) | **Canonical state gate** and the production `--play --headless` digest: the simulation contract from `spec.md`. Independent of the options fold. |
 | `tracker_hash` | each slot in index order: index, state code, name | **Tracker gate**: acquisition, duplicate-name sharing and lowest-free reuse. Independent of both folds above. |
 | `classification_hash` | the five name lists in documented order: list id, exact count, then per name the name bytes, admission code, load-role code and asset-tree code | **Name-table gate**: the exact membership and roles of the spawn policy. Independent of every fold above; lives in `src/engine/spawn.rs` tests. |
-| `actor_runtime_hash` | profile kind, the eight trios, entry-array kind, entry ids; then relation, state, target and flags | **Actor-runtime gate**: the data-keyed AI initial state. No name is folded. Independent of every fold above; lives in `src/engine/determinism.rs` tests. |
+| `actor_runtime_hash` | profile kind, the eight trios, entry-array kind, entry ids; then relation, the four state bytes, target and flags | **Actor-runtime gate**: the data-keyed AI initial state. No name is folded. Independent of every fold above; lives in `src/engine/determinism.rs` tests. |
 
 `tracker_hash` folds all 48 slots, empty ones included, so a release is
 observable and a name's slot index is part of the contract, not just its
@@ -132,12 +138,14 @@ to a new number.
 The canonical world fold, in order: `tick` as `u64`, then for each live entry in
 **live-list order** (spawn order, survivors keep relative order after removals)
 `class` as `u8`, `position.x/y/z` as `i32`, `visible` as `u8`, the
-actor-presence byte as `u8`, the actor `relation` as `u8` and the actor action
-`state` as `u8`. Presence is `1` only when the live object carries an
-`ActorRuntime`; when it is `0`, relation and state are the neutral `0` and the
-presence byte already states that the fields are absent. `GOLDEN_WORLD_STATE_HASH`
-pins that exact byte stream. T3+ extends the fold and the constant deliberately,
-in the same PR that updates `spec.md`; it is never "fixed" to go green.
+actor-presence byte as `u8`, the actor `relation` as `u8`, then the four actor
+state bytes: `current` as `u8`, `queued` as `u8`, `alternate` as a presence byte
+plus a value byte when present, and `entry_action` as `u8`. Presence is `1` only when the
+live object carries an `ActorRuntime`; when it is `0`, every actor numeric field
+is the neutral `0`/`None` and the presence byte already states that the fields
+are absent. `GOLDEN_WORLD_STATE_HASH` pins that exact byte stream. T3+ extends
+the fold and the constant deliberately, in the same PR that updates `spec.md`;
+it is never "fixed" to go green.
 
 ## Name-table classification (T6)
 
@@ -178,8 +186,8 @@ The actor seam is data-keyed, not name-keyed. `ActorProfile` copies the kind,
 the eight state trios, the behaviour-entry ids and the entry-array kind from the
 shipped per-model block through the existing `actor::parse_actor_block`; it has
 no name field. `ActorRuntime` embeds the profile and adds only numeric state:
-relation and action state (raw bytes, no invented enum), an optional live target
-and a flag word.
+relation and the four state bytes (raw bytes and an `Option<u8>` alternate, no
+invented enum or sentinel), an optional live target and a flag word.
 
 The initial state is derived from the profile alone, so two models with
 byte-identical actor blocks start in equal runtime state even when their asset
@@ -238,6 +246,44 @@ The actor carrier is now part of the frame loop, still without AI semantics.
   counters and tick count are unchanged, so the move is the fold extension.
   The real run attaches one actor carrier (`raziel`); `under1` has no monster
   placement.
+
+## Actor refresh (engine-actor-refresh)
+
+The one CONFIRMED actor transition is frozen as a pure function, and the four
+state bytes it needs are now represented on the carrier. The rule stays
+unwired: `ActorRuntime::advance` still returns `NotInterpreted` and changes
+nothing, so no simulation value changes.
+
+- **Rule.** `refresh(current, queued, alternate)` returns `current` unless it is
+  the post-action value `8`; then it returns the alternate state when set,
+  otherwise the queued state. `alternate` is `Option<u8>` because the on-disk
+  not-set sentinel is UNKNOWN (`actor-transition-table`, section 9, item 7);
+  `None` models "not set" without inventing a sentinel, and `Some(0)` stays
+  distinct.
+- **Carrier.** `current`, `queued`, `alternate` and `entry_action` replace the
+  single `state` byte. `relation`, `target`, `flags` and the profile are
+  unchanged.
+- **Fold.** The canonical world fold and the actor-runtime fold now cover all
+  four state bytes. Alternate is folded as a presence byte plus value. The fold
+  therefore covers strictly more than the old relation-plus-one-byte shape;
+  because the rule never runs, every moved digest is a fold extension.
+- **Goldens.** `GOLDEN_WORLD_STATE_HASH` moved from `0x2c8e_61aa_2f02_31b0` to
+  `0x043f_f933_4dfe_3b58`; `GOLDEN_FRAME_STATE_HASH` from
+  `0xa203_0add_093d_a5e6` to `0xd1f3_6008_a152_04a2`; `GOLDEN_HEADLESS_DIGEST`
+  from `0x490c_8582_c297_df18` to `0x56d6_79ea_3c48_6e14`; and
+  `GOLDEN_ACTOR_RUNTIME_HASH` from `0xe169_695d_0eda_ec99` to
+  `0xd7d6_0c24_050a_d833`. The options, error, tracker, classification and
+  stage-order goldens did not move.
+- **The gate bites.** Removing the alternate presence/value from
+  `world_state_hash` moved the observed values to `0xcfa1_0a36_60a0_1290`
+  (world), `0x3ca4_7313_70c6_83d6` (frame) and `0xa1e7_aa14_e1d4_70e8`
+  (headless), and failed the alternate-presence sensitivity test. The
+  perturbation was reverted before commit.
+- **Real data.** Two 60-tick headless runs per unit on the shipped corpus
+  (read-only, runtime only) are byte-identical: `skinnr1` prints
+  `digest=d93bcb5cd913f812` twice (pre-slice `ab4048e4183a00a6`) and `under1`
+  prints `digest=ede39c540a10ee39` twice (pre-slice `b0d675df0f56e371`). The
+  counters, live set and tick count are unchanged.
 
 ## Frame pipeline (T8)
 

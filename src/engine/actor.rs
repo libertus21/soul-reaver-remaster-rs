@@ -7,10 +7,18 @@
 //! **no name**, because the name is a spawn-policy key and must never reach the
 //! AI layer (`docs/changes/engine-skeleton/design.md`, seam B).
 //!
-//! [`ActorRuntime`] holds only numeric state: the relation code, the action
-//! state id, an optional live target and a flag word. No enum is invented for
-//! the state ids: the shipped ids are model-relative bytes, as recorded in
-//! `docs/notes/actor-ai.md` and `docs/notes/actor-behaviour-data.md`.
+//! [`ActorRuntime`] holds only numeric state: the relation code, the four state
+//! bytes the transition-table note identifies (**current**, **queued**,
+//! **alternate** and **entry/action**), an optional live target and a flag
+//! word. No enum is invented for the state ids: the shipped ids are
+//! model-relative bytes, as recorded in `docs/notes/actor-ai.md`,
+//! `docs/notes/actor-behaviour-data.md` and
+//! `docs/notes/actor-transition-table.md` section 1.
+//!
+//! Only one state transition is CONFIRMED: the behaviour-set refresh
+//! ([`refresh`]). It is frozen here as a pure function and is deliberately not
+//! called by [`ActorRuntime::advance`]. The eleven writer bodies remain
+//! UNKNOWN (`docs/notes/actor-transition-table.md` section 6).
 
 use crate::actor::{self as parser, ActorBlock, ActorKind, BehaviourEntry, EntryArrayKind};
 use crate::engine::clock::ObjectTick;
@@ -59,6 +67,45 @@ impl ActorProfile {
     }
 }
 
+/// The post-action state value.
+///
+/// CONFIRMED by the shipped behaviour-set refresh: when the current state is
+/// this value, the refresh substitutes the pending alternate or queued state.
+/// It is a raw byte, not an enum member: no other state value has an
+/// established name (`docs/notes/actor-transition-table.md` sections 1 and 6).
+pub const POST_ACTION_STATE: u8 = 8;
+
+/// Apply the one CONFIRMED actor-state transition rule.
+///
+/// ```text
+/// refresh(current, queued, alternate):
+///     if current != 8: next = current
+///     else:            next = alternate if set, else queued
+/// ```
+///
+/// This is the behaviour-set refresh (`docs/notes/actor-transition-table.md`
+/// section 2, step 4). The rule is pure: it reads no world state, mutates
+/// nothing and returns the next value. It is intentionally **unwired**:
+/// [`ActorRuntime::advance`] does not call it, because the activation program,
+/// the event layer and the engagement/target data that populate `queued` and
+/// `alternate` are not modelled yet (same note, section 6).
+///
+/// # `alternate` and its UNKNOWN sentinel
+///
+/// The note records only that "alternate is set" means "any value other than
+/// the not-set sentinel", and that the concrete sentinel value is **UNKNOWN**
+/// (it was observed as the all-ones byte in one shipped path, not proven as a
+/// general sentinel). `Option<u8>` is therefore a Rust representation choice,
+/// **not** an evidence claim about the on-disk byte: `None` models "not set"
+/// without inventing a sentinel constant, and `Some(value)` models "set to
+/// `value`", including `Some(0)` if a shipped path ever sets zero.
+pub fn refresh(current: u8, queued: u8, alternate: Option<u8>) -> u8 {
+    if current != POST_ACTION_STATE {
+        return current;
+    }
+    alternate.unwrap_or(queued)
+}
+
 /// Outcome of one actor transition step.
 ///
 /// The decision body is not implemented, so the only outcome this slice can
@@ -76,14 +123,31 @@ pub enum ActorTransition {
 /// Numeric runtime state for one live actor.
 ///
 /// There is intentionally no name field. The profile is the only data key, so
-/// renaming a model cannot change its runtime state. `relation` and `state` stay
-/// raw bytes: the shipped action ids have no stable global meaning and must not
-/// be turned into an invented enum.
+/// renaming a model cannot change its runtime state. Every state field stays a
+/// raw byte: the shipped ids have no stable global meaning and must not be
+/// turned into an invented enum.
+///
+/// The four state bytes are the ones the transition-table note identifies
+/// (`docs/notes/actor-transition-table.md` section 1):
+///
+/// - `current` - the selector the AI tick and the animation set read,
+/// - `queued` - a pending state,
+/// - `alternate` - a higher-priority pending state,
+/// - `entry_action` - the fourth companion byte written from the behaviour
+///   entry and copied into `current` by three writers. It is a state source,
+///   not the current state.
+///
+/// `alternate` is `Option<u8>` because the note establishes only that "set"
+/// means "not the not-set sentinel" and leaves the concrete sentinel UNKNOWN
+/// (see [`refresh`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorRuntime {
     profile: ActorProfile,
     relation: u8,
-    state: u8,
+    current: u8,
+    queued: u8,
+    alternate: Option<u8>,
+    entry_action: u8,
     target: Option<LiveId>,
     flags: u32,
 }
@@ -92,14 +156,19 @@ impl ActorRuntime {
     /// Build the initial runtime state from a profile.
     ///
     /// The numeric fields start neutral: relation `0` (the first code of the
-    /// documented `0..3` relation space) and action state `0` (no action
-    /// selected yet). The profile is embedded, so two runtimes built from equal
-    /// profiles are equal regardless of the model name.
+    /// documented `0..3` relation space) and all four state bytes at their
+    /// neutral values (`0`, `0`, not set, `0`). No activation program has run,
+    /// so no queued or alternate state exists yet. The profile is embedded, so
+    /// two runtimes built from equal profiles are equal regardless of the model
+    /// name.
     pub fn initial(profile: ActorProfile) -> Self {
         Self {
             profile,
             relation: 0,
-            state: 0,
+            current: 0,
+            queued: 0,
+            alternate: None,
+            entry_action: 0,
             target: None,
             flags: 0,
         }
@@ -113,8 +182,24 @@ impl ActorRuntime {
         self.relation
     }
 
-    pub fn state(&self) -> u8 {
-        self.state
+    /// The current state selector.
+    pub fn current(&self) -> u8 {
+        self.current
+    }
+
+    /// The queued (pending) state.
+    pub fn queued(&self) -> u8 {
+        self.queued
+    }
+
+    /// The alternate (higher-priority pending) state, if set.
+    pub fn alternate(&self) -> Option<u8> {
+        self.alternate
+    }
+
+    /// The behaviour-entry companion byte (a state source, not `current`).
+    pub fn entry_action(&self) -> u8 {
+        self.entry_action
     }
 
     pub fn target(&self) -> Option<LiveId> {
@@ -130,9 +215,24 @@ impl ActorRuntime {
         self.relation = relation;
     }
 
-    /// Set the numeric action state id.
-    pub fn set_state(&mut self, state: u8) {
-        self.state = state;
+    /// Set the current state selector.
+    pub fn set_current(&mut self, current: u8) {
+        self.current = current;
+    }
+
+    /// Set the queued (pending) state.
+    pub fn set_queued(&mut self, queued: u8) {
+        self.queued = queued;
+    }
+
+    /// Set or clear the alternate (higher-priority pending) state.
+    pub fn set_alternate(&mut self, alternate: Option<u8>) {
+        self.alternate = alternate;
+    }
+
+    /// Set the behaviour-entry companion byte.
+    pub fn set_entry_action(&mut self, entry_action: u8) {
+        self.entry_action = entry_action;
     }
 
     /// The documented transition entry point, called by the per-frame tick.
@@ -148,8 +248,11 @@ impl ActorRuntime {
     /// `docs/notes/actor-behaviour-data.md` section 7). The step therefore
     /// leaves every field untouched regardless of what `events` contains, and
     /// returns an explicit [`ActorTransition::NotInterpreted`] instead of
-    /// inventing a transition. Damage, health, knockback and combat resolution
-    /// are out of scope and are not read here.
+    /// inventing a transition. In particular it does **not** apply [`refresh`]:
+    /// that rule is frozen as a pure function and stays unwired until the
+    /// activation and event inputs exist (`docs/notes/actor-transition-table.md`
+    /// section 6). Damage, health, knockback and combat resolution are out of
+    /// scope and are not read here.
     ///
     /// Later evidence-backed slices replace this body; the dispatch, the carrier,
     /// the event plumbing and the determinism fold do not need to change for
@@ -171,7 +274,7 @@ impl ActorRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{ActorProfile, ActorRuntime};
+    use super::{ActorProfile, ActorRuntime, POST_ACTION_STATE, refresh};
     use crate::actor::{ActorKind, EntryArrayKind};
     use crate::engine::live::LiveId;
 
@@ -230,10 +333,72 @@ mod tests {
     fn initial_runtime_is_numeric_and_neutral() {
         let runtime = ActorRuntime::initial(profile("skinner", &[0x25]));
         assert_eq!(runtime.relation(), 0);
-        assert_eq!(runtime.state(), 0);
+        assert_eq!(runtime.current(), 0);
+        assert_eq!(runtime.queued(), 0);
+        assert_eq!(runtime.alternate(), None);
+        assert_eq!(runtime.entry_action(), 0);
         assert_eq!(runtime.target(), None);
         assert_eq!(runtime.flags(), 0);
         assert_eq!(runtime.profile().kind, ActorKind::Monster);
+    }
+
+    #[test]
+    fn refresh_keeps_a_non_post_action_current_unchanged() {
+        for current in [0, 1, 7, 9, 0x25, u8::MAX] {
+            for alternate in [None, Some(0), Some(3)] {
+                assert_eq!(
+                    refresh(current, 4, alternate),
+                    current,
+                    "current {current} is not the post-action value, so nothing may substitute it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_selects_alternate_at_the_post_action_value() {
+        assert_eq!(refresh(POST_ACTION_STATE, 4, Some(7)), 7);
+        assert_eq!(
+            refresh(POST_ACTION_STATE, 4, Some(0)),
+            0,
+            "Some(0) is set, so it wins over queued; only None is not-set"
+        );
+    }
+
+    #[test]
+    fn refresh_falls_back_to_the_queued_state_when_alternate_is_not_set() {
+        assert_eq!(refresh(POST_ACTION_STATE, 4, None), 4);
+        assert_eq!(refresh(POST_ACTION_STATE, 0, None), 0);
+        assert_eq!(refresh(POST_ACTION_STATE, u8::MAX, None), u8::MAX);
+    }
+
+    #[test]
+    fn refresh_is_pure_repeatable_and_does_not_mutate_the_carrier() {
+        let mut runtime = ActorRuntime::initial(profile("skinner", &[0x18, 0x25]));
+        runtime.set_current(POST_ACTION_STATE);
+        runtime.set_queued(4);
+        runtime.set_alternate(Some(7));
+        runtime.set_entry_action(2);
+        let before = runtime.clone();
+
+        let first = refresh(runtime.current(), runtime.queued(), runtime.alternate());
+        let second = refresh(runtime.current(), runtime.queued(), runtime.alternate());
+
+        assert_eq!(first, second, "same inputs must produce the same output");
+        assert_eq!(first, 7);
+        assert_eq!(
+            runtime, before,
+            "refresh takes values, not the carrier, and must not mutate it"
+        );
+        assert_eq!(
+            (
+                runtime.current(),
+                runtime.queued(),
+                runtime.alternate(),
+                runtime.entry_action()
+            ),
+            (POST_ACTION_STATE, 4, Some(7), 2)
+        );
     }
 
     #[test]
@@ -279,9 +444,55 @@ mod tests {
         assert_eq!(outcome, crate::engine::actor::ActorTransition::NotInterpreted);
         assert_eq!(
             runtime, before,
-            "receiving events must not change relation, state, target, flags or the profile"
+            "receiving events must not change relation, the four state bytes, target, flags or the profile"
         );
-        assert_eq!((runtime.relation(), runtime.state()), (0, 0));
+        assert_eq!(
+            (
+                runtime.relation(),
+                runtime.current(),
+                runtime.queued(),
+                runtime.alternate(),
+                runtime.entry_action()
+            ),
+            (0, 0, 0, None, 0)
+        );
+    }
+
+    #[test]
+    fn advance_does_not_apply_the_confirmed_refresh_rule() {
+        use crate::engine::actor::ActorTransition;
+        use crate::engine::events::{EngineEvent, Message};
+
+        let mut runtime = ActorRuntime::initial(profile("skinner", &[0x18, 0x25]));
+        runtime.set_current(POST_ACTION_STATE);
+        runtime.set_queued(4);
+        runtime.set_alternate(Some(7));
+        runtime.set_entry_action(2);
+        let before = runtime.clone();
+
+        let events = [EngineEvent::Message(Message {
+            target: LiveId {
+                index: 2,
+                generation: 0,
+            },
+            code: 7,
+        })];
+        let outcome = runtime.advance(crate::engine::clock::ObjectTick::step(1), &events);
+
+        assert_eq!(outcome, ActorTransition::NotInterpreted);
+        assert_eq!(
+            runtime, before,
+            "advance must not call refresh: current stays 8 even though the pure rule would select 7"
+        );
+        assert_eq!(
+            (
+                runtime.current(),
+                runtime.queued(),
+                runtime.alternate(),
+                runtime.entry_action()
+            ),
+            (POST_ACTION_STATE, 4, Some(7), 2)
+        );
     }
 
     #[test]
@@ -290,7 +501,10 @@ mod tests {
         let initial = runtime.clone();
 
         runtime.set_relation(2);
-        runtime.set_state(0x25);
+        runtime.set_current(0x25);
+        runtime.set_queued(0x26);
+        runtime.set_alternate(Some(0x27));
+        runtime.set_entry_action(0x28);
         runtime.set_flags(0x04);
         runtime.set_target(Some(LiveId {
             index: 3,
@@ -299,7 +513,10 @@ mod tests {
 
         assert_ne!(runtime, initial);
         assert_eq!(runtime.relation(), 2);
-        assert_eq!(runtime.state(), 0x25);
+        assert_eq!(runtime.current(), 0x25);
+        assert_eq!(runtime.queued(), 0x26);
+        assert_eq!(runtime.alternate(), Some(0x27));
+        assert_eq!(runtime.entry_action(), 0x28);
         assert_eq!(runtime.flags(), 0x04);
         assert_eq!(
             runtime.target(),
