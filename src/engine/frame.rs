@@ -204,6 +204,11 @@ pub struct FrameStats {
     pub generic_player_ticks: u64,
     pub hooked_ticks: u64,
     pub hooked_player_ticks: u64,
+    /// Tick-hook calls that reached an actor carrier. A class tick hook fires on
+    /// `raziel__` and `monster_`; this counter additionally requires the live
+    /// object to carry an [`ActorRuntime`], so it proves that the actor path ran
+    /// and not merely that the class gate opened.
+    pub actor_ticks: u64,
     pub spawned: u64,
     pub despawned: u64,
 }
@@ -304,6 +309,7 @@ impl FrameState {
             visible: true,
             slot: None,
             anim_index: 0,
+            actor: None,
         };
         self.player = Some(self.live.spawn(object));
     }
@@ -567,18 +573,20 @@ impl FrameState {
             if self.player == Some(id) {
                 self.stats.generic_player_ticks = self.stats.generic_player_ticks.saturating_add(1);
             }
-            let hook = self
-                .live
-                .get(id)
-                .ok()
-                .and_then(|object| hooks_for_class(object.class).tick);
+            let (hook, has_actor) = match self.live.get(id) {
+                Ok(object) => (hooks_for_class(object.class).tick, object.actor.is_some()),
+                Err(_) => (None, false),
+            };
             if let Some(hook) = hook {
                 self.stats.hooked_ticks = self.stats.hooked_ticks.saturating_add(1);
+                if has_actor {
+                    self.stats.actor_ticks = self.stats.actor_ticks.saturating_add(1);
+                }
                 if self.player == Some(id) {
                     self.stats.hooked_player_ticks =
                         self.stats.hooked_player_ticks.saturating_add(1);
                 }
-                hook(&mut self.world, id, tick);
+                hook(&mut self.world, &mut self.live, id, tick);
             }
         }
     }
@@ -637,6 +645,7 @@ impl FrameState {
                 visible: true,
                 slot: None,
                 anim_index: 0,
+                actor: None,
             };
             self.live.spawn(object);
             self.stats.spawned = self.stats.spawned.saturating_add(1);
@@ -734,6 +743,29 @@ mod tests {
         World::from_report("test".to_string(), 1, &report)
     }
 
+    fn empty_world() -> World {
+        World::from_report(
+            "test".to_string(),
+            1,
+            &ObjectReport {
+                room_offset: 0,
+                count: 0,
+                array_offset: 0,
+                objects: Vec::new(),
+            },
+        )
+    }
+
+    /// One representative name per documented class prefix.
+    const CLASS_PROBES: [&str; 6] = [
+        "raziel__player",
+        "sreavr__probe",
+        "glphicon_probe",
+        "physical_probe",
+        "monster_wallcr",
+        "particle_dust",
+    ];
+
     fn frame() -> FrameState {
         FrameState::new(world_with_raziel())
     }
@@ -777,6 +809,72 @@ mod tests {
         tick(&mut frame, 1);
         let stats = frame.stats();
         assert_eq!((stats.direct_player_ticks, stats.generic_player_ticks), (2, 2));
+    }
+
+    #[test]
+    fn only_the_two_class_table_tick_rows_receive_the_per_object_pass() {
+        let mut frame = FrameState::new(empty_world());
+        for name in CLASS_PROBES {
+            frame.queue_spawn(name, [0, 0, 0]);
+        }
+        // Stage 18 of the first tick applies the deferred spawns; stage 12 of
+        // the second tick is the first pass that sees all six objects.
+        tick(&mut frame, 0);
+        assert_eq!(frame.live().len(), CLASS_PROBES.len());
+
+        let expected_hooks = frame
+            .live()
+            .iter()
+            .filter(|(_, object)| super::hooks_for_class(object.class).tick.is_some())
+            .count() as u64;
+        assert_eq!(
+            expected_hooks, 2,
+            "the class table installs a tick only for raziel__ and monster_"
+        );
+
+        tick(&mut frame, 1);
+        let stats = frame.stats();
+        assert_eq!(
+            stats.generic_ticks,
+            CLASS_PROBES.len() as u64,
+            "stage 12 visits every live object"
+        );
+        assert_eq!(
+            stats.hooked_ticks, expected_hooks,
+            "only the two tick rows run a body; the other four make zero calls"
+        );
+        assert_eq!(
+            stats.actor_ticks, 0,
+            "no live object carries an actor profile in this fixture"
+        );
+
+        for index in 2..7 {
+            tick(&mut frame, index);
+        }
+        let stats = frame.stats();
+        assert_eq!(stats.generic_ticks, 6 * CLASS_PROBES.len() as u64);
+        assert_eq!(
+            stats.hooked_ticks,
+            6 * expected_hooks,
+            "the dispatch is stable across ticks and never drifts to another class"
+        );
+    }
+
+    #[test]
+    fn the_four_non_tick_classes_never_reach_the_actor_pass() {
+        let mut frame = FrameState::new(empty_world());
+        for name in ["sreavr__probe", "glphicon_probe", "physical_probe", "particle_dust"] {
+            frame.queue_spawn(name, [0, 0, 0]);
+        }
+        tick(&mut frame, 0);
+        for index in 1..11 {
+            tick(&mut frame, index);
+        }
+
+        let stats = frame.stats();
+        assert_eq!(stats.generic_ticks, 10 * 4);
+        assert_eq!(stats.hooked_ticks, 0, "no non-tick class may run a tick body");
+        assert_eq!(stats.actor_ticks, 0);
     }
 
     #[test]

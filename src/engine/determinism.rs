@@ -566,6 +566,7 @@ mod tests {
             visible: true,
             slot: None,
             anim_index: 0,
+            actor: None,
         }
     }
 
