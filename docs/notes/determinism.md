@@ -92,6 +92,12 @@ slice, not part of this gate.
   `0x490c_8582_c297_df18`. The options, error, tracker, classification,
   actor-runtime and stage-order goldens do not move. See "Actor tick
   (engine-actor-tick)" below.
+- engine-events (event/message carrier): the queue, the hit/contact/message
+  carriers and the delivery seam are transient and are deliberately not part of
+  the canonical fold. Stage 11 and stage 13 keep empty producer bodies because
+  the engine has no animation timeline and no pinned trigger extent, so **all
+  goldens are untouched**. `events.rs` joins the wall-clock guard. See
+  `docs/changes/engine-events/proposal.md`.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.
