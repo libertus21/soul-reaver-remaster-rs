@@ -198,6 +198,17 @@ The actor carrier is now part of the frame loop, still without AI semantics.
   object's render class. `raziel__` and `monster_` install one; `sreavr__`,
   `glphicon`, `physical` and `particle` leave it null. A null tick is the
   documented opt-out and makes zero calls.
+- **The dispatch key is the loaded model, not the placed instance name.** The
+  class table is unchanged, but it is now applied to the resolved model's
+  prototype (padded model name plus the actor-family kind), not to the placed
+  instance name (`object-prototype`). A real `skinner` instance is therefore
+  `monster_` and installs the tick hook. The canonical fold fields did not move:
+  only the per-object class byte changes for real models. A 60-tick `skinnr1`
+  run moved from `0x5aef_a6d0_f462_7f69` to `0x0730_d5c4_0f97_d622` with the
+  same counts (5 monster carriers plus the player tick; `hooked = actor_ticks =
+  355`); `under1` stayed byte-identical at `0x3ac3_3bf0_8aab_697d` (player
+  only). No synthetic golden moved: their fixtures already classify their spawn
+  names, or carry no model.
 - **Carriage is data-keyed.** A live object owns `Option<ActorRuntime>`, filled
   only from the loaded model's actor block (`ModelAsset::actor`). The bound
   player receives its profile in the shared boot pass. A model without an actor
