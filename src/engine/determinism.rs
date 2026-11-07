@@ -161,15 +161,27 @@ pub struct WorldState {
 
 /// One live object in the canonical fold. `class` is the render class as `u8`,
 /// `position` is integer world units and `visible` is the render flag.
+///
+/// `actor` is `1` when the live object carries an [`ActorRuntime`] and `0`
+/// otherwise. When it is `1`, `relation` and `state` are the carrier's numeric
+/// values; when it is `0`, both are the neutral `0` and the `actor` byte already
+/// says the fields are absent. The presence byte keeps "no carrier" distinct
+/// from "carrier in its neutral state" without inventing an actor state for
+/// non-actors.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorldEntry {
     pub class: u8,
     pub position: [i32; 3],
     pub visible: bool,
+    pub actor: u8,
+    pub relation: u8,
+    pub state: u8,
 }
 
 /// Hash the canonical world state: tick count, live-list order, then per entry
-/// `class`, `position.x/y/z` and `visible`, all little-endian and fixed width.
+/// `class`, `position.x/y/z`, `visible`, the actor-presence byte and, when a
+/// carrier exists, the actor `relation` and action `state` bytes, all
+/// little-endian and fixed width.
 ///
 /// This is the **production digest**: `--play --headless` folds the real
 /// `FrameState` live world through this function and prints the result. It is
@@ -184,6 +196,9 @@ pub fn world_state_hash(state: &WorldState) -> u64 {
         hasher.write_i32(entry.position[1]);
         hasher.write_i32(entry.position[2]);
         hasher.write_u8(u8::from(entry.visible));
+        hasher.write_u8(entry.actor);
+        hasher.write_u8(entry.relation);
+        hasher.write_u8(entry.state);
     }
     hasher.finish()
 }
@@ -380,24 +395,32 @@ mod tests {
     }
 
     // Guards the canonical world-state fold: the tick count, the live-list
-    // order, and per entry the class, position x/y/z and visible byte, plus the
+    // order, and per entry the class, position x/y/z, visible byte, actor
+    // presence byte, and the actor relation and action state bytes, plus the
     // FNV-1a constants and little-endian encoding. It is independent of the
     // options fold above.
     //
     // T10 makes this the PRODUCTION digest: `--play --headless` folds the real
     // `FrameState` live world through `world_state_hash`. The constant was
     // re-pinned deliberately from the retired T2 synthetic vector
-    // `0x82fe_8a38_1b9d_2a6d` to the end-to-end real-world run below
-    // (`0xb5bb_59fd_97b9_50b1`); the headless CLI gate adds
-    // `GOLDEN_HEADLESS_DIGEST` in `src/engine/play.rs`. This is the update the
-    // design anticipated; it is never "fixed" to make a test green.
-    const GOLDEN_WORLD_STATE_HASH: u64 = 0xb5bb_59fd_97b9_50b1;
+    // `0x82fe_8a38_1b9d_2a6d` to the end-to-end real-world run below. The
+    // engine-actor-tick slice then moved it from `0xb5bb_59fd_97b9_50b1` to
+    // `0x2c8e_61aa_2f02_31b0` when the actor carrier entered the fold; the
+    // headless CLI gate moved in the same PR. This is a deliberate spec change,
+    // never a fix to make a test green.
+    const GOLDEN_WORLD_STATE_HASH: u64 = 0x2c8e_61aa_2f02_31b0;
 
     /// A real `FrameState` world: the player plus two deferred spawns, one of
     /// them outside the cull radius so the fold observes a `visible` change.
+    /// The monster spawn carries a synthetic actor profile so the canonical fold
+    /// exercises the actor-presence byte and the carrier fields.
     fn real_world_seed() -> FrameState {
         let mut frame = FrameState::new(frame_world());
-        frame.queue_spawn("monster_wallcr", [10, 0, 0]);
+        frame.queue_spawn_loaded(
+            "monster_wallcr",
+            [10, 0, 0],
+            Some(synthetic_profile(&[0x18, 0x25])),
+        );
         frame.queue_spawn("particle_dust", [5000, 0, 0]);
         frame
     }
@@ -424,11 +447,17 @@ mod tests {
                     class: 1,
                     position: [0, 0, 0],
                     visible: true,
+                    actor: 0,
+                    relation: 0,
+                    state: 0,
                 },
                 WorldEntry {
                     class: 2,
                     position: [10, 0, 0],
                     visible: false,
+                    actor: 1,
+                    relation: 2,
+                    state: 0x25,
                 },
             ],
         };
@@ -484,6 +513,30 @@ mod tests {
         let mut hidden = base.clone();
         hidden.live[0].visible = false;
         assert_ne!(world_state_hash(&base), world_state_hash(&hidden));
+
+        let mut carrier = base.clone();
+        carrier.live[0].actor = 1;
+        assert_ne!(
+            world_state_hash(&base),
+            world_state_hash(&carrier),
+            "the actor-presence byte must be folded"
+        );
+
+        let mut relation = base.clone();
+        relation.live[1].relation = 3;
+        assert_ne!(
+            world_state_hash(&base),
+            world_state_hash(&relation),
+            "the actor relation must be folded"
+        );
+
+        let mut action = base.clone();
+        action.live[1].state = 0x18;
+        assert_ne!(
+            world_state_hash(&base),
+            world_state_hash(&action),
+            "the actor action state must be folded"
+        );
     }
 
     // Guards the tracker fold: for each of the 48 slots in index order, the
@@ -748,8 +801,10 @@ mod tests {
     // Final canonical state of the 40-tick scripted replay below. This is a
     // seventh, independent gate: it pins the per-tick stage order, input
     // sampling, direct player translation, culling, render snapshot and
-    // post-frame bookkeeping together. It does not move any existing golden.
-    const GOLDEN_FRAME_STATE_HASH: u64 = 0x7b7f_16bc_a6af_b9b2;
+    // post-frame bookkeeping together. Because it pins the canonical world fold,
+    // the engine-actor-tick slice moved it from `0x7b7f_16bc_a6af_b9b2` to
+    // `0xa203_0add_093d_a5e6` with the same fold extension.
+    const GOLDEN_FRAME_STATE_HASH: u64 = 0xa203_0add_093d_a5e6;
 
     fn frame_record(name: &str, position: [i16; 3]) -> ObjectRecord {
         ObjectRecord {

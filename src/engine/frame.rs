@@ -444,10 +444,19 @@ impl FrameState {
             live: self
                 .live
                 .iter()
-                .map(|(_, object)| WorldEntry {
-                    class: object.class.code(),
-                    position: object.position,
-                    visible: object.visible,
+                .map(|(_, object)| {
+                    let (actor, relation, state) = match &object.actor {
+                        Some(runtime) => (1, runtime.relation(), runtime.state()),
+                        None => (0, 0, 0),
+                    };
+                    WorldEntry {
+                        class: object.class.code(),
+                        position: object.position,
+                        visible: object.visible,
+                        actor,
+                        relation,
+                        state,
+                    }
                 })
                 .collect(),
         }

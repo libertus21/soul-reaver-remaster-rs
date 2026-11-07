@@ -114,7 +114,10 @@ fn run_report(path: &Path, ticks: u32) -> HeadlessReport {
     headless_run(&mut frame, path, ticks).expect("the synthetic world must tick")
 }
 
-const GOLDEN_HEADLESS_DIGEST: u64 = 0x8dd6_3315_4e26_f1c4;
+// Moved deliberately by the engine-actor-tick slice when the actor presence and
+// relation/state bytes entered the canonical fold: `0x8dd6_3315_4e26_f1c4` ->
+// `0x490c_8582_c297_df18`. The live set and tick count are unchanged.
+const GOLDEN_HEADLESS_DIGEST: u64 = 0x490c_8582_c297_df18;
 
 #[test]
 fn windowed_boot_matches_the_headless_live_count_and_digest() {
