@@ -15,7 +15,8 @@ This note continues `actor-ai` (the runtime AI block and the per-frame tick),
 `object-behaviour` (name-keyed dispatch), `determinism` (the actor fold) and
 `docs/changes/engine-actor-tick/proposal.md`. It answers the four questions that
 keep `ActorRuntime::advance` at `NotInterpreted`, and it records one dispatch
-finding that changes how those questions must be read.
+finding that changes how those questions must be read. The writer chain and the
+exact forced-class bits are resolved in `actor-state-writer`.
 
 ## Verdict
 
