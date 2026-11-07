@@ -10,7 +10,7 @@
 //! linear prefix lookup, so adding a class is a row, not another match arm.
 
 use crate::engine::clock::ObjectTick;
-use crate::engine::live::LiveId;
+use crate::engine::live::{LiveArena, LiveId};
 use crate::engine::world::World;
 
 /// The six renderer families plus the no-match sentinel.
@@ -50,7 +50,13 @@ pub struct QueryAnswer;
 /// Event/message entry (`+0x1A0`).
 pub type EventHook = fn(&mut World, LiveId, &Event);
 /// Per-frame tick (`+0x1A8`).
-pub type TickHook = fn(&mut World, LiveId, ObjectTick);
+///
+/// The live arena is passed explicitly because an actor's per-object runtime
+/// state lives on its [`crate::engine::live::LiveObject`], not on the authored
+/// [`World`]. The original reads and writes the same per-object block from the
+/// tick hook; keeping the two stores separate is the engine's existing world /
+/// live split.
+pub type TickHook = fn(&mut World, &mut LiveArena, LiveId, ObjectTick);
 /// Query/state getter (`+0x1B0`).
 pub type QueryHook = fn(&World, LiveId, Query) -> QueryAnswer;
 
@@ -85,16 +91,43 @@ pub struct ClassEntry {
     pub hooks: Hooks,
 }
 
-fn raziel_tick(_world: &mut World, _id: LiveId, _tick: ObjectTick) {}
+/// Shared body of the two installed tick hooks.
+///
+/// The class table is the **dispatch gate**: only `raziel__` and `monster_`
+/// install this body. The body itself does not decide anything. It advances the
+/// per-object [`crate::engine::actor::ActorRuntime`] carrier if the live object
+/// has one, through the documented
+/// [`crate::engine::actor::ActorRuntime::advance`] entry point.
+///
+/// The documented per-class bodies (the player interaction tick and the monster
+/// locomotion thunk) are not implemented; they need animation, input queries and
+/// collision. This slice only wires the existing carrier into the frame loop, so
+/// both classes share one carriage body. Diverging them later is changing the
+/// table row, not the dispatch.
+fn actor_runtime_tick(_world: &mut World, live: &mut LiveArena, id: LiveId, tick: ObjectTick) {
+    let Ok(object) = live.get_mut(id) else {
+        return;
+    };
+    if let Some(actor) = object.actor.as_mut() {
+        actor.advance(tick);
+    }
+}
 
-fn monster_tick(_world: &mut World, _id: LiveId, _tick: ObjectTick) {}
+fn raziel_tick(world: &mut World, live: &mut LiveArena, id: LiveId, tick: ObjectTick) {
+    actor_runtime_tick(world, live, id, tick);
+}
+
+fn monster_tick(world: &mut World, live: &mut LiveArena, id: LiveId, tick: ObjectTick) {
+    actor_runtime_tick(world, live, id, tick);
+}
 
 /// The six documented renderer prefixes.
 ///
 /// `raziel__` and `monster_` opt into the generic tick; `sreavr__`, `glphicon`,
 /// `physical` and `particle` leave it null. No class carries an event or query
-/// hook in this milestone. The tick bodies are no-ops until the frame pipeline
-/// installs the real players.
+/// hook in this milestone. Both installed tick bodies share the actor-carriage
+/// body: the per-class behaviour (player interaction, monster locomotion) is not
+/// implemented, but the dispatch and the carrier are real.
 pub const CLASS_TABLE: [ClassEntry; 6] = [
     ClassEntry {
         prefix: "raziel__",

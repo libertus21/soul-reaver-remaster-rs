@@ -15,6 +15,7 @@
 
 use std::fmt;
 
+use crate::engine::actor::ActorRuntime;
 use crate::engine::class::RenderClass;
 
 /// Stable identity of a live object.
@@ -33,8 +34,10 @@ pub struct LiveId {
 ///
 /// `slot` and `anim_index` are placeholders for the tracker slot and the tracker
 /// animation index (`+0x1A`) that later slices fill; they stay numeric and carry
-/// no invented behaviour. Actor state and the class hooks belong to later
-/// slices.
+/// no invented behaviour. `actor` is the per-object actor carrier: it is present
+/// only when the loaded model carried an actor block, so it is data-keyed, not
+/// name- or class-keyed. The class table decides whether the carrier is ever
+/// ticked (`raziel__` and `monster_`), which keeps the two axes separate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveObject {
     pub name: String,
@@ -43,6 +46,7 @@ pub struct LiveObject {
     pub visible: bool,
     pub slot: Option<usize>,
     pub anim_index: u16,
+    pub actor: Option<ActorRuntime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +214,7 @@ mod tests {
             visible: true,
             slot: None,
             anim_index: 0,
+            actor: None,
         }
     }
 

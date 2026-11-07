@@ -13,6 +13,7 @@
 //! `docs/notes/actor-ai.md` and `docs/notes/actor-behaviour-data.md`.
 
 use crate::actor::{self as parser, ActorBlock, ActorKind, BehaviourEntry, EntryArrayKind};
+use crate::engine::clock::ObjectTick;
 use crate::engine::live::LiveId;
 use crate::object::ObjectError;
 
@@ -55,6 +56,20 @@ impl ActorProfile {
         parser::parse_actor_block(bytes)
             .map(|block| block.as_ref().map(Self::from_block))
     }
+}
+
+/// Outcome of one actor transition step.
+///
+/// The decision body is not implemented, so the only outcome this slice can
+/// produce is [`ActorTransition::NotInterpreted`]. The marker is explicit: it is
+/// not a plausible default that pretends to be behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorTransition {
+    /// The runtime was ticked. No relation change and no action id can be
+    /// selected, because perception, the engagement-radius comparison, the melee
+    /// gate and the state-to-clip mapping are UNKNOWN (`docs/notes/actor-ai.md`
+    /// section 5 and 10).
+    NotInterpreted,
 }
 
 /// Numeric runtime state for one live actor.
@@ -117,6 +132,22 @@ impl ActorRuntime {
     /// Set the numeric action state id.
     pub fn set_state(&mut self, state: u8) {
         self.state = state;
+    }
+
+    /// The documented transition entry point, called by the per-frame tick.
+    ///
+    /// This is the only route by which the runtime may advance. The decision
+    /// body that would choose a relation or an action id is UNKNOWN: the notes
+    /// pin the numeric ids but not their meaning, and the shipped ids are
+    /// model-relative (`docs/notes/actor-ai.md` section 5,
+    /// `docs/notes/actor-behaviour-data.md` section 7). The step therefore
+    /// selects nothing and leaves every field untouched; it returns an explicit
+    /// [`ActorTransition::NotInterpreted`] instead of inventing a transition.
+    ///
+    /// Later evidence-backed slices replace this body; the dispatch, the carrier
+    /// and the determinism fold do not need to change for that.
+    pub fn advance(&mut self, _step: ObjectTick) -> ActorTransition {
+        ActorTransition::NotInterpreted
     }
 
     /// Set or clear the live target.

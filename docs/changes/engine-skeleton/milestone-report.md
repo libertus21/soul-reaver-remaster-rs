@@ -192,6 +192,23 @@ Non-constant gates:
 - The acceptance module proves the fixed-step bound: a 10 s advance yields at
   most 5 ticks, the remainder is kept, and the drain reaches 600 ticks.
 
+## Next slice: engine-actor-tick (plumbing only)
+
+The first post-milestone slice wires the existing actor machinery into the frame
+loop without adding AI semantics. Stage 12 now dispatches the class tick hook in
+live order, a live object carries `Option<ActorRuntime>` filled from the loaded
+model block, and the canonical digest folds actor presence plus the numeric
+relation and state. The behaviour trios and entry ids remain data and are not
+consumed; `ActorRuntime::advance` is explicitly `NotInterpreted`.
+
+Still open and deliberately unimplemented: the named state machine, the meaning
+of relation/action ids, perception, engagement, melee, turn-to-face, disengage,
+animation, damage and death. See `docs/changes/engine-actor-tick/proposal.md`.
+
+A 60-tick read-only `--play --headless` run on `under1` moved the production
+digest from `fe951463efc0dbec` to `3ac33bf08aab697d` (two identical runs); the
+counters and live set did not change.
+
 ## Definition of done for this milestone
 
 - Headless `under1` runs, exits 0 and prints the contract line.

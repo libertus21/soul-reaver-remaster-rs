@@ -81,6 +81,17 @@ slice, not part of this gate.
   (`GOLDEN_HEADLESS_DIGEST`) pins a synthetic-archive acceptance run. The
   options, error, tracker, classification, actor-runtime, stage-order and
   frame-state goldens do not move. See "Headless acceptance (T10)" below.
+- engine-actor-tick (actor tick plumbing): stage 12 now dispatches the class
+  tick hook and a live object may carry an `ActorRuntime`. The canonical fold
+  gains, per live object in live order, an actor-presence byte plus the actor
+  relation and action state bytes. `GOLDEN_WORLD_STATE_HASH` moves from
+  `0xb5bb_59fd_97b9_50b1` to `0x2c8e_61aa_2f02_31b0`;
+  `GOLDEN_FRAME_STATE_HASH` moves with it (`0x7b7f_16bc_a6af_b9b2` to
+  `0xa203_0add_093d_a5e6`) because it pins the same fold; and
+  `GOLDEN_HEADLESS_DIGEST` moves from `0x8dd6_3315_4e26_f1c4` to
+  `0x490c_8582_c297_df18`. The options, error, tracker, classification,
+  actor-runtime and stage-order goldens do not move. See "Actor tick
+  (engine-actor-tick)" below.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.
@@ -97,7 +108,7 @@ questions:
 | Golden | Fold | Guards |
 |---|---|---|
 | `options_hash` / `error_hash` | parsed `PlayOptions`, typed error text | **Regression gate**: argv parsing, fold order, field set, error tags. No simulation state. |
-| `world_state_hash` | tick count, live-list order, per-entry class, position, visible | **Canonical state gate** and the production `--play --headless` digest: the simulation contract from `spec.md`. Independent of the options fold. |
+| `world_state_hash` | tick count, live-list order, per-entry class, position, visible, actor presence, actor relation and actor state | **Canonical state gate** and the production `--play --headless` digest: the simulation contract from `spec.md`. Independent of the options fold. |
 | `tracker_hash` | each slot in index order: index, state code, name | **Tracker gate**: acquisition, duplicate-name sharing and lowest-free reuse. Independent of both folds above. |
 | `classification_hash` | the five name lists in documented order: list id, exact count, then per name the name bytes, admission code, load-role code and asset-tree code | **Name-table gate**: the exact membership and roles of the spawn policy. Independent of every fold above; lives in `src/engine/spawn.rs` tests. |
 | `actor_runtime_hash` | profile kind, the eight trios, entry-array kind, entry ids; then relation, state, target and flags | **Actor-runtime gate**: the data-keyed AI initial state. No name is folded. Independent of every fold above; lives in `src/engine/determinism.rs` tests. |
@@ -114,7 +125,11 @@ to a new number.
 
 The canonical world fold, in order: `tick` as `u64`, then for each live entry in
 **live-list order** (spawn order, survivors keep relative order after removals)
-`class` as `u8`, `position.x/y/z` as `i32`, `visible` as `u8`. `GOLDEN_WORLD_STATE_HASH`
+`class` as `u8`, `position.x/y/z` as `i32`, `visible` as `u8`, the
+actor-presence byte as `u8`, the actor `relation` as `u8` and the actor action
+`state` as `u8`. Presence is `1` only when the live object carries an
+`ActorRuntime`; when it is `0`, relation and state are the neutral `0` and the
+presence byte already states that the fields are absent. `GOLDEN_WORLD_STATE_HASH`
 pins that exact byte stream. T3+ extends the fold and the constant deliberately,
 in the same PR that updates `spec.md`; it is never "fixed" to go green.
 
@@ -174,6 +189,35 @@ name through the bigfile index with the existing container and actor parsers and
 reuses the existing textured-mesh builder). `LoadQueue` is only a deterministic
 FIFO shape for a later asynchronous source; it adds no thread, runtime or
 dependency, and a missing model is `Unresolved`, never a panic.
+
+## Actor tick (engine-actor-tick)
+
+The actor carrier is now part of the frame loop, still without AI semantics.
+
+- **Dispatch is the class table.** Stage 12 looks up the tick hook for the live
+  object's render class. `raziel__` and `monster_` install one; `sreavr__`,
+  `glphicon`, `physical` and `particle` leave it null. A null tick is the
+  documented opt-out and makes zero calls.
+- **Carriage is data-keyed.** A live object owns `Option<ActorRuntime>`, filled
+  only from the loaded model's actor block (`ModelAsset::actor`). The bound
+  player receives its profile in the shared boot pass. A model without an actor
+  block stays a non-actor even when its class name would otherwise tick.
+- **No semantics.** `ActorRuntime::advance` is the single transition entry
+  point and returns `ActorTransition::NotInterpreted`. It changes no relation
+  and selects no action id. The eight trios and the behaviour-entry ids remain
+  profile data and are never consumed by ticking.
+- **State is folded.** The canonical stream adds the presence byte and, when a
+  carrier exists, the relation and state bytes. Non-actors fold `0/0/0`.
+- **The gate bites.** Dropping `hasher.write_u8(entry.state)` moves the
+  world-state gate to `0xccb5_59a4_77be_1118`, the frame-state gate to
+  `0xd710_2563_f731_9382` and the headless gate to `0xf51c_9abc_d024_b374`. The
+  perturbation was reverted before the commit.
+- **Real data.** A 60-tick `--play --headless` run on the shipped `under1` unit
+  (read-only, nothing committed) prints `digest=3ac33bf08aab697d` on two
+  consecutive runs. The pre-slice digest was `fe951463efc0dbec`; the live set,
+  counters and tick count are unchanged, so the move is the fold extension.
+  The real run attaches one actor carrier (`raziel`); `under1` has no monster
+  placement.
 
 ## Frame pipeline (T8)
 
