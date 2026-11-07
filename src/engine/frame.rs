@@ -218,14 +218,15 @@ pub struct FrameStats {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeferredSpawn {
     pub name: String,
-    /// The loaded model's prototype key, when the spawn came from a resolved
-    /// model. The class table is applied to this key, not to the placed instance
-    /// name (`object-prototype`). `None` is the synthetic/no-model fallback: the
-    /// instance name is the only key available.
-    pub prototype: Option<String>,
+    /// The loaded model's class, resolved at load-complete before actor
+    /// initialisation. The class table is applied to this, not to the placed
+    /// instance name (`object-prototype`). `None` is the synthetic/no-model
+    /// fallback: the instance-name prefix lookup is the only key available.
+    pub class: Option<RenderClass>,
     pub position: [i32; 3],
     /// The actor profile the loaded model carried, if any. It is copied from
-    /// `ModelAsset::actor`; the spawner never parses data itself.
+    /// `ModelAsset::actor` and initialised here, **after** the class was
+    /// captured; the class never comes from this profile.
     pub actor: Option<ActorProfile>,
 }
 
@@ -410,25 +411,24 @@ impl FrameState {
         position: [i32; 3],
         actor: Option<ActorProfile>,
     ) {
-        self.queue_spawn_with_prototype(name, None, position, actor);
+        self.queue_spawn_with_class(name, None, position, actor);
     }
 
-    /// Defer a spawn keyed by the loaded model's prototype.
+    /// Defer a spawn whose class was resolved from the loaded model.
     ///
-    /// The class table is applied to `prototype`, not to the placed instance
-    /// name. The boot pass derives this key from the loaded model (padded model
-    /// name plus the actor-family kind); a resolved real monster therefore gets
-    /// the `monster_` row even though its instance name is bare.
-    pub fn queue_spawn_with_prototype(
+    /// The class is captured at load-complete, before actor initialisation; the
+    /// post-frame stage only copies it. `None` keeps the synthetic instance-name
+    /// fallback.
+    pub fn queue_spawn_with_class(
         &mut self,
         name: impl Into<String>,
-        prototype: Option<String>,
+        class: Option<RenderClass>,
         position: [i32; 3],
         actor: Option<ActorProfile>,
     ) {
         self.spawn_queue.push(DeferredSpawn {
             name: name.into(),
-            prototype,
+            class,
             position,
             actor,
         });
@@ -702,12 +702,17 @@ impl FrameState {
 
         for spawn in std::mem::take(&mut self.spawn_queue) {
             let object = LiveObject {
-                class: classify(spawn.prototype.as_deref().unwrap_or(&spawn.name)),
+                class: spawn
+                    .class
+                    .unwrap_or_else(|| classify(&spawn.name)),
                 name: spawn.name,
                 position: spawn.position,
                 visible: true,
                 slot: None,
                 anim_index: 0,
+                // Actor initialisation runs here, in stage 18, strictly after
+                // the class was captured at load-complete. It never feeds back
+                // into the class.
                 actor: spawn.actor.map(ActorRuntime::initial),
             };
             self.live.spawn(object);
@@ -977,16 +982,16 @@ mod tests {
     }
 
     #[test]
-    fn a_monster_instance_is_classified_from_its_prototype_not_its_name() {
+    fn a_monster_instance_is_classified_from_its_loaded_class_not_its_name() {
         let mut frame = FrameState::new(empty_world());
         let profile = actor_profile(&[0x18, 0x25]);
 
         // Real-data shape: the placed instance is bare `skinner`; the loaded
-        // model supplies the monster row. Contrast: the same bare name with no
-        // model key stays unclassified.
-        frame.queue_spawn_with_prototype(
+        // model supplied the monster row. Contrast: the same bare name with no
+        // model class stays unclassified.
+        frame.queue_spawn_with_class(
             "skinner",
-            Some("monster_".to_string()),
+            Some(crate::engine::class::RenderClass::Monster),
             [0, 0, 0],
             Some(profile),
         );
@@ -1001,7 +1006,7 @@ mod tests {
         let keyed = live
             .iter()
             .find(|object| object.position == [0, 0, 0])
-            .expect("prototype-keyed spawn");
+            .expect("class-keyed spawn");
         let bare = live
             .iter()
             .find(|object| object.position == [1, 0, 0])
@@ -1009,7 +1014,7 @@ mod tests {
         assert_eq!(
             keyed.class,
             crate::engine::class::RenderClass::Monster,
-            "the prototype key must select the monster row"
+            "the loaded class must select the monster row"
         );
         assert!(keyed.actor.is_some(), "the monster carrier is attached");
         assert_eq!(
@@ -1020,20 +1025,57 @@ mod tests {
         assert!(bare.actor.is_none());
 
         let stats = frame.stats();
-        assert_eq!(stats.hooked_ticks, 1, "only the prototype-keyed monster ticks");
+        assert_eq!(stats.hooked_ticks, 1, "only the class-keyed monster ticks");
         assert_eq!(stats.actor_ticks, 1, "and its carrier is advanced");
     }
 
     #[test]
-    fn prototype_keys_for_the_four_non_tick_classes_install_no_hook() {
+    fn the_class_is_fixed_before_actor_initialisation_runs() {
         let mut frame = FrameState::new(empty_world());
-        for prototype in ["sreavr__", "glphicon", "physical", "particle"] {
-            frame.queue_spawn_with_prototype(
-                prototype,
-                Some(prototype.to_string()),
-                [0, 0, 0],
-                None,
-            );
+        let profile = actor_profile(&[0x18, 0x25]);
+
+        frame.queue_spawn_with_class(
+            "skinner_",
+            Some(crate::engine::class::RenderClass::Physical),
+            [0, 0, 0],
+            Some(profile),
+        );
+
+        assert_eq!(frame.pending_changes().0, 1, "the spawn is still deferred");
+        assert!(frame.live().is_empty(), "no actor exists before stage 18");
+
+        // Stage 18 initialises the actor carrier. The class was already fixed in
+        // the deferred spawn, so it cannot be re-derived from the profile.
+        tick(&mut frame, 0);
+        let object = frame
+            .live()
+            .iter()
+            .map(|(_, object)| object)
+            .next()
+            .expect("the deferred spawn is applied");
+        assert_eq!(
+            object.class,
+            crate::engine::class::RenderClass::Physical,
+            "the load-time class survives actor initialisation"
+        );
+        let actor = object.actor.as_ref().expect("the profile is initialised");
+        assert_eq!(
+            actor.profile().kind,
+            crate::actor::ActorKind::Monster,
+            "the profile kind is not the class source"
+        );
+    }
+
+    #[test]
+    fn non_tick_classes_install_no_hook() {
+        let mut frame = FrameState::new(empty_world());
+        for class in [
+            crate::engine::class::RenderClass::Sreavr,
+            crate::engine::class::RenderClass::GlyphIcon,
+            crate::engine::class::RenderClass::Physical,
+            crate::engine::class::RenderClass::Particle,
+        ] {
+            frame.queue_spawn_with_class("probe", Some(class), [0, 0, 0], None);
         }
         tick(&mut frame, 0);
         for index in 1..6 {
@@ -1044,7 +1086,7 @@ mod tests {
         assert_eq!(stats.generic_ticks, 5 * 4);
         assert_eq!(
             stats.hooked_ticks, 0,
-            "no non-tick prototype may install a hook"
+            "no non-tick class may install a hook"
         );
         assert_eq!(stats.actor_ticks, 0);
     }

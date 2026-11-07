@@ -27,7 +27,7 @@ use crate::cli_out::outln;
 use crate::engine::actor::ActorProfile;
 use crate::engine::assets::{AssetRequest, AssetStore, ImmediateSource};
 use crate::engine::backend_wgpu::WgpuBackend;
-use crate::engine::class::prototype_key;
+use crate::engine::class::RenderClass;
 use crate::engine::clock::ObjectTick;
 use crate::engine::determinism::world_state_hash;
 use crate::engine::frame::{FrameError, FrameState, PLAYER_NAME};
@@ -365,8 +365,8 @@ fn boot_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunE
     let player = frame.player();
     let mut player_profile: Option<ActorProfile> = None;
     let mut counts = SeedCounts::default();
-    let mut resolved: BTreeMap<String, (bool, Option<ActorProfile>, String)> = BTreeMap::new();
-    let mut spawns: Vec<(String, String, [i32; 3], Option<ActorProfile>)> = Vec::new();
+    let mut resolved: BTreeMap<String, (bool, Option<ActorProfile>, RenderClass)> = BTreeMap::new();
+    let mut spawns: Vec<(String, RenderClass, [i32; 3], Option<ActorProfile>)> = Vec::new();
 
     let records = frame.world().placed.records_for_boot();
     counts.placed = records.len();
@@ -399,9 +399,9 @@ fn boot_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunE
             continue;
         }
 
-        let (loaded, actor, prototype) = match resolved.get(name) {
-            Some((loaded, actor, prototype)) => {
-                (*loaded, actor.clone(), prototype.clone())
+        let (loaded, actor, class) = match resolved.get(name) {
+            Some((loaded, actor, class)) => {
+                (*loaded, actor.clone(), *class)
             }
             None => {
                 let completion = assets
@@ -410,29 +410,21 @@ fn boot_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunE
                 let loaded = completion.is_loaded();
                 let asset = completion.asset();
                 let actor = asset.and_then(|asset| asset.actor.clone());
-                // The class key comes from the loaded model, never from the
-                // placed instance name: the padded prototype name plus the
-                // actor-family kind (`object-prototype`).
-                let prototype = asset.map_or_else(
-                    || prototype_key(name, None),
-                    |asset| {
-                        prototype_key(
-                            &asset.model.name,
-                            asset.actor.as_ref().map(|profile| profile.kind),
-                        )
-                    },
-                );
+                // The class was resolved at load-complete from the captured
+                // class-flags word and padded prototype, before the actor
+                // profile was parsed. The boot pass must not re-derive it.
+                let class = asset.map_or(RenderClass::Unclassified, |asset| asset.class);
                 if !loaded {
                     counts.unresolved += 1;
                 }
-                resolved.insert(name.clone(), (loaded, actor.clone(), prototype.clone()));
-                (loaded, actor, prototype)
+                resolved.insert(name.clone(), (loaded, actor.clone(), class));
+                (loaded, actor, class)
             }
         };
         if loaded {
             spawns.push((
                 name.clone(),
-                prototype,
+                class,
                 [
                     i32::from(record.position[0]),
                     i32::from(record.position[1]),
@@ -443,8 +435,8 @@ fn boot_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunE
         }
     }
 
-    for (name, prototype, position, actor) in spawns {
-        frame.queue_spawn_with_prototype(name, Some(prototype), position, actor);
+    for (name, class, position, actor) in spawns {
+        frame.queue_spawn_with_class(name, Some(class), position, actor);
     }
     if let (Some(player), Some(profile)) = (player, player_profile) {
         let _attached = frame.attach_actor(player, profile);
@@ -1052,3 +1044,4 @@ mod tests {
 #[cfg(test)]
 #[path = "play_acceptance.rs"]
 mod acceptance;
+

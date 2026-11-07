@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use crate::bigfile::{self, BigfileEntry};
 use crate::engine::actor::ActorProfile;
+use crate::engine::class::{RenderClass, classify_loaded};
 use crate::object::{self, ObjectError};
 
 /// One asset request, keyed by the placed-object name.
@@ -40,12 +41,18 @@ impl AssetRequest {
 
 /// A loaded model plus the data-derived pieces the engine needs.
 ///
+/// `class` is resolved at load-complete from the class-flags word and padded
+/// prototype the parser captured, **before** the actor profile is parsed. The
+/// flags slot is reused later as the actor parameter-program pointer, so the
+/// class must never be read after that point.
+///
 /// `actor: None` is the normal non-actor case: a door, prop, effect or pickup.
 /// The profile is the only bridge between the model data and [`ActorRuntime`].
 #[derive(Debug, PartialEq)]
 pub struct ModelAsset {
     pub model: object::ObjectModel,
     pub textured: object::TexturedMesh,
+    pub class: RenderClass,
     pub actor: Option<ActorProfile>,
 }
 
@@ -165,6 +172,9 @@ impl AssetSource for ImmediateSource {
             if !model.name.eq_ignore_ascii_case(&request.name) {
                 continue;
             }
+            // Class first: the captured flags word is only valid at
+            // load-complete, before actor initialisation reuses the slot.
+            let class = classify_loaded(model.class_flags, &model.prototype);
             let actor = ActorProfile::parse(&bytes)?;
             let textured = object::textured_mesh(&model);
             return Ok(AssetCompletion::Loaded(
@@ -172,6 +182,7 @@ impl AssetSource for ImmediateSource {
                 ModelAsset {
                     model,
                     textured,
+                    class,
                     actor,
                 },
             ));
@@ -355,6 +366,15 @@ mod tests {
         };
         assert_eq!(request.name, "skinner");
         assert_eq!(asset.model.name, "skinner");
+        assert_eq!(
+            asset.model.prototype, "skinner",
+            "the synthetic helper writes the bare name"
+        );
+        assert_eq!(
+            asset.class,
+            crate::engine::class::RenderClass::Unclassified,
+            "no forced bit and no exact prototype row"
+        );
         assert_eq!(asset.textured.positions.len(), 6);
         let profile = asset.actor.as_ref().expect("skinner is an actor");
         assert_eq!(profile.kind, ActorKind::Monster);
@@ -363,6 +383,78 @@ mod tests {
             profile.entries.iter().map(|entry| entry.id).collect::<Vec<_>>(),
             vec![0x18, 0x25, 0x26]
         );
+    }
+
+    fn set_class_flags(bytes: &mut [u8], flags: u32) {
+        let base = crate::level::data_base(1);
+        bytes[base + 0x2C..base + 0x30].copy_from_slice(&flags.to_le_bytes());
+    }
+
+    /// The flags slot is reused later as the parameter-program pointer, so the
+    /// class must be captured at load-complete. These cases prove the class
+    /// comes from that word and not from the actor block (which is still parsed
+    /// into the same asset).
+    #[test]
+    fn class_is_resolved_from_the_load_time_flags_word_not_the_actor_kind() {
+        use crate::engine::class::{CLASS_FLAG_MONSTER, CLASS_FLAG_PHYSICAL, RenderClass};
+
+        let (_dir, path) = fixture();
+
+        let mut forced = crate::actor::synthetic_actor("skinner", &[5], trios());
+        set_class_flags(&mut forced, CLASS_FLAG_MONSTER | CLASS_FLAG_PHYSICAL);
+        let bytes = archive(&[(*b"NNER", forced)]);
+        std::fs::write(&path, bytes).expect("synthetic archive");
+        let source = ImmediateSource::open(&path).expect("index");
+        let AssetCompletion::Loaded(_, asset) =
+            source.load(&AssetRequest::for_name("skinner")).expect("load")
+        else {
+            panic!("skinner must load");
+        };
+        assert_eq!(
+            asset.class,
+            RenderClass::Physical,
+            "bit 18 is checked first and wins over bit 19"
+        );
+        assert!(
+            asset.actor.is_some(),
+            "the actor profile is still parsed after the class capture"
+        );
+
+        let mut clear = crate::actor::synthetic_actor("skinner", &[5], trios());
+        set_class_flags(&mut clear, 0);
+        let bytes = archive(&[(*b"NNER", clear)]);
+        std::fs::write(&path, bytes).expect("synthetic archive");
+        let source = ImmediateSource::open(&path).expect("index");
+        let AssetCompletion::Loaded(_, asset) =
+            source.load(&AssetRequest::for_name("skinner")).expect("load")
+        else {
+            panic!("skinner must load");
+        };
+        assert_eq!(
+            asset.class,
+            RenderClass::Unclassified,
+            "a monster actor block must not supply the class once the bits are clear"
+        );
+        assert_eq!(asset.actor.as_ref().map(|profile| profile.kind), Some(ActorKind::Monster));
+    }
+
+    #[test]
+    fn a_matching_prototype_name_classifies_without_a_forced_bit() {
+        use crate::engine::class::RenderClass;
+
+        let (_dir, path) = fixture();
+        let bytes = archive(&[(
+            *b"ZIEL",
+            crate::actor::synthetic_actor("raziel__", &[5], trios()),
+        )]);
+        std::fs::write(&path, bytes).expect("synthetic archive");
+        let source = ImmediateSource::open(&path).expect("index");
+        let AssetCompletion::Loaded(_, asset) =
+            source.load(&AssetRequest::for_name("raziel")).expect("load")
+        else {
+            panic!("raziel must load");
+        };
+        assert_eq!(asset.class, RenderClass::Raziel, "exact prototype row");
     }
 
     #[test]
