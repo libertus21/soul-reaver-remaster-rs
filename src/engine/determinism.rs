@@ -893,13 +893,14 @@ mod tests {
     // caller only decides how many fixed ticks are owed. No simulation module
     // may name a clock type, and two different wall-clock schedules that reach
     // the same tick count must fold the same state.
-    const SIMULATION_SOURCES: [(&str, &str); 12] = [
+    const SIMULATION_SOURCES: [(&str, &str); 13] = [
         ("clock.rs", include_str!("clock.rs")),
         ("frame.rs", include_str!("frame.rs")),
         ("world.rs", include_str!("world.rs")),
         ("placed.rs", include_str!("placed.rs")),
         ("live.rs", include_str!("live.rs")),
         ("class.rs", include_str!("class.rs")),
+        ("events.rs", include_str!("events.rs")),
         ("input.rs", include_str!("input.rs")),
         ("tracker.rs", include_str!("tracker.rs")),
         ("spawn.rs", include_str!("spawn.rs")),
