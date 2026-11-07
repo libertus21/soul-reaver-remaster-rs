@@ -24,6 +24,7 @@
 use std::fmt;
 use std::time::Duration;
 
+use crate::engine::actor::{ActorProfile, ActorRuntime};
 use crate::engine::class::{CLASS_TABLE, Hooks, Query, RenderClass, classify};
 use crate::engine::clock::{ObjectTick, SimClock};
 use crate::engine::determinism::{WorldEntry, WorldState};
@@ -218,6 +219,9 @@ pub struct FrameStats {
 pub struct DeferredSpawn {
     pub name: String,
     pub position: [i32; 3],
+    /// The actor profile the loaded model carried, if any. It is copied from
+    /// `ModelAsset::actor`; the spawner never parses data itself.
+    pub actor: Option<ActorProfile>,
 }
 
 /// What the frame driver can fail on.
@@ -387,10 +391,38 @@ impl FrameState {
     /// that frame: it lands in the post-frame bookkeeping pass, exactly like an
     /// asynchronous load completion.
     pub fn queue_spawn(&mut self, name: impl Into<String>, position: [i32; 3]) {
+        self.queue_spawn_loaded(name, position, None);
+    }
+
+    /// Defer a spawn that carries the actor profile the loaded model supplied.
+    ///
+    /// This is the spawner's only route to an [`ActorRuntime`]: a model with no
+    /// actor block produces `actor = None`, so a non-actor can never gain an
+    /// actor carrier by name or class.
+    pub fn queue_spawn_loaded(
+        &mut self,
+        name: impl Into<String>,
+        position: [i32; 3],
+        actor: Option<ActorProfile>,
+    ) {
         self.spawn_queue.push(DeferredSpawn {
             name: name.into(),
             position,
+            actor,
         });
+    }
+
+    /// Attach an actor profile to an already-live object (the bound player).
+    ///
+    /// The player is bound by [`FrameState::new`] before assets are read, so the
+    /// boot pass supplies its profile here once. Returns `true` when the id
+    /// resolves and the carrier was attached.
+    pub fn attach_actor(&mut self, id: LiveId, profile: ActorProfile) -> bool {
+        let Ok(object) = self.live.get_mut(id) else {
+            return false;
+        };
+        object.actor = Some(ActorRuntime::initial(profile));
+        true
     }
 
     /// Defer a despawn to stage 18 of the next tick.
@@ -645,7 +677,7 @@ impl FrameState {
                 visible: true,
                 slot: None,
                 anim_index: 0,
-                actor: None,
+                actor: spawn.actor.map(ActorRuntime::initial),
             };
             self.live.spawn(object);
             self.stats.spawned = self.stats.spawned.saturating_add(1);
@@ -715,6 +747,7 @@ mod tests {
     use super::{
         CullView, FrameState, PLAYER_SPEED_UNITS_PER_TICK, STAGE_ORDER, Stage,
     };
+    use crate::engine::actor::ActorProfile;
     use crate::engine::determinism::world_state_hash;
     use crate::engine::input::{InputButton, InputEvent};
     use crate::engine::clock::ObjectTick;
@@ -765,6 +798,41 @@ mod tests {
         "monster_wallcr",
         "particle_dust",
     ];
+
+    fn probe_trios() -> [[u8; 3]; 8] {
+        [
+            [13, 31, 31],
+            [25, 16, 12],
+            [9, 5, 11],
+            [7, 13, 27],
+            [19, 2, 11],
+            [20, 3, 2],
+            [9, 0, 55],
+            [19, 8, 1],
+        ]
+    }
+
+    fn actor_profile(ids: &[u8]) -> ActorProfile {
+        ActorProfile::parse(&crate::actor::synthetic_actor("probe", ids, probe_trios()))
+            .expect("a synthetic actor must parse")
+            .expect("a synthetic actor must carry a block")
+    }
+
+    fn carrier_profiles(frame: &FrameState) -> Vec<(crate::actor::ActorKind, [[u8; 3]; 8], Vec<u8>)> {
+        frame
+            .live()
+            .iter()
+            .filter_map(|(_, object)| object.actor.as_ref())
+            .map(|actor| {
+                let profile = actor.profile();
+                (
+                    profile.kind,
+                    profile.trios,
+                    profile.entries.iter().map(|entry| entry.id).collect(),
+                )
+            })
+            .collect()
+    }
 
     fn frame() -> FrameState {
         FrameState::new(world_with_raziel())
@@ -875,6 +943,116 @@ mod tests {
         assert_eq!(stats.generic_ticks, 10 * 4);
         assert_eq!(stats.hooked_ticks, 0, "no non-tick class may run a tick body");
         assert_eq!(stats.actor_ticks, 0);
+    }
+
+    #[test]
+    fn actor_state_sequence_is_stable_and_repeatable() {
+        fn run() -> (Vec<Vec<(u8, u8)>>, u64) {
+            let mut frame = FrameState::new(empty_world());
+            let profile = actor_profile(&[0x18, 0x25]);
+            frame.queue_spawn_loaded("monster_wallcr", [1, 0, 0], Some(profile.clone()));
+            frame.queue_spawn_loaded("raziel__probe", [2, 0, 0], Some(profile));
+            tick(&mut frame, 0);
+
+            let mut sequence = Vec::new();
+            for index in 1..=20 {
+                tick(&mut frame, index);
+                sequence.push(
+                    frame
+                        .live()
+                        .iter()
+                        .map(|(_, object)| {
+                            let actor = object.actor.as_ref().expect("both probes are actors");
+                            (actor.relation(), actor.state())
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            (sequence, frame.stats().actor_ticks)
+        }
+
+        let (first, first_ticks) = run();
+        let (second, second_ticks) = run();
+        assert_eq!(
+            first, second,
+            "the same actor world must replay the same per-tick runtime state"
+        );
+        assert_eq!(first_ticks, second_ticks);
+        assert_eq!(
+            first_ticks,
+            2 * 20,
+            "both tick classes reach an actor carrier on every tick"
+        );
+        assert!(
+            first.iter().all(|row| row == &vec![(0u8, 0u8); 2]),
+            "no relation or action id is selected while the decision body is UNKNOWN"
+        );
+    }
+
+    #[test]
+    fn profile_data_is_observable_and_unchanged_by_ticking() {
+        let mut frame = FrameState::new(empty_world());
+        let profile = actor_profile(&[0x18, 0x25, 0x26]);
+        frame.queue_spawn_loaded("monster_wallcr", [0, 0, 0], Some(profile.clone()));
+        tick(&mut frame, 0);
+
+        let before = carrier_profiles(&frame);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].1, probe_trios());
+        assert_eq!(before[0].2, vec![0x18, 0x25, 0x26]);
+
+        for index in 1..=30 {
+            tick(&mut frame, index);
+        }
+
+        assert_eq!(
+            carrier_profiles(&frame),
+            before,
+            "ticking must not consume, reorder or reinterpret the behaviour data"
+        );
+        assert_eq!(
+            frame
+                .live()
+                .iter()
+                .find(|(_, object)| object.name == "monster_wallcr")
+                .and_then(|(_, object)| object.actor.as_ref())
+                .expect("the carrier survives")
+                .state(),
+            0,
+            "the profile ids stay data; no id is copied into the action state"
+        );
+    }
+
+    #[test]
+    fn a_non_actor_class_never_advances_an_actor_carrier() {
+        let mut frame = FrameState::new(empty_world());
+        frame.queue_spawn_loaded("particle_dust", [0, 0, 0], Some(actor_profile(&[0x18])));
+        // A tick class with no actor block is hooked but has nothing to advance.
+        frame.queue_spawn_loaded("monster_wallcr", [1, 0, 0], None);
+        tick(&mut frame, 0);
+
+        for index in 1..=10 {
+            tick(&mut frame, index);
+        }
+
+        let stats = frame.stats();
+        assert_eq!(stats.generic_ticks, 10 * 2);
+        assert_eq!(
+            stats.hooked_ticks, 10,
+            "only the monster row installs a tick; the particle class never does"
+        );
+        assert_eq!(
+            stats.actor_ticks, 0,
+            "the particle carrier is never advanced and the monster has no carrier"
+        );
+
+        let particle = frame
+            .live()
+            .iter()
+            .find(|(_, object)| object.name == "particle_dust")
+            .and_then(|(_, object)| object.actor.as_ref())
+            .expect("the non-actor class still carries the data it was given");
+        assert_eq!((particle.relation(), particle.state()), (0, 0));
     }
 
     #[test]

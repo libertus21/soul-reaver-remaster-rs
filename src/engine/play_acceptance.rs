@@ -299,3 +299,65 @@ fn fixed_step_bound_holds_on_the_synthetic_world() {
     assert_eq!(total, 600, "ten seconds at 60 Hz is 600 ticks, none lost");
     assert_eq!(frame.ticks(), 600);
 }
+
+#[test]
+fn boot_carries_a_loaded_actor_profile_into_the_live_object() {
+    let trios = [
+        [13, 31, 31],
+        [25, 16, 12],
+        [9, 5, 11],
+        [7, 13, 27],
+        [19, 2, 11],
+        [20, 3, 2],
+        [9, 0, 55],
+        [19, 8, 1],
+    ];
+    let room = pcm_room("under1", &[("monster_wal", [0, 0, 0])]);
+    let model = crate::actor::synthetic_actor("monster_wal", &[0x18, 0x25], trios);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("BIGFILE.DAT");
+    let bytes = synthetic_archive(&[
+        (suffix("under1"), room),
+        (suffix("monster_wal"), model),
+    ]);
+    std::fs::write(&path, bytes).expect("synthetic archive");
+
+    let world = World::load(&path, "under1").expect("the synthetic world must load");
+    let mut frame = FrameState::new(world);
+    let counts = boot_world(&mut frame, &path).expect("boot");
+    assert_eq!(counts.admitted, 1);
+
+    frame
+        .run_tick(crate::engine::clock::ObjectTick::step(0))
+        .expect("stage 18 applies the deferred spawn");
+    let object = frame
+        .live()
+        .iter()
+        .find(|(_, object)| object.name == "monster_wal")
+        .map(|(_, object)| object)
+        .expect("the model must spawn");
+    let actor = object
+        .actor
+        .as_ref()
+        .expect("boot must carry the loaded actor profile");
+    assert_eq!(actor.profile().trios, trios);
+    assert_eq!(
+        actor
+            .profile()
+            .entries
+            .iter()
+            .map(|entry| entry.id)
+            .collect::<Vec<_>>(),
+        vec![0x18, 0x25]
+    );
+
+    frame
+        .run_tick(crate::engine::clock::ObjectTick::step(1))
+        .expect("tick");
+    assert_eq!(
+        frame.stats().actor_ticks,
+        1,
+        "the monster class reaches the carrier on the next per-object pass"
+    );
+}

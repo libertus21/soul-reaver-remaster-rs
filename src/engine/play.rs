@@ -24,6 +24,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::cli_out::outln;
+use crate::engine::actor::ActorProfile;
 use crate::engine::assets::{AssetRequest, AssetStore, ImmediateSource};
 use crate::engine::backend_wgpu::WgpuBackend;
 use crate::engine::clock::ObjectTick;
@@ -360,9 +361,11 @@ fn boot_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunE
     let mut assets = AssetStore::new(source);
 
     let player_bound = frame.player().is_some();
+    let player = frame.player();
+    let mut player_profile: Option<ActorProfile> = None;
     let mut counts = SeedCounts::default();
-    let mut resolved: BTreeMap<String, bool> = BTreeMap::new();
-    let mut spawns: Vec<(String, [i32; 3])> = Vec::new();
+    let mut resolved: BTreeMap<String, (bool, Option<ActorProfile>)> = BTreeMap::new();
+    let mut spawns: Vec<(String, [i32; 3], Option<ActorProfile>)> = Vec::new();
 
     let records = frame.world().placed.records_for_boot();
     counts.placed = records.len();
@@ -383,22 +386,31 @@ fn boot_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunE
 
         let name = &record.name;
         if player_bound && name.eq_ignore_ascii_case(PLAYER_NAME) {
-            // `FrameState::new` already bound the player live object.
+            // `FrameState::new` already bound the player live object; only its
+            // data-keyed actor carrier is still missing. A player model without
+            // a container stays a non-actor, exactly like an unresolved spawn.
+            let completion = assets
+                .load(AssetRequest::for_name(name))
+                .map_err(|error| RunError::Asset(error.to_string()))?;
+            if let Some(profile) = completion.asset().and_then(|asset| asset.actor.clone()) {
+                player_profile = Some(profile);
+            }
             continue;
         }
 
-        let loaded = match resolved.get(name) {
-            Some(&loaded) => loaded,
+        let (loaded, actor) = match resolved.get(name) {
+            Some((loaded, actor)) => (*loaded, actor.clone()),
             None => {
                 let completion = assets
                     .load(AssetRequest::for_name(name))
                     .map_err(|error| RunError::Asset(error.to_string()))?;
                 let loaded = completion.is_loaded();
+                let actor = completion.asset().and_then(|asset| asset.actor.clone());
                 if !loaded {
                     counts.unresolved += 1;
                 }
-                resolved.insert(name.clone(), loaded);
-                loaded
+                resolved.insert(name.clone(), (loaded, actor.clone()));
+                (loaded, actor)
             }
         };
         if loaded {
@@ -409,12 +421,16 @@ fn boot_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunE
                     i32::from(record.position[1]),
                     i32::from(record.position[2]),
                 ],
+                actor,
             ));
         }
     }
 
-    for (name, position) in spawns {
-        frame.queue_spawn(name, position);
+    for (name, position, actor) in spawns {
+        frame.queue_spawn_loaded(name, position, actor);
+    }
+    if let (Some(player), Some(profile)) = (player, player_profile) {
+        let _attached = frame.attach_actor(player, profile);
     }
     Ok(counts)
 }
