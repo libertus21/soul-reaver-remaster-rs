@@ -28,6 +28,7 @@ use crate::engine::actor::{ActorProfile, ActorRuntime};
 use crate::engine::class::{CLASS_TABLE, Hooks, Query, RenderClass, classify};
 use crate::engine::clock::{ObjectTick, SimClock};
 use crate::engine::determinism::{WorldEntry, WorldState};
+use crate::engine::events::{EngineEvent, EventQueue};
 use crate::engine::input::{InputEvent, InputFrame, InputQueue};
 use crate::engine::live::{LiveArena, LiveId, LiveObject};
 use crate::engine::tracker::{ObjectTracker, TrackerError};
@@ -210,6 +211,14 @@ pub struct FrameStats {
     /// object to carry an [`ActorRuntime`], so it proves that the actor path ran
     /// and not merely that the class gate opened.
     pub actor_ticks: u64,
+    /// Events pushed through [`FrameState::queue_event`]. Events synthesized by
+    /// a producing stage would not pass through this counter.
+    pub events_queued: u64,
+    /// Events drained at the delivery stage and handed to a target lookup.
+    pub events_delivered: u64,
+    /// Delivered events whose target class installs an event hook. The hook body
+    /// is an empty witness; this counter proves the seam reached the object.
+    pub event_hook_calls: u64,
     pub spawned: u64,
     pub despawned: u64,
 }
@@ -258,6 +267,7 @@ pub struct FrameState {
     tracker: ObjectTracker,
     clock: SimClock,
     input_queue: InputQueue,
+    events: EventQueue,
     current_input: InputFrame,
     player: Option<LiveId>,
     view: CullView,
@@ -284,6 +294,7 @@ impl FrameState {
             tracker: ObjectTracker::new(),
             clock: SimClock::new(),
             input_queue: InputQueue::new(),
+            events: EventQueue::new(),
             current_input: InputFrame::NONE,
             player: None,
             view: CullView::default(),
@@ -389,6 +400,28 @@ impl FrameState {
 
     pub fn queued_input_len(&self) -> usize {
         self.input_queue.pending_len()
+    }
+
+    /// Queue one event for the tick that is about to run.
+    ///
+    /// This is the carrier seam, not gameplay. In this slice no producing stage
+    /// feeds it from real world state: stage 11 has no animation timeline to
+    /// reach a strike transition, and stage 13 has no pinned cylinder extent or
+    /// trigger-record source. The seam exists so the queue, the delivery stage
+    /// and the actor view are real and testable; a later evidence-backed slice
+    /// replaces the empty producer bodies, not the plumbing.
+    ///
+    /// The event is delivered once, at the delivery stage of the next tick, and
+    /// the queue is cleared there. It is never delivered by a later tick and it
+    /// never enters the canonical digest.
+    pub fn queue_event(&mut self, event: EngineEvent) {
+        self.events.push(event);
+        self.stats.events_queued = self.stats.events_queued.saturating_add(1);
+    }
+
+    /// Events waiting for the next tick's delivery stage.
+    pub fn pending_events(&self) -> usize {
+        self.events.len()
     }
 
     /// Defer a spawn to stage 18 of the next tick.
@@ -620,8 +653,15 @@ impl FrameState {
     /// until the contact slice.
     fn stage_pairwise_contact(&mut self) {}
 
-    /// Stage 11 - hit-record pass per object. Documented no-op until the hit
-    /// slice.
+    /// Stage 11 - hit-record pass per object.
+    ///
+    /// Evidence: the pass walks each object's attack/hit list and resolves it
+    /// (`docs/notes/actor-ai.md` section 1). The **producer** of a hit record is
+    /// the actor base update's strike transition, which needs the animation
+    /// timeline's action kind (`docs/notes/actor-ai.md` section 3). This engine
+    /// has no animation timeline, so it has no evidenced source of a hit record
+    /// and this pass queues none. The body is the producer seam; it does not
+    /// manufacture a hit to keep the pass busy.
     fn stage_hit_list(&mut self) {}
 
     /// Stage 12 - generic per-object tick.
@@ -654,9 +694,42 @@ impl FrameState {
         }
     }
 
-    /// Stage 13 - area/trigger query pass. Documented no-op until the trigger
-    /// slice.
-    fn stage_trigger_query(&mut self) {}
+    /// Stage 13 - area/trigger query pass and the defined event delivery stage.
+    ///
+    /// Evidence: a spatial query from a cylinder around each object
+    /// (`docs/notes/actor-ai.md` section 1). The cylinder dimensions and the
+    /// trigger-record source are UNKNOWN, so this pass produces no contact
+    /// event. It is also the **delivery stage**: every event queued for this
+    /// tick is drained here, in FIFO order, delivered to the target's event hook
+    /// and then forgotten. Because the drain clears the queue, an event produced
+    /// in tick N can never be delivered by tick N+1.
+    fn stage_trigger_query(&mut self) {
+        self.deliver_events();
+    }
+
+    /// Deliver every queued event to its target object's event hook.
+    ///
+    /// Delivery follows the queue's FIFO order and never reorders by class,
+    /// producer or target. A target that is no longer live still counts as
+    /// delivered; a null hook is the documented class opt-out and makes zero
+    /// calls. The hook body is an empty witness, so this function changes no
+    /// simulation state; the drain is what makes the event transient.
+    fn deliver_events(&mut self) {
+        let events = self.events.drain();
+        for event in events {
+            self.stats.events_delivered = self.stats.events_delivered.saturating_add(1);
+            let target = event.target();
+            let hook = self
+                .live
+                .get(target)
+                .ok()
+                .and_then(|object| hooks_for_class(object.class).event);
+            if let Some(hook) = hook {
+                self.stats.event_hook_calls = self.stats.event_hook_calls.saturating_add(1);
+                hook(&mut self.world, target, &event);
+            }
+        }
+    }
 
     /// Stage 14 - moving-object world/contact pass. Documented no-op until the
     /// contact slice.
@@ -785,6 +858,7 @@ mod tests {
     };
     use crate::engine::actor::ActorProfile;
     use crate::engine::determinism::world_state_hash;
+    use crate::engine::events::{ContactRecord, EngineEvent, HitRecord, Message};
     use crate::engine::input::{InputButton, InputEvent};
     use crate::engine::clock::ObjectTick;
     use crate::engine::world::World;
@@ -1353,5 +1427,78 @@ mod tests {
         assert_eq!(STAGE_ORDER[0], Stage::Clock);
         assert_eq!(STAGE_ORDER[17], Stage::PostFrameChanges);
         assert_eq!(STAGE_ORDER[17].name(), "post-frame-changes");
+    }
+
+    #[test]
+    fn queued_events_are_drained_once_at_the_delivery_stage() {
+        let mut frame = frame();
+        let player = frame.player().expect("the player is bound");
+        frame.queue_event(EngineEvent::Message(Message {
+            target: player,
+            code: 1,
+        }));
+        frame.queue_event(EngineEvent::Contact(ContactRecord {
+            source: player,
+            target: player,
+        }));
+        assert_eq!(frame.pending_events(), 2);
+
+        tick(&mut frame, 0);
+        assert_eq!(frame.pending_events(), 0, "the delivery stage drained the queue");
+        assert_eq!(frame.stats().events_delivered, 2);
+        assert_eq!(
+            frame.stats().event_hook_calls,
+            2,
+            "the Raziel row installs the event witness, so delivery reaches a hook"
+        );
+
+        tick(&mut frame, 1);
+        assert_eq!(
+            frame.stats().events_delivered,
+            2,
+            "a drained event is never delivered again"
+        );
+        assert_eq!(frame.stats().event_hook_calls, 2);
+    }
+
+    #[test]
+    fn an_event_produced_in_one_tick_is_never_delivered_in_the_next() {
+        let mut frame = frame();
+        let player = frame.player().expect("the player is bound");
+        frame.queue_event(EngineEvent::Hit(HitRecord {
+            attacker: player,
+            target: player,
+            bone: 2,
+            radius_mask: 0x0004,
+        }));
+        tick(&mut frame, 0);
+        let delivered = frame.stats().events_delivered;
+        assert_eq!(delivered, 1);
+
+        for index in 1..=5 {
+            tick(&mut frame, index);
+            assert_eq!(
+                frame.stats().events_delivered,
+                delivered,
+                "tick {index} must not see the previous tick's event"
+            );
+            assert_eq!(frame.pending_events(), 0);
+        }
+        assert_eq!(frame.stats().events_queued, 1);
+    }
+
+    #[test]
+    fn the_hit_and_trigger_passes_produce_no_event_without_an_evidenced_source() {
+        let mut frame = frame();
+        for index in 0..10 {
+            tick(&mut frame, index);
+            assert_eq!(
+                frame.pending_events(),
+                0,
+                "no producing pass may invent a hit or a trigger"
+            );
+        }
+        assert_eq!(frame.stats().events_queued, 0);
+        assert_eq!(frame.stats().events_delivered, 0);
     }
 }

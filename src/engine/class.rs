@@ -11,6 +11,7 @@
 //! exactly, so adding a class is still a row, not another match arm.
 
 use crate::engine::clock::ObjectTick;
+use crate::engine::events::EngineEvent;
 use crate::engine::live::{LiveArena, LiveId};
 use crate::engine::world::World;
 
@@ -38,19 +39,20 @@ impl RenderClass {
     }
 }
 
-/// Placeholder payloads for the hook signatures. The frame pipeline (T8) fills
-/// their bodies; they exist now so the class table can carry concrete function
-/// pointers without inventing AI state.
-#[allow(dead_code)]
-pub struct Event;
+/// Placeholder payload for the query signature. The query pass fills it later;
+/// it exists now so the class table can carry a concrete function pointer
+/// without inventing query state.
 #[allow(dead_code)]
 pub struct Query;
 #[allow(dead_code)]
 pub struct QueryAnswer;
 
-/// Event/message entry (`+0x1A0`).
-pub type EventHook = fn(&mut World, LiveId, &Event);
-/// Per-frame tick (`+0x1A8`).
+/// Event/message entry (hook slot 3).
+///
+/// The evidence says this entry receives the world context and hit payloads.
+/// The event carrier is [`EngineEvent`]; the body is not implemented.
+pub type EventHook = fn(&mut World, LiveId, &EngineEvent);
+/// Per-frame tick (hook slot 6).
 ///
 /// The live arena is passed explicitly because an actor's per-object runtime
 /// state lives on its [`crate::engine::live::LiveObject`], not on the authored
@@ -122,19 +124,30 @@ fn monster_tick(world: &mut World, live: &mut LiveArena, id: LiveId, tick: Objec
     actor_runtime_tick(world, live, id, tick);
 }
 
+/// Witness body for the event/message hook slot.
+///
+/// The evidence pins the slot and that per-actor binders install a body there;
+/// it does not pin the body. This function therefore does nothing: it takes the
+/// event and changes no world, live or actor state. Its only purpose is to make
+/// the delivery seam real and testable without inventing a handler.
+fn actor_event(_world: &mut World, _id: LiveId, _event: &EngineEvent) {}
+
 /// The six documented renderer prefixes.
 ///
 /// `raziel__` and `monster_` opt into the generic tick; `sreavr__`, `glphicon`,
-/// `physical` and `particle` leave it null. No class carries an event or query
-/// hook in this milestone. Both installed tick bodies share the actor-carriage
-/// body: the per-class behaviour (player interaction, monster locomotion) is not
-/// implemented, but the dispatch and the carrier are real.
+/// `physical` and `particle` leave it null. The same two actor rows install the
+/// empty event witness on hook slot 3: the evidence attests per-actor event
+/// entries, not entries for the other four rows, so those stay null rather than
+/// growing an unproven hook. No class carries a query hook in this milestone.
+/// Both installed tick bodies share the actor-carriage body: the per-class
+/// behaviour (player interaction, monster locomotion) is not implemented, but
+/// the dispatch and the carrier are real.
 pub const CLASS_TABLE: [ClassEntry; 6] = [
     ClassEntry {
         prefix: "raziel__",
         class: RenderClass::Raziel,
         hooks: Hooks {
-            event: None,
+            event: Some(actor_event),
             tick: Some(raziel_tick),
             query: None,
         },
@@ -158,7 +171,7 @@ pub const CLASS_TABLE: [ClassEntry; 6] = [
         prefix: "monster_",
         class: RenderClass::Monster,
         hooks: Hooks {
-            event: None,
+            event: Some(actor_event),
             tick: Some(monster_tick),
             query: None,
         },
@@ -226,15 +239,15 @@ mod tests {
     fn class_table_covers_every_prefix_and_declares_every_slot() {
         assert_eq!(CLASS_TABLE.len(), 6, "the six documented prefixes");
 
-        let cases: [(&str, RenderClass, bool); 6] = [
-            ("raziel__", RenderClass::Raziel, true),
-            ("sreavr__", RenderClass::Sreavr, false),
-            ("glphicon", RenderClass::GlyphIcon, false),
-            ("physical", RenderClass::Physical, false),
-            ("monster_", RenderClass::Monster, true),
-            ("particle", RenderClass::Particle, false),
+        let cases: [(&str, RenderClass, bool, bool); 6] = [
+            ("raziel__", RenderClass::Raziel, true, true),
+            ("sreavr__", RenderClass::Sreavr, false, false),
+            ("glphicon", RenderClass::GlyphIcon, false, false),
+            ("physical", RenderClass::Physical, false, false),
+            ("monster_", RenderClass::Monster, true, true),
+            ("particle", RenderClass::Particle, false, false),
         ];
-        for (prefix, class, has_tick) in cases {
+        for (prefix, class, has_tick, has_event) in cases {
             let entry = classify_entry(prefix)
                 .unwrap_or_else(|| panic!("prefix '{prefix}' must be in the table"));
             assert_eq!(entry.prefix, prefix);
@@ -245,7 +258,11 @@ mod tests {
                 has_tick,
                 "tick slot for '{prefix}'"
             );
-            assert!(entry.hooks.event.is_none(), "event slot for '{prefix}'");
+            assert_eq!(
+                entry.hooks.event.is_some(),
+                has_event,
+                "event slot for '{prefix}'"
+            );
             assert!(entry.hooks.query.is_none(), "query slot for '{prefix}'");
         }
 
@@ -268,6 +285,28 @@ mod tests {
                 | RenderClass::Particle => {
                     assert!(entry.hooks.tick.is_none(), "{} must not tick", entry.prefix)
                 }
+                RenderClass::Unclassified => panic!("no table row may be unclassified"),
+            }
+        }
+    }
+
+    #[test]
+    fn only_raziel_and_monster_install_the_event_witness() {
+        for entry in CLASS_TABLE {
+            match entry.class {
+                RenderClass::Raziel | RenderClass::Monster => assert!(
+                    entry.hooks.event.is_some(),
+                    "{} carries the attested per-actor event entry",
+                    entry.prefix
+                ),
+                RenderClass::Sreavr
+                | RenderClass::GlyphIcon
+                | RenderClass::Physical
+                | RenderClass::Particle => assert!(
+                    entry.hooks.event.is_none(),
+                    "{} has no attested event entry; the slot stays null",
+                    entry.prefix
+                ),
                 RenderClass::Unclassified => panic!("no table row may be unclassified"),
             }
         }
