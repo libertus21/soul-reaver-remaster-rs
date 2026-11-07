@@ -14,6 +14,7 @@
 
 use crate::actor::{self as parser, ActorBlock, ActorKind, BehaviourEntry, EntryArrayKind};
 use crate::engine::clock::ObjectTick;
+use crate::engine::events::EngineEvent;
 use crate::engine::live::LiveId;
 use crate::object::ObjectError;
 
@@ -136,17 +137,24 @@ impl ActorRuntime {
 
     /// The documented transition entry point, called by the per-frame tick.
     ///
-    /// This is the only route by which the runtime may advance. The decision
-    /// body that would choose a relation or an action id is UNKNOWN: the notes
-    /// pin the numeric ids but not their meaning, and the shipped ids are
-    /// model-relative (`docs/notes/actor-ai.md` section 5,
-    /// `docs/notes/actor-behaviour-data.md` section 7). The step therefore
-    /// selects nothing and leaves every field untouched; it returns an explicit
-    /// [`ActorTransition::NotInterpreted`] instead of inventing a transition.
+    /// This is the only route by which the runtime may advance. `events` is the
+    /// FIFO view of the events addressed to this object for the current tick,
+    /// already produced by the frame pipeline. The carrier now **receives**
+    /// events; it still selects nothing from them.
     ///
-    /// Later evidence-backed slices replace this body; the dispatch, the carrier
-    /// and the determinism fold do not need to change for that.
-    pub fn advance(&mut self, _step: ObjectTick) -> ActorTransition {
+    /// The decision body that would choose a relation or an action id is
+    /// UNKNOWN: the notes pin the numeric ids but not their meaning, and the
+    /// shipped ids are model-relative (`docs/notes/actor-ai.md` section 5,
+    /// `docs/notes/actor-behaviour-data.md` section 7). The step therefore
+    /// leaves every field untouched regardless of what `events` contains, and
+    /// returns an explicit [`ActorTransition::NotInterpreted`] instead of
+    /// inventing a transition. Damage, health, knockback and combat resolution
+    /// are out of scope and are not read here.
+    ///
+    /// Later evidence-backed slices replace this body; the dispatch, the carrier,
+    /// the event plumbing and the determinism fold do not need to change for
+    /// that.
+    pub fn advance(&mut self, _step: ObjectTick, _events: &[EngineEvent]) -> ActorTransition {
         ActorTransition::NotInterpreted
     }
 
@@ -226,6 +234,54 @@ mod tests {
         assert_eq!(runtime.target(), None);
         assert_eq!(runtime.flags(), 0);
         assert_eq!(runtime.profile().kind, ActorKind::Monster);
+    }
+
+    #[test]
+    fn advance_receives_events_and_still_selects_nothing() {
+        use crate::engine::events::{ContactRecord, EngineEvent, HitRecord, Message};
+
+        let mut runtime = ActorRuntime::initial(profile("skinner", &[0x18, 0x25]));
+        let before = runtime.clone();
+        let events = [
+            EngineEvent::Hit(HitRecord {
+                attacker: LiveId {
+                    index: 1,
+                    generation: 0,
+                },
+                target: LiveId {
+                    index: 2,
+                    generation: 0,
+                },
+                bone: 3,
+                radius_mask: 0x0001,
+            }),
+            EngineEvent::Contact(ContactRecord {
+                source: LiveId {
+                    index: 2,
+                    generation: 0,
+                },
+                target: LiveId {
+                    index: 2,
+                    generation: 0,
+                },
+            }),
+            EngineEvent::Message(Message {
+                target: LiveId {
+                    index: 2,
+                    generation: 0,
+                },
+                code: 7,
+            }),
+        ];
+
+        let outcome = runtime.advance(crate::engine::clock::ObjectTick::step(1), &events);
+
+        assert_eq!(outcome, crate::engine::actor::ActorTransition::NotInterpreted);
+        assert_eq!(
+            runtime, before,
+            "receiving events must not change relation, state, target, flags or the profile"
+        );
+        assert_eq!((runtime.relation(), runtime.state()), (0, 0));
     }
 
     #[test]
