@@ -505,17 +505,28 @@ impl FrameState {
                 .live
                 .iter()
                 .map(|(_, object)| {
-                    let (actor, relation, state) = match &object.actor {
-                        Some(runtime) => (1, runtime.relation(), runtime.state()),
-                        None => (0, 0, 0),
-                    };
+                    let (actor, relation, current, queued, alternate, entry_action) =
+                        match &object.actor {
+                            Some(runtime) => (
+                                1,
+                                runtime.relation(),
+                                runtime.current(),
+                                runtime.queued(),
+                                runtime.alternate(),
+                                runtime.entry_action(),
+                            ),
+                            None => (0, 0, 0, 0, None, 0),
+                        };
                     WorldEntry {
                         class: object.class.code(),
                         position: object.position,
                         visible: object.visible,
                         actor,
                         relation,
-                        state,
+                        current,
+                        queued,
+                        alternate,
+                        entry_action,
                     }
                 })
                 .collect(),
@@ -1205,7 +1216,7 @@ mod tests {
                         .iter()
                         .map(|(_, object)| {
                             let actor = object.actor.as_ref().expect("both probes are actors");
-                            (actor.relation(), actor.state())
+                            (actor.relation(), actor.current())
                         })
                         .collect::<Vec<_>>(),
                 );
@@ -1259,9 +1270,9 @@ mod tests {
                 .find(|(_, object)| object.name == "monster_wallcr")
                 .and_then(|(_, object)| object.actor.as_ref())
                 .expect("the carrier survives")
-                .state(),
+                .current(),
             0,
-            "the profile ids stay data; no id is copied into the action state"
+            "the profile ids stay data; no id is copied into the current state"
         );
     }
 
@@ -1294,7 +1305,7 @@ mod tests {
             .find(|(_, object)| object.name == "particle_dust")
             .and_then(|(_, object)| object.actor.as_ref())
             .expect("the non-actor class still carries the data it was given");
-        assert_eq!((particle.relation(), particle.state()), (0, 0));
+        assert_eq!((particle.relation(), particle.current()), (0, 0));
     }
 
     #[test]
@@ -1567,7 +1578,7 @@ mod tests {
             without, with,
             "advance receives events but must not change relation, state, target or flags"
         );
-        assert_eq!((without.relation(), without.state()), (0, 0));
+        assert_eq!((without.relation(), without.current()), (0, 0));
         assert_eq!(passed_without, 0, "the no-event run passes nothing");
         assert_eq!(
             passed_with, 2,

@@ -92,8 +92,10 @@ engine unit=<name> rooms=<R> placed=<P> admitted=<A> tracked=<T> skipped_markers
 ```
 
 `digest` is FNV-1a 64 over the tick count and, in live-list order, each live
-object's class byte, integer position and visible byte. It does not include the
-tracker slot, wall-clock time, GPU state or hash-map order. It is a
+object's class byte, integer position and visible byte, plus, when the object
+carries an actor runtime, its relation and four state bytes (`current`,
+`queued`, `alternate`, entry/action). It does not include the tracker slot,
+wall-clock time, GPU state or hash-map order. It is a
 same-platform, same-build gate: the path fold uses the OS-native encoding, so
 non-ASCII paths are out of scope across platforms. `--unit` defaults to
 `under1`; `--ticks` defaults to 60 in headless mode.

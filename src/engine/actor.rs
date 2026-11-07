@@ -7,10 +7,17 @@
 //! **no name**, because the name is a spawn-policy key and must never reach the
 //! AI layer (`docs/changes/engine-skeleton/design.md`, seam B).
 //!
-//! [`ActorRuntime`] holds only numeric state: the relation code, the action
-//! state id, an optional live target and a flag word. No enum is invented for
-//! the state ids: the shipped ids are model-relative bytes, as recorded in
-//! `docs/notes/actor-ai.md` and `docs/notes/actor-behaviour-data.md`.
+//! [`ActorRuntime`] holds only numeric state: the relation code, the four state
+//! bytes the transition-table note identifies (**current**, **queued**,
+//! **alternate** and **entry/action**), an optional live target and a flag
+//! word. No enum is invented for the state ids: the shipped ids are
+//! model-relative bytes, as recorded in `docs/notes/actor-ai.md`,
+//! `docs/notes/actor-behaviour-data.md` and
+//! `docs/notes/actor-transition-table.md` section 1.
+//!
+//! The four state bytes are carried now, but no transition rule runs yet. The
+//! eleven writer bodies remain UNKNOWN
+//! (`docs/notes/actor-transition-table.md` section 6).
 
 use crate::actor::{self as parser, ActorBlock, ActorKind, BehaviourEntry, EntryArrayKind};
 use crate::engine::clock::ObjectTick;
@@ -76,14 +83,31 @@ pub enum ActorTransition {
 /// Numeric runtime state for one live actor.
 ///
 /// There is intentionally no name field. The profile is the only data key, so
-/// renaming a model cannot change its runtime state. `relation` and `state` stay
-/// raw bytes: the shipped action ids have no stable global meaning and must not
-/// be turned into an invented enum.
+/// renaming a model cannot change its runtime state. Every state field stays a
+/// raw byte: the shipped ids have no stable global meaning and must not be
+/// turned into an invented enum.
+///
+/// The four state bytes are the ones the transition-table note identifies
+/// (`docs/notes/actor-transition-table.md` section 1):
+///
+/// - `current` - the selector the AI tick and the animation set read,
+/// - `queued` - a pending state,
+/// - `alternate` - a higher-priority pending state,
+/// - `entry_action` - the fourth companion byte written from the behaviour
+///   entry and copied into `current` by three writers. It is a state source,
+///   not the current state.
+///
+/// `alternate` is `Option<u8>` because the note establishes only that "set"
+/// means "not the not-set sentinel" and leaves the concrete sentinel UNKNOWN
+/// (see the transition-table note).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorRuntime {
     profile: ActorProfile,
     relation: u8,
-    state: u8,
+    current: u8,
+    queued: u8,
+    alternate: Option<u8>,
+    entry_action: u8,
     target: Option<LiveId>,
     flags: u32,
 }
@@ -92,14 +116,19 @@ impl ActorRuntime {
     /// Build the initial runtime state from a profile.
     ///
     /// The numeric fields start neutral: relation `0` (the first code of the
-    /// documented `0..3` relation space) and action state `0` (no action
-    /// selected yet). The profile is embedded, so two runtimes built from equal
-    /// profiles are equal regardless of the model name.
+    /// documented `0..3` relation space) and all four state bytes at their
+    /// neutral values (`0`, `0`, not set, `0`). No activation program has run,
+    /// so no queued or alternate state exists yet. The profile is embedded, so
+    /// two runtimes built from equal profiles are equal regardless of the model
+    /// name.
     pub fn initial(profile: ActorProfile) -> Self {
         Self {
             profile,
             relation: 0,
-            state: 0,
+            current: 0,
+            queued: 0,
+            alternate: None,
+            entry_action: 0,
             target: None,
             flags: 0,
         }
@@ -113,8 +142,24 @@ impl ActorRuntime {
         self.relation
     }
 
-    pub fn state(&self) -> u8 {
-        self.state
+    /// The current state selector.
+    pub fn current(&self) -> u8 {
+        self.current
+    }
+
+    /// The queued (pending) state.
+    pub fn queued(&self) -> u8 {
+        self.queued
+    }
+
+    /// The alternate (higher-priority pending) state, if set.
+    pub fn alternate(&self) -> Option<u8> {
+        self.alternate
+    }
+
+    /// The behaviour-entry companion byte (a state source, not `current`).
+    pub fn entry_action(&self) -> u8 {
+        self.entry_action
     }
 
     pub fn target(&self) -> Option<LiveId> {
@@ -130,9 +175,24 @@ impl ActorRuntime {
         self.relation = relation;
     }
 
-    /// Set the numeric action state id.
-    pub fn set_state(&mut self, state: u8) {
-        self.state = state;
+    /// Set the current state selector.
+    pub fn set_current(&mut self, current: u8) {
+        self.current = current;
+    }
+
+    /// Set the queued (pending) state.
+    pub fn set_queued(&mut self, queued: u8) {
+        self.queued = queued;
+    }
+
+    /// Set or clear the alternate (higher-priority pending) state.
+    pub fn set_alternate(&mut self, alternate: Option<u8>) {
+        self.alternate = alternate;
+    }
+
+    /// Set the behaviour-entry companion byte.
+    pub fn set_entry_action(&mut self, entry_action: u8) {
+        self.entry_action = entry_action;
     }
 
     /// The documented transition entry point, called by the per-frame tick.
@@ -148,8 +208,9 @@ impl ActorRuntime {
     /// `docs/notes/actor-behaviour-data.md` section 7). The step therefore
     /// leaves every field untouched regardless of what `events` contains, and
     /// returns an explicit [`ActorTransition::NotInterpreted`] instead of
-    /// inventing a transition. Damage, health, knockback and combat resolution
-    /// are out of scope and are not read here.
+    /// inventing a transition. In particular it applies no transition rule.
+    /// Damage, health, knockback and combat resolution are out of scope and are
+    /// not read here.
     ///
     /// Later evidence-backed slices replace this body; the dispatch, the carrier,
     /// the event plumbing and the determinism fold do not need to change for
@@ -230,7 +291,10 @@ mod tests {
     fn initial_runtime_is_numeric_and_neutral() {
         let runtime = ActorRuntime::initial(profile("skinner", &[0x25]));
         assert_eq!(runtime.relation(), 0);
-        assert_eq!(runtime.state(), 0);
+        assert_eq!(runtime.current(), 0);
+        assert_eq!(runtime.queued(), 0);
+        assert_eq!(runtime.alternate(), None);
+        assert_eq!(runtime.entry_action(), 0);
         assert_eq!(runtime.target(), None);
         assert_eq!(runtime.flags(), 0);
         assert_eq!(runtime.profile().kind, ActorKind::Monster);
@@ -279,9 +343,18 @@ mod tests {
         assert_eq!(outcome, crate::engine::actor::ActorTransition::NotInterpreted);
         assert_eq!(
             runtime, before,
-            "receiving events must not change relation, state, target, flags or the profile"
+            "receiving events must not change relation, the four state bytes, target, flags or the profile"
         );
-        assert_eq!((runtime.relation(), runtime.state()), (0, 0));
+        assert_eq!(
+            (
+                runtime.relation(),
+                runtime.current(),
+                runtime.queued(),
+                runtime.alternate(),
+                runtime.entry_action()
+            ),
+            (0, 0, 0, None, 0)
+        );
     }
 
     #[test]
@@ -290,7 +363,10 @@ mod tests {
         let initial = runtime.clone();
 
         runtime.set_relation(2);
-        runtime.set_state(0x25);
+        runtime.set_current(0x25);
+        runtime.set_queued(0x26);
+        runtime.set_alternate(Some(0x27));
+        runtime.set_entry_action(0x28);
         runtime.set_flags(0x04);
         runtime.set_target(Some(LiveId {
             index: 3,
@@ -299,7 +375,10 @@ mod tests {
 
         assert_ne!(runtime, initial);
         assert_eq!(runtime.relation(), 2);
-        assert_eq!(runtime.state(), 0x25);
+        assert_eq!(runtime.current(), 0x25);
+        assert_eq!(runtime.queued(), 0x26);
+        assert_eq!(runtime.alternate(), Some(0x27));
+        assert_eq!(runtime.entry_action(), 0x28);
         assert_eq!(runtime.flags(), 0x04);
         assert_eq!(
             runtime.target(),
