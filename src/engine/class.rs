@@ -59,7 +59,11 @@ pub type EventHook = fn(&mut World, LiveId, &EngineEvent);
 /// [`World`]. The original reads and writes the same per-object block from the
 /// tick hook; keeping the two stores separate is the engine's existing world /
 /// live split.
-pub type TickHook = fn(&mut World, &mut LiveArena, LiveId, ObjectTick);
+///
+/// The last argument is the FIFO view of the events addressed to this object for
+/// the current tick. It is how the carrier receives events; the body still
+/// selects nothing.
+pub type TickHook = fn(&mut World, &mut LiveArena, LiveId, ObjectTick, &[EngineEvent]);
 /// Query/state getter (`+0x1B0`).
 pub type QueryHook = fn(&World, LiveId, Query) -> QueryAnswer;
 
@@ -107,21 +111,39 @@ pub struct ClassEntry {
 /// collision. This slice only wires the existing carrier into the frame loop, so
 /// both classes share one carriage body. Diverging them later is changing the
 /// table row, not the dispatch.
-fn actor_runtime_tick(_world: &mut World, live: &mut LiveArena, id: LiveId, tick: ObjectTick) {
+fn actor_runtime_tick(
+    _world: &mut World,
+    live: &mut LiveArena,
+    id: LiveId,
+    tick: ObjectTick,
+    events: &[EngineEvent],
+) {
     let Ok(object) = live.get_mut(id) else {
         return;
     };
     if let Some(actor) = object.actor.as_mut() {
-        actor.advance(tick);
+        actor.advance(tick, events);
     }
 }
 
-fn raziel_tick(world: &mut World, live: &mut LiveArena, id: LiveId, tick: ObjectTick) {
-    actor_runtime_tick(world, live, id, tick);
+fn raziel_tick(
+    world: &mut World,
+    live: &mut LiveArena,
+    id: LiveId,
+    tick: ObjectTick,
+    events: &[EngineEvent],
+) {
+    actor_runtime_tick(world, live, id, tick, events);
 }
 
-fn monster_tick(world: &mut World, live: &mut LiveArena, id: LiveId, tick: ObjectTick) {
-    actor_runtime_tick(world, live, id, tick);
+fn monster_tick(
+    world: &mut World,
+    live: &mut LiveArena,
+    id: LiveId,
+    tick: ObjectTick,
+    events: &[EngineEvent],
+) {
+    actor_runtime_tick(world, live, id, tick, events);
 }
 
 /// Witness body for the event/message hook slot.

@@ -219,6 +219,11 @@ pub struct FrameStats {
     /// Delivered events whose target class installs an event hook. The hook body
     /// is an empty witness; this counter proves the seam reached the object.
     pub event_hook_calls: u64,
+    /// Events handed to an actor carrier through the per-object tick. It counts
+    /// only target-matched events on a live object that has an
+    /// [`ActorRuntime`] and a tick hook, so it proves `advance` received a
+    /// non-empty view without changing any state.
+    pub actor_events_passed: u64,
     pub spawned: u64,
     pub despawned: u64,
 }
@@ -671,6 +676,10 @@ impl FrameState {
     /// time after stage 9; that double update is documented original behaviour.
     fn stage_per_object_tick(&mut self) {
         let tick = ObjectTick::step(self.tick_index);
+        // Snapshot this tick's events once, in FIFO order. Stage 11 has already
+        // run as a producer seam; stage 13 has not drained the queue yet, so the
+        // carrier sees exactly the events that belong to this tick.
+        let batch: Vec<EngineEvent> = self.events.pending().to_vec();
         for id in self.live.order().to_vec() {
             self.stats.generic_ticks = self.stats.generic_ticks.saturating_add(1);
             if self.player == Some(id) {
@@ -682,14 +691,26 @@ impl FrameState {
             };
             if let Some(hook) = hook {
                 self.stats.hooked_ticks = self.stats.hooked_ticks.saturating_add(1);
+                // The carrier receives only the events addressed to it, in the
+                // same FIFO order. The slice is read-only: `advance` still
+                // selects nothing.
+                let targeted: Vec<EngineEvent> = batch
+                    .iter()
+                    .copied()
+                    .filter(|event| event.target() == id)
+                    .collect();
                 if has_actor {
                     self.stats.actor_ticks = self.stats.actor_ticks.saturating_add(1);
+                    self.stats.actor_events_passed = self
+                        .stats
+                        .actor_events_passed
+                        .saturating_add(targeted.len() as u64);
                 }
                 if self.player == Some(id) {
                     self.stats.hooked_player_ticks =
                         self.stats.hooked_player_ticks.saturating_add(1);
                 }
-                hook(&mut self.world, &mut self.live, id, tick);
+                hook(&mut self.world, &mut self.live, id, tick, &targeted);
             }
         }
     }
@@ -854,13 +875,14 @@ fn hooks_for_class(class: RenderClass) -> Hooks {
 #[cfg(test)]
 mod tests {
     use super::{
-        CullView, FrameState, PLAYER_SPEED_UNITS_PER_TICK, STAGE_ORDER, Stage,
+        CullView, FrameState, FrameStats, PLAYER_SPEED_UNITS_PER_TICK, STAGE_ORDER, Stage,
     };
     use crate::engine::actor::ActorProfile;
     use crate::engine::determinism::world_state_hash;
     use crate::engine::events::{ContactRecord, EngineEvent, HitRecord, Message};
     use crate::engine::input::{InputButton, InputEvent};
     use crate::engine::clock::ObjectTick;
+    use crate::engine::live::LiveId;
     use crate::engine::world::World;
     use crate::level::{ObjectRecord, ObjectReport};
     use std::time::Duration;
@@ -1429,6 +1451,15 @@ mod tests {
         assert_eq!(STAGE_ORDER[17].name(), "post-frame-changes");
     }
 
+    fn id_of(frame: &FrameState, name: &str) -> LiveId {
+        frame
+            .live()
+            .iter()
+            .find(|(_, object)| object.name == name)
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| panic!("no live object named '{name}'"))
+    }
+
     #[test]
     fn queued_events_are_drained_once_at_the_delivery_stage() {
         let mut frame = frame();
@@ -1485,6 +1516,94 @@ mod tests {
             assert_eq!(frame.pending_events(), 0);
         }
         assert_eq!(frame.stats().events_queued, 1);
+    }
+
+    #[test]
+    fn events_reach_the_actor_carrier_without_changing_its_state() {
+        fn run(with_events: bool) -> (crate::engine::actor::ActorRuntime, u64, u64) {
+            let mut frame = FrameState::new(empty_world());
+            frame.queue_spawn_loaded(
+                "monster_wallcr",
+                [0, 0, 0],
+                Some(actor_profile(&[0x18, 0x25, 0x26])),
+            );
+            tick(&mut frame, 0);
+            let actor = id_of(&frame, "monster_wallcr");
+
+            if with_events {
+                frame.queue_event(EngineEvent::Hit(HitRecord {
+                    attacker: actor,
+                    target: actor,
+                    bone: 1,
+                    radius_mask: 0x0001,
+                }));
+                frame.queue_event(EngineEvent::Message(Message {
+                    target: actor,
+                    code: 9,
+                }));
+            }
+
+            for index in 1..=20 {
+                tick(&mut frame, index);
+            }
+            let runtime = frame
+                .live()
+                .get(actor)
+                .expect("the actor is live")
+                .actor
+                .clone()
+                .expect("the actor carrier survives");
+            (
+                runtime,
+                frame.stats().actor_events_passed,
+                world_state_hash(&frame.world_state()),
+            )
+        }
+
+        let (without, passed_without, digest_without) = run(false);
+        let (with, passed_with, digest_with) = run(true);
+
+        assert_eq!(
+            without, with,
+            "advance receives events but must not change relation, state, target or flags"
+        );
+        assert_eq!((without.relation(), without.state()), (0, 0));
+        assert_eq!(passed_without, 0, "the no-event run passes nothing");
+        assert_eq!(
+            passed_with, 2,
+            "both target-matched events reached advance in their tick"
+        );
+        assert_eq!(
+            digest_with, digest_without,
+            "events are transient and must not enter the canonical fold"
+        );
+    }
+
+    #[test]
+    fn an_event_run_replays_the_same_digest_and_stats() {
+        fn run() -> (u64, FrameStats) {
+            let mut frame = FrameState::new(empty_world());
+            frame.queue_spawn_loaded(
+                "monster_wallcr",
+                [1, 0, 0],
+                Some(actor_profile(&[0x18, 0x25])),
+            );
+            tick(&mut frame, 0);
+            let actor = id_of(&frame, "monster_wallcr");
+            frame.queue_event(EngineEvent::Contact(ContactRecord {
+                source: actor,
+                target: actor,
+            }));
+            for index in 1..=15 {
+                tick(&mut frame, index);
+            }
+            (world_state_hash(&frame.world_state()), frame.stats())
+        }
+
+        let first = run();
+        let second = run();
+        assert_eq!(first, second, "the same event run must replay byte for byte");
+        assert!(first.1.actor_events_passed > 0);
     }
 
     #[test]
