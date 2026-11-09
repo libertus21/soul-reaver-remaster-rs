@@ -12,6 +12,8 @@ pub mod actor;
 #[allow(dead_code)]
 pub mod assets;
 #[allow(dead_code)]
+pub mod axis;
+#[allow(dead_code)]
 pub mod backend_wgpu;
 #[allow(dead_code)]
 pub mod class;
