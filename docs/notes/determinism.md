@@ -104,6 +104,16 @@ slice, not part of this gate.
   rule itself is unwired, so no simulation value changes; **the four digests
   below move only because the fold extends**. See
   `docs/changes/engine-actor-refresh/proposal.md`.
+- engine-collision (solid room walls): stage 9 now resolves its `X`/`Z` delta
+  through a deterministic fixed-point swept circle over a uniform grid built
+  from the same integer room triangles that feed placement. The fold does not
+  change. A zero axis returns before any query or write, so a no-input run is
+  byte-identical: the 60-tick headless digests stay `ede39c540a10ee39` for
+  `under1` and `d93bcb5cd913f812` for `skinnr1` (both unchanged from `main`).
+  **All existing goldens are untouched.** `collision.rs` joins the wall-clock
+  source scan, and a second scan rejects hash-ordered containers, `rand`,
+  `Instant` and `SystemTime` on the collision/movement path. See
+  `docs/notes/engine-collision.md`.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.
