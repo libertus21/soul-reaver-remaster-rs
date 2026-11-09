@@ -780,5 +780,43 @@ mod tests {
         assert_eq!(mesh.positions[3], [1.0, 2.0, 3.0]);
         assert_eq!(mesh.positions[5], [4.0, 5.0, 6.0]);
     }
-}
 
+    /// Index of the longest bounding-box axis of `positions`.
+    fn tallest_axis(positions: &[[f32; 3]]) -> usize {
+        let mut minimum = [f32::INFINITY; 3];
+        let mut maximum = [f32::NEG_INFINITY; 3];
+        for position in positions {
+            for axis in 0..3 {
+                minimum[axis] = minimum[axis].min(position[axis]);
+                maximum[axis] = maximum[axis].max(position[axis]);
+            }
+        }
+        let mut tallest = 0;
+        for axis in 1..3 {
+            if maximum[axis] - minimum[axis] > maximum[tallest] - minimum[tallest] {
+                tallest = axis;
+            }
+        }
+        tallest
+    }
+
+    #[test]
+    fn a_humanoid_fixture_is_tallest_along_the_object_local_up_axis() {
+        // A synthetic standing figure: narrower in both horizontal axes than it
+        // is tall, exactly the shape the Phase-1 corpus measured on the real
+        // humanoids (`docs/notes/object-up-axis.md`).
+        let positions = [
+            [-2.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 0.0, 12.0],
+        ];
+        assert_eq!(
+            tallest_axis(&positions),
+            crate::engine::axis::OBJECT_UP,
+            "a standing humanoid is tallest along the object-local up axis"
+        );
+    }
+}

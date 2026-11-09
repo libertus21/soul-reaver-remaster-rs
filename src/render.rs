@@ -707,26 +707,36 @@ fn fit_point(positions: &[[f32; 3]], point: [f32; 3]) -> Result<[f32; 3], String
 /// World up axis a legacy viewer hands the renderer.
 ///
 /// The shipped room/level data is confirmed Z-up (`crate::engine::axis`,
-/// `docs/notes/up-axis.md`). Object-model local space - both the archived
-/// object containers and the loose `.SRM` meshes - has **no established up
-/// axis** (`docs/notes/object-models.md`, section 6, item 9), so it stays on
-/// the classic Y-up basis. The choice is an explicit parameter at every viewer
-/// entry point instead of a hidden default, which is exactly the class of
-/// silent regression that left the level viewers rolled.
+/// `docs/notes/up-axis.md`). The object-model local space - both the archived
+/// object containers and the loose `.SRM` meshes - is also confirmed Z-up
+/// (`docs/notes/object-up-axis.md`, `crate::engine::axis::OBJECT_UP`), so the
+/// object viewers use the same Z-up basis as the world. The choice is an
+/// explicit parameter at every viewer entry point instead of a hidden default,
+/// which is exactly the class of silent regression that left the level viewers
+/// rolled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SceneUp {
-    /// Classic Y-up basis. Used for object-model local space, whose up axis is
-    /// UNCONFIRMED. This is the documented default for object viewers.
+    /// Classic Y-up basis. Kept for callers that have no axis evidence; no
+    /// shipped object or level path uses it after the object-axis proof.
     YUp,
-    /// Confirmed Z-up world basis (`+Z` up). Used for room/level space.
+    /// Confirmed Z-up basis (`+Z` up). Used for room/level space and for the
+    /// object-model local space.
     ZUp,
 }
 
 impl SceneUp {
-    /// Documented default for object-model local space: the up axis is
-    /// UNCONFIRMED, so do not guess - keep the classic Y-up basis.
+    /// Object-model local-space up axis, derived from the single shared
+    /// definition [`crate::engine::axis::OBJECT_UP`].
+    ///
+    /// Phase-1 evidence (`docs/notes/object-up-axis.md`) confirms the archived
+    /// object containers and `.SRM` meshes store up on local `+Z`, the same
+    /// vertical as the world. The match is expressed in terms of the constants
+    /// so the mapping can never drift into a second literal.
     pub const fn object_local() -> Self {
-        Self::YUp
+        match crate::engine::axis::OBJECT_UP {
+            crate::engine::axis::UP => Self::ZUp,
+            _ => Self::YUp,
+        }
     }
 
     /// Confirmed world/level space up axis (`+Z` up).
@@ -2322,7 +2332,7 @@ impl<'a> ApplicationHandler for MeshGalleryApp<'a> {
             }
         };
         // The gallery browses loose `.SRM` object meshes: object-model local
-        // space, up axis UNCONFIRMED, so it keeps the Y-up default.
+        // space, confirmed Z-up (`docs/notes/object-up-axis.md`).
         match pollster::block_on(TexturedMeshState::new(
             window,
             &self.current,
@@ -2584,7 +2594,7 @@ mod mesh_tests {
     }
 
     #[test]
-    fn level_camera_rig_uses_z_up_and_object_local_rig_stays_y_up() {
+    fn level_and_object_local_camera_rigs_both_use_z_up() {
         let positions = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]];
 
         // Confirmed world/level space: both orbit and fly cameras must be Z-up.
@@ -2595,12 +2605,14 @@ mod mesh_tests {
         assert!((up[2] - 1.0).abs() < 1e-6, "level orbit up is world +Z");
         assert!(right[2].abs() < 1e-6, "level orbit right stays horizontal");
 
-        // Object-model local space: up axis UNCONFIRMED, so both stay Y-up.
+        // Object-model local space: phase-1 evidence confirms Z-up, so both
+        // object viewers must use the same basis as the world.
+        assert_eq!(SceneUp::object_local(), SceneUp::ZUp);
         let object = CameraRig::new(&positions, None, SceneUp::object_local()).unwrap();
-        assert!(!object.camera.z_up, "object orbit camera stays Y-up");
-        assert!(!object.fly.z_up, "object fly camera stays Y-up");
+        assert!(object.camera.z_up, "object orbit camera is Z-up");
+        assert!(object.fly.z_up, "object fly camera is Z-up");
         let (_, object_up) = object.camera.basis();
-        assert!((object_up[1] - 1.0).abs() < 1e-6, "object orbit up is +Y");
+        assert!((object_up[2] - 1.0).abs() < 1e-6, "object orbit up is +Z");
     }
 
     #[test]
@@ -2608,8 +2620,11 @@ mod mesh_tests {
         let positions = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]];
         let z = initial_fly_camera(&positions, None, SceneUp::world()).unwrap();
         assert!(z.z_up, "a world choice must reach the fly camera");
-        let y = initial_fly_camera(&positions, None, SceneUp::object_local()).unwrap();
-        assert!(!y.z_up, "an object-local choice must reach the fly camera");
+        let object = initial_fly_camera(&positions, None, SceneUp::object_local()).unwrap();
+        assert!(
+            object.z_up,
+            "the confirmed object-local choice must reach the fly camera as Z-up"
+        );
     }
 
     #[test]

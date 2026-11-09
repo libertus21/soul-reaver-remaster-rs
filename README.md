@@ -65,8 +65,9 @@ faster; `R` resets the camera; `Esc` exits.
 
 The legacy **level** viewers (`--level-render`, flat and textured) render on the
 confirmed **Z-up** world. The legacy **object-model** viewers (`--object-mesh`,
-`--mesh`, `--mesh-textured`, `--mesh-all`) stay **Y-up** because the object
-model's local up axis is UNKNOWN; see `docs/notes/legacy-viewers-up-axis.md`.
+`--mesh`, `--mesh-textured`, `--mesh-all`) are also **Z-up**: the object-model
+local vertical is confirmed to be `+Z`, the same as the world
+(`docs/notes/object-up-axis.md`); see `docs/notes/legacy-viewers-up-axis.md`.
 
 ## Play mode (engine skeleton)
 

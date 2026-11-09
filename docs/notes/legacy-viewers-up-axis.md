@@ -2,8 +2,9 @@
 
 Date: 2026-11-09. The world convention is already confirmed and fixed
 (`docs/notes/up-axis.md`, `src/engine/axis.rs`: `UP = 2`, `+Z` up). This note
-records how the **legacy viewers** now choose their camera up axis, and why the
-object-model viewers deliberately do not follow the world.
+records how the **legacy viewers** choose their camera up axis. The object-model
+local up axis was proven afterwards (`docs/notes/object-up-axis.md`): it is also
+Z-up, so every viewer now uses the Z-up basis.
 
 ## Verdict
 
@@ -16,29 +17,25 @@ is visible at the call site. There is no hidden default on the render path.
 | `--level-render <PATH>` | room/level world space | **ZUp** | `run_level_render` -> `SceneUp::world()` |
 | `--level-render ... --textures` | room/level world space | **ZUp** | `run_level_render_textured` -> `SceneUp::world()` |
 | `--level-render ... --objects [--textures]` | mixed (world rooms + placed models) | **ZUp** | same two call sites |
-| `--object-mesh --bigfile <DAT> --entry <I>` | object-model local space | **YUp** | `run_object_mesh` -> `SceneUp::object_local()` |
-| `--object-mesh ... --textures` | object-model local space | **YUp** | `run_object_mesh_textured` -> `SceneUp::object_local()` |
-| `--mesh <SRM>` | `.SRM` object-model local space | **YUp** | `run_mesh` -> `SceneUp::object_local()` |
-| `--mesh-textured <SRM>` | `.SRM` object-model local space | **YUp** | `run_mesh_textured` -> `SceneUp::object_local()` |
-| `--mesh-all <DIR>` | `.SRM` object-model local space | **YUp** | `show_mesh_gallery` (`SceneUp::object_local()`) |
+| `--object-mesh --bigfile <DAT> --entry <I>` | object-model local space | **ZUp** | `run_object_mesh` -> `SceneUp::object_local()` |
+| `--object-mesh ... --textures` | object-model local space | **ZUp** | `run_object_mesh_textured` -> `SceneUp::object_local()` |
+| `--mesh <SRM>` | `.SRM` object-model local space | **ZUp** | `run_mesh` -> `SceneUp::object_local()` |
+| `--mesh-textured <SRM>` | `.SRM` object-model local space | **ZUp** | `run_mesh_textured` -> `SceneUp::object_local()` |
+| `--mesh-all <DIR>` | `.SRM` object-model local space | **ZUp** | `show_mesh_gallery` (`SceneUp::object_local()`) |
 | engine `--play` | room/level world space | **ZUp** | already correct (`src/engine/play.rs`) |
 
-## Why the object viewers stay Y-up
+## Why the object viewers now use Z-up
 
-The shipped room and object data is Z-up, but an **object model's own local up
-axis is not established** (`docs/notes/object-models.md`, section 6, item 9:
-where a placed object's world orientation is composed is UNKNOWN; the level
-record carries a position only, and the vertices are model-local). Rotating
-those vertices into a guessed frame would launder an unproven assumption into
-the viewer.
+The shipped room data and the object-model local space are both **confirmed
+Z-up** (`docs/notes/object-up-axis.md`): 9/9 humanoids are tallest along local Z
+and their bone chains extend along Z, and the `.SRM` humanoids agree. The object
+viewers must therefore use the Z-up basis.
 
-The chosen option is **(b)**: an explicit, typed parameter at every entry point,
-with `SceneUp::object_local()` documented as the object-model default (`YUp`).
-It is stronger than leaving an implicit Y-up default because each viewer now
-*states* its domain, and a future proof of the object axis changes one named
-constructor instead of hunting for hidden camera state. Keeping the render
-layer defaultless is what makes the next regression hard: `CameraRig` cannot
-create an `OrbitCamera` without a `SceneUp`.
+`SceneUp::object_local()` derives its answer from
+`engine::axis::OBJECT_UP`, so a future axis change updates one named constant,
+not a scattered sign flip. Keeping the render layer defaultless is what makes
+the next regression hard: `CameraRig` cannot create an `OrbitCamera` without a
+`SceneUp`.
 
 ## The mixed case: `--level-render --objects`
 
@@ -52,10 +49,10 @@ create an `OrbitCamera` without a `SceneUp`.
 
 The scene is therefore world space: it is dominated by, and anchored to, the
 confirmed Z-up room. The required camera up is **ZUp** for the whole scene.
-Using Y-up here is exactly the old bug that rolled the room 90 degrees. Any
-misorientation of a placed model is a separate object-model issue (the local
-axis is still UNKNOWN) and must not be "fixed" by rolling the world camera:
-that would trade a known-correct room for a guess.
+Both the room and the placed models are Z-up, so the placed models are upright
+under their translation (`docs/notes/object-up-axis.md`). The placement path is
+still a translation with no rotation; that is now a proven-correct transform,
+not an assumption.
 
 ## Determinism
 
@@ -72,15 +69,15 @@ byte-identical before and after; the change only reaches the interactive window.
 
 ## Tests
 
-- `render::mesh_tests::level_camera_rig_uses_z_up_and_object_local_rig_stays_y_up`
-  builds the level rig and asserts both the orbit and fly cameras report `+Z`
-  up (and the object rig stays `+Y`).
+- `render::mesh_tests::level_and_object_local_camera_rigs_both_use_z_up` builds
+  both rigs and asserts every orbit and fly camera reports `+Z` up, and that
+  `SceneUp::object_local() == SceneUp::ZUp`.
 - `render::mesh_tests::initial_fly_camera_applies_the_scene_up_choice` proves
-  the flag reaches the fly eye.
+  the flag reaches the fly eye for both the world and object choices.
 - The existing `z_up_cameras_use_world_z_as_up_and_rise_along_it` and
   `z_up_looking_at_faces_the_target_with_world_z_up` still pin the camera math.
 
 ## UNKNOWN (unchanged)
 
-The object-model (`.SRM` and archived object container) local up axis. Until it
-is proven, object viewers keep `YUp` and this note stays the reminder.
+The local **facing** axis (front/back) is not pinned; see
+`docs/notes/object-up-axis.md`. The vertical is confirmed Z-up.

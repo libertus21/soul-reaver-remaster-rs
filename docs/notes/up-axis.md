@@ -121,10 +121,11 @@ deep inside a horizontal spread, not a floor.
   state but never writes it, so determinism is unaffected.
 - The **legacy level viewers** now opt into Z-up too: `--level-render` (flat and
   textured) renders with `render::SceneUp::world()`. The object-model viewers
-  (`--object-mesh`, `--mesh`, `--mesh-textured`, `--mesh-all`) stay Y-up because
-  the object-model local up axis is UNKNOWN; see
-  `docs/notes/legacy-viewers-up-axis.md` for the per-path table and the mixed
-  `--level-render --objects` case.
+  (`--object-mesh`, `--mesh`, `--mesh-textured`, `--mesh-all`) also use Z-up:
+  `docs/notes/object-up-axis.md` later confirmed the object-model local vertical
+  is Z (index 2, `+Z`), and `render::SceneUp::object_local()` derives its basis
+  from `engine::axis::OBJECT_UP`. See
+  `docs/notes/legacy-viewers-up-axis.md` for the per-path table.
 
 No level, object or texture data is rotated at load.
 
@@ -171,9 +172,9 @@ See `docs/notes/determinism.md`.
 
 - The winding sign is the only normal-direction source, so floor/ceiling is a
   diagnostic split; ground uses every near-horizontal surface.
-- The `.SRM`/object-model local up axis is not established here. The engine
-  world path and the legacy level viewers are Z-up; the legacy object-model
-  viewers keep their Y-up camera. See
+- The object-model local up axis was not established here. It was proven
+  afterwards to be Z-up (`docs/notes/object-up-axis.md`), so the object viewers
+  now use the same Z-up basis as the world. See
   `docs/notes/legacy-viewers-up-axis.md`.
 - Whether the original applied a load-time axis conversion is not claimed; this
   engine makes the code axis-correct instead.
