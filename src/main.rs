@@ -776,8 +776,8 @@ fn prepare_pose(
 /// close exits 0.
 fn run_mesh(args: &[String]) -> ExitCode {
     run_mesh_with(args, |positions, indices, title| {
-        // `.SRM` mesh: object-model local space. The up axis is UNCONFIRMED
-        // (`docs/notes/object-models.md`), so keep the Y-up default.
+        // `.SRM` mesh: object-model local space, confirmed Z-up
+        // (`docs/notes/object-up-axis.md`), the same vertical as the world.
         render::show_mesh(positions, indices, title, None, render::SceneUp::object_local())
     })
 }
@@ -887,7 +887,8 @@ fn run_mesh_textured(args: &[String]) -> ExitCode {
         &entry.textures,
         &entry.title,
         None,
-        // `.SRM` mesh: object-model local space, up axis UNCONFIRMED.
+        // `.SRM` mesh: object-model local space, confirmed Z-up
+        // (`docs/notes/object-up-axis.md`).
         render::SceneUp::object_local(),
     ) {
         eprintln!("error: {}: {e}", srm_path.display());
@@ -1423,10 +1424,9 @@ fn run_level_render(args: &[String]) -> ExitCode {
     );
     let title = format!("level {name}");
     // Room geometry is CONFIRMED Z-up world space. `--objects` also appends
-    // placed object models, but they are only translated to their world record
-    // position (no rotation; the local axis is UNCONFIRMED). The scene as a
-    // whole is world space, so the camera is Z-up; any object-model orientation
-    // error is a separate model issue, never a reason to roll the room.
+    // placed object models, whose local up is confirmed Z too, so they are
+    // translated to their world record position without any rotation. The scene
+    // as a whole is world space, so the camera is Z-up.
     if let Err(error) = render::show_mesh(
         &mesh.vertices,
         &mesh.indices,
@@ -1539,8 +1539,8 @@ fn run_object_mesh(args: &[String]) -> ExitCode {
         return run_object_mesh_textured(args);
     }
     run_object_mesh_with(args, |positions, indices, title| {
-        // Archived object container: object-model local space, up axis
-        // UNCONFIRMED (`docs/notes/object-models.md`), so stay Y-up.
+        // Archived object container: object-model local space, confirmed Z-up
+        // (`docs/notes/object-up-axis.md`), the same vertical as the world.
         render::show_mesh(positions, indices, title, None, render::SceneUp::object_local())
     })
 }
@@ -1667,7 +1667,8 @@ fn run_object_mesh_textured(args: &[String]) -> ExitCode {
         &textures,
         &title,
         None,
-        // Archived object container: object-model local space, up UNCONFIRMED.
+        // Archived object container: object-model local space, confirmed Z-up
+        // (`docs/notes/object-up-axis.md`).
         render::SceneUp::object_local(),
     ) {
         eprintln!("error: {error}");

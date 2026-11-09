@@ -2619,6 +2619,32 @@ mod tests {
     }
 
     #[test]
+    fn a_placed_model_keeps_its_local_up_aligned_with_the_world_up() {
+        use crate::engine::axis::{HORIZONTAL_A, HORIZONTAL_B, OBJECT_UP, UP};
+
+        // Object-local up and world up are the same axis, so a placed model is
+        // a pure translation: local +Z must land on world +Z with no swap.
+        assert_eq!(OBJECT_UP, UP);
+
+        let object = ObjectRecord {
+            name: "raziel".to_string(),
+            position: [10, 20, 30],
+            ..ObjectRecord::default()
+        };
+        let local = vec![[0.0, 0.0, 7.0], [1.0, 0.0, 7.0], [0.0, 1.0, 7.0]];
+        let mut source =
+            |name: &str| (name == "raziel").then(|| (local.clone(), vec![0u32, 1, 2]));
+        let mut mesh = RoomMesh::default();
+        append_objects(&mut mesh, &[object], Some(&mut source))
+            .expect("a resolvable model must be placed");
+
+        assert_eq!(mesh.vertices[0], [10.0, 20.0, 37.0], "position + local, axis order kept");
+        assert_eq!(mesh.vertices[0][UP], 30.0 + 7.0, "local up adds to world up");
+        assert_eq!(mesh.vertices[0][HORIZONTAL_A], 10.0);
+        assert_eq!(mesh.vertices[0][HORIZONTAL_B], 20.0);
+    }
+
+    #[test]
     fn textured_entry_expands_room_faces_and_maps_object_pages() {
         let tmp = tempfile::tempdir().expect("tempdir must succeed");
         let pcm = object_pcm(&[("raziel", [5, 0, 0], 1), ("campath", [0, 0, 0], 1)]);
