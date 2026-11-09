@@ -32,10 +32,11 @@ your own install; nothing is bundled.
 | Archived object model info | `cargo run -- --object-info --bigfile <BIGFILE.DAT> --entry 66` | Reads one object container in memory and prints vertex/polygon/material counts, both array-boundary identities and the out-of-range index count. Entry 66 is `raziel` (299 V / 640 P). No extraction. |
 | Archived object model render | `cargo run -- --object-mesh --bigfile <BIGFILE.DAT> --entry 66` / `cargo run -- --object-mesh --bigfile <BIGFILE.DAT> --entry 66 --textures <TEXTURES.BIG>` | Parses the same container, applies the 24-byte bone rest pose and draws its triangles through the flat-shaded viewer. `--textures` draws each face with its `TextureFT3` page. Louder refusals happen before any window opens. |
 | Actor behaviour census | `cargo run -- --actor-census --bigfile <BIGFILE.DAT> [--objects-dir <DIR>]` / `cargo run -- --object-info --bigfile <BIGFILE.DAT> --entry 129 --actors` | Reads the object-header `+0x1C` actor block, prints each actor's 0x20-byte entry count, entry ids (hex) and the eight 8x3 state trios, then a corpus summary. Partial actors report `variant`/`none` and never contribute to the totals. Real corpus: 21 actors / 75 entries / 37 distinct ids (19 archive + `morboss`/`priests` loose). |
+| `.SRL` clip summary | `cargo run -- --srl-info <FILE.SRL>` | Parses the 20-byte `.SRL` header and prints track count, frame count, fps and derived duration, asserting `len = 20 + tracks*frames*48`. The cells are per-frame 48-byte 3x4 transforms; the track-to-bone binding stays UNKNOWN (`docs/notes/srl-animation.md`). |
 | `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --entry <INDEX>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --group under [--objects] [--textures <TEXTURES.BIG>]` | Renders room geometry, flat or textured from `TEXTURES.BIG`. Orbit, wheel zoom, pan, `R` reset; `F` enters a first-person fly camera. `--objects` adds each placed object's real archived model at its world position; `--textures` textures both rooms and models. |
 | Level reachability | `cargo run -- --level-reach --bigfile <BIGFILE.DAT> [--start <UNIT>] [--names]` | BFS from `under1` over the decoded link graph, then groups reachable, in-degree islands and inbound-but-unreachable units. `--names` lists each island unit. Corrected reader: 372 discovered / 334 reachable / 38 unreachable / 1 island (`push1`). |
 | Engine play mode | `cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG>` / `cargo run -- --play --headless --bigfile <BIGFILE.DAT> --ticks <N>` | Opens a deterministic engine window (orbit, fly or player camera; player mode is `WASD`, `Space` jumps, `F` cycles the camera, `Esc` exits 0), or prints one headless acceptance line with the FNV-1a 64 state digest. Fixed 60 Hz clock, 48-slot tracker, name-keyed spawning, 18-stage frame loop, solid room walls, Z-up gravity with ground/landing, ceiling blocking, a synthetic ground-only jump and a Z-up third-person player camera. Still no AI, animation, scripts or audio. |
-| Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 33 capabilities in six groups; grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
+| Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 34 capabilities in six groups; grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
 
 `<PATH>` accepts a `.PCM` file or a room directory. The level arms also accept
 `--bigfile <DAT> --entry <INDEX>` or `--bigfile <DAT> --group <PREFIX>`.
@@ -116,9 +117,13 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
 
 ## What's missing / known limits
 
-- **No animation.** `.SRA` is not parsed by this build (the loader callback is a
+- **No skeletal animation.** `.SRA` is not parsed by this build (the loader callback is a
   `RET 0` stub) and `.SRM` has no hierarchy, so `--pose` is a local cluster
-  rotation only and the mesh tears at cluster seams.
+  rotation only and the mesh tears at cluster seams. `.SRL` is decoded as a
+  **voice-line animation container** (header, frame count, fps, duration and
+  48-byte per-frame 3x4 cells confirmed; `docs/notes/srl-animation.md`), but it
+  has no channel-to-bone table, so it cannot drive a skeletal pose. `.PMF`
+  remains undecoded.
 - **No game logic.** `--play` is a deterministic skeleton: no actor AI,
   animation, scripts, audio, streaming, particles, menus, warps or save. Room
   walls are solid, gravity lands the player on floors, ceilings block upward
@@ -150,8 +155,7 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
   and a full mip-chain UI are deferred.
 - **Binary startup beyond `run` stays UNKNOWN**, and the loader's post-open error
   rows remain HELD with their existing prefixes pinned by regression tests.
-- **`.SRL` (60 files) and the `.PMF` codec are undecoded**; the SR2 side is
-  unscoped.
+- **`.PMF` is undecoded**; the SR2 side is unscoped.
 - **Menu prompts show only the operand token** (no path hint), so a menu-style
   number typed as a path fails downstream by design.
 
