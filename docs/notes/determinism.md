@@ -114,6 +114,20 @@ slice, not part of this gate.
   source scan, and a second scan rejects hash-ordered containers, `rand`,
   `Instant` and `SystemTime` on the collision/movement path. See
   `docs/notes/engine-collision.md`.
+- engine-gravity (vertical collision): stage 9 now resolves gravity, ground and
+  landing after the horizontal sweep, using the same fixed-point integer
+  discipline. Faces are classified as wall / floor-facing / ceiling-facing /
+  other by the geometric normal; ground detection uses every near-horizontal
+  surface because the winding sign is the only normal-direction source. Gravity
+  acts only when the mesh carries near-horizontal surfaces, so synthetic worlds
+  and geometry-free fixtures keep `Y` untouched. **All synthetic goldens are
+  untouched.** The real no-input digests move because both shipped spawns are
+  airborne: `under1` 60-tick `ede39c540a10ee39` -> `def409846ff3a2cf` and
+  `skinnr1` 60-tick `d93bcb5cd913f812` -> `131ce9555e923980`. Both land and stop
+  moving (`under1` at `y = -3357`, `skinnr1` at `y = -959`) and replay
+  byte-identically; 300-tick digests are `adbfd4d88af3f093` and
+  `b4bda7e380c3157b`. This is a deliberate simulation change: gravity now acts,
+  not a fold change. See `docs/notes/engine-collision.md`.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.
