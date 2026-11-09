@@ -267,6 +267,8 @@ confirmed path. This is a documented no-go, not a not-found-yet.
 1. The exact file field that carries the **actor** spline-set descriptor. The
    sub-model `+0x2C` carrier is confirmed but rare; the actor-block animation
    record path is structurally identified but not mapped to one named field.
+   `actor-spline-census.md` adds the corpus negative that constrains this: no
+   actor container carries a valid descriptor in the documented shape.
 2. Whether the trio clip bytes select a spline slot, and how a `(name, id)` pair
    resolves to a spline set.
 3. The meaning of the twelve further qwords copied into the spline set at
@@ -303,7 +305,9 @@ Ordered by cost:
    "YES for every actor".
 2. **Corpus census of actor-block animation records.** Count non-empty spline
    descriptors across the 21 actor containers; if none are non-empty, the actor
-   spline set may be built from a global table instead.
+   spline set may be built from a global table instead. **Closed by
+   `actor-spline-census.md`: 0 of 21 actor containers carry a valid non-empty
+   descriptor; only the non-actor `font` does.**
 3. **Controlled runtime capture (read-only).** With one moving actor, break on
    the spline-set builder and record the source container offset, `numkeys` and
    stride flag. This settles both the actor field and the clip identity.
