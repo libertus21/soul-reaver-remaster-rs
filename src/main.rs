@@ -776,7 +776,9 @@ fn prepare_pose(
 /// close exits 0.
 fn run_mesh(args: &[String]) -> ExitCode {
     run_mesh_with(args, |positions, indices, title| {
-        render::show_mesh(positions, indices, title, None)
+        // `.SRM` mesh: object-model local space. The up axis is UNCONFIRMED
+        // (`docs/notes/object-models.md`), so keep the Y-up default.
+        render::show_mesh(positions, indices, title, None, render::SceneUp::object_local())
     })
 }
 
@@ -885,6 +887,8 @@ fn run_mesh_textured(args: &[String]) -> ExitCode {
         &entry.textures,
         &entry.title,
         None,
+        // `.SRM` mesh: object-model local space, up axis UNCONFIRMED.
+        render::SceneUp::object_local(),
     ) {
         eprintln!("error: {}: {e}", srm_path.display());
         return ExitCode::from(1);
@@ -1418,7 +1422,18 @@ fn run_level_render(args: &[String]) -> ExitCode {
         mesh.vertices.len(), mesh.indices.len() / 3
     );
     let title = format!("level {name}");
-    if let Err(error) = render::show_mesh(&mesh.vertices, &mesh.indices, &title, mesh.spawn) {
+    // Room geometry is CONFIRMED Z-up world space. `--objects` also appends
+    // placed object models, but they are only translated to their world record
+    // position (no rotation; the local axis is UNCONFIRMED). The scene as a
+    // whole is world space, so the camera is Z-up; any object-model orientation
+    // error is a separate model issue, never a reason to roll the room.
+    if let Err(error) = render::show_mesh(
+        &mesh.vertices,
+        &mesh.indices,
+        &title,
+        mesh.spawn,
+        render::SceneUp::world(),
+    ) {
         eprintln!("error: {error}");
         return ExitCode::from(1);
     }
@@ -1496,6 +1511,8 @@ fn run_level_render_textured(
         if markers { " and objects" } else { "" }
     );
     let title = format!("level {name}");
+    // Same mixed scene as the flat path: confirmed Z-up rooms plus placed
+    // object models translated (not rotated) to world positions.
     if let Err(error) = render::show_mesh_textured(
         &mesh.vertices,
         &mesh.uvs,
@@ -1505,6 +1522,7 @@ fn run_level_render_textured(
         &textures,
         &title,
         mesh.spawn,
+        render::SceneUp::world(),
     ) {
         eprintln!("error: {error}");
         return ExitCode::from(1);
@@ -1521,7 +1539,9 @@ fn run_object_mesh(args: &[String]) -> ExitCode {
         return run_object_mesh_textured(args);
     }
     run_object_mesh_with(args, |positions, indices, title| {
-        render::show_mesh(positions, indices, title, None)
+        // Archived object container: object-model local space, up axis
+        // UNCONFIRMED (`docs/notes/object-models.md`), so stay Y-up.
+        render::show_mesh(positions, indices, title, None, render::SceneUp::object_local())
     })
 }
 
@@ -1647,6 +1667,8 @@ fn run_object_mesh_textured(args: &[String]) -> ExitCode {
         &textures,
         &title,
         None,
+        // Archived object container: object-model local space, up UNCONFIRMED.
+        render::SceneUp::object_local(),
     ) {
         eprintln!("error: {error}");
         return ExitCode::from(1);

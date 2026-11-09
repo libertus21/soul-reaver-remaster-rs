@@ -63,6 +63,11 @@ Fly camera keys: `F` toggles orbit/fly; `W`/`A`/`S`/`D` move relative to the
 view; the mouse looks around; `Space`/`E` rise; `C`/`Q` sink; `Shift` flies
 faster; `R` resets the camera; `Esc` exits.
 
+The legacy **level** viewers (`--level-render`, flat and textured) render on the
+confirmed **Z-up** world. The legacy **object-model** viewers (`--object-mesh`,
+`--mesh`, `--mesh-textured`, `--mesh-all`) stay **Y-up** because the object
+model's local up axis is UNKNOWN; see `docs/notes/legacy-viewers-up-axis.md`.
+
 ## Play mode (engine skeleton)
 
 `--play` runs the deterministic engine skeleton on one archive unit. It is a

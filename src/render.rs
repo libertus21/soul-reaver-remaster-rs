@@ -704,13 +704,54 @@ fn fit_point(positions: &[[f32; 3]], point: [f32; 3]) -> Result<[f32; 3], String
     ])
 }
 
-/// Fitted fly eye for `spawn`, aimed at the fitted scene centre (the origin).
-fn initial_fly_camera(positions: &[[f32; 3]], spawn: Option<[f32; 3]>) -> Result<FlyCamera, String> {
+/// World up axis a legacy viewer hands the renderer.
+///
+/// The shipped room/level data is confirmed Z-up (`crate::engine::axis`,
+/// `docs/notes/up-axis.md`). Object-model local space - both the archived
+/// object containers and the loose `.SRM` meshes - has **no established up
+/// axis** (`docs/notes/object-models.md`, section 6, item 9), so it stays on
+/// the classic Y-up basis. The choice is an explicit parameter at every viewer
+/// entry point instead of a hidden default, which is exactly the class of
+/// silent regression that left the level viewers rolled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SceneUp {
+    /// Classic Y-up basis. Used for object-model local space, whose up axis is
+    /// UNCONFIRMED. This is the documented default for object viewers.
+    YUp,
+    /// Confirmed Z-up world basis (`+Z` up). Used for room/level space.
+    ZUp,
+}
+
+impl SceneUp {
+    /// Documented default for object-model local space: the up axis is
+    /// UNCONFIRMED, so do not guess - keep the classic Y-up basis.
+    pub const fn object_local() -> Self {
+        Self::YUp
+    }
+
+    /// Confirmed world/level space up axis (`+Z` up).
+    pub const fn world() -> Self {
+        Self::ZUp
+    }
+
+    /// True when the camera must use a Z-up basis.
+    pub const fn is_z_up(self) -> bool {
+        matches!(self, Self::ZUp)
+    }
+}
+
+/// Fitted fly eye for `spawn`, aimed at the fitted scene centre (the origin)
+/// under the viewer's chosen world up axis.
+fn initial_fly_camera(
+    positions: &[[f32; 3]],
+    spawn: Option<[f32; 3]>,
+    up: SceneUp,
+) -> Result<FlyCamera, String> {
     let eye = match spawn {
         Some(point) => fit_point(positions, point)?,
         None => [0.0; 3],
     };
-    Ok(FlyCamera::looking_at(eye, [0.0; 3]))
+    Ok(FlyCamera::looking_at_with_up(eye, [0.0; 3], up.is_z_up()))
 }
 
 /// Remap a vector between the classic Y-up camera frame and the Z-up world.
@@ -903,11 +944,6 @@ impl FlyCamera {
     pub fn z_up(mut self) -> Self {
         self.z_up = true;
         self
-    }
-
-    /// Start at `position` facing `target` in the classic Y-up frame.
-    pub fn looking_at(position: [f32; 3], target: [f32; 3]) -> Self {
-        Self::looking_at_with_up(position, target, false)
     }
 
     /// Start at `position` facing `target` under the chosen world up axis.
@@ -1138,13 +1174,23 @@ struct CameraRig {
 }
 
 impl CameraRig {
-    fn new(positions: &[[f32; 3]], spawn: Option<[f32; 3]>) -> Result<Self, String> {
-        Ok(Self::from_start(initial_fly_camera(positions, spawn)?))
+    fn new(
+        positions: &[[f32; 3]],
+        spawn: Option<[f32; 3]>,
+        up: SceneUp,
+    ) -> Result<Self, String> {
+        Ok(Self::from_start(initial_fly_camera(positions, spawn, up)?, up))
     }
 
-    fn from_start(start: FlyCamera) -> Self {
+    fn from_start(start: FlyCamera, up: SceneUp) -> Self {
         Self {
-            camera: OrbitCamera::new(),
+            // The orbit camera is created here, so this is the one place that
+            // must honour the viewer's up axis. `reset` preserves it.
+            camera: if up.is_z_up() {
+                OrbitCamera::new().z_up()
+            } else {
+                OrbitCamera::new()
+            },
             fly: start,
             start,
             input: CameraInput::default(),
@@ -1232,6 +1278,7 @@ impl<'window> MeshState<'window> {
         vertices: &[[f32; 3]],
         indices: &[u32],
         start: FlyCamera,
+        up: SceneUp,
     ) -> Result<Self, String> {
         let mut vbytes = Vec::with_capacity(vertices.len() * 12);
         for v in vertices {
@@ -1352,7 +1399,7 @@ impl<'window> MeshState<'window> {
             uniform_buffer,
             uniform_bind_group,
             depth_view,
-            rig: CameraRig::from_start(start),
+            rig: CameraRig::from_start(start, up),
         })
     }
 
@@ -1424,6 +1471,7 @@ struct MeshApp {
     vertices: Vec<[f32; 3]>,
     indices: Vec<u32>,
     start: FlyCamera,
+    up: SceneUp,
     state: Option<MeshState<'static>>,
     init_error: Option<String>,
 }
@@ -1445,7 +1493,7 @@ impl ApplicationHandler for MeshApp {
         };
         let vertices = std::mem::take(&mut self.vertices);
         let indices = std::mem::take(&mut self.indices);
-        match pollster::block_on(MeshState::new(window, &vertices, &indices, self.start)) {
+        match pollster::block_on(MeshState::new(window, &vertices, &indices, self.start, self.up)) {
             Ok(state) => {
                 self.state = Some(state);
                 self.vertices = vertices;
@@ -1504,9 +1552,10 @@ pub fn show_mesh(
     indices: &[u32],
     title: &str,
     spawn: Option<[f32; 3]>,
+    up: SceneUp,
 ) -> Result<(), String> {
     let fitted = fit_positions(positions)?;
-    let start = initial_fly_camera(positions, spawn)?;
+    let start = initial_fly_camera(positions, spawn, up)?;
     if indices.is_empty() {
         return Err("cannot show a mesh with 0 indices".to_string());
     }
@@ -1523,6 +1572,7 @@ pub fn show_mesh(
         vertices: fitted,
         indices: indices.to_vec(),
         start,
+        up,
         state: None,
         init_error: None,
     };
@@ -1882,6 +1932,7 @@ impl<'window> TexturedMeshState<'window> {
         window: Arc<Window>,
         entry: &crate::mesh_entry::MeshEntry,
         spawn: Option<[f32; 3]>,
+        up: SceneUp,
     ) -> Result<Self, String> {
         let core = open_core(window.clone(), "srm textured").await?;
         let GpuCore { surface, device, queue, config } = core;
@@ -1941,7 +1992,7 @@ impl<'window> TexturedMeshState<'window> {
             texture_layout,
             sampler,
             depth_view,
-            rig: CameraRig::new(&entry.positions, spawn)?,
+            rig: CameraRig::new(&entry.positions, spawn, up)?,
             vertex_buffer: dummy,
             index_buffers: Vec::new(),
             texture_bind_groups: Vec::new(),
@@ -2108,6 +2159,7 @@ impl<'window> TexturedMeshState<'window> {
 struct TexturedMeshApp {
     entry: crate::mesh_entry::MeshEntry,
     spawn: Option<[f32; 3]>,
+    up: SceneUp,
     state: Option<TexturedMeshState<'static>>,
     init_error: Option<String>,
 }
@@ -2127,7 +2179,7 @@ impl ApplicationHandler for TexturedMeshApp {
                 return;
             }
         };
-        match pollster::block_on(TexturedMeshState::new(window, &self.entry, self.spawn)) {
+        match pollster::block_on(TexturedMeshState::new(window, &self.entry, self.spawn, self.up)) {
             Ok(state) => self.state = Some(state),
             Err(e) => {
                 self.init_error = Some(e);
@@ -2177,6 +2229,7 @@ pub fn show_mesh_textured(
     textures: &[crate::textures_object::MaterialTextures],
     title: &str,
     spawn: Option<[f32; 3]>,
+    up: SceneUp,
 ) -> Result<(), String> {
     let entry = crate::mesh_entry::MeshEntry {
         srm_path: std::path::PathBuf::from(title),
@@ -2192,7 +2245,7 @@ pub fn show_mesh_textured(
     let event_loop =
         EventLoop::new().map_err(|e| format!("cannot create window event loop: {e}"))?;
     let mut app =
-        TexturedMeshApp { entry, spawn, state: None, init_error: None };
+        TexturedMeshApp { entry, spawn, up, state: None, init_error: None };
     event_loop
         .run_app(&mut app)
         .map_err(|e| format!("window event loop failed: {e}"))?;
@@ -2268,7 +2321,14 @@ impl<'a> ApplicationHandler for MeshGalleryApp<'a> {
                 return;
             }
         };
-        match pollster::block_on(TexturedMeshState::new(window, &self.current, None)) {
+        // The gallery browses loose `.SRM` object meshes: object-model local
+        // space, up axis UNCONFIRMED, so it keeps the Y-up default.
+        match pollster::block_on(TexturedMeshState::new(
+            window,
+            &self.current,
+            None,
+            SceneUp::object_local(),
+        )) {
             Ok(state) => {
                 outln!("{label}");
                 self.state = Some(state);
@@ -2381,7 +2441,7 @@ pub fn show_mesh_gallery(entries: &[PathBuf], tex_dir: &Path) -> Result<(), Stri
 mod mesh_tests {
     use super::{
         fit_point, fit_positions, initial_fly_camera, validate_entry_shape, CameraMode, CameraRig,
-        FlyCamera, OrbitCamera, FIT_DISTANCE, FLY_FAST_MULTIPLIER, FLY_MAX_STEP, FLY_SPEED,
+        FlyCamera, OrbitCamera, SceneUp, FIT_DISTANCE, FLY_FAST_MULTIPLIER, FLY_MAX_STEP, FLY_SPEED,
         MAX_DISTANCE, MIN_DISTANCE, PITCH_LIMIT,
     };
 
@@ -2524,6 +2584,35 @@ mod mesh_tests {
     }
 
     #[test]
+    fn level_camera_rig_uses_z_up_and_object_local_rig_stays_y_up() {
+        let positions = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]];
+
+        // Confirmed world/level space: both orbit and fly cameras must be Z-up.
+        let level = CameraRig::new(&positions, None, SceneUp::world()).unwrap();
+        assert!(level.camera.z_up, "level orbit camera must be Z-up");
+        assert!(level.fly.z_up, "level fly camera must be Z-up");
+        let (right, up) = level.camera.basis();
+        assert!((up[2] - 1.0).abs() < 1e-6, "level orbit up is world +Z");
+        assert!(right[2].abs() < 1e-6, "level orbit right stays horizontal");
+
+        // Object-model local space: up axis UNCONFIRMED, so both stay Y-up.
+        let object = CameraRig::new(&positions, None, SceneUp::object_local()).unwrap();
+        assert!(!object.camera.z_up, "object orbit camera stays Y-up");
+        assert!(!object.fly.z_up, "object fly camera stays Y-up");
+        let (_, object_up) = object.camera.basis();
+        assert!((object_up[1] - 1.0).abs() < 1e-6, "object orbit up is +Y");
+    }
+
+    #[test]
+    fn initial_fly_camera_applies_the_scene_up_choice() {
+        let positions = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]];
+        let z = initial_fly_camera(&positions, None, SceneUp::world()).unwrap();
+        assert!(z.z_up, "a world choice must reach the fly camera");
+        let y = initial_fly_camera(&positions, None, SceneUp::object_local()).unwrap();
+        assert!(!y.z_up, "an object-local choice must reach the fly camera");
+    }
+
+    #[test]
     fn fit_point_maps_a_world_position_into_the_fitted_scene() {
         let mesh = [[0.0, 0.0, 0.0], [4.0, 2.0, 0.0]];
         assert_eq!(fit_point(&mesh, [2.0, 1.0, 0.0]).unwrap(), [0.0, 0.0, 0.0]);
@@ -2555,7 +2644,7 @@ mod mesh_tests {
         // on the x-min edge while the scene centre is 5 world units along +X and
         // the scene is thin in Z. A default -Z eye looks away and renders black.
         let positions = [[0.0, -1.0, -1.0], [10.0, 1.0, 1.0]];
-        let fly = initial_fly_camera(&positions, Some([0.0, 0.0, 0.0])).unwrap();
+        let fly = initial_fly_camera(&positions, Some([0.0, 0.0, 0.0]), SceneUp::YUp).unwrap();
         let m = fly.mvp(1.0);
         let centre = [0.0f32, 0.0, 0.0, 1.0];
         let clip: Vec<f32> =
@@ -2620,8 +2709,8 @@ mod mesh_tests {
     fn rig_starts_in_orbit_and_resets_to_the_spawn_view() {
         let positions = [[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 4.0, 0.0]];
         let spawn = Some([4.0, 0.0, 0.0]);
-        let start = initial_fly_camera(&positions, spawn).unwrap();
-        let mut rig = CameraRig::new(&positions, spawn).unwrap();
+        let start = initial_fly_camera(&positions, spawn, SceneUp::YUp).unwrap();
+        let mut rig = CameraRig::new(&positions, spawn, SceneUp::YUp).unwrap();
         assert_eq!(rig.input.mode, CameraMode::Orbit);
         assert_eq!(rig.fly, start);
         assert_eq!(rig.start, start);
