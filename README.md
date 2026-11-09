@@ -66,9 +66,10 @@ faster; `R` resets the camera; `Esc` exits.
 ## Play mode (engine skeleton)
 
 `--play` runs the deterministic engine skeleton on one archive unit. It is a
-skeleton, not a playable game: actor AI, animation, collision, scripts, audio,
-streaming, particles, menus, warps and save are absent. The close-out is in
-`docs/changes/engine-skeleton/milestone-report.md`.
+skeleton, not a playable game: actor AI, animation, scripts, audio, streaming,
+particles, menus, warps and save are absent. The close-out is in
+`docs/changes/engine-skeleton/milestone-report.md`. Room collision in the
+horizontal `X`/`Z` plane is implemented for the player (`docs/notes/engine-collision.md`).
 
 Windowed mode needs `--textures` and a display:
 
@@ -83,6 +84,11 @@ milestone, so other placements are not spawned in the window. Camera mode is
 set with `--camera`: `fly` is the default, `orbit` circles the unit, and
 `player` follows `raziel`. `Esc` exits 0. A missing texture page fails loud
 before the window opens.
+
+In player camera, `W`/`A`/`S`/`D` drive `raziel` on the horizontal plane. Walls
+from the loaded room triangles are solid: the movement is a deterministic
+fixed-point swept circle that stops before a wall and slides along it. It is not
+the original's four-step solver; see `docs/notes/engine-collision.md`.
 
 Headless mode runs the fixed 60 Hz clock without a window and prints exactly one
 line, then exits 0:
@@ -106,8 +112,8 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
   `RET 0` stub) and `.SRM` has no hierarchy, so `--pose` is a local cluster
   rotation only and the mesh tears at cluster seams.
 - **No game logic.** `--play` is a deterministic skeleton: no actor AI,
-  animation, collision, scripts, audio, streaming, particles, menus, warps or
-  save. This is not a playable engine.
+  animation, scripts, audio, streaming, particles, menus, warps or save, and no
+  vertical collision. This is not a playable engine.
 - **No sound sequences.** `.SND` waves export to WAV and loops are reported, but
   they are decoded one-shot; there is no `QSMa`/sequence playback, mixing or ADSR.
 - **Objects are real archived models, not markers.** `--level-render --objects`
@@ -162,7 +168,7 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
 | Game data | Read-only at runtime from the user's install; paths via CLI args/env only, never committed. |
 | Legal guardrails | Whitelist `.gitignore` verified every commit; single-player/offline owned copy only; community work credited in `THIRD-PARTY-NOTICES.md` once reuse starts. |
 | Process | Small chained slices (≤400 changed lines each); proposal → spec → tasks → code → playtest report. |
-| Tests | `cargo test` — 451 tests on synthetic bytes only; no game files in the suite. |
+| Tests | `cargo test` — 503 tests on synthetic bytes only; no game files in the suite. |
 
 ## Further reading
 

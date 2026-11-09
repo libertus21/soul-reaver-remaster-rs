@@ -1006,7 +1006,7 @@ mod tests {
     // caller only decides how many fixed ticks are owed. No simulation module
     // may name a clock type, and two different wall-clock schedules that reach
     // the same tick count must fold the same state.
-    const SIMULATION_SOURCES: [(&str, &str); 13] = [
+    const SIMULATION_SOURCES: [(&str, &str); 14] = [
         ("clock.rs", include_str!("clock.rs")),
         ("frame.rs", include_str!("frame.rs")),
         ("world.rs", include_str!("world.rs")),
@@ -1020,6 +1020,7 @@ mod tests {
         ("assets.rs", include_str!("assets.rs")),
         ("actor.rs", include_str!("actor.rs")),
         ("state.rs", include_str!("state.rs")),
+        ("collision.rs", include_str!("collision.rs")),
     ];
 
     #[test]
@@ -1033,6 +1034,25 @@ mod tests {
                 !source.contains("SystemTime"),
                 "{name} must not read or name SystemTime (wall clock)"
             );
+        }
+    }
+
+    /// The collision and movement path must not introduce a hash-ordered
+    /// container, a wall clock or an unseeded generator. The sweep is integer
+    /// and ordered: this scan is the tripwire.
+    #[test]
+    fn collision_and_movement_path_never_names_hash_clock_or_random_sources() {
+        let sources = [
+            ("collision.rs", include_str!("collision.rs")),
+            ("frame.rs", include_str!("frame.rs")),
+        ];
+        for (name, source) in sources {
+            for needle in ["HashMap", "HashSet", "rand::", "thread_rng", "Instant", "SystemTime"] {
+                assert!(
+                    !source.contains(needle),
+                    "{name} must not name {needle} on the collision/movement path"
+                );
+            }
         }
     }
 
