@@ -128,6 +128,18 @@ slice, not part of this gate.
   byte-identically; 300-tick digests are `adbfd4d88af3f093` and
   `b4bda7e380c3157b`. This is a deliberate simulation change: gravity now acts,
   not a fold change. See `docs/notes/engine-collision.md`.
+- engine-jump (ceiling blocking + jump): stage 9 now applies a signed vertical
+  velocity. A press edge of the existing `Jump` button replaces the velocity
+  with a documented synthetic upward impulse **only when the player ended the
+  previous tick grounded**; rising motion is clamped by the lowest near-horizontal
+  surface above the feet, using the classification the gravity slice produced.
+  Landing sets `grounded` again, a held button is one edge and a mid-air press is
+  ignored, so there is no double jump. The fold and its field set do not change;
+  `player_vertical_velocity` and `player_grounded` stay diagnostics. A no-input
+  run produces no upward velocity, so both real 60-tick digests are unchanged:
+  `under1` `def409846ff3a2cf` and `skinnr1` `131ce9555e923980`. A jump changes
+  the digest only through the existing integer `Y` position field. **All
+  synthetic goldens are untouched.** See `docs/notes/engine-collision.md`.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.

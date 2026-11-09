@@ -71,17 +71,28 @@
 //! keeps no-geometry worlds free of a meaningless ground plane and keeps the
 //! synthetic determinism goldens stable.
 //!
-//! Ceilings block nothing in this slice: the only vertical producer is gravity,
-//! so the player never moves upward. Ceiling triangles are still classified so
-//! the next slice can resolve them without a second parse.
+//! Ceilings resolve upward motion. A positive velocity (a jump impulse) rises
+//! the feet, and the whole near-horizontal surface set is queried again for the
+//! lowest surface above the feet: that is the ceiling under which the player's
+//! head would pass. The feet are clamped so the head stops at the ceiling, the
+//! velocity resets to zero and the next tick's gravity pulls the player back
+//! down. The same classification feeds both directions, so a ceiling is never
+//! re-parsed or re-classified for this step.
+//!
+//! Because a plane supports a body from either side and the winding sign is the
+//! only normal-direction source, the ground query and the ceiling query share
+//! the same surface set: ground is the highest surface at or below the feet,
+//! ceiling is the lowest surface strictly above the feet. A floor of a higher
+//! storey therefore acts as a ceiling from below, exactly as it physically
+//! should.
 //!
 //! # Honesty
 //!
-//! This is a correct, deterministic sweep-and-slide plus a gravity/ground
-//! resolver. It is **not** a reproduction of the original's exact four-step
-//! probe/resolve/commit solver; the original stage 8 behaviour is UNKNOWN and is
-//! not claimed here. The gravity constants and the player height are documented
-//! synthetic values, not retail values.
+//! This is a correct, deterministic sweep-and-slide plus a gravity/ground and
+//! ceiling resolver. It is **not** a reproduction of the original's exact
+//! four-step probe/resolve/commit solver; the original stage 8 behaviour is
+//! UNKNOWN and is not claimed here. The gravity constants, the jump impulse and
+//! the player height are documented synthetic values, not retail values.
 
 use std::collections::BTreeMap;
 
@@ -117,6 +128,21 @@ pub const MAX_FALL_SUBUNITS_PER_TICK: i64 = 16 * SUBUNITS;
 /// A walkable slope may stand a few units higher between two ticks; this
 /// tolerance keeps the player on the slope instead of treating it as a ledge.
 pub const MAX_STEP_UP_UNITS: i32 = 4;
+
+/// Player height in integer world units, from the feet to the top of the head.
+///
+/// The height is what turns an upward velocity into a ceiling contact: the feet
+/// may rise until `feet + height` reaches the surface above. This is a
+/// documented synthetic value; the original player height is UNKNOWN.
+pub const PLAYER_HEIGHT_UNITS: i32 = 48;
+
+/// Upward jump impulse, in fixed-point subunits per tick.
+///
+/// Ten world units per tick is a documented synthetic value chosen below the
+/// terminal fall speed so the rise is bounded and the jump arc is visible. Under
+/// [`GRAVITY_SUBUNITS_PER_TICK2`] the discrete arc peaks 45 world units above the
+/// launch point. The original jump impulse is UNKNOWN and is not claimed.
+pub const JUMP_IMPULSE_SUBUNITS_PER_TICK: i64 = 10 * SUBUNITS;
 
 /// One floor triangle kept for ground detection, with its geometric normal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,8 +332,8 @@ impl CollisionMesh {
 
     /// Number of near-horizontal triangles whose normal points down.
     ///
-    /// Classified for the next slice's ceiling resolver; this slice never moves
-    /// upward, so ceilings block nothing.
+    /// This is a diagnostic split; ceiling resolution uses the whole surface
+    /// set, because the winding sign is the only normal-direction source.
     pub fn ceiling_count(&self) -> usize {
         self.down_facing
     }
@@ -442,18 +468,57 @@ impl CollisionMesh {
         best
     }
 
-    /// Integrate one gravity tick and resolve the player against the floors.
+    /// Lowest horizontal surface at `(x, z)` that is strictly above `min_y`, in
+    /// integer world units.
     ///
-    /// Downward velocity is negative and accumulates [`GRAVITY_SUBUNITS_PER_TICK2`]
-    /// per tick, capped at [`MAX_FALL_SUBUNITS_PER_TICK`]. The candidate height
-    /// is `from.y + velocity`; when it reaches a floor at or below the feet (up
-    /// to [`MAX_STEP_UP_UNITS`] above them, so a walkable slope does not read as
-    /// a ledge), the player lands exactly on that surface, the velocity resets to
-    /// zero and `grounded` is `true`. Otherwise the candidate stands and the
-    /// fall continues.
+    /// This is the ceiling query: it mirrors [`CollisionMesh::ground_height`]
+    /// over the same near-horizontal triangle set. A surface exactly at the feet
+    /// is the floor the player stands on and is not a ceiling, so the test is
+    /// strict. Every surface is queried, in source order; the result is a
+    /// minimum, so iteration order cannot change it. A point outside every
+    /// projected surface returns `None`, i.e. open sky.
+    pub fn ceiling_height(&self, x: i32, z: i32, min_y: i32) -> Option<i32> {
+        if self.surfaces.is_empty() {
+            return None;
+        }
+        let px = i64::from(x) * SUBUNITS;
+        let pz = i64::from(z) * SUBUNITS;
+        let mut best: Option<i32> = None;
+        for surface in &self.surfaces {
+            let Some(height) = surface.height_at(px, pz) else {
+                continue;
+            };
+            let world = to_world(height);
+            if world > min_y && best.is_none_or(|current| world < current) {
+                best = Some(world);
+            }
+        }
+        best
+    }
+
+    /// Integrate one gravity tick and resolve the player against the floors and
+    /// the ceiling.
+    ///
+    /// The velocity is signed. Downward movement is negative and accumulates
+    /// [`GRAVITY_SUBUNITS_PER_TICK2`] per tick, capped at
+    /// [`MAX_FALL_SUBUNITS_PER_TICK`]. Upward movement is positive (a jump
+    /// impulse) and loses the same gravity each tick.
+    ///
+    /// - **Rising**: the candidate feet are `from.y + velocity`. The lowest
+    ///   surface strictly above the feet is the ceiling. The feet may rise until
+    ///   the head (`feet + [`PLAYER_HEIGHT_UNITS`]`) reaches that surface; at
+    ///   contact the feet are clamped below it, the velocity resets to zero and
+    ///   the next tick falls. Hitting a ceiling is not landing, so `grounded` is
+    ///   `false`.
+    /// - **Falling or resting**: the candidate height is `from.y + velocity`;
+    ///   when it reaches a floor at or below the feet (up to
+    ///   [`MAX_STEP_UP_UNITS`] above them, so a walkable slope does not read as a
+    ///   ledge), the player lands exactly on that surface, the velocity resets to
+    ///   zero and `grounded` is `true`.
     ///
     /// A mesh with no surfaces leaves `from.y` untouched and reports
-    /// `grounded = false`: there is no ground geometry to resolve against.
+    /// `grounded = false`: there is no ground geometry, so gravity and the jump
+    /// impulse both do nothing.
     pub fn vertical_step(&self, from: [i32; 3], velocity_subunits: i64) -> VerticalStep {
         if self.surfaces.is_empty() {
             return VerticalStep {
@@ -465,6 +530,30 @@ impl CollisionMesh {
         let velocity = velocity_subunits
             .saturating_sub(GRAVITY_SUBUNITS_PER_TICK2)
             .max(-MAX_FALL_SUBUNITS_PER_TICK);
+        if velocity > 0 {
+            let candidate_y = to_world(
+                i64::from(from[1])
+                    .saturating_mul(SUBUNITS)
+                    .saturating_add(velocity),
+            );
+            if let Some(ceiling) = self.ceiling_height(from[0], from[2], from[1]) {
+                let max_feet = ceiling.saturating_sub(PLAYER_HEIGHT_UNITS);
+                if candidate_y.saturating_add(PLAYER_HEIGHT_UNITS) >= ceiling {
+                    // Clamp below the ceiling, but never push the feet down
+                    // through the floor the player is already standing on.
+                    return VerticalStep {
+                        y: from[1].max(max_feet),
+                        velocity_subunits: 0,
+                        grounded: false,
+                    };
+                }
+            }
+            return VerticalStep {
+                y: candidate_y,
+                velocity_subunits: velocity,
+                grounded: false,
+            };
+        }
         let candidate_y = to_world(
             i64::from(from[1])
                 .saturating_mul(SUBUNITS)
@@ -1202,6 +1291,124 @@ mod tests {
             let mut velocity = 0i64;
             let mut observed = Vec::new();
             for _ in 0..40 {
+                let step = mesh.vertical_step(position, velocity);
+                position[1] = step.y;
+                velocity = step.velocity_subunits;
+                observed.push((step.y, step.velocity_subunits, step.grounded));
+            }
+            observed
+        }
+        assert_eq!(run(), run());
+    }
+
+    /// Run one jump arc from `from_y` and return the per-tick `(y, velocity)`.
+    ///
+    /// The first sample is the launch tick: the impulse loses one gravity step
+    /// before the first rise. The loop stops one tick after the landing tick so
+    /// the caller sees the final grounded sample.
+    fn jump_arc(mesh: &CollisionMesh, from_y: i32) -> Vec<(i32, i64, bool)> {
+        let mut position = [0, from_y, 0];
+        let mut velocity = super::JUMP_IMPULSE_SUBUNITS_PER_TICK;
+        let mut observed = Vec::new();
+        for _ in 0..200 {
+            let step = mesh.vertical_step(position, velocity);
+            position[1] = step.y;
+            velocity = step.velocity_subunits;
+            observed.push((step.y, step.velocity_subunits, step.grounded));
+            if step.grounded {
+                break;
+            }
+        }
+        observed
+    }
+
+    #[test]
+    fn a_jump_rises_peaks_and_lands_back_on_the_floor() {
+        let mesh = floor_mesh(0);
+        let arc = jump_arc(&mesh, 0);
+
+        let peak = arc.iter().map(|sample| sample.0).max().expect("an arc");
+        let impulse_units = (super::JUMP_IMPULSE_SUBUNITS_PER_TICK / super::SUBUNITS) as i32;
+        let expected_peak = impulse_units * (impulse_units - 1) / 2;
+        assert!(peak > 0, "the jump must rise: {arc:?}");
+        assert_eq!(peak, expected_peak, "the discrete arc peaks at the documented height");
+        assert!(arc.iter().all(|sample| sample.0 >= 0), "the jump must not fall through the floor");
+
+        let (land_y, land_velocity, grounded) = *arc.last().expect("the arc lands");
+        assert!(grounded, "the arc must end on the floor");
+        assert_eq!(land_y, 0, "the jump must land exactly on the ground");
+        assert_eq!(land_velocity, 0);
+    }
+
+    #[test]
+    fn a_repeated_jump_lands_at_the_same_height_without_drift() {
+        let mesh = floor_mesh(0);
+        let first = jump_arc(&mesh, 0);
+        let landed = first.last().expect("the first jump lands").0;
+        let second = jump_arc(&mesh, landed);
+
+        assert_eq!(first, second, "a jump from the same ground is the same arc");
+        assert_eq!(second.last().expect("the second jump lands").0, landed);
+    }
+
+    #[test]
+    fn a_jump_under_a_low_ceiling_stops_at_it_and_falls_back() {
+        // Walkable floor at 0 and a downward-facing plane at 60: a 48-unit
+        // player has 12 units of headroom.
+        let (mut vertices, mut faces) = floor_up(0, -100, 100, -100, 100);
+        let (v, f) = floor(60, -100, 100, -100, 100);
+        append(&mut vertices, &mut faces, v, f);
+        let mesh = CollisionMesh::from_room_triangles(&vertices, &faces);
+        assert_eq!(mesh.ceiling_count(), 2, "the downward plane is a ceiling");
+
+        let arc = jump_arc(&mesh, 0);
+        let clearance = 60 - super::PLAYER_HEIGHT_UNITS;
+        let peak = arc.iter().map(|sample| sample.0).max().expect("an arc");
+        assert_eq!(peak, clearance, "the head stops at the ceiling");
+        assert!(
+            arc.iter().all(|sample| sample.0 <= clearance),
+            "the player must never pass through the ceiling: {arc:?}"
+        );
+        let (land_y, _, grounded) = *arc.last().expect("the arc falls back");
+        assert!(grounded, "the player must fall back to the floor");
+        assert_eq!(land_y, 0);
+    }
+
+    #[test]
+    fn ceiling_height_is_the_lowest_surface_above_the_feet() {
+        let (mut vertices, mut faces) = floor_up(0, -100, 100, -100, 100);
+        let (v, f) = floor(60, -100, 100, -100, 100);
+        append(&mut vertices, &mut faces, v, f);
+        let mesh = CollisionMesh::from_room_triangles(&vertices, &faces);
+
+        assert_eq!(mesh.ceiling_height(0, 0, -1000), Some(0), "the floor is above -1000");
+        assert_eq!(mesh.ceiling_height(0, 0, 0), Some(60), "strictly above the feet");
+        assert_eq!(mesh.ceiling_height(0, 0, 60), None, "nothing above the sky");
+        assert_eq!(mesh.ceiling_height(5000, 0, -1000), None, "outside every surface");
+    }
+
+    #[test]
+    fn an_upward_step_without_surfaces_does_nothing() {
+        let step = CollisionMesh::default().vertical_step([0, 42, 0], super::JUMP_IMPULSE_SUBUNITS_PER_TICK);
+        assert_eq!(step.y, 42);
+        assert_eq!(step.velocity_subunits, 0);
+        assert!(!step.grounded);
+    }
+
+    #[test]
+    fn the_same_jump_script_replays_identically() {
+        fn run() -> Vec<(i32, i64, bool)> {
+            let (mut vertices, mut faces) = floor_up(0, -500, 500, -500, 500);
+            let (v, f) = floor(200, -500, 500, -500, 500);
+            append(&mut vertices, &mut faces, v, f);
+            let mesh = CollisionMesh::from_room_triangles(&vertices, &faces);
+            let mut position = [0, 0, 0];
+            let mut velocity = 0i64;
+            let mut observed = Vec::new();
+            for tick in 0..120 {
+                if tick == 5 {
+                    velocity = super::JUMP_IMPULSE_SUBUNITS_PER_TICK;
+                }
                 let step = mesh.vertical_step(position, velocity);
                 position[1] = step.y;
                 velocity = step.velocity_subunits;

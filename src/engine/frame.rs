@@ -22,6 +22,14 @@
 //! triangles. A synthetic or geometry-free world has no ground plane, so stage 9
 //! leaves `Y` untouched and the synthetic determinism goldens stay stable.
 //!
+//! A jump is a deterministic input edge, not a timer: the `Jump` press edge
+//! replaces the vertical velocity with a documented synthetic upward impulse
+//! **only while the player ended the previous tick grounded**. Rising motion is
+//! resolved by the same collision mesh, which clamps the head at the lowest
+//! surface above the feet. A jump therefore cannot start in mid-air and there is
+//! no double jump; landing re-enables the next press edge. The velocity and the
+//! grounded flag are diagnostics and are not part of the canonical fold.
+//!
 //! The player is updated twice per tick, exactly as documented: first by the
 //! direct player path (stage 9) and again as an ordinary live object in the
 //! generic per-object pass (stage 12). The double update is original behaviour
@@ -33,9 +41,10 @@ use std::time::Duration;
 use crate::engine::actor::{ActorProfile, ActorRuntime};
 use crate::engine::class::{CLASS_TABLE, Hooks, Query, RenderClass, classify};
 use crate::engine::clock::{ObjectTick, SimClock};
+use crate::engine::collision::JUMP_IMPULSE_SUBUNITS_PER_TICK;
 use crate::engine::determinism::{WorldEntry, WorldState};
 use crate::engine::events::{EngineEvent, EventQueue};
-use crate::engine::input::{InputEvent, InputFrame, InputQueue};
+use crate::engine::input::{InputButton, InputEvent, InputFrame, InputQueue};
 use crate::engine::live::{LiveArena, LiveId, LiveObject};
 use crate::engine::tracker::{ObjectTracker, TrackerError};
 use crate::engine::world::World;
@@ -287,8 +296,9 @@ pub struct FrameState {
     events: EventQueue,
     current_input: InputFrame,
     player: Option<LiveId>,
-    /// Downward vertical velocity in fixed-point subunits per tick. Negative is
-    /// falling; zero is grounded. Not part of the canonical fold.
+    /// Signed vertical velocity in fixed-point subunits per tick. Positive is
+    /// rising (a jump); negative is falling; zero is grounded or at the apex.
+    /// Not part of the canonical fold.
     player_vertical_velocity: i64,
     /// Whether the player ended the last tick resting on a walkable floor.
     player_grounded: bool,
@@ -393,8 +403,9 @@ impl FrameState {
         self.player_grounded
     }
 
-    /// The player's downward vertical velocity in fixed-point subunits per tick.
-    /// Negative is falling; zero is grounded. Diagnostic only.
+    /// The player's signed vertical velocity in fixed-point subunits per tick.
+    /// Positive is rising; negative is falling; zero is grounded or at the apex.
+    /// Diagnostic only.
     pub fn player_vertical_velocity(&self) -> i64 {
         self.player_vertical_velocity
     }
@@ -679,8 +690,8 @@ impl FrameState {
     /// next to the translation it resolves.
     fn stage_player_solver(&mut self) {}
 
-    /// Stage 9 - player input to movement through the deterministic sweep and
-    /// the gravity/ground resolver.
+    /// Stage 9 - player input to movement through the deterministic sweep, the
+    /// jump rule and the gravity/ground/ceiling resolver.
     ///
     /// The sampled input becomes an integer `X`/`Z` delta and is resolved
     /// against the world's [`CollisionMesh`](crate::engine::collision::CollisionMesh).
@@ -688,11 +699,19 @@ impl FrameState {
     /// no-input tick cannot change the position on its own. The sweep stops
     /// before walls and slides along them.
     ///
+    /// A `Jump` press edge starts a jump only when the player ended the previous
+    /// tick grounded; it replaces the signed vertical velocity with
+    /// [`JUMP_IMPULSE_SUBUNITS_PER_TICK`]. Because the edge is consumed once and
+    /// the flag is `false` while airborne, a held button and a mid-air press do
+    /// nothing, so there is no double jump. Landing sets `grounded` again and the
+    /// next press edge is allowed.
+    ///
     /// Vertical motion is resolved after the horizontal sweep, at the resulting
-    /// `X`/`Z`: gravity accumulates downward velocity, and the player lands
-    /// exactly on the highest floor at or below the feet. A world with no floor
-    /// triangles leaves `Y` untouched. This is a correct deterministic resolver,
-    /// not the original four-step solver.
+    /// `X`/`Z`: gravity accumulates a signed velocity, a rising player is
+    /// clamped below the lowest ceiling above the feet, and a falling player
+    /// lands exactly on the highest floor at or below the feet. A world with no
+    /// floor triangles leaves `Y` untouched. This is a correct deterministic
+    /// resolver, not the original four-step solver.
     fn stage_player_movement(&mut self) {
         let Some(player) = self.player else {
             return;
@@ -710,6 +729,10 @@ impl FrameState {
             if let Ok(object) = self.live.get_mut(player) {
                 object.position = collision.sweep(object.position, delta, PLAYER_RADIUS_UNITS);
             }
+        }
+
+        if self.player_grounded && self.current_input.is_pressed(InputButton::Jump) {
+            self.player_vertical_velocity = JUMP_IMPULSE_SUBUNITS_PER_TICK;
         }
 
         let Ok(position) = self.live.get(player).map(|object| object.position) else {
@@ -1084,6 +1107,42 @@ mod tests {
         };
         let mut world = World::from_report("test".to_string(), 1, &report);
         world.collision = floor_mesh(&[(floor_y, -500, 500, -500, 500)]);
+        assert!(world.collision.has_ground(), "the fixture must carry ground");
+        world
+    }
+
+    /// One walkable floor at `floor_y` and one downward-facing plane at
+    /// `ceiling_y`, spanning the same 200x200 footprint.
+    fn floor_and_ceiling_mesh(floor_y: i32, ceiling_y: i32) -> CollisionMesh {
+        let mut vertices = Vec::new();
+        let mut faces = Vec::new();
+        vertices.extend([[ -100, floor_y, -100], [-100, floor_y, 100], [100, floor_y, 100], [100, floor_y, -100]]);
+        faces.push([0, 1, 2]);
+        faces.push([0, 2, 3]);
+        let base = vertices.len() as u32;
+        vertices.extend([[ -100, ceiling_y, -100], [100, ceiling_y, -100], [100, ceiling_y, 100], [-100, ceiling_y, 100]]);
+        faces.push([base, base + 1, base + 2]);
+        faces.push([base, base + 2, base + 3]);
+        CollisionMesh::from_room_triangles(&vertices, &faces)
+    }
+
+    /// The raziel world at the origin with a walkable floor at 0 and a solid
+    /// wall at `x = 100` tall enough that a jump cannot clear it.
+    fn world_with_wall_and_floor() -> World {
+        let mut world = world_with_raziel();
+        let mut vertices = vec![
+            [100, -100, -500],
+            [100, -100, 500],
+            [100, 400, 500],
+            [100, 400, -500],
+        ];
+        let mut faces = vec![[0u32, 1, 2], [0, 2, 3]];
+        let base = vertices.len() as u32;
+        vertices.extend([[-500, 0, -500], [-500, 0, 500], [100, 0, 500], [100, 0, -500]]);
+        faces.push([base, base + 1, base + 2]);
+        faces.push([base, base + 2, base + 3]);
+        world.collision = CollisionMesh::from_room_triangles(&vertices, &faces);
+        assert!(!world.collision.is_empty(), "the fixture must carry a wall");
         assert!(world.collision.has_ground(), "the fixture must carry ground");
         world
     }
@@ -1553,6 +1612,183 @@ mod tests {
         let second = run();
         assert_eq!(first.0, second.0, "the same gravity run must replay positions");
         assert_eq!(first.1, second.1, "the same gravity run must fold the same digest");
+    }
+
+    #[test]
+    fn a_jump_rises_peaks_and_lands_back_on_the_ground() {
+        let mut frame = FrameState::new(world_with_floor(0, 0));
+        tick(&mut frame, 0);
+        assert!(frame.player_grounded(), "the first tick must establish the ground");
+
+        frame.queue_input(InputEvent::press(InputButton::Jump));
+        let mut peak = 0;
+        let mut landed = false;
+        for index in 1..200 {
+            tick(&mut frame, index);
+            let y = frame.player_position().expect("the player is bound")[1];
+            assert!(y >= 0, "the jump must not fall through the floor: tick {index}");
+            peak = peak.max(y);
+            if frame.player_grounded() {
+                landed = true;
+                assert_eq!(y, 0, "the jump must land exactly on the ground");
+                assert_eq!(frame.player_vertical_velocity(), 0);
+                break;
+            }
+        }
+        assert!(peak > 0, "the jump must rise");
+        assert_eq!(peak, 45, "the documented synthetic arc peaks at 45 units");
+        assert!(landed, "the jump must come back down");
+    }
+
+    #[test]
+    fn a_jump_under_a_low_ceiling_stops_there_and_falls_back() {
+        let report = ObjectReport {
+            room_offset: 0,
+            count: 1,
+            array_offset: 0,
+            objects: vec![record("raziel", [0, 0, 0])],
+        };
+        let mut world = World::from_report("test".to_string(), 1, &report);
+        world.collision = floor_and_ceiling_mesh(0, 60);
+        let mut frame = FrameState::new(world);
+        tick(&mut frame, 0);
+        assert!(frame.player_grounded());
+
+        let clearance = 60 - crate::engine::collision::PLAYER_HEIGHT_UNITS;
+        frame.queue_input(InputEvent::press(InputButton::Jump));
+        let mut peak = 0;
+        let mut landed = false;
+        for index in 1..200 {
+            tick(&mut frame, index);
+            let y = frame.player_position().expect("the player is bound")[1];
+            assert!(y <= clearance, "the head must stop at the ceiling: tick {index}");
+            peak = peak.max(y);
+            if frame.player_grounded() {
+                landed = true;
+                assert_eq!(y, 0);
+                break;
+            }
+        }
+        assert_eq!(peak, clearance, "the jump stops at the ceiling clearance");
+        assert!(landed, "the player must fall back to the floor");
+    }
+
+    #[test]
+    fn a_jump_while_airborne_does_nothing() {
+        let mut frame = FrameState::new(world_with_floor(0, 50));
+        tick(&mut frame, 0);
+        assert!(!frame.player_grounded(), "the spawn is airborne");
+
+        let before = frame.player_position().expect("the player is bound")[1];
+        frame.queue_input(InputEvent::press(InputButton::Jump));
+        tick(&mut frame, 1);
+        assert!(
+            frame.player_vertical_velocity() <= 0,
+            "a mid-air press must not start a jump"
+        );
+        assert!(
+            frame.player_position().expect("the player is bound")[1] <= before,
+            "a mid-air press must not lift the player"
+        );
+
+        // Landing restores the ability: a fresh press after the floor is
+        // reached does start a jump.
+        for index in 2..200 {
+            tick(&mut frame, index);
+            if frame.player_grounded() {
+                break;
+            }
+        }
+        assert!(frame.player_grounded(), "the fall must land");
+        frame.queue_input(InputEvent::release(InputButton::Jump));
+        tick(&mut frame, 200);
+        frame.queue_input(InputEvent::press(InputButton::Jump));
+        tick(&mut frame, 201);
+        assert!(
+            frame.player_vertical_velocity() > 0,
+            "landing must re-enable the jump"
+        );
+    }
+
+    #[test]
+    fn a_held_jump_button_does_not_jump_again() {
+        let mut frame = FrameState::new(world_with_floor(0, 0));
+        tick(&mut frame, 0);
+        frame.queue_input(InputEvent::press(InputButton::Jump));
+
+        let mut rises = 0;
+        let mut was_rising = false;
+        let mut landed_after_jump = false;
+        for index in 1..300 {
+            tick(&mut frame, index);
+            let rising = frame.player_vertical_velocity() > 0;
+            if rising && !was_rising {
+                rises += 1;
+            }
+            was_rising = rising;
+            if !rising && frame.player_grounded() {
+                landed_after_jump = true;
+            }
+        }
+        assert_eq!(rises, 1, "a held button is one edge and one jump");
+        assert!(landed_after_jump, "the single jump must land");
+    }
+
+    #[test]
+    fn jumping_into_a_wall_corner_does_not_tunnel() {
+        let mut frame = FrameState::new(world_with_wall_and_floor());
+        tick(&mut frame, 0);
+        assert!(frame.player_grounded());
+        frame.queue_input(InputEvent::press(InputButton::Right));
+        frame.queue_input(InputEvent::press(InputButton::Forward));
+        frame.queue_input(InputEvent::press(InputButton::Jump));
+
+        let mut peak = 0;
+        for index in 1..180 {
+            tick(&mut frame, index);
+            let position = frame.player_position().expect("the player is bound");
+            assert!(position[0] < 100, "the player tunnelled the wall on tick {index}");
+            assert!(position[1] >= 0, "the player fell through the floor on tick {index}");
+            peak = peak.max(position[1]);
+        }
+        assert!(peak > 0, "the combined script must include a jump");
+    }
+
+    #[test]
+    fn zero_input_never_moves_the_player_upward() {
+        let mut frame = FrameState::new(world_with_floor(0, 50));
+        let mut previous = frame.player_position().expect("the player is bound")[1];
+        for index in 0..200 {
+            tick(&mut frame, index);
+            let y = frame.player_position().expect("the player is bound")[1];
+            assert!(y <= previous, "tick {index} moved upward without a jump");
+            assert!(frame.player_vertical_velocity() <= 0);
+            previous = y;
+        }
+        assert!(frame.player_grounded(), "the no-input fall still lands");
+    }
+
+    #[test]
+    fn the_same_jump_input_script_replays_the_same_digest() {
+        fn run() -> (Vec<[i32; 3]>, u64) {
+            let mut frame = FrameState::new(world_with_floor(0, 0));
+            tick(&mut frame, 0);
+            let mut positions = Vec::new();
+            for index in 1..=140 {
+                match index {
+                    5 => frame.queue_input(InputEvent::press(InputButton::Jump)),
+                    40 => frame.queue_input(InputEvent::release(InputButton::Jump)),
+                    70 => frame.queue_input(InputEvent::press(InputButton::Jump)),
+                    _ => {}
+                }
+                tick(&mut frame, index);
+                positions.push(frame.player_position().expect("the player is bound"));
+            }
+            (positions, world_state_hash(&frame.world_state()))
+        }
+
+        let first = run();
+        assert_eq!(first, run(), "the same jump script must replay byte for byte");
     }
 
     #[test]

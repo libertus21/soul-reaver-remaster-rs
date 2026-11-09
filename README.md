@@ -34,7 +34,7 @@ your own install; nothing is bundled.
 | Actor behaviour census | `cargo run -- --actor-census --bigfile <BIGFILE.DAT> [--objects-dir <DIR>]` / `cargo run -- --object-info --bigfile <BIGFILE.DAT> --entry 129 --actors` | Reads the object-header `+0x1C` actor block, prints each actor's 0x20-byte entry count, entry ids (hex) and the eight 8x3 state trios, then a corpus summary. Partial actors report `variant`/`none` and never contribute to the totals. Real corpus: 21 actors / 75 entries / 37 distinct ids (19 archive + `morboss`/`priests` loose). |
 | `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --entry <INDEX>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --group under [--objects] [--textures <TEXTURES.BIG>]` | Renders room geometry, flat or textured from `TEXTURES.BIG`. Orbit, wheel zoom, pan, `R` reset; `F` enters a first-person fly camera. `--objects` adds each placed object's real archived model at its world position; `--textures` textures both rooms and models. |
 | Level reachability | `cargo run -- --level-reach --bigfile <BIGFILE.DAT> [--start <UNIT>] [--names]` | BFS from `under1` over the decoded link graph, then groups reachable, in-degree islands and inbound-but-unreachable units. `--names` lists each island unit. Corrected reader: 372 discovered / 334 reachable / 38 unreachable / 1 island (`push1`). |
-| Engine play mode | `cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG>` / `cargo run -- --play --headless --bigfile <BIGFILE.DAT> --ticks <N>` | Opens a deterministic engine window (orbit, fly or player camera; `Esc` exits 0), or prints one headless acceptance line with the FNV-1a 64 state digest. Fixed 60 Hz clock, 48-slot tracker, name-keyed spawning, 18-stage frame loop, solid room walls, and gravity with ground/landing. Still no AI, animation, scripts or audio. |
+| Engine play mode | `cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG>` / `cargo run -- --play --headless --bigfile <BIGFILE.DAT> --ticks <N>` | Opens a deterministic engine window (orbit, fly or player camera; player mode is `WASD`, `Space` jumps, `F` cycles the camera, `Esc` exits 0), or prints one headless acceptance line with the FNV-1a 64 state digest. Fixed 60 Hz clock, 48-slot tracker, name-keyed spawning, 18-stage frame loop, solid room walls, gravity with ground/landing, ceiling blocking and a synthetic ground-only jump. Still no AI, animation, scripts or audio. |
 | Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 33 capabilities in six groups; grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
 
 `<PATH>` accepts a `.PCM` file or a room directory. The level arms also accept
@@ -113,9 +113,9 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
   rotation only and the mesh tears at cluster seams.
 - **No game logic.** `--play` is a deterministic skeleton: no actor AI,
   animation, scripts, audio, streaming, particles, menus, warps or save. Room
-  walls are solid and gravity lands the player on floors, but there is no jump,
-  no ceiling blocking, no step-height climbing and no water/lava. This is not a
-  playable engine.
+  walls are solid, gravity lands the player on floors, ceilings block upward
+  motion and a ground-only jump works (synthetic constants), but there is no
+  step-height climbing and no water/lava. This is not a playable engine.
 - **No sound sequences.** `.SND` waves export to WAV and loops are reported, but
   they are decoded one-shot; there is no `QSMa`/sequence playback, mixing or ADSR.
 - **Objects are real archived models, not markers.** `--level-render --objects`
