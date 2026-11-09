@@ -30,6 +30,11 @@ those ids index, its record count would have to exceed the largest id it is
 indexed by. It never does. That is a systematic falsification, not a
 not-found-yet.
 
+A later pass searched the payload directly for the confirmed spline key shapes
+instead of comparing counts: `docs/notes/sra-key-search.md`. Its detector is
+calibrated on the one known positive (`font`) and reconfirms the negative from
+the key-pattern side.
+
 ## Quick path
 
 1. Read section 1 for the container (what is confirmed).

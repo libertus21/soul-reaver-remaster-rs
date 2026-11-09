@@ -118,7 +118,9 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
 ## What's missing / known limits
 
 - **No skeletal animation.** `.SRA` is not parsed by this build (the loader callback is a
-  `RET 0` stub) and `.SRM` has no hierarchy, so `--pose` is a local cluster
+  `RET 0` stub); a font-calibrated search for the confirmed spline key shapes
+  found no coherent channel in its payloads (`docs/notes/sra-key-search.md`), and
+  `.SRM` has no hierarchy, so `--pose` is a local cluster
   rotation only and the mesh tears at cluster seams. `.SRL` is decoded as a
   **voice-line animation container** (header, frame count, fps, duration and
   48-byte per-frame 3x4 cells confirmed; `docs/notes/srl-animation.md`), but it

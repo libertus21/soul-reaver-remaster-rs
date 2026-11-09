@@ -66,6 +66,10 @@ mod tex_hd_map;
 #[allow(dead_code)]
 mod srm;
 mod srl;
+// Read-only `.SRA` key-shape detector: validated against the documented
+// `font` channel. The corpus census is negative, so it stays unwired.
+#[allow(dead_code)]
+mod sra;
 mod snd;
 mod textures;
 mod textures_object;
