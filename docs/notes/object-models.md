@@ -313,8 +313,10 @@ port of that reader; no source code was copied.
 7. The 115 relocation positions (0.24%) that resolve between payload end and
    entry end.
 8. Why `box` and `eye` carry a leading `\` in the fourth index dword.
-9. Where a placed object's world transform (orientation and scale) is composed;
-   the level record has position only, and the model is in local space.
+9. Where a placed object's world transform is composed beyond the record
+   position. The local **vertical** is now confirmed (`docs/notes/object-up-axis.md`:
+   object-local up is `+Z`, the same as the world, so placement is a pure
+   translation). The facing axis and any authored yaw remain UNKNOWN.
 10. Whether any non-type-1 path reads the auxiliary table.
 
 ## 7. Reader in this tree
@@ -338,8 +340,9 @@ record carries no rotation). Unresolved names fall back to the existing cube
 marker. A summary line reports the mesh/marker split; without `--objects` the
 render output is unchanged.
 
-Rendering, textures, material interior, bones, orientation and world transforms
-beyond the record position are not decoded.
+Rendering, textures, material interior, bones and animation are not decoded.
+Object-local up is now confirmed `+Z` (`docs/notes/object-up-axis.md`), so
+placement is a translation with no rotation; the facing/yaw remains undecoded.
 
 ## 8. Legal
 
