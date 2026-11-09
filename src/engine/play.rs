@@ -602,6 +602,10 @@ impl CameraKeys {
     }
 }
 
+/// Map a key to a player input button in the engine window.
+///
+/// Player mode is `WASD` for the direct translation axes and `Space` for the
+/// jump edge. The jump rule itself is stage 9; this binding only queues the edge.
 fn player_button(key: &Key) -> Option<InputButton> {
     match key {
         Key::Character(text) => match text.to_ascii_lowercase().as_str() {
@@ -611,7 +615,7 @@ fn player_button(key: &Key) -> Option<InputButton> {
             "d" => Some(InputButton::Right),
             _ => None,
         },
-        Key::Named(NamedKey::Space) => Some(InputButton::Action),
+        Key::Named(NamedKey::Space) => Some(InputButton::Jump),
         _ => None,
     }
 }
