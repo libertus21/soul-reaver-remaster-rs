@@ -34,7 +34,7 @@ your own install; nothing is bundled.
 | Actor behaviour census | `cargo run -- --actor-census --bigfile <BIGFILE.DAT> [--objects-dir <DIR>]` / `cargo run -- --object-info --bigfile <BIGFILE.DAT> --entry 129 --actors` | Reads the object-header `+0x1C` actor block, prints each actor's 0x20-byte entry count, entry ids (hex) and the eight 8x3 state trios, then a corpus summary. Partial actors report `variant`/`none` and never contribute to the totals. Real corpus: 21 actors / 75 entries / 37 distinct ids (19 archive + `morboss`/`priests` loose). |
 | `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --entry <INDEX>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --group under [--objects] [--textures <TEXTURES.BIG>]` | Renders room geometry, flat or textured from `TEXTURES.BIG`. Orbit, wheel zoom, pan, `R` reset; `F` enters a first-person fly camera. `--objects` adds each placed object's real archived model at its world position; `--textures` textures both rooms and models. |
 | Level reachability | `cargo run -- --level-reach --bigfile <BIGFILE.DAT> [--start <UNIT>] [--names]` | BFS from `under1` over the decoded link graph, then groups reachable, in-degree islands and inbound-but-unreachable units. `--names` lists each island unit. Corrected reader: 372 discovered / 334 reachable / 38 unreachable / 1 island (`push1`). |
-| Engine play mode | `cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG>` / `cargo run -- --play --headless --bigfile <BIGFILE.DAT> --ticks <N>` | Opens a deterministic engine window (orbit, fly or player camera; player mode is `WASD`, `Space` jumps, `F` cycles the camera, `Esc` exits 0), or prints one headless acceptance line with the FNV-1a 64 state digest. Fixed 60 Hz clock, 48-slot tracker, name-keyed spawning, 18-stage frame loop, solid room walls, gravity with ground/landing, ceiling blocking and a synthetic ground-only jump. Still no AI, animation, scripts or audio. |
+| Engine play mode | `cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG>` / `cargo run -- --play --headless --bigfile <BIGFILE.DAT> --ticks <N>` | Opens a deterministic engine window (orbit, fly or player camera; player mode is `WASD`, `Space` jumps, `F` cycles the camera, `Esc` exits 0), or prints one headless acceptance line with the FNV-1a 64 state digest. Fixed 60 Hz clock, 48-slot tracker, name-keyed spawning, 18-stage frame loop, solid room walls, Z-up gravity with ground/landing, ceiling blocking, a synthetic ground-only jump and a Z-up third-person player camera. Still no AI, animation, scripts or audio. |
 | Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 33 capabilities in six groups; grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
 
 `<PATH>` accepts a `.PCM` file or a room directory. The level arms also accept
@@ -68,8 +68,9 @@ faster; `R` resets the camera; `Esc` exits.
 `--play` runs the deterministic engine skeleton on one archive unit. It is a
 skeleton, not a playable game: actor AI, animation, scripts, audio, streaming,
 particles, menus, warps and save are absent. The close-out is in
-`docs/changes/engine-skeleton/milestone-report.md`. Room collision in the
-horizontal `X`/`Z` plane is implemented for the player (`docs/notes/engine-collision.md`).
+`docs/changes/engine-skeleton/milestone-report.md`. Room collision runs on the
+horizontal `X`/`Y` plane of the **Z-up** world, with gravity and the player
+camera on `Z` (`docs/notes/up-axis.md`, `docs/notes/engine-collision.md`).
 
 Windowed mode needs `--textures` and a display:
 
@@ -82,10 +83,11 @@ The window draws the unit's room geometry and the player's live model. The
 authored placed-object seeding pass runs only in headless mode in this
 milestone, so other placements are not spawned in the window. Camera mode is
 set with `--camera`: `fly` is the default, `orbit` circles the unit, and
-`player` follows `raziel`. `Esc` exits 0. A missing texture page fails loud
-before the window opens.
+`player` is a third-person camera behind and above `raziel` that follows it.
+`Esc` exits 0. A missing texture page fails loud before the window opens.
 
-In player camera, `W`/`A`/`S`/`D` drive `raziel` on the horizontal plane. Walls
+In player camera, `W`/`A`/`S`/`D` drive `raziel` on the horizontal `X`/`Y`
+plane of the Z-up world. Walls
 from the loaded room triangles are solid: the movement is a deterministic
 fixed-point swept circle that stops before a wall and slides along it. It is not
 the original's four-step solver; see `docs/notes/engine-collision.md`.

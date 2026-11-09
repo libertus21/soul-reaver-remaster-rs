@@ -917,7 +917,11 @@ mod tests {
     // engine-actor-refresh slice moved it from `0xa203_0add_093d_a5e6` to
     // `0xd1f3_6008_a152_04a2` because the four state bytes replaced the single
     // `state` byte in the same fold.
-    const GOLDEN_FRAME_STATE_HASH: u64 = 0xd1f3_6008_a152_04a2;
+    // engine-up-axis moved it from `0xd1f3_6008_a152_04a2` to
+    // `0x9c68_230a_4907_fbe2`: the script moves the player with Forward/Right,
+    // and the movement plane is now the horizontal `X`/`Y` plane of the Z-up
+    // world instead of the wrong `X`/`Z` plane. The fold itself did not change.
+    const GOLDEN_FRAME_STATE_HASH: u64 = 0x9c68_230a_4907_fbe2;
 
     fn frame_record(name: &str, position: [i16; 3]) -> ObjectRecord {
         ObjectRecord {
@@ -986,13 +990,13 @@ mod tests {
             );
         }
 
-        assert_eq!(first[0].2, [0, 0, 4], "forward moves +Z directly");
-        assert_eq!(first[19].2, [40, 0, 80], "right moves +X while forward holds");
+        assert_eq!(first[0].2, [0, 4, 0], "forward moves +Y directly (world is Z-up)");
+        assert_eq!(first[19].2, [40, 80, 0], "right moves +X while forward holds");
         assert_eq!(
             first[20].2, first[19].2,
             "the release is sampled at the tick boundary and stops movement"
         );
-        assert_eq!(first[39].2, [40, 0, 40], "back subtracts from the same axis");
+        assert_eq!(first[39].2, [40, 40, 0], "back subtracts from the same axis");
         assert_ne!(first[0].1, first[39].1, "the state stream must move");
 
         let last = first[39].1;

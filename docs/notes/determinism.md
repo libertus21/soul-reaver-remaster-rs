@@ -140,6 +140,19 @@ slice, not part of this gate.
   `under1` `def409846ff3a2cf` and `skinnr1` `131ce9555e923980`. A jump changes
   the digest only through the existing integer `Y` position field. **All
   synthetic goldens are untouched.** See `docs/notes/engine-collision.md`.
+- engine-up-axis (Z-up world): phase-1 evidence establishes the data is Z-up
+  (`docs/notes/up-axis.md`), so gravity, ground/ceiling classification, the
+  horizontal movement plane and the engine cameras now read the named up axis in
+  `engine/axis.rs` (`UP = 2`, `+Z` up). The canonical fold shape and field set
+  did **not** change; the real no-input digests moved because the old engine ran
+  gravity down the wrong axis. `under1` 60-tick `def409846ff3a2cf` ->
+  `ede39c540a10ee39` (its spawn already rests on the Z floor) and `skinnr1`
+  60-tick `131ce9555e923980` -> `398d1870a463fd7a` (its airborne spawn now lands
+  on `z = -636`). One synthetic golden moved: `GOLDEN_FRAME_STATE_HASH`
+  `0xd1f3_6008_a152_04a2` -> `0x9c68_230a_4907_fbe2`, because its scripted run
+  moves the player and the movement plane changed from the wrong X/Z to the
+  correct X/Y. The options, error, tracker, classification, actor-runtime,
+  world-state and headless goldens are untouched. See `docs/notes/up-axis.md`.
 - Every later slice re-runs the determinism test unchanged. A slice that
   changes the canonical state stream updates `spec.md` and the test in the same
   PR.

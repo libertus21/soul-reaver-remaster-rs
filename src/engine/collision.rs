@@ -7,18 +7,20 @@
 //!
 //! # Geometry model
 //!
-//! Positions are integer world units and stage 9 only moves the player in the
-//! `X`/`Z` plane; `Y` is unchanged. Collision is therefore a **2D swept circle
-//! in the XZ plane**, not a full 3D sweep:
+//! The authored world is **Z-up** (see [`crate::engine::axis`] and
+//! `docs/notes/up-axis.md`). Positions are integer world units and stage 9 only
+//! moves the player in the horizontal `X`/`Y` plane; the vertical `Z` component
+//! is owned by gravity. Collision is therefore a **2D swept circle in the XY
+//! plane**, not a full 3D sweep:
 //!
 //! - A face is a *wall* when its 3D normal is within about 30 degrees of
-//!   horizontal (`nx^2 + nz^2 >= 3 * ny^2`). Floors, ceilings and gentle slopes
-//!   are skipped: this milestone has no vertical movement, so the player must
+//!   horizontal (`nA^2 + nB^2 >= 3 * nUp^2`). Floors, ceilings and gentle slopes
+//!   are skipped: vertical movement is resolved separately, so the player must
 //!   walk across them rather than collide with their triangle edges.
-//! - A wall's three edges are projected to XZ. A vertical wall projects to the
-//!   line segment that is its footprint, which is exactly the barrier the player
-//!   must not cross. Duplicate projected edges are harmless: the narrow phase
-//!   takes the earliest contact.
+//! - A wall's three edges are projected to the horizontal plane. A vertical wall
+//!   projects to the line segment that is its footprint, which is exactly the
+//!   barrier the player must not cross. Duplicate projected edges are harmless:
+//!   the narrow phase takes the earliest contact.
 //!
 //! # Numbers
 //!
@@ -33,22 +35,23 @@
 //!
 //! Wall triangles are inserted, in source face order, into a
 //! [`BTreeMap`]-backed uniform grid of [`CELL_UNITS`]-unit cells. A query walks
-//! the cell rectangle in a fixed `(x, z)` order, collects wall indices, then
+//! the cell rectangle in a fixed `(A, B)` order, collects wall indices, then
 //! sorts and deduplicates them. Iteration order is therefore identical on every
 //! run; no hash-ordered container is used.
 //!
 //! # Vertical movement (gravity, ground and landing)
 //!
-//! Faces are classified once by the direction of their geometric normal:
+//! Faces are classified once by the direction of their geometric normal, using
+//! the named up axis from [`crate::engine::axis`] (`UP`, `HORIZONTAL_A`,
+//! `HORIZONTAL_B`):
 //!
 //! - **wall**: the normal is within about 30 degrees of horizontal
-//!   (`nx^2 + nz^2 >= 3 * ny^2`), the existing horizontal barrier;
+//!   (`nA^2 + nB^2 >= 3 * nUp^2`), the horizontal barrier;
 //! - **walkable floor**: the normal points up and is within about 30 degrees of
-//!   vertical (`ny > 0 && ny^2 >= 3 * (nx^2 + nz^2)`); gentle slopes count as
+//!   vertical (`nUp > 0 && nUp^2 >= 3 * (nA^2 + nB^2)`); gentle slopes count as
 //!   walkable;
 //! - **ceiling**: the same near-vertical test with the normal pointing down
-//!   (`ny < 0`); ceilings are classified but not resolved here because this
-//!   milestone has no upward motion (see below);
+//!   (`nUp < 0`); ceilings block rising motion (see below);
 //! - **other**: steeper slopes and degenerate faces are kept out.
 //!
 //! The winding sign is the only normal-direction source the parser provides, and
@@ -60,16 +63,17 @@
 //!
 //! Ground detection is a deterministic integer point query over the floor
 //! triangles. [`CollisionMesh::ground_height`] returns the highest walkable
-//! surface at `(x, z)` that is not above the query ceiling, and
-//! [`CollisionMesh::vertical_step`] integrates one gravity tick and either lands
-//! the player exactly on that surface (stopping the fall) or lets them keep
-//! falling. Because the player's `Y` is an integer world unit, a grounded player
-//! rests exactly on the surface every tick and cannot jitter or sink.
+//! surface at the horizontal point `(A, B)` that is not above the query ceiling,
+//! and [`CollisionMesh::vertical_step`] integrates one gravity tick and either
+//! lands the player exactly on that surface (stopping the fall) or lets them keep
+//! falling. Because the player's up coordinate is an integer world unit, a
+//! grounded player rests exactly on the surface every tick and cannot jitter or
+//! sink.
 //!
 //! Gravity is level-geometry-driven: a mesh with **no** floor triangles (the
-//! synthetic fixtures, or a unit without geometry) leaves `Y` untouched. That
-//! keeps no-geometry worlds free of a meaningless ground plane and keeps the
-//! synthetic determinism goldens stable.
+//! synthetic fixtures, or a unit without geometry) leaves the up coordinate
+//! untouched. That keeps no-geometry worlds free of a meaningless ground plane
+//! and keeps the synthetic determinism goldens stable.
 //!
 //! Ceilings resolve upward motion. A positive velocity (a jump impulse) rises
 //! the feet, and the whole near-horizontal surface set is queried again for the
@@ -95,6 +99,8 @@
 //! the player height are documented synthetic values, not retail values.
 
 use std::collections::BTreeMap;
+
+use crate::engine::axis::{HORIZONTAL_A, HORIZONTAL_B, UP, UP_SIGN, horizontal_of};
 
 /// Fixed-point subunits per world unit.
 pub const SUBUNITS: i64 = 1024;
@@ -152,27 +158,28 @@ struct FloorTriangle {
 }
 
 impl FloorTriangle {
-    /// Surface height at the fixed-point point `(px, pz)`, or `None` when the
-    /// point is outside the projected triangle.
+    /// Surface height at the fixed-point horizontal point `(pa, pb)`, or `None`
+    /// when the point is outside the projected triangle.
     ///
     /// The point-in-triangle test is the sign of three edge functions in the
-    /// `XZ` plane. The surface height comes from the triangle plane:
-    /// `y = ay - (nx * (x - ax) + nz * (z - az)) / ny`. Division is integer
-    /// truncation, which is deterministic; `ny` is non-zero for a floor.
-    fn height_at(&self, px: i64, pz: i64) -> Option<i64> {
+    /// horizontal plane. The surface height comes from the triangle plane:
+    /// `up = a.up - (nA * (A - a.A) + nB * (B - a.B)) / nUp`. Division is integer
+    /// truncation, which is deterministic; `nUp` is non-zero for a floor.
+    fn height_at(&self, pa: i64, pb: i64) -> Option<i64> {
         let [a, b, c] = self.vertices;
-        let ax = i64::from(a[0]) * SUBUNITS;
-        let az = i64::from(a[2]) * SUBUNITS;
-        let bx = i64::from(b[0]) * SUBUNITS;
-        let bz = i64::from(b[2]) * SUBUNITS;
-        let cx = i64::from(c[0]) * SUBUNITS;
-        let cz = i64::from(c[2]) * SUBUNITS;
+        let ah = fixed_horizontal(a);
+        let bh = fixed_horizontal(b);
+        let ch = fixed_horizontal(c);
 
         let mut positive = false;
         let mut negative = false;
-        for (x0, z0, x1, z1) in [(ax, az, bx, bz), (bx, bz, cx, cz), (cx, cz, ax, az)] {
-            let edge = i128::from(x1 - x0) * i128::from(pz - z0)
-                - i128::from(z1 - z0) * i128::from(px - x0);
+        for (a0, a1, b0, b1) in [
+            (ah[0], ah[1], bh[0], bh[1]),
+            (bh[0], bh[1], ch[0], ch[1]),
+            (ch[0], ch[1], ah[0], ah[1]),
+        ] {
+            let edge = i128::from(b0 - a0) * i128::from(pb - a1)
+                - i128::from(b1 - a1) * i128::from(pa - a0);
             if edge > 0 {
                 positive = true;
             } else if edge < 0 {
@@ -185,22 +192,22 @@ impl FloorTriangle {
             return None;
         }
 
-        let [nx, ny, nz] = self.normal;
-        if ny == 0 {
+        let n_up = self.normal[UP];
+        if n_up == 0 {
             return None;
         }
-        let ay = i64::from(a[1]) * SUBUNITS;
-        let numerator = i128::from(nx) * i128::from(px - ax)
-            + i128::from(nz) * i128::from(pz - az);
-        Some(saturate_i64(i128::from(ay) - numerator / i128::from(ny)))
+        let a_up = i64::from(a[UP]) * SUBUNITS;
+        let numerator = i128::from(self.normal[HORIZONTAL_A]) * i128::from(pa - ah[0])
+            + i128::from(self.normal[HORIZONTAL_B]) * i128::from(pb - ah[1]);
+        Some(saturate_i64(i128::from(a_up) - numerator / i128::from(n_up)))
     }
 }
 
 /// Result of one vertical tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerticalStep {
-    /// New feet height in integer world units.
-    pub y: i32,
+    /// New feet height along the world up axis, in integer world units.
+    pub vertical: i32,
     /// Downward velocity after the step, in fixed-point subunits per tick.
     /// Negative means falling; zero means grounded.
     pub velocity_subunits: i64,
@@ -208,14 +215,14 @@ pub struct VerticalStep {
     pub grounded: bool,
 }
 
-/// One wall triangle, projected to XZ.
+/// One wall triangle, projected to the horizontal plane.
 ///
-/// `xz` keeps the three projected vertices in face order; the three edges are
-/// derived on demand. `min`/`max` are the projected bounding box used by the
-/// broad phase.
+/// `horizontal` keeps the three projected vertices in face order; the three
+/// edges are derived on demand. `min`/`max` are the projected bounding box used
+/// by the broad phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WallTriangle {
-    xz: [[i32; 2]; 3],
+    horizontal: [[i32; 2]; 3],
     min: [i32; 2],
     max: [i32; 2],
 }
@@ -259,21 +266,29 @@ impl CollisionMesh {
             };
             match classify_face(*a, *b, *c) {
                 FaceClass::Wall => {
-                    let xz = [[a[0], a[2]], [b[0], b[2]], [c[0], c[2]]];
+                    let horizontal = [
+                        horizontal_of(*a),
+                        horizontal_of(*b),
+                        horizontal_of(*c),
+                    ];
                     let min = [
-                        xz[0][0].min(xz[1][0]).min(xz[2][0]),
-                        xz[0][1].min(xz[1][1]).min(xz[2][1]),
+                        horizontal[0][0].min(horizontal[1][0]).min(horizontal[2][0]),
+                        horizontal[0][1].min(horizontal[1][1]).min(horizontal[2][1]),
                     ];
                     let max = [
-                        xz[0][0].max(xz[1][0]).max(xz[2][0]),
-                        xz[0][1].max(xz[1][1]).max(xz[2][1]),
+                        horizontal[0][0].max(horizontal[1][0]).max(horizontal[2][0]),
+                        horizontal[0][1].max(horizontal[1][1]).max(horizontal[2][1]),
                     ];
                     if min == max {
                         // The whole triangle projects to one point: no barrier.
                         skipped_faces += 1;
                         continue;
                     }
-                    walls.push(WallTriangle { xz, min, max });
+                    walls.push(WallTriangle {
+                        horizontal,
+                        min,
+                        max,
+                    });
                 }
                 FaceClass::Floor => {
                     up_facing += 1;
@@ -406,21 +421,29 @@ impl CollisionMesh {
     /// component, the result is exactly `from + delta`: a zero-input tick never
     /// moves or collides.
     ///
-    /// The sweep is a fixed-point 2D circle cast in XZ. It stops before the
+    /// The sweep is a fixed-point 2D circle cast in the horizontal plane. It stops before the
     /// earliest contact and then projects the leftover delta onto that contact's
     /// tangent, so a diagonal push slides along the wall. At most
     /// [`MAX_SLIDE_ITERATIONS`] contacts are resolved, which bounds the tick
     /// cost and keeps the result deterministic.
     pub fn sweep(&self, from: [i32; 3], delta: [i32; 3], radius: i32) -> [i32; 3] {
         let direct = add_world(from, delta);
-        if self.walls.is_empty() || (delta[0] == 0 && delta[2] == 0) {
+        let from_h = horizontal_of(from);
+        let delta_h = horizontal_of(delta);
+        if self.walls.is_empty() || (delta_h[0] == 0 && delta_h[1] == 0) {
             return direct;
         }
 
         let radius = radius.max(0);
         let fixed_radius = i64::from(radius) * SUBUNITS;
-        let mut current = [i64::from(from[0]) * SUBUNITS, i64::from(from[2]) * SUBUNITS];
-        let mut remaining = [i64::from(delta[0]) * SUBUNITS, i64::from(delta[2]) * SUBUNITS];
+        let mut current = [
+            i64::from(from_h[0]) * SUBUNITS,
+            i64::from(from_h[1]) * SUBUNITS,
+        ];
+        let mut remaining = [
+            i64::from(delta_h[0]) * SUBUNITS,
+            i64::from(delta_h[1]) * SUBUNITS,
+        ];
 
         for _ in 0..MAX_SLIDE_ITERATIONS {
             let candidate = [current[0] + remaining[0], current[1] + remaining[1]];
@@ -440,36 +463,39 @@ impl CollisionMesh {
             remaining = slid;
         }
 
-        [to_world(current[0]), direct[1], to_world(current[1])]
+        let mut end = direct;
+        end[HORIZONTAL_A] = to_world(current[0]);
+        end[HORIZONTAL_B] = to_world(current[1]);
+        end
     }
 
-    /// Highest horizontal surface at `(x, z)` that is at or below `max_y`, in
-    /// integer world units.
+    /// Highest surface at horizontal point `(h0, h1)` that is at or below
+    /// `max_up`, in integer world units.
     ///
     /// Every near-horizontal triangle is queried, in source order; the result is
     /// a maximum, so iteration order cannot change it. A point outside every
     /// projected surface returns `None`, which is a ledge or a hole.
-    pub fn ground_height(&self, x: i32, z: i32, max_y: i32) -> Option<i32> {
+    pub fn ground_height(&self, h0: i32, h1: i32, max_up: i32) -> Option<i32> {
         if self.surfaces.is_empty() {
             return None;
         }
-        let px = i64::from(x) * SUBUNITS;
-        let pz = i64::from(z) * SUBUNITS;
+        let pa = i64::from(h0) * SUBUNITS;
+        let pb = i64::from(h1) * SUBUNITS;
         let mut best: Option<i32> = None;
         for floor in &self.surfaces {
-            let Some(height) = floor.height_at(px, pz) else {
+            let Some(height) = floor.height_at(pa, pb) else {
                 continue;
             };
             let world = to_world(height);
-            if world <= max_y && best.is_none_or(|current| world > current) {
+            if world <= max_up && best.is_none_or(|current| world > current) {
                 best = Some(world);
             }
         }
         best
     }
 
-    /// Lowest horizontal surface at `(x, z)` that is strictly above `min_y`, in
-    /// integer world units.
+    /// Lowest surface at horizontal point `(h0, h1)` that is strictly above
+    /// `min_up`, in integer world units.
     ///
     /// This is the ceiling query: it mirrors [`CollisionMesh::ground_height`]
     /// over the same near-horizontal triangle set. A surface exactly at the feet
@@ -477,19 +503,19 @@ impl CollisionMesh {
     /// strict. Every surface is queried, in source order; the result is a
     /// minimum, so iteration order cannot change it. A point outside every
     /// projected surface returns `None`, i.e. open sky.
-    pub fn ceiling_height(&self, x: i32, z: i32, min_y: i32) -> Option<i32> {
+    pub fn ceiling_height(&self, h0: i32, h1: i32, min_up: i32) -> Option<i32> {
         if self.surfaces.is_empty() {
             return None;
         }
-        let px = i64::from(x) * SUBUNITS;
-        let pz = i64::from(z) * SUBUNITS;
+        let pa = i64::from(h0) * SUBUNITS;
+        let pb = i64::from(h1) * SUBUNITS;
         let mut best: Option<i32> = None;
         for surface in &self.surfaces {
-            let Some(height) = surface.height_at(px, pz) else {
+            let Some(height) = surface.height_at(pa, pb) else {
                 continue;
             };
             let world = to_world(height);
-            if world > min_y && best.is_none_or(|current| world < current) {
+            if world > min_up && best.is_none_or(|current| world < current) {
                 best = Some(world);
             }
         }
@@ -520,9 +546,11 @@ impl CollisionMesh {
     /// `grounded = false`: there is no ground geometry, so gravity and the jump
     /// impulse both do nothing.
     pub fn vertical_step(&self, from: [i32; 3], velocity_subunits: i64) -> VerticalStep {
+        let up = from[UP];
+        let horizontal = horizontal_of(from);
         if self.surfaces.is_empty() {
             return VerticalStep {
-                y: from[1],
+                vertical: up,
                 velocity_subunits: 0,
                 grounded: false,
             };
@@ -530,44 +558,41 @@ impl CollisionMesh {
         let velocity = velocity_subunits
             .saturating_sub(GRAVITY_SUBUNITS_PER_TICK2)
             .max(-MAX_FALL_SUBUNITS_PER_TICK);
+        let candidate_up = to_world(
+            i64::from(up)
+                .saturating_mul(SUBUNITS)
+                .saturating_add(velocity),
+        );
         if velocity > 0 {
-            let candidate_y = to_world(
-                i64::from(from[1])
-                    .saturating_mul(SUBUNITS)
-                    .saturating_add(velocity),
-            );
-            if let Some(ceiling) = self.ceiling_height(from[0], from[2], from[1]) {
+            if let Some(ceiling) =
+                self.ceiling_height(horizontal[0], horizontal[1], up)
+            {
                 let max_feet = ceiling.saturating_sub(PLAYER_HEIGHT_UNITS);
-                if candidate_y.saturating_add(PLAYER_HEIGHT_UNITS) >= ceiling {
+                if candidate_up.saturating_add(PLAYER_HEIGHT_UNITS) >= ceiling {
                     // Clamp below the ceiling, but never push the feet down
                     // through the floor the player is already standing on.
                     return VerticalStep {
-                        y: from[1].max(max_feet),
+                        vertical: up.max(max_feet),
                         velocity_subunits: 0,
                         grounded: false,
                     };
                 }
             }
             return VerticalStep {
-                y: candidate_y,
+                vertical: candidate_up,
                 velocity_subunits: velocity,
                 grounded: false,
             };
         }
-        let candidate_y = to_world(
-            i64::from(from[1])
-                .saturating_mul(SUBUNITS)
-                .saturating_add(velocity),
-        );
-        let max_support = from[1].saturating_add(MAX_STEP_UP_UNITS);
-        match self.ground_height(from[0], from[2], max_support) {
-            Some(surface) if candidate_y <= surface => VerticalStep {
-                y: surface,
+        let max_support = up.saturating_add(MAX_STEP_UP_UNITS);
+        match self.ground_height(horizontal[0], horizontal[1], max_support) {
+            Some(surface) if candidate_up <= surface => VerticalStep {
+                vertical: surface,
                 velocity_subunits: 0,
                 grounded: true,
             },
             _ => VerticalStep {
-                y: candidate_y,
+                vertical: candidate_up,
                 velocity_subunits: velocity,
                 grounded: false,
             },
@@ -590,8 +615,8 @@ impl CollisionMesh {
         for id in ids {
             let wall = &self.walls[id as usize];
             for edge in 0..3 {
-                let a = wall.xz[edge];
-                let b = wall.xz[(edge + 1) % 3];
+                let a = wall.horizontal[edge];
+                let b = wall.horizontal[(edge + 1) % 3];
                 if let Some(contact) = edge_contact(from, delta, radius, a, b) {
                     if best.is_none_or(|current| contact.is_earlier_than(current)) {
                         best = Some(contact);
@@ -855,19 +880,20 @@ enum FaceClass {
 /// Classify a face by the direction of its geometric normal.
 ///
 /// The wall test is the existing one: within about 30 degrees of vertical
-/// (`horizontal >= 3 * ny^2`). The floor/ceiling tests are its mirror: within
+/// (`horizontal >= 3 * nUp^2`). The floor/ceiling tests are its mirror: within
 /// about 30 degrees of vertical normal (`vertical >= 3 * horizontal`), split by
-/// the sign of `ny`. Squared magnitudes use `i128` so large room coordinates
-/// cannot overflow.
+/// the sign of the up component relative to [`UP_SIGN`]. Squared magnitudes use
+/// `i128` so large room coordinates cannot overflow.
 fn classify_face(a: [i32; 3], b: [i32; 3], c: [i32; 3]) -> FaceClass {
-    let [nx, ny, nz] = face_normal(a, b, c);
-    let horizontal =
-        i128::from(nx) * i128::from(nx) + i128::from(nz) * i128::from(nz);
-    let vertical = i128::from(ny) * i128::from(ny);
+    let normal = face_normal(a, b, c);
+    let n_up = normal[UP];
+    let horizontal = i128::from(normal[HORIZONTAL_A]) * i128::from(normal[HORIZONTAL_A])
+        + i128::from(normal[HORIZONTAL_B]) * i128::from(normal[HORIZONTAL_B]);
+    let vertical = i128::from(n_up) * i128::from(n_up);
     if horizontal > 0 && horizontal >= 3 * vertical {
         FaceClass::Wall
     } else if vertical > 0 && vertical >= 3 * horizontal {
-        if ny > 0 {
+        if n_up * i64::from(UP_SIGN) > 0 {
             FaceClass::Floor
         } else {
             FaceClass::Ceiling
@@ -877,43 +903,53 @@ fn classify_face(a: [i32; 3], b: [i32; 3], c: [i32; 3]) -> FaceClass {
     }
 }
 
+/// The horizontal components of `vertex`, in fixed-point subunits.
+fn fixed_horizontal(vertex: [i32; 3]) -> [i64; 2] {
+    [
+        i64::from(vertex[HORIZONTAL_A]) * SUBUNITS,
+        i64::from(vertex[HORIZONTAL_B]) * SUBUNITS,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CELL_UNITS, CollisionMesh, MAX_STEP_UP_UNITS};
 
-    /// Two triangles forming a vertical wall at `x`, spanning `z0..z1` and
-    /// `y0..y1`. Its XZ projection is the segment `(x, z0)..(x, z1)`.
-    fn vertical_wall(x: i32, z0: i32, z1: i32, y0: i32, y1: i32) -> (Vec<[i32; 3]>, Vec<[u32; 3]>) {
+    /// Two triangles forming a vertical wall at world `x`, spanning the
+    /// horizontal `h0..h1` and the vertical `up0..up1`. Its horizontal
+    /// projection is the segment `(x, h0)..(x, h1)`.
+    fn vertical_wall(x: i32, h0: i32, h1: i32, up0: i32, up1: i32) -> (Vec<[i32; 3]>, Vec<[u32; 3]>) {
         let vertices = vec![
-            [x, y0, z0],
-            [x, y0, z1],
-            [x, y1, z1],
-            [x, y1, z0],
+            [x, h0, up0],
+            [x, h1, up0],
+            [x, h1, up1],
+            [x, h0, up1],
         ];
         (vertices, vec![[0, 1, 2], [0, 2, 3]])
     }
 
-    /// Two triangles forming a horizontal plane at `y`, spanning `x0..x1` and
-    /// `z0..z1`. This winding yields a downward normal, so it classifies as a
-    /// ceiling; it is used by the "floor is not a barrier" regression test.
-    fn floor(y: i32, x0: i32, x1: i32, z0: i32, z1: i32) -> (Vec<[i32; 3]>, Vec<[u32; 3]>) {
+    /// Two triangles forming a horizontal plane at vertical `up`, spanning
+    /// `x0..x1` and `h0..h1`. This winding yields a downward normal, so it
+    /// classifies as a ceiling; it is used by the "floor is not a barrier"
+    /// regression test.
+    fn floor(up: i32, x0: i32, x1: i32, h0: i32, h1: i32) -> (Vec<[i32; 3]>, Vec<[u32; 3]>) {
         let vertices = vec![
-            [x0, y, z0],
-            [x1, y, z0],
-            [x1, y, z1],
-            [x0, y, z1],
+            [x0, h0, up],
+            [x0, h1, up],
+            [x1, h1, up],
+            [x1, h0, up],
         ];
         (vertices, vec![[0, 1, 2], [0, 2, 3]])
     }
 
-    /// Two triangles forming a walkable floor at `y` with an upward normal,
-    /// spanning `x0..x1` and `z0..z1`.
-    fn floor_up(y: i32, x0: i32, x1: i32, z0: i32, z1: i32) -> (Vec<[i32; 3]>, Vec<[u32; 3]>) {
+    /// Two triangles forming a walkable floor at vertical `up` with an upward
+    /// (+Z) normal, spanning `x0..x1` and `h0..h1`.
+    fn floor_up(up: i32, x0: i32, x1: i32, h0: i32, h1: i32) -> (Vec<[i32; 3]>, Vec<[u32; 3]>) {
         let vertices = vec![
-            [x0, y, z0],
-            [x0, y, z1],
-            [x1, y, z1],
-            [x1, y, z0],
+            [x0, h0, up],
+            [x1, h0, up],
+            [x1, h1, up],
+            [x0, h1, up],
         ];
         (vertices, vec![[0, 1, 2], [0, 2, 3]])
     }
@@ -1055,11 +1091,11 @@ mod tests {
         let mesh = wall_mesh();
         let mut position = [0, 0, 0];
         for _ in 0..60 {
-            position = mesh.sweep(position, [4, 0, 4], 16);
+            position = mesh.sweep(position, [4, 4, 0], 16);
             assert!(position[0] < 100, "crossed the wall: {position:?}");
         }
         assert!(
-            position[2] > 200,
+            position[1] > 200,
             "the push must keep making progress along the wall: {position:?}"
         );
         assert!((80..=84).contains(&position[0]), "final {position:?}");
@@ -1073,10 +1109,10 @@ mod tests {
             let mut observed = Vec::new();
             for tick in 0..80 {
                 let delta = match tick % 4 {
-                    0 => [4, 0, 4],
+                    0 => [4, 4, 0],
                     1 => [4, 0, 0],
-                    2 => [4, 0, -2],
-                    _ => [0, 0, 4],
+                    2 => [4, -2, 0],
+                    _ => [0, 4, 0],
                 };
                 position = mesh.sweep(position, delta, 16);
                 observed.push(position);
@@ -1112,8 +1148,8 @@ mod tests {
             let mut brute: Option<super::Contact> = None;
             for wall in &mesh.walls {
                 for edge in 0..3 {
-                    let a = wall.xz[edge];
-                    let b = wall.xz[(edge + 1) % 3];
+                    let a = wall.horizontal[edge];
+                    let b = wall.horizontal[(edge + 1) % 3];
                     if let Some(contact) = super::edge_contact(from, delta, radius, a, b)
                         && brute.is_none_or(|current| contact.is_earlier_than(current))
                     {
@@ -1151,9 +1187,30 @@ mod tests {
     }
 
     #[test]
+    fn floor_classification_agrees_with_the_named_up_axis() {
+        use crate::engine::axis::{HORIZONTAL_A, HORIZONTAL_B, UP};
+
+        // A plane at constant world Z is a walkable floor, and its ground height
+        // is that Z. This is the assertion that ties classification to `UP`.
+        let (vertices, faces) = floor_up(7, -100, 100, -100, 100);
+        let mesh = CollisionMesh::from_room_triangles(&vertices, &faces);
+        assert!(mesh.floor_count() > 0, "a +Z plane is a walkable floor");
+        assert_eq!(mesh.ground_height(0, 0, 100), Some(7));
+        assert_eq!(UP, 2, "the vertical index is Z");
+        assert_eq!((HORIZONTAL_A, HORIZONTAL_B), (0, 1), "the horizontal plane is X/Y");
+
+        // A plane that spans world Z is a wall, never a floor.
+        let (vertices, faces) = vertical_wall(100, -500, 500, -10, 10);
+        let mesh = CollisionMesh::from_room_triangles(&vertices, &faces);
+        assert!(mesh.wall_count() > 0, "a plane spanning Z is a wall");
+        assert_eq!(mesh.floor_count(), 0);
+    }
+
+    #[test]
     fn a_slope_steeper_than_the_threshold_is_kept_out() {
-        // Normal (100, -100, 0): neither horizontal nor vertical dominates.
-        let vertices = vec![[0, 0, 0], [10, 10, 0], [0, 0, 10]];
+        // Normal (-100, -100, 100): no axis dominates, so it is not a wall,
+        // floor or ceiling in the Z-up frame.
+        let vertices = vec![[0, 0, 0], [10, 0, 10], [0, 10, 10]];
         let mesh = CollisionMesh::from_room_triangles(&vertices, &[[0, 1, 2]]);
         assert_eq!(mesh.wall_count(), 0);
         assert_eq!(mesh.floor_count(), 0);
@@ -1186,15 +1243,15 @@ mod tests {
     #[test]
     fn a_player_above_the_floor_falls_and_lands_on_it() {
         let mesh = floor_mesh(0);
-        let mut position = [0, 50, 0];
+        let mut position = [0, 0, 50];
         let mut velocity = 0i64;
         let mut grounded = false;
         for _ in 0..200 {
             let step = mesh.vertical_step(position, velocity);
-            position[1] = step.y;
+            position[2] = step.vertical;
             velocity = step.velocity_subunits;
             assert!(
-                position[1] >= 0,
+                position[2] >= 0,
                 "the player must never pass through the floor: {position:?}"
             );
             if step.grounded {
@@ -1203,7 +1260,7 @@ mod tests {
             }
         }
         assert!(grounded, "the fall must end on the floor");
-        assert_eq!(position[1], 0);
+        assert_eq!(position[2], 0);
         assert_eq!(velocity, 0);
     }
 
@@ -1215,9 +1272,9 @@ mod tests {
         for tick in 0..300 {
             let step = mesh.vertical_step(position, velocity);
             assert!(step.grounded, "tick {tick} lost the ground");
-            assert_eq!(step.y, 0, "tick {tick} moved the resting height");
+            assert_eq!(step.vertical, 0, "tick {tick} moved the resting height");
             assert_eq!(step.velocity_subunits, 0, "tick {tick} kept falling");
-            position[1] = step.y;
+            position[2] = step.vertical;
             velocity = step.velocity_subunits;
         }
     }
@@ -1243,24 +1300,24 @@ mod tests {
         let mut velocity = 0i64;
         let resting = mesh.vertical_step(position, velocity);
         assert!(resting.grounded);
-        assert_eq!(resting.y, 0);
+        assert_eq!(resting.vertical, 0);
 
         // Step horizontally off the ledge, then fall.
-        position = [300, resting.y, 0];
+        position = [300, 0, resting.vertical];
         velocity = resting.velocity_subunits;
         let mut fell = false;
         let mut landed = false;
         for _ in 0..200 {
             let step = mesh.vertical_step(position, velocity);
-            assert!(step.y >= -100, "fell through the lower floor: {}", step.y);
+            assert!(step.vertical >= -100, "fell through the lower floor: {}", step.vertical);
             if !step.grounded {
                 fell = true;
             }
-            position[1] = step.y;
+            position[2] = step.vertical;
             velocity = step.velocity_subunits;
             if step.grounded {
                 landed = true;
-                assert_eq!(step.y, -100, "must land on the lower floor");
+                assert_eq!(step.vertical, -100, "must land on the lower floor");
                 break;
             }
         }
@@ -1273,12 +1330,12 @@ mod tests {
     fn a_mesh_without_floors_leaves_y_untouched() {
         let mesh = wall_mesh();
         assert!(!mesh.has_ground());
-        let step = mesh.vertical_step([0, 42, 0], 0);
-        assert_eq!(step.y, 42);
+        let step = mesh.vertical_step([0, 0, 42], 0);
+        assert_eq!(step.vertical, 42);
 
         let mesh = CollisionMesh::default();
-        let step = mesh.vertical_step([0, -7, 0], -5000);
-        assert_eq!(step.y, -7);
+        let step = mesh.vertical_step([0, 0, -7], -5000);
+        assert_eq!(step.vertical, -7);
         assert_eq!(step.velocity_subunits, 0);
         assert!(!step.grounded);
     }
@@ -1287,14 +1344,14 @@ mod tests {
     fn the_same_vertical_script_replays_identically() {
         fn run() -> Vec<(i32, i64, bool)> {
             let mesh = floor_mesh(0);
-            let mut position = [0, 80, 0];
+            let mut position = [0, 0, 80];
             let mut velocity = 0i64;
             let mut observed = Vec::new();
             for _ in 0..40 {
                 let step = mesh.vertical_step(position, velocity);
-                position[1] = step.y;
+                position[2] = step.vertical;
                 velocity = step.velocity_subunits;
-                observed.push((step.y, step.velocity_subunits, step.grounded));
+                observed.push((step.vertical, step.velocity_subunits, step.grounded));
             }
             observed
         }
@@ -1307,14 +1364,14 @@ mod tests {
     /// before the first rise. The loop stops one tick after the landing tick so
     /// the caller sees the final grounded sample.
     fn jump_arc(mesh: &CollisionMesh, from_y: i32) -> Vec<(i32, i64, bool)> {
-        let mut position = [0, from_y, 0];
+        let mut position = [0, 0, from_y];
         let mut velocity = super::JUMP_IMPULSE_SUBUNITS_PER_TICK;
         let mut observed = Vec::new();
         for _ in 0..200 {
             let step = mesh.vertical_step(position, velocity);
-            position[1] = step.y;
+            position[2] = step.vertical;
             velocity = step.velocity_subunits;
-            observed.push((step.y, step.velocity_subunits, step.grounded));
+            observed.push((step.vertical, step.velocity_subunits, step.grounded));
             if step.grounded {
                 break;
             }
@@ -1389,8 +1446,8 @@ mod tests {
 
     #[test]
     fn an_upward_step_without_surfaces_does_nothing() {
-        let step = CollisionMesh::default().vertical_step([0, 42, 0], super::JUMP_IMPULSE_SUBUNITS_PER_TICK);
-        assert_eq!(step.y, 42);
+        let step = CollisionMesh::default().vertical_step([0, 0, 42], super::JUMP_IMPULSE_SUBUNITS_PER_TICK);
+        assert_eq!(step.vertical, 42);
         assert_eq!(step.velocity_subunits, 0);
         assert!(!step.grounded);
     }
@@ -1410,9 +1467,9 @@ mod tests {
                     velocity = super::JUMP_IMPULSE_SUBUNITS_PER_TICK;
                 }
                 let step = mesh.vertical_step(position, velocity);
-                position[1] = step.y;
+                position[2] = step.vertical;
                 velocity = step.velocity_subunits;
-                observed.push((step.y, step.velocity_subunits, step.grounded));
+                observed.push((step.vertical, step.velocity_subunits, step.grounded));
             }
             observed
         }
