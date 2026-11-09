@@ -11,10 +11,11 @@
 //! `todo!()`: adding AI, animation, contact or streaming later is filling a body,
 //! not editing the loop.
 //!
-//! Stage 8 (the four-step player move/collide/commit solver) is deliberately a
-//! named no-op. This milestone has no collision, and the only movement is the
-//! direct input translation in stage 9. A stub solver would be invented
-//! behaviour.
+//! Stage 8 (the four-step player move/collide/commit solver) stays a named
+//! no-op: the original's exact solver is UNKNOWN and is not claimed. The
+//! deterministic horizontal sweep lives beside the movement it resolves, in
+//! stage 9, so the two cannot drift apart. That sweep is a correct
+//! sweep-and-slide, not a reproduction of the original.
 //!
 //! The player is updated twice per tick, exactly as documented: first by the
 //! direct player path (stage 9) and again as an ordinary live object in the
@@ -39,10 +40,16 @@ pub const PLAYER_NAME: &str = "raziel";
 
 /// Direct translation speed in integer world units per tick.
 ///
-/// There is no collision in this milestone, so the delta is applied directly.
-/// `1/60 s` times this constant is the whole movement contract until the
-/// original solver arrives.
+/// Stage 9 applies this delta through the deterministic horizontal sweep. The
+/// sweep only reduces it when a wall is in the way.
 pub const PLAYER_SPEED_UNITS_PER_TICK: i32 = 4;
+
+/// Player collision radius in integer world units.
+///
+/// The original radius is UNKNOWN; this is a documented synthetic value that
+/// keeps the sweep small relative to the room scale (rooms span thousands of
+/// units) while giving a visible stand-off from walls.
+pub const PLAYER_RADIUS_UNITS: i32 = 16;
 
 /// Default cull radius, in integer world units.
 pub const DEFAULT_CULL_RADIUS: i32 = 4096;
@@ -640,29 +647,39 @@ impl FrameState {
     /// Stage 8 - player movement solver. Documented no-op.
     ///
     /// The original runs a four-step sequential move/collide/commit solver from
-    /// the frame tick. This milestone has no collision and no solver, and the
-    /// direct input translation lives in stage 9, so the stage stays a named
-    /// no-op instead of inventing a partial solver.
+    /// the frame tick. Its exact probe/resolve/commit order is UNKNOWN, so this
+    /// stage stays a named no-op instead of inventing a partial copy. The
+    /// deterministic horizontal sweep that makes walls solid lives in stage 9,
+    /// next to the translation it resolves.
     fn stage_player_solver(&mut self) {}
 
-    /// Stage 9 - player input to movement by direct translation.
+    /// Stage 9 - player input to movement through the deterministic sweep.
     ///
-    /// The sampled input is applied directly to the player live object. There is
-    /// no collision and no four-step commit; this is the documented stage-8
-    /// simplification, not the original solver.
+    /// The sampled input becomes an integer `X`/`Z` delta and is resolved
+    /// against the world's [`CollisionMesh`](crate::engine::collision::CollisionMesh).
+    /// A zero axis performs no movement and no collision query, so a no-input
+    /// tick cannot change the position or the digest. The sweep stops before
+    /// walls and slides along them; it is a correct sweep-and-slide, not the
+    /// original four-step solver.
     fn stage_player_movement(&mut self) {
         let Some(player) = self.player else {
             return;
         };
         self.stats.direct_player_ticks = self.stats.direct_player_ticks.saturating_add(1);
         let [x, y] = self.current_input.move_axis();
+        if x == 0 && y == 0 {
+            return;
+        }
+        let delta = [
+            x.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK),
+            0,
+            y.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK),
+        ];
+        let collision = &self.world.collision;
         let Ok(object) = self.live.get_mut(player) else {
             return;
         };
-        object.position[0] = object.position[0]
-            .saturating_add(x.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK));
-        object.position[2] = object.position[2]
-            .saturating_add(y.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK));
+        object.position = collision.sweep(object.position, delta, PLAYER_RADIUS_UNITS);
     }
 
     /// Stage 10 - pairwise contact broad phase and resolver. Documented no-op
@@ -889,6 +906,7 @@ mod tests {
         CullView, FrameState, FrameStats, PLAYER_SPEED_UNITS_PER_TICK, STAGE_ORDER, Stage,
     };
     use crate::engine::actor::ActorProfile;
+    use crate::engine::collision::CollisionMesh;
     use crate::engine::determinism::world_state_hash;
     use crate::engine::events::{ContactRecord, EngineEvent, HitRecord, Message};
     use crate::engine::input::{InputButton, InputEvent};
@@ -979,6 +997,22 @@ mod tests {
 
     fn frame() -> FrameState {
         FrameState::new(world_with_raziel())
+    }
+
+    /// The raziel world plus one vertical wall at `x = 100` spanning
+    /// `z = -500..500`. The player starts at the origin, 100 units away.
+    fn world_with_wall() -> World {
+        let mut world = world_with_raziel();
+        let vertices = vec![
+            [100, -100, -500],
+            [100, -100, 500],
+            [100, 100, 500],
+            [100, 100, -500],
+        ];
+        let faces = vec![[0u32, 1, 2], [0, 2, 3]];
+        world.collision = CollisionMesh::from_room_triangles(&vertices, &faces);
+        assert!(!world.collision.is_empty(), "the test wall must be a barrier");
+        world
     }
 
     fn tick(frame: &mut FrameState, index: u64) {
@@ -1318,6 +1352,65 @@ mod tests {
         assert_eq!(frame.queued_input_len(), 0);
         assert_eq!(frame.player_position(), Some(before));
         assert_eq!(frame.ticks(), 60);
+    }
+
+    #[test]
+    fn zero_input_with_a_wall_matches_the_collision_free_digest() {
+        let mut walled = FrameState::new(world_with_wall());
+        let mut plain = FrameState::new(world_with_raziel());
+        for index in 0..40 {
+            tick(&mut walled, index);
+            tick(&mut plain, index);
+        }
+        assert_eq!(walled.player_position(), Some([0, 0, 0]), "no input, no collision move");
+        assert_eq!(plain.player_position(), Some([0, 0, 0]));
+        assert_eq!(
+            world_state_hash(&walled.world_state()),
+            world_state_hash(&plain.world_state()),
+            "a wall must not change a no-input run"
+        );
+    }
+
+    #[test]
+    fn a_wall_stops_the_player_on_the_near_side() {
+        let mut frame = FrameState::new(world_with_wall());
+        frame.queue_input(InputEvent::press(InputButton::Right));
+        frame.queue_input(InputEvent::press(InputButton::Forward));
+        for index in 0..60 {
+            tick(&mut frame, index);
+        }
+        let position = frame.player_position().expect("the player is bound");
+        assert!(position[0] < 100, "the player crossed the wall: {position:?}");
+        assert!(
+            (80..=84).contains(&position[0]),
+            "the player must stop at the radius: {position:?}"
+        );
+        assert!(
+            position[2] > 200,
+            "a diagonal push must slide along the wall: {position:?}"
+        );
+    }
+
+    #[test]
+    fn the_same_walled_input_script_replays_identically() {
+        fn run() -> Vec<([i32; 3], u64)> {
+            let mut frame = FrameState::new(world_with_wall());
+            frame.queue_input(InputEvent::press(InputButton::Right));
+            frame.queue_input(InputEvent::press(InputButton::Forward));
+            let mut observed = Vec::new();
+            for index in 0..60 {
+                tick(&mut frame, index);
+                observed.push((
+                    frame.player_position().expect("the player is bound"),
+                    world_state_hash(&frame.world_state()),
+                ));
+            }
+            observed
+        }
+
+        let first = run();
+        assert_eq!(first, run(), "the same input script must replay byte for byte");
+        assert!(first.last().expect("60 ticks").0[0] < 100);
     }
 
     #[test]

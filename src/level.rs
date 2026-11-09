@@ -1046,6 +1046,23 @@ pub fn read_entry_objects(
     Ok(vec![(unit.name, report)])
 }
 
+/// Read one archive entry **once** and return the object array together with
+/// the integer room triangles for the collision mesh.
+///
+/// The entry bytes are read and parsed as a `.PCM` once; the arrays are then
+/// decoded by the existing `object_report` and `room_triangles` helpers. Callers
+/// that need both never read or parse the entry a second time.
+pub fn read_entry_world(
+    path: &Path,
+    index: usize,
+) -> Result<(String, ObjectReport, RoomTriangles), LevelError> {
+    let (unit, bytes) = entry_unit(path, index)?;
+    let data = &bytes[unit.structure.data_base..];
+    let objects = object_report(data)?;
+    let triangles = room_triangles(data)?;
+    Ok((unit.name, objects, triangles))
+}
+
 /// `--level-objects --bigfile ... --group ...`: one object report per matching
 /// room, in numeric-suffix order.
 pub fn read_group_objects(
@@ -2567,6 +2584,22 @@ mod tests {
         assert_eq!(mesh.vertices[0], [0.0, 0.0, 0.0]);
         assert_eq!(mesh.vertices[3], [10.0, 0.0, 0.0], "world-space position is not transformed");
         assert_eq!(mesh.indices, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn entry_world_reads_objects_and_integer_triangles_from_one_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let vertices = [[-3i16, 4, 5], [7, -8, 9], [0, 1, 2]];
+        let faces = [[0u16, 1, 2]];
+        let path = tmp.path().join("BIGFILE.DAT");
+        std::fs::write(&path, archive(&[named_geometry_pcm("under1", &vertices, &faces)]))
+            .expect("synthetic archive must be writable");
+
+        let (name, report, triangles) = read_entry_world(&path, 0).expect("must read");
+        assert_eq!(name, "under1");
+        assert_eq!(report.count, 0, "the synthetic unit places no objects");
+        assert_eq!(triangles.vertices, vec![[-3, 4, 5], [7, -8, 9], [0, 1, 2]]);
+        assert_eq!(triangles.faces, vec![[0, 1, 2]]);
     }
 
     #[test]

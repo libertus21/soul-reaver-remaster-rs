@@ -9,6 +9,7 @@
 use std::fmt;
 use std::path::Path;
 
+use crate::engine::collision::CollisionMesh;
 use crate::engine::placed::{PlacedDb, PlacedObject};
 use crate::level::{self, LevelError};
 
@@ -20,11 +21,13 @@ pub struct LevelData {
     pub rooms: usize,
 }
 
-/// The authored world: level identity plus the placed-object database.
+/// The authored world: level identity, the placed-object database and the
+/// horizontal collision mesh built from the same loaded room triangles.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct World {
     pub level: LevelData,
     pub placed: PlacedDb,
+    pub collision: CollisionMesh,
 }
 
 /// Why a world could not be built.
@@ -57,17 +60,24 @@ impl std::error::Error for WorldError {}
 
 impl World {
     /// Resolve `name` in the archive and build the world from that entry.
+    ///
+    /// The entry is read once: `read_entry_world` returns both the placed-object
+    /// report and the integer room triangles, so the collision mesh is built
+    /// from the same parse that feeds placement.
     pub fn load(dat: &Path, name: &str) -> Result<Self, WorldError> {
         let entry = level::resolve_unit_entry(dat, name)
             .ok_or_else(|| WorldError::UnitNotFound { name: name.to_string() })?;
-        let (unit_name, report) = level::read_entry_objects(dat, entry)?
-            .into_iter()
-            .next()
-            .ok_or(WorldError::EmptyReport)?;
-        Ok(Self::from_report(unit_name, entry, &report))
+        let (unit_name, report, triangles) = level::read_entry_world(dat, entry)?;
+        let mut world = Self::from_report(unit_name, entry, &report);
+        world.collision =
+            CollisionMesh::from_room_triangles(&triangles.vertices, &triangles.faces);
+        Ok(world)
     }
 
     /// Build the world from an already parsed object report.
+    ///
+    /// The collision mesh stays empty; callers that need geometry use
+    /// [`World::load`] or assign [`World::collision`] explicitly.
     pub fn from_report(name: String, entry: usize, report: &level::ObjectReport) -> Self {
         let placed = PlacedDb::from_records(
             report.objects.iter().map(PlacedObject::from_record).collect(),
@@ -75,6 +85,7 @@ impl World {
         Self {
             level: LevelData { name, entry, rooms: 1 },
             placed,
+            collision: CollisionMesh::default(),
         }
     }
 }
