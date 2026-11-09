@@ -27,6 +27,19 @@ pub const HORIZONTAL_B: usize = 1;
 /// Sign of "up" along [`UP`]. The evidence fixes `+Z` as up.
 pub const UP_SIGN: i32 = 1;
 
+/// Index of the up component in an **object-model local** position.
+///
+/// Phase-1 corpus evidence (`docs/notes/object-up-axis.md`) establishes that the
+/// archived object containers and the loose `.SRM` meshes store their vertical
+/// on index 2, with `+Z` up: a standing humanoid is tallest along index 2 and
+/// its bone chain extends along index 2. This matches the world vertical, so a
+/// placed model needs **no rotation** to stand upright; placement stays a pure
+/// translation. Object viewers derive their camera basis from this constant.
+pub const OBJECT_UP: usize = 2;
+
+/// Sign of object-local up along [`OBJECT_UP`]. The evidence fixes `+Z` as up.
+pub const OBJECT_UP_SIGN: i32 = 1;
+
 /// World up (vertical) component of a position.
 pub const fn up_of(position: [i32; 3]) -> i32 {
     position[UP]
@@ -86,8 +99,8 @@ impl WorldAxis {
 #[cfg(test)]
 mod tests {
     use super::{
-        HORIZONTAL_A, HORIZONTAL_B, UP, UP_SIGN, WorldAxis, from_horizontal, horizontal_of, up_of,
-        with_up,
+        HORIZONTAL_A, HORIZONTAL_B, OBJECT_UP, OBJECT_UP_SIGN, UP, UP_SIGN, WorldAxis,
+        from_horizontal, horizontal_of, up_of, with_up,
     };
 
     #[test]
@@ -100,6 +113,20 @@ mod tests {
         assert!(!WorldAxis::X.is_up());
         assert!(!WorldAxis::Y.is_up());
         assert_eq!(WorldAxis::Z.index(), UP);
+    }
+
+    #[test]
+    fn the_object_local_up_axis_matches_the_world_up_axis() {
+        // Both checks are expressed against the shared constants so a future
+        // axis change updates one place, never a scattered literal.
+        assert_eq!(
+            OBJECT_UP, UP,
+            "object-local up is the same index as world up: placement needs no rotation"
+        );
+        assert_eq!(
+            OBJECT_UP_SIGN, UP_SIGN,
+            "object-local up points the same way as world up"
+        );
     }
 
     #[test]
