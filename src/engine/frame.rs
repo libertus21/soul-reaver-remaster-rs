@@ -39,6 +39,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::engine::actor::{ActorProfile, ActorRuntime};
+use crate::engine::axis::{HORIZONTAL_A, HORIZONTAL_B, UP};
 use crate::engine::class::{CLASS_TABLE, Hooks, Query, RenderClass, classify};
 use crate::engine::clock::{ObjectTick, SimClock};
 use crate::engine::collision::JUMP_IMPULSE_SUBUNITS_PER_TICK;
@@ -693,11 +694,12 @@ impl FrameState {
     /// Stage 9 - player input to movement through the deterministic sweep, the
     /// jump rule and the gravity/ground/ceiling resolver.
     ///
-    /// The sampled input becomes an integer `X`/`Z` delta and is resolved
-    /// against the world's [`CollisionMesh`](crate::engine::collision::CollisionMesh).
-    /// A zero axis performs no horizontal movement and no collision query, so a
-    /// no-input tick cannot change the position on its own. The sweep stops
-    /// before walls and slides along them.
+    /// The sampled input becomes an integer horizontal `X`/`Y` delta (the world
+    /// is Z-up, see [`crate::engine::axis`]) and is resolved against the world's
+    /// [`CollisionMesh`](crate::engine::collision::CollisionMesh). A zero axis
+    /// performs no horizontal movement and no collision query, so a no-input
+    /// tick cannot change the position on its own. The sweep stops before walls
+    /// and slides along them.
     ///
     /// A `Jump` press edge starts a jump only when the player ended the previous
     /// tick grounded; it replaces the signed vertical velocity with
@@ -706,25 +708,23 @@ impl FrameState {
     /// nothing, so there is no double jump. Landing sets `grounded` again and the
     /// next press edge is allowed.
     ///
-    /// Vertical motion is resolved after the horizontal sweep, at the resulting
-    /// `X`/`Z`: gravity accumulates a signed velocity, a rising player is
-    /// clamped below the lowest ceiling above the feet, and a falling player
-    /// lands exactly on the highest floor at or below the feet. A world with no
-    /// floor triangles leaves `Y` untouched. This is a correct deterministic
-    /// resolver, not the original four-step solver.
+    /// Vertical motion (`Z`) is resolved after the horizontal sweep, at the
+    /// resulting horizontal point: gravity accumulates a signed velocity, a
+    /// rising player is clamped below the lowest ceiling above the feet, and a
+    /// falling player lands exactly on the highest floor at or below the feet. A
+    /// world with no floor triangles leaves `Z` untouched. This is a correct
+    /// deterministic resolver, not the original four-step solver.
     fn stage_player_movement(&mut self) {
         let Some(player) = self.player else {
             return;
         };
         self.stats.direct_player_ticks = self.stats.direct_player_ticks.saturating_add(1);
 
-        let [x, y] = self.current_input.move_axis();
-        if x != 0 || y != 0 {
-            let delta = [
-                x.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK),
-                0,
-                y.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK),
-            ];
+        let [right, forward] = self.current_input.move_axis();
+        if right != 0 || forward != 0 {
+            let mut delta = [0i32; 3];
+            delta[HORIZONTAL_A] = right.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK);
+            delta[HORIZONTAL_B] = forward.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK);
             let collision = &self.world.collision;
             if let Ok(object) = self.live.get_mut(player) {
                 object.position = collision.sweep(object.position, delta, PLAYER_RADIUS_UNITS);
@@ -745,7 +745,7 @@ impl FrameState {
         self.player_vertical_velocity = step.velocity_subunits;
         self.player_grounded = step.grounded;
         if let Ok(object) = self.live.get_mut(player) {
-            object.position[1] = step.y;
+            object.position[UP] = step.vertical;
         }
     }
 
@@ -1066,15 +1066,16 @@ mod tests {
         FrameState::new(world_with_raziel())
     }
 
-    /// The raziel world plus one vertical wall at `x = 100` spanning
-    /// `z = -500..500`. The player starts at the origin, 100 units away.
+    /// The raziel world plus one vertical wall at `x = 100` spanning the
+    /// horizontal `y = -500..500` and the vertical `z = -100..400`. The player
+    /// starts at the origin, 100 units away.
     fn world_with_wall() -> World {
         let mut world = world_with_raziel();
         let vertices = vec![
-            [100, -100, -500],
-            [100, -100, 500],
-            [100, 100, 500],
-            [100, 100, -500],
+            [100, -500, -100],
+            [100, 500, -100],
+            [100, 500, 400],
+            [100, -500, 400],
         ];
         let faces = vec![[0u32, 1, 2], [0, 2, 3]];
         world.collision = CollisionMesh::from_room_triangles(&vertices, &faces);
@@ -1082,45 +1083,61 @@ mod tests {
         world
     }
 
-    /// A collision mesh made of upward-facing floor quads. Each tuple is
-    /// `(y, x0, x1, z0, z1)`.
+    /// A collision mesh made of upward-facing (+Z) floor quads. Each tuple is
+    /// `(up, x0, x1, h0, h1)`, where `up` is the vertical coordinate and
+    /// `h0..h1` is the horizontal world Y range.
     fn floor_mesh(quads: &[(i32, i32, i32, i32, i32)]) -> CollisionMesh {
         let mut vertices = Vec::new();
         let mut faces = Vec::new();
-        for &(y, x0, x1, z0, z1) in quads {
+        for &(up, x0, x1, h0, h1) in quads {
             let base = vertices.len() as u32;
-            vertices.extend([[x0, y, z0], [x0, y, z1], [x1, y, z1], [x1, y, z0]]);
+            vertices.extend([
+                [x0, h0, up],
+                [x1, h0, up],
+                [x1, h1, up],
+                [x0, h1, up],
+            ]);
             faces.push([base, base + 1, base + 2]);
             faces.push([base, base + 2, base + 3]);
         }
         CollisionMesh::from_room_triangles(&vertices, &faces)
     }
 
-    /// The raziel world plus one walkable floor at `floor_y`, with the player
-    /// spawned at `player_y`.
-    fn world_with_floor(floor_y: i32, player_y: i16) -> World {
+    /// The raziel world plus one walkable floor at vertical `floor_up`, with the
+    /// player spawned `player_up` units above it.
+    fn world_with_floor(floor_up: i32, player_up: i16) -> World {
         let report = ObjectReport {
             room_offset: 0,
             count: 1,
             array_offset: 0,
-            objects: vec![record("raziel", [0, player_y, 0])],
+            objects: vec![record("raziel", [0, 0, player_up])],
         };
         let mut world = World::from_report("test".to_string(), 1, &report);
-        world.collision = floor_mesh(&[(floor_y, -500, 500, -500, 500)]);
+        world.collision = floor_mesh(&[(floor_up, -500, 500, -500, 500)]);
         assert!(world.collision.has_ground(), "the fixture must carry ground");
         world
     }
 
-    /// One walkable floor at `floor_y` and one downward-facing plane at
-    /// `ceiling_y`, spanning the same 200x200 footprint.
-    fn floor_and_ceiling_mesh(floor_y: i32, ceiling_y: i32) -> CollisionMesh {
+    /// One walkable floor at vertical `floor_up` and one downward-facing plane
+    /// at `ceiling_up`, spanning the same 200x200 footprint.
+    fn floor_and_ceiling_mesh(floor_up: i32, ceiling_up: i32) -> CollisionMesh {
         let mut vertices = Vec::new();
         let mut faces = Vec::new();
-        vertices.extend([[ -100, floor_y, -100], [-100, floor_y, 100], [100, floor_y, 100], [100, floor_y, -100]]);
+        vertices.extend([
+            [-100, -100, floor_up],
+            [100, -100, floor_up],
+            [100, 100, floor_up],
+            [-100, 100, floor_up],
+        ]);
         faces.push([0, 1, 2]);
         faces.push([0, 2, 3]);
         let base = vertices.len() as u32;
-        vertices.extend([[ -100, ceiling_y, -100], [100, ceiling_y, -100], [100, ceiling_y, 100], [-100, ceiling_y, 100]]);
+        vertices.extend([
+            [-100, -100, ceiling_up],
+            [-100, 100, ceiling_up],
+            [100, 100, ceiling_up],
+            [100, -100, ceiling_up],
+        ]);
         faces.push([base, base + 1, base + 2]);
         faces.push([base, base + 2, base + 3]);
         CollisionMesh::from_room_triangles(&vertices, &faces)
@@ -1131,14 +1148,19 @@ mod tests {
     fn world_with_wall_and_floor() -> World {
         let mut world = world_with_raziel();
         let mut vertices = vec![
-            [100, -100, -500],
-            [100, -100, 500],
-            [100, 400, 500],
-            [100, 400, -500],
+            [100, -500, -100],
+            [100, 500, -100],
+            [100, 500, 400],
+            [100, -500, 400],
         ];
         let mut faces = vec![[0u32, 1, 2], [0, 2, 3]];
         let base = vertices.len() as u32;
-        vertices.extend([[-500, 0, -500], [-500, 0, 500], [100, 0, 500], [100, 0, -500]]);
+        vertices.extend([
+            [-500, -500, 0],
+            [100, -500, 0],
+            [100, 500, 0],
+            [-500, 500, 0],
+        ]);
         faces.push([base, base + 1, base + 2]);
         faces.push([base, base + 2, base + 3]);
         world.collision = CollisionMesh::from_room_triangles(&vertices, &faces);
@@ -1511,7 +1533,7 @@ mod tests {
             tick(&mut frame, index);
             let position = frame.player_position().expect("the player is bound");
             assert!(
-                position[1] >= 0,
+                position[2] >= 0,
                 "the player must never pass through the floor: {position:?}"
             );
             if frame.player_grounded() {
@@ -1520,7 +1542,7 @@ mod tests {
             }
         }
         assert!(landed, "gravity must land the player on the floor");
-        assert_eq!(frame.player_position().expect("the player is bound")[1], 0);
+        assert_eq!(frame.player_position().expect("the player is bound")[2], 0);
         assert_eq!(frame.player_vertical_velocity(), 0);
     }
 
@@ -1530,7 +1552,7 @@ mod tests {
         for index in 0..300 {
             tick(&mut frame, index);
             assert_eq!(
-                frame.player_position().expect("the player is bound")[1],
+                frame.player_position().expect("the player is bound")[2],
                 0,
                 "the resting height moved on tick {index}"
             );
@@ -1562,13 +1584,13 @@ mod tests {
         for index in 0..300 {
             tick(&mut frame, index);
             let position = frame.player_position().expect("the player is bound");
-            assert!(position[1] >= -100, "fell through the lower floor: {position:?}");
+            assert!(position[2] >= -100, "fell through the lower floor: {position:?}");
             if !frame.player_grounded() {
                 fell = true;
             }
             if fell && frame.player_grounded() {
                 landed_low = true;
-                assert_eq!(position[1], -100, "must land on the lower floor");
+                assert_eq!(position[2], -100, "must land on the lower floor");
                 break;
             }
         }
@@ -1625,7 +1647,7 @@ mod tests {
         let mut landed = false;
         for index in 1..200 {
             tick(&mut frame, index);
-            let y = frame.player_position().expect("the player is bound")[1];
+            let y = frame.player_position().expect("the player is bound")[2];
             assert!(y >= 0, "the jump must not fall through the floor: tick {index}");
             peak = peak.max(y);
             if frame.player_grounded() {
@@ -1660,7 +1682,7 @@ mod tests {
         let mut landed = false;
         for index in 1..200 {
             tick(&mut frame, index);
-            let y = frame.player_position().expect("the player is bound")[1];
+            let y = frame.player_position().expect("the player is bound")[2];
             assert!(y <= clearance, "the head must stop at the ceiling: tick {index}");
             peak = peak.max(y);
             if frame.player_grounded() {
@@ -1679,7 +1701,7 @@ mod tests {
         tick(&mut frame, 0);
         assert!(!frame.player_grounded(), "the spawn is airborne");
 
-        let before = frame.player_position().expect("the player is bound")[1];
+        let before = frame.player_position().expect("the player is bound")[2];
         frame.queue_input(InputEvent::press(InputButton::Jump));
         tick(&mut frame, 1);
         assert!(
@@ -1687,7 +1709,7 @@ mod tests {
             "a mid-air press must not start a jump"
         );
         assert!(
-            frame.player_position().expect("the player is bound")[1] <= before,
+            frame.player_position().expect("the player is bound")[2] <= before,
             "a mid-air press must not lift the player"
         );
 
@@ -1748,8 +1770,8 @@ mod tests {
             tick(&mut frame, index);
             let position = frame.player_position().expect("the player is bound");
             assert!(position[0] < 100, "the player tunnelled the wall on tick {index}");
-            assert!(position[1] >= 0, "the player fell through the floor on tick {index}");
-            peak = peak.max(position[1]);
+            assert!(position[2] >= 0, "the player fell through the floor on tick {index}");
+            peak = peak.max(position[2]);
         }
         assert!(peak > 0, "the combined script must include a jump");
     }
@@ -1757,10 +1779,10 @@ mod tests {
     #[test]
     fn zero_input_never_moves_the_player_upward() {
         let mut frame = FrameState::new(world_with_floor(0, 50));
-        let mut previous = frame.player_position().expect("the player is bound")[1];
+        let mut previous = frame.player_position().expect("the player is bound")[2];
         for index in 0..200 {
             tick(&mut frame, index);
-            let y = frame.player_position().expect("the player is bound")[1];
+            let y = frame.player_position().expect("the player is bound")[2];
             assert!(y <= previous, "tick {index} moved upward without a jump");
             assert!(frame.player_vertical_velocity() <= 0);
             previous = y;
@@ -1806,7 +1828,7 @@ mod tests {
             "the player must stop at the radius: {position:?}"
         );
         assert!(
-            position[2] > 200,
+            position[1] > 200,
             "a diagonal push must slide along the wall: {position:?}"
         );
     }
@@ -1846,7 +1868,11 @@ mod tests {
 
         let after = frame.player_position().expect("the player is bound");
         assert_eq!(after[0], before[0]);
-        assert_eq!(after[2], before[2] + 60 * PLAYER_SPEED_UNITS_PER_TICK);
+        assert_eq!(after[1], before[1] + 60 * PLAYER_SPEED_UNITS_PER_TICK);
+        assert_eq!(
+            after[2], before[2],
+            "walking horizontally must not change the vertical (Z) coordinate"
+        );
         assert_ne!(
             world_state_hash(&frame.world_state()),
             before_hash,

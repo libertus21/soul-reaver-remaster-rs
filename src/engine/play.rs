@@ -528,9 +528,11 @@ fn open_window(
         }
     }
 
+    // The shipped level data is Z-up (see `crate::engine::axis`), so the engine
+    // window's free cameras use a Z-up basis.
     let start = match assets.render_spawn() {
-        Some(spawn) => FlyCamera::looking_at(spawn, [0.0; 3]),
-        None => FlyCamera::new([0.0; 3]),
+        Some(spawn) => FlyCamera::looking_at_with_up(spawn, [0.0; 3], true),
+        None => FlyCamera::new([0.0; 3]).z_up(),
     };
     let event_loop =
         EventLoop::new().map_err(|error| RunError::Window(format!("event loop: {error}")))?;
@@ -541,7 +543,7 @@ fn open_window(
         backend: None,
         window: None,
         mode,
-        orbit: OrbitCamera::new(),
+        orbit: OrbitCamera::new().z_up(),
         fly: start,
         start,
         keys: CameraKeys::default(),
@@ -620,6 +622,63 @@ fn player_button(key: &Key) -> Option<InputButton> {
     }
 }
 
+/// Third-person boom distance behind the player, in integer world units.
+const PLAYER_CAMERA_BACK: f32 = 600.0;
+
+/// Third-person eye height above the player's feet, in integer world units.
+const PLAYER_CAMERA_HEIGHT: f32 = 400.0;
+
+/// Height of the look target above the player's feet, in integer world units.
+const PLAYER_LOOK_HEIGHT: f32 = 60.0;
+
+/// Build the third-person view matrix for the Z-up world.
+///
+/// `eye` looks at `target` and screen up is world `+Z`. `right` is the
+/// horizontal cross product of `forward` with world up and `up` is their cross
+/// product, so the basis stays orthonormal even when the eye is directly above
+/// the target. This is presentation only: it never reads or writes simulation
+/// state, so determinism is unaffected.
+fn third_person_mvp(eye: [f32; 3], target: [f32; 3], aspect: f32) -> [[f32; 4]; 4] {
+    let dir = [
+        target[0] - eye[0],
+        target[1] - eye[1],
+        target[2] - eye[2],
+    ];
+    let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+    let forward = if len > 1e-6 {
+        [dir[0] / len, dir[1] / len, dir[2] / len]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let mut right = [forward[1], -forward[0], 0.0];
+    let rlen = (right[0] * right[0] + right[1] * right[1]).sqrt();
+    if rlen > 1e-6 {
+        right = [right[0] / rlen, right[1] / rlen, 0.0];
+    } else {
+        right = [1.0, 0.0, 0.0];
+    }
+    let up = [
+        right[1] * forward[2] - right[2] * forward[1],
+        right[2] * forward[0] - right[0] * forward[2],
+        right[0] * forward[1] - right[1] * forward[0],
+    ];
+    render::view_proj(eye, (right, up), forward, 0.02, 100.0, aspect)
+}
+
+/// World-space eye and look target for the third-person player camera.
+///
+/// The eye is behind the player on world `-Y` (forward is `+Y` in the Z-up
+/// world) and above it on world `+Z`. The target is a little above the feet.
+fn player_camera_world(player: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let target = [player[0], player[1], player[2] + PLAYER_LOOK_HEIGHT];
+    let eye = [
+        player[0],
+        player[1] - PLAYER_CAMERA_BACK,
+        player[2] + PLAYER_CAMERA_HEIGHT,
+    ];
+    (eye, target)
+}
+
 struct PlayApp {
     frame: FrameState,
     assets: SceneAssets,
@@ -664,21 +723,28 @@ impl PlayApp {
                 }
             }
             CameraMode::Player => {
-                let target = self
-                    .frame
-                    .player_position()
-                    .map(|position| {
-                        self.assets.transform().apply([
+                // Third-person follow: the camera sits behind (world -Y) and
+                // above (world +Z) the player and tracks it every frame. The
+                // world is Z-up, so "above" is +Z and the horizontal boom lies
+                // in the X/Y plane. UI-only: it never touches simulation state.
+                let player = self.frame.player_position().map_or(
+                    [0.0; 3],
+                    |position| {
+                        [
                             position[0] as f32,
                             position[1] as f32,
                             position[2] as f32,
-                        ])
-                    })
-                    .unwrap_or([0.0; 3]);
-                let eye = [target[0], target[1] + 0.35, target[2] + 1.2];
-                let camera = FlyCamera::looking_at(eye, target);
+                        ]
+                    },
+                );
+                let (eye_world, target_world) = player_camera_world(player);
+                let transform = self.assets.transform();
                 CameraView {
-                    mvp: camera.mvp(aspect),
+                    mvp: third_person_mvp(
+                        transform.apply(eye_world),
+                        transform.apply(target_world),
+                        aspect,
+                    ),
                 }
             }
         }
@@ -862,7 +928,10 @@ impl ApplicationHandler for PlayApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{CameraMode, PlayError, PlayOptions, RunError};
+    use super::{
+        CameraMode, PLAYER_CAMERA_BACK, PLAYER_CAMERA_HEIGHT, PLAYER_LOOK_HEIGHT, PlayError,
+        PlayOptions, RunError, player_camera_world, third_person_mvp,
+    };
     use std::path::PathBuf;
 
     fn argv(input: &[&str]) -> Vec<String> {
@@ -1041,6 +1110,40 @@ mod tests {
         assert!(
             !continuation_ran,
             "the window continuation ran after a seed failure; the window would exist"
+        );
+    }
+
+    #[test]
+    fn the_player_camera_sits_behind_and_above_on_the_correct_axes() {
+        let player = [123.0, -450.0, 700.0];
+        let (eye, target) = player_camera_world(player);
+        assert_eq!(eye[0], player[0], "the boom keeps the same world X");
+        assert_eq!(eye[1], player[1] - PLAYER_CAMERA_BACK, "behind is world -Y");
+        assert_eq!(eye[2], player[2] + PLAYER_CAMERA_HEIGHT, "above is world +Z");
+        assert!(eye[2] > player[2], "the eye is above the player");
+        assert!(eye[1] < player[1], "the eye is behind the player");
+        assert_eq!(target[2], player[2] + PLAYER_LOOK_HEIGHT);
+    }
+
+    #[test]
+    fn the_player_camera_keeps_the_target_in_front_and_uses_world_z_up() {
+        let player = [0.0, 0.0, 0.0];
+        let (eye, target) = player_camera_world(player);
+        let m = third_person_mvp(eye, target, 1.0);
+        let point = [target[0], target[1], target[2], 1.0];
+        let clip: Vec<f32> =
+            (0..4).map(|row| (0..4).map(|col| m[col][row] * point[col]).sum()).collect();
+        assert!(clip[3] > 0.0, "the player target is in front of the camera");
+        assert!(clip.iter().all(|value| value.is_finite()));
+
+        // World +Z must map to screen up: a point above the target has a larger
+        // clip-space y than the target itself.
+        let above = [target[0], target[1], target[2] + 100.0, 1.0];
+        let clip_above: Vec<f32> =
+            (0..4).map(|row| (0..4).map(|col| m[col][row] * above[col]).sum()).collect();
+        assert!(
+            clip_above[1] / clip_above[3] > clip[1] / clip[3],
+            "world +Z points toward screen up"
         );
     }
 }

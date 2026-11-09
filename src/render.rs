@@ -713,6 +713,15 @@ fn initial_fly_camera(positions: &[[f32; 3]], spawn: Option<[f32; 3]>) -> Result
     Ok(FlyCamera::looking_at(eye, [0.0; 3]))
 }
 
+/// Remap a vector between the classic Y-up camera frame and the Z-up world.
+///
+/// The map is the involution `[x, y, z] -> [x, z, y]`, which sends the classic
+/// camera up `+Y` to the world up `+Z` (see [`crate::engine::axis`]). It is its
+/// own inverse, so applying it once converts either way.
+fn map3(v: [f32; 3], z_up: bool) -> [f32; 3] {
+    if z_up { [v[0], v[2], v[1]] } else { v }
+}
+
 fn mul4(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
     let mut out = [[0.0f32; 4]; 4];
     for col in 0..4 {
@@ -750,14 +759,35 @@ pub struct OrbitCamera {
     distance: f32,
     target: [f32; 3],
     auto_rotate: bool,
+    /// When set, the camera treats world `+Z` as up (the shipped level data),
+    /// mapping its classic Y-up basis through [`map3`].
+    z_up: bool,
 }
 
 impl OrbitCamera {
     pub const fn new() -> Self {
-        Self { yaw: 0.0, pitch: 0.0, distance: FIT_DISTANCE, target: [0.0; 3], auto_rotate: true }
+        Self {
+            yaw: 0.0,
+            pitch: 0.0,
+            distance: FIT_DISTANCE,
+            target: [0.0; 3],
+            auto_rotate: true,
+            z_up: false,
+        }
     }
 
-    pub fn reset(&mut self) { *self = Self::new(); }
+    /// Return this camera with a Z-up world basis.
+    pub fn z_up(mut self) -> Self {
+        self.z_up = true;
+        self
+    }
+
+    /// Reset the orbit state, preserving the world up axis.
+    pub fn reset(&mut self) {
+        let z_up = self.z_up;
+        *self = Self::new();
+        self.z_up = z_up;
+    }
 
     fn interact(&mut self) { self.auto_rotate = false; }
 
@@ -792,19 +822,26 @@ impl OrbitCamera {
     fn basis(&self) -> ([f32; 3], [f32; 3]) {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
-        ([cy, 0.0, -sy], [-sy * sp, cp, -cy * sp])
+        (
+            map3([cy, 0.0, -sy], self.z_up),
+            map3([-sy * sp, cp, -cy * sp], self.z_up),
+        )
     }
 
     /// Near/far scale with distance, so interior geometry survives any zoom.
     pub(crate) fn mvp(&self, aspect: f32) -> [[f32; 4]; 4] {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
-        let eye = [
-            self.target[0] + self.distance * cp * sy,
-            self.target[1] + self.distance * sp,
-            self.target[2] + self.distance * cp * cy,
-        ];
-        let forward = [-cp * sy, -sp, -cp * cy];
+        let target = map3(self.target, self.z_up);
+        let eye = map3(
+            [
+                target[0] + self.distance * cp * sy,
+                target[1] + self.distance * sp,
+                target[2] + self.distance * cp * cy,
+            ],
+            self.z_up,
+        );
+        let forward = map3([-cp * sy, -sp, -cp * cy], self.z_up);
         let near = (self.distance * 0.02).max(1e-3);
         view_proj(eye, self.basis(), forward, near, self.distance + 4.0, aspect)
     }
@@ -853,30 +890,53 @@ pub struct FlyCamera {
     position: [f32; 3],
     yaw: f32,
     pitch: f32,
+    /// When set, the camera treats world `+Z` as up (the shipped level data).
+    z_up: bool,
 }
 
 impl FlyCamera {
     pub const fn new(position: [f32; 3]) -> Self {
-        Self { position, yaw: 0.0, pitch: 0.0 }
+        Self { position, yaw: 0.0, pitch: 0.0, z_up: false }
     }
 
-    /// Start at `position` facing `target`. The fitted scene is centred on the
-    /// origin, so this aims the eye at the geometry instead of blindly down -Z:
-    /// a spawn on the scene edge would otherwise look out into the void.
+    /// Return this camera with a Z-up world basis.
+    pub fn z_up(mut self) -> Self {
+        self.z_up = true;
+        self
+    }
+
+    /// Start at `position` facing `target` in the classic Y-up frame.
     pub fn looking_at(position: [f32; 3], target: [f32; 3]) -> Self {
-        let dir = [
-            target[0] - position[0],
-            target[1] - position[1],
-            target[2] - position[2],
-        ];
+        Self::looking_at_with_up(position, target, false)
+    }
+
+    /// Start at `position` facing `target` under the chosen world up axis.
+    ///
+    /// The fitted scene is centred on the origin, so this aims the eye at the
+    /// geometry instead of blindly down one axis: a spawn on the scene edge
+    /// would otherwise look out into the void. The direction is solved in the
+    /// classic Y-up frame and the basis is mapped to the world. If the direction
+    /// is degenerate the camera keeps its default yaw/pitch.
+    pub fn looking_at_with_up(position: [f32; 3], target: [f32; 3], z_up: bool) -> Self {
+        let dir = map3(
+            [
+                target[0] - position[0],
+                target[1] - position[1],
+                target[2] - position[2],
+            ],
+            z_up,
+        );
         let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
-        if !(len > 1e-6) || !len.is_finite() {
-            return Self::new(position);
-        }
-        let unit = [dir[0] / len, dir[1] / len, dir[2] / len];
-        let pitch = (-unit[1]).asin().clamp(-PITCH_LIMIT, PITCH_LIMIT);
-        let yaw = (-unit[0]).atan2(-unit[2]);
-        Self { position, yaw, pitch }
+        let (yaw, pitch) = if !(len > 1e-6) || !len.is_finite() {
+            (0.0, 0.0)
+        } else {
+            let unit = [dir[0] / len, dir[1] / len, dir[2] / len];
+            (
+                (-unit[0]).atan2(-unit[2]),
+                (-unit[1]).asin().clamp(-PITCH_LIMIT, PITCH_LIMIT),
+            )
+        };
+        Self { position, yaw, pitch, z_up }
     }
 
     pub fn look(&mut self, dx: f32, dy: f32) {
@@ -894,14 +954,19 @@ impl FlyCamera {
         for axis in 0..3 {
             self.position[axis] += step * (front[axis] * forward + right[axis] * strafe);
         }
-        self.position[1] += step * rise;
+        let up_axis = if self.z_up { 2 } else { 1 };
+        self.position[up_axis] += step * rise;
     }
 
     /// View direction, right and up; all unit length.
     fn basis(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
-        ([-cp * sy, -sp, -cp * cy], [cy, 0.0, -sy], [-sy * sp, cp, -cy * sp])
+        (
+            map3([-cp * sy, -sp, -cp * cy], self.z_up),
+            map3([cy, 0.0, -sy], self.z_up),
+            map3([-sy * sp, cp, -cy * sp], self.z_up),
+        )
     }
 
     pub(crate) fn mvp(&self, aspect: f32) -> [[f32; 4]; 4] {
@@ -2430,6 +2495,32 @@ mod mesh_tests {
         fly.fly(1.0, 0.0, 0.0, 0.1, false);
         assert!((fly.position[0] - FLY_SPEED * 0.1).abs() < 1e-3, "a quarter turn faces +X");
         assert!(fly.position[2].abs() < 1e-3);
+    }
+
+    #[test]
+    fn z_up_cameras_use_world_z_as_up_and_rise_along_it() {
+        let mut fly = FlyCamera::new([0.0; 3]).z_up();
+        fly.fly(0.0, 0.0, 1.0, 0.1, false);
+        assert!((fly.position[2] - FLY_SPEED * 0.1).abs() < 1e-5, "rise is +Z");
+        assert!(fly.position[1].abs() < 1e-6, "rise never moves Y");
+        let (_, _, up) = fly.basis();
+        assert!((up[2] - 1.0).abs() < 1e-6, "fly camera up is world +Z");
+
+        let orbit = OrbitCamera::new().z_up();
+        let (_, up) = orbit.basis();
+        assert!((up[2] - 1.0).abs() < 1e-6, "orbit camera up is world +Z");
+    }
+
+    #[test]
+    fn z_up_looking_at_faces_the_target_with_world_z_up() {
+        let fly = FlyCamera::looking_at_with_up([0.0, -5.0, 0.0], [0.0, 0.0, 0.0], true);
+        let m = fly.mvp(1.0);
+        let point = [0.0, 0.0, 0.0, 1.0];
+        let clip: Vec<f32> =
+            (0..4).map(|row| (0..4).map(|col| m[col][row] * point[col]).sum()).collect();
+        assert!(clip[3] > 0.0, "the target stays in front of the camera");
+        let (_, _, up) = fly.basis();
+        assert!((up[2] - 1.0).abs() < 1e-6, "up remains world +Z");
     }
 
     #[test]

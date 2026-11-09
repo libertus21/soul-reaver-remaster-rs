@@ -126,9 +126,11 @@ impl InputFrame {
     /// Direct translation axes for this tick: `x` is right minus left and `y` is
     /// forward minus back, each in `-1..=1`.
     ///
-    /// This is a synthetic, camera-free convention for the milestone: forward is
-    /// `+Z` and right is `+X`. The original applies a camera-relative delta in
-    /// stage 9; camera orientation arrives with the renderer slice.
+    /// This is a synthetic, camera-free convention for the milestone: in the
+    /// Z-up world (see [`crate::engine::axis`]) forward is `+Y` and right is
+    /// `+X`, so stage 9 moves the player on the horizontal `X`/`Y` plane. The
+    /// original applies a camera-relative delta in stage 9; camera orientation
+    /// arrives with the renderer slice.
     pub fn move_axis(self) -> [i32; 2] {
         let x = i32::from(self.is_held(InputButton::Right))
             - i32::from(self.is_held(InputButton::Left));
