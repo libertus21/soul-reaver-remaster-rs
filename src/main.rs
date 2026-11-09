@@ -65,6 +65,7 @@ mod tex_hd_map;
 // test-only so dead-code warnings are allowed here, nowhere else.
 #[allow(dead_code)]
 mod srm;
+mod srl;
 mod snd;
 mod textures;
 mod textures_object;
@@ -180,6 +181,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--object-info") {
         return run_object_info(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--srl-info") {
+        return run_srl_info(&args[1..]);
+    }
     if args.first().is_some_and(|a| a == "--object-mesh") {
         return run_object_mesh(&args[1..]);
     }
@@ -218,6 +222,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --object-info --bigfile <BIGFILE.DAT> --entry <INDEX> [--actors]");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --textures <TEXTURES.BIG>");
+        eprintln!("   or: soul-reaver-remaster-rs --srl-info <FILE.SRL>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
         eprintln!("Opens a window showing one .DDS texture file, or browses a");
@@ -1782,6 +1787,33 @@ fn run_object_info(args: &[String]) -> ExitCode {
                 for line in actor::object_lines(block.as_ref()) {
                     outln!("{line}");
                 }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(error.exit_code())
+        }
+    }
+}
+
+fn run_srl_info(args: &[String]) -> ExitCode {
+    let Some(path) = args.first() else {
+        eprintln!("usage: soul-reaver-remaster-rs --srl-info <FILE.SRL>");
+        return ExitCode::from(1);
+    };
+    if args.len() != 1 {
+        eprintln!("usage: soul-reaver-remaster-rs --srl-info <FILE.SRL>");
+        return ExitCode::from(1);
+    }
+    let path = Path::new(path);
+    match srl::load(path) {
+        Ok((clip, bytes)) => {
+            let name = path
+                .file_stem()
+                .map_or_else(|| "?".to_string(), |stem| stem.to_string_lossy().into_owned());
+            for line in srl::summary_lines(&name, &clip, bytes) {
+                outln!("{line}");
             }
             ExitCode::SUCCESS
         }
