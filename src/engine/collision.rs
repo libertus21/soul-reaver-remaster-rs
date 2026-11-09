@@ -55,6 +55,12 @@ const CELL_UNITS: i32 = 512;
 /// the complete wall list. A normal player sweep spans one or two cells.
 const MAX_QUERY_CELLS: i64 = 1 << 18;
 
+/// Maximum slide iterations for one sweep.
+const MAX_SLIDE_ITERATIONS: usize = 4;
+
+/// Extra precision used when projecting a leftover delta onto a tangent.
+const PROJECT_SCALE: i128 = 1 << 20;
+
 /// One wall triangle, projected to XZ.
 ///
 /// `xz` keeps the three projected vertices in face order; the three edges are
@@ -181,6 +187,293 @@ impl CollisionMesh {
         found.dedup();
         found
     }
+
+    /// Resolve one horizontal movement against the mesh and return the end
+    /// position.
+    ///
+    /// `from` and the returned position are integer world units. Only `X` and
+    /// `Z` are resolved; `Y` is translated directly because this milestone has
+    /// no vertical movement. When the mesh is empty, or the delta has no `X`/`Z`
+    /// component, the result is exactly `from + delta`: a zero-input tick never
+    /// moves or collides.
+    ///
+    /// The sweep is a fixed-point 2D circle cast in XZ. It stops before the
+    /// earliest contact and then projects the leftover delta onto that contact's
+    /// tangent, so a diagonal push slides along the wall. At most
+    /// [`MAX_SLIDE_ITERATIONS`] contacts are resolved, which bounds the tick
+    /// cost and keeps the result deterministic.
+    pub fn sweep(&self, from: [i32; 3], delta: [i32; 3], radius: i32) -> [i32; 3] {
+        let direct = add_world(from, delta);
+        if self.walls.is_empty() || (delta[0] == 0 && delta[2] == 0) {
+            return direct;
+        }
+
+        let radius = radius.max(0);
+        let fixed_radius = i64::from(radius) * SUBUNITS;
+        let mut current = [i64::from(from[0]) * SUBUNITS, i64::from(from[2]) * SUBUNITS];
+        let mut remaining = [i64::from(delta[0]) * SUBUNITS, i64::from(delta[2]) * SUBUNITS];
+
+        for _ in 0..MAX_SLIDE_ITERATIONS {
+            let candidate = [current[0] + remaining[0], current[1] + remaining[1]];
+            let Some(contact) = self.first_contact(current, candidate, remaining, fixed_radius) else {
+                current = candidate;
+                break;
+            };
+            let resolved = advance(current, remaining, contact);
+            let leftover = [candidate[0] - resolved[0], candidate[1] - resolved[1]];
+            let slid = project_onto_tangent(leftover, contact.tangent);
+            if resolved != current {
+                current = resolved;
+            }
+            if slid[0] == 0 && slid[1] == 0 {
+                break;
+            }
+            remaining = slid;
+        }
+
+        [to_world(current[0]), direct[1], to_world(current[1])]
+    }
+
+    /// Earliest contact along one horizontal sweep, using the broad phase.
+    fn first_contact(
+        &self,
+        from: [i64; 2],
+        to: [i64; 2],
+        delta: [i64; 2],
+        radius: i64,
+    ) -> Option<Contact> {
+        let world_radius = ((radius + SUBUNITS - 1) / SUBUNITS) as i32;
+        let query_from = [to_world_floor(from[0]), to_world_floor(from[1])];
+        let query_to = [to_world_ceil(to[0]), to_world_ceil(to[1])];
+        let ids = self.candidates(query_from, query_to, world_radius);
+        let mut best: Option<Contact> = None;
+        for id in ids {
+            let wall = &self.walls[id as usize];
+            for edge in 0..3 {
+                let a = wall.xz[edge];
+                let b = wall.xz[(edge + 1) % 3];
+                if let Some(contact) = edge_contact(from, delta, radius, a, b) {
+                    if best.is_none_or(|current| contact.is_earlier_than(current)) {
+                        best = Some(contact);
+                    }
+                }
+            }
+        }
+        best
+    }
+}
+
+/// One resolved contact: a rational `t = num/den` in `0..=1` plus the tangent
+/// direction used to slide.
+#[derive(Debug, Clone, Copy)]
+struct Contact {
+    num: i128,
+    den: i128,
+    tangent: [i128; 2],
+}
+
+impl Contact {
+    fn is_earlier_than(self, other: Self) -> bool {
+        self.num * other.den < other.num * self.den
+    }
+}
+
+/// Earliest contact between a moving circle (center `p`, delta `d`, radius `r`)
+/// and one projected wall edge `a..b`. All values are fixed-point subunits.
+fn edge_contact(
+    p: [i64; 2],
+    d: [i64; 2],
+    r: i64,
+    a: [i32; 2],
+    b: [i32; 2],
+) -> Option<Contact> {
+    let a = [i64::from(a[0]) * SUBUNITS, i64::from(a[1]) * SUBUNITS];
+    let b = [i64::from(b[0]) * SUBUNITS, i64::from(b[1]) * SUBUNITS];
+    let edge = [b[0] - a[0], b[1] - a[1]];
+    let edge_len2 = i128::from(edge[0]) * i128::from(edge[0])
+        + i128::from(edge[1]) * i128::from(edge[1]);
+    if edge_len2 == 0 {
+        return None;
+    }
+    let m = [p[0] - a[0], p[1] - a[1]];
+    let normal = [-edge[1], edge[0]];
+    let s0 = i128::from(m[0]) * i128::from(normal[0]) + i128::from(m[1]) * i128::from(normal[1]);
+    let sd = i128::from(d[0]) * i128::from(normal[0]) + i128::from(d[1]) * i128::from(normal[1]);
+
+    let mut best: Option<Contact> = None;
+
+    // Infinite line: |sized distance| = r * |normal|.
+    if sd != 0 {
+        let normal_len = isqrt_ceil(edge_len2);
+        let big_r = i128::from(r) * normal_len;
+        let signed = if s0 > big_r {
+            if sd >= 0 {
+                None
+            } else {
+                Some((big_r - s0, sd))
+            }
+        } else if s0 < -big_r {
+            if sd <= 0 {
+                None
+            } else {
+                Some((-big_r - s0, sd))
+            }
+        } else {
+            // Already within the radius slab: block only if moving deeper.
+            let deeper = (s0 > 0 && sd < 0) || (s0 < 0 && sd > 0);
+            deeper.then_some((0i128, 1i128))
+        };
+        if let Some((num, den)) = signed {
+            let (num, den) = if den < 0 { (-num, -den) } else { (num, den) };
+            if den > 0 && num >= 0 && num <= den {
+                // Contact point must fall within the segment, not its infinite line.
+                let dot_de = i128::from(d[0]) * i128::from(edge[0])
+                    + i128::from(d[1]) * i128::from(edge[1]);
+                let dot_me = i128::from(m[0]) * i128::from(edge[0])
+                    + i128::from(m[1]) * i128::from(edge[1]);
+                let u_num = dot_me * den + num * dot_de;
+                if u_num >= 0 && u_num <= edge_len2 * den {
+                    best = Some(Contact {
+                        num,
+                        den,
+                        tangent: [i128::from(edge[0]), i128::from(edge[1])],
+                    });
+                }
+            }
+        }
+    }
+
+    // Endpoint caps: circle vs point at both ends of the segment.
+    for point in [a, b] {
+        let mq = [p[0] - point[0], p[1] - point[1]];
+        let a_coef = i128::from(d[0]) * i128::from(d[0]) + i128::from(d[1]) * i128::from(d[1]);
+        if a_coef == 0 {
+            continue;
+        }
+        let b_coef = 2 * (i128::from(mq[0]) * i128::from(d[0]) + i128::from(mq[1]) * i128::from(d[1]));
+        let c_coef = i128::from(mq[0]) * i128::from(mq[0])
+            + i128::from(mq[1]) * i128::from(mq[1])
+            - i128::from(r) * i128::from(r);
+        let candidate = if c_coef <= 0 {
+            // Already touching the cap: block now and let the tangent slide.
+            Some((0i128, 1i128, [-i128::from(mq[1]), i128::from(mq[0])]))
+        } else {
+            let discriminant = b_coef * b_coef - 4 * a_coef * c_coef;
+            if discriminant < 0 {
+                None
+            } else {
+                let root = isqrt_ceil(discriminant);
+                let num = -b_coef - root;
+                let den = 2 * a_coef;
+                let (num, den) = if den < 0 { (-num, -den) } else { (num, den) };
+                if den > 0 && num >= 0 && num <= den {
+                    let normal = [
+                        i128::from(mq[0]) * den + num * i128::from(d[0]),
+                        i128::from(mq[1]) * den + num * i128::from(d[1]),
+                    ];
+                    Some((num, den, [-normal[1], normal[0]]))
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some((num, den, tangent)) = candidate {
+            let contact = Contact {
+                num,
+                den,
+                tangent,
+            };
+            if best.is_none_or(|current| contact.is_earlier_than(current)) {
+                best = Some(contact);
+            }
+        }
+    }
+
+    best
+}
+
+/// Advance `p` by `t * d`, truncating toward zero so the result never passes
+/// the contact point.
+fn advance(p: [i64; 2], d: [i64; 2], contact: Contact) -> [i64; 2] {
+    let sx = i128::from(d[0]) * contact.num / contact.den;
+    let sz = i128::from(d[1]) * contact.num / contact.den;
+    [
+        p[0].saturating_add(saturate_i64(sx)),
+        p[1].saturating_add(saturate_i64(sz)),
+    ]
+}
+
+/// Keep only the component of `v` along `tangent`.
+fn project_onto_tangent(v: [i64; 2], tangent: [i128; 2]) -> [i64; 2] {
+    let tt = tangent[0] * tangent[0] + tangent[1] * tangent[1];
+    if tt == 0 {
+        return [0, 0];
+    }
+    let vt = i128::from(v[0]) * tangent[0] + i128::from(v[1]) * tangent[1];
+    let factor = vt * PROJECT_SCALE / tt;
+    [
+        saturate_i64(tangent[0] * factor / PROJECT_SCALE),
+        saturate_i64(tangent[1] * factor / PROJECT_SCALE),
+    ]
+}
+
+/// Deterministic integer square root, rounded up.
+///
+/// `isqrt_ceil` is used for every irrational length so contacts are computed
+/// slightly early: the sweep stays strictly on the near side of the surface.
+fn isqrt_ceil(value: i128) -> i128 {
+    if value <= 0 {
+        return 0;
+    }
+    let value = value as u128;
+    let mut low = 0u128;
+    let mut high = 1u128;
+    while high.saturating_mul(high) < value {
+        high <<= 1;
+    }
+    while low + 1 < high {
+        let mid = (low + high) / 2;
+        if mid * mid < value {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    high as i128
+}
+
+fn add_world(from: [i32; 3], delta: [i32; 3]) -> [i32; 3] {
+    [
+        from[0].saturating_add(delta[0]),
+        from[1].saturating_add(delta[1]),
+        from[2].saturating_add(delta[2]),
+    ]
+}
+
+/// Round a fixed-point value to the nearest world unit, half away from zero.
+fn to_world(value: i64) -> i32 {
+    let rounded = if value >= 0 {
+        (value + SUBUNITS / 2) / SUBUNITS
+    } else {
+        (value - SUBUNITS / 2) / SUBUNITS
+    };
+    saturate_i32(i128::from(rounded))
+}
+
+fn to_world_floor(value: i64) -> i32 {
+    saturate_i32(i128::from(value.div_euclid(SUBUNITS)))
+}
+
+fn to_world_ceil(value: i64) -> i32 {
+    saturate_i32(i128::from((value + SUBUNITS - 1).div_euclid(SUBUNITS)))
+}
+
+fn saturate_i64(value: i128) -> i64 {
+    value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+fn saturate_i32(value: i128) -> i32 {
+    value.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
 }
 
 fn cell_of(value: i32) -> i32 {
@@ -317,5 +610,130 @@ mod tests {
     #[test]
     fn cell_size_is_a_positive_documented_constant() {
         assert!(CELL_UNITS > 0);
+    }
+
+    fn wall_mesh() -> CollisionMesh {
+        let (vertices, faces) = vertical_wall(100, -500, 500, -100, 100);
+        CollisionMesh::from_room_triangles(&vertices, &faces)
+    }
+
+    #[test]
+    fn an_empty_mesh_moves_freely() {
+        let end = CollisionMesh::default().sweep([1, 2, 3], [4, -1, 4], 16);
+        assert_eq!(end, [5, 1, 7]);
+    }
+
+    #[test]
+    fn a_floor_only_mesh_does_not_block_horizontal_movement() {
+        let (vertices, faces) = floor(-100, -500, 500, -500, 500);
+        let mesh = CollisionMesh::from_room_triangles(&vertices, &faces);
+        assert!(mesh.is_empty());
+        assert_eq!(mesh.sweep([0, 0, 0], [40, 0, 0], 16), [40, 0, 0]);
+    }
+
+    #[test]
+    fn a_sweep_stops_before_a_wall() {
+        let mesh = wall_mesh();
+        let end = mesh.sweep([0, 0, 0], [200, 0, 0], 16);
+        let contact_x = 100 - 16;
+        assert!(end[0] < 100, "the endpoint must stay on the near side: {end:?}");
+        assert!(
+            (contact_x - 2..=contact_x).contains(&end[0]),
+            "the sweep stops at the radius, got {end:?}"
+        );
+        assert_eq!(end[1], 0);
+        assert_eq!(end[2], 0);
+    }
+
+    #[test]
+    fn repeated_forward_ticks_never_cross_the_wall() {
+        let mesh = wall_mesh();
+        let mut position = [0, 0, 0];
+        for _ in 0..100 {
+            position = mesh.sweep(position, [4, 0, 0], 16);
+            assert!(position[0] < 100, "crossed the wall: {position:?}");
+        }
+        assert!((80..=84).contains(&position[0]), "final {position:?}");
+    }
+
+    #[test]
+    fn a_diagonal_push_slides_along_the_wall_and_keeps_progress() {
+        let mesh = wall_mesh();
+        let mut position = [0, 0, 0];
+        for _ in 0..60 {
+            position = mesh.sweep(position, [4, 0, 4], 16);
+            assert!(position[0] < 100, "crossed the wall: {position:?}");
+        }
+        assert!(
+            position[2] > 200,
+            "the push must keep making progress along the wall: {position:?}"
+        );
+        assert!((80..=84).contains(&position[0]), "final {position:?}");
+    }
+
+    #[test]
+    fn the_same_sweep_script_replays_identically() {
+        fn run() -> Vec<[i32; 3]> {
+            let mesh = wall_mesh();
+            let mut position = [0, 0, 0];
+            let mut observed = Vec::new();
+            for tick in 0..80 {
+                let delta = match tick % 4 {
+                    0 => [4, 0, 4],
+                    1 => [4, 0, 0],
+                    2 => [4, 0, -2],
+                    _ => [0, 0, 4],
+                };
+                position = mesh.sweep(position, delta, 16);
+                observed.push(position);
+            }
+            observed
+        }
+        assert_eq!(run(), run());
+    }
+
+    #[test]
+    fn broad_phase_and_brute_force_choose_the_same_earliest_contact() {
+        let mut vertices = Vec::new();
+        let mut faces = Vec::new();
+        for step in 0..24 {
+            let x = -4000 + step * 350;
+            let z0 = -3000 + (step % 5) * 400;
+            let (mut v, mut f) = vertical_wall(x, z0, z0 + 700, -200, 200);
+            let base = vertices.len() as u32;
+            vertices.append(&mut v);
+            faces.extend(f.drain(..).map(|face| face.map(|index| index + base)));
+        }
+        let mesh = CollisionMesh::from_room_triangles(&vertices, &faces);
+        let probes: [([i64; 2], [i64; 2], i64); 5] = [
+            ([0, 0], [4 * 1024, 4 * 1024], 16 * 1024),
+            ([-4000 * 1024, 0], [4000 * 1024, 0], 16 * 1024),
+            ([100 * 1024, 0], [200 * 1024, 0], 16 * 1024),
+            ([-1000 * 1024, 1000 * 1024], [0, 0], 8 * 1024),
+            ([3000 * 1024, -3000 * 1024], [3000 * 1024, 3000 * 1024], 32 * 1024),
+        ];
+        for (from, delta, radius) in probes {
+            let to = [from[0] + delta[0], from[1] + delta[1]];
+            let grid = mesh.first_contact(from, to, delta, radius);
+            let mut brute: Option<super::Contact> = None;
+            for wall in &mesh.walls {
+                for edge in 0..3 {
+                    let a = wall.xz[edge];
+                    let b = wall.xz[(edge + 1) % 3];
+                    if let Some(contact) = super::edge_contact(from, delta, radius, a, b)
+                        && brute.is_none_or(|current| contact.is_earlier_than(current))
+                    {
+                        brute = Some(contact);
+                    }
+                }
+            }
+            match (grid, brute) {
+                (Some(a), Some(b)) => {
+                    assert_eq!((a.num, a.den), (b.num, b.den), "probe {from:?}->{to:?}");
+                }
+                (None, None) => {}
+                other => panic!("broad and narrow phase disagree for {from:?}->{to:?}: {other:?}"),
+            }
+        }
     }
 }
