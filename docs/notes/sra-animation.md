@@ -1,150 +1,294 @@
-# `.SRA` probe - decode ledger (2026-10-27)
+# `.SRA` decode ledger - container confirmed, animation NOT recoverable (2026-11-09)
 
-Planning note for the `sra-animation` change. Read-only probe of the SR1
-remaster game data (`1\OBJECT\`); nothing under the install was written, no
-game bytes were copied into the repo, and scratch lived only in the session
-temp directory. Aggregates and shapes only: no file listings, no raw
-coordinates, no dumps, no absolute install paths.
+Read-only probe of the SR1 remaster `OBJECT` folder (227 `.SRA` files). Nothing
+under the install was written, no game bytes were copied into the repository, and
+scratch lived only in the session temp directory. This note records counts,
+structural shapes and small format constants only: no absolute offsets, no
+addresses, no dumps, no install paths.
 
-## Box (what was and was not done)
-
-Three passes, no Ghidra, no disassembly:
-
-1. Census, size classes, naming, sibling types.
-2. Header model and payload classification on every file.
-3. Community tools and sibling formats.
-
-Bounded to roughly 90 minutes of probing. Anything not answered here is
-listed as UNKNOWN, not guessed.
-
-## Census
-
-- 227 `.SRA` files, **all** under `OBJECT`, alongside 349 `.SRM`, 60 `.SRL`
-  and 29 `.PCM`. No `.SRA` anywhere else in the SR1 tree.
-- Total 3,828,348 bytes. Min 2,084; p25 2,308; median 3,236; p75 12,432;
-  p90 41,176; p99 125,448; max 533,444.
-- 134 distinct SHA-256 contents; 93 files are byte-identical duplicates of
-  another file, in clusters of up to 36 and 30. A large part of the set is
-  repeated placeholder/static content.
-- Basenames are 4-8 uppercase alphanumerics. Only 1/227 basenames also
-  exist as an `.SRM`; 13/227 match any other file (12 `.PCM`, 1 `.SRM`).
-
-Evidence class: observed.
-
-## Header model
-
-| Field | Shape | Evidence class |
-|---|---|---|
-| Word 0 | declaration count `N`, observed 2..1054 | Observed |
-| Word 1 | `0` in 227/227 | Observed |
-| Word 2 | `4` (144 files), `28` (79), or one of 36/40/68/140 | Observed |
-| Table | `N` ascending offsets from word 2, then a `0` terminator in 227/227 | Observed |
-| Header length | `max(2048, 8 + 4*(N+1))` | Derived (strong) |
-| Payload | `[header_len, EOF)` | Derived |
-
-The 2 KiB floor is the load-bearing part: in 225/227 files the first
-non-zero byte after the table lands exactly at
-`max(2048, 8 + 4*(N+1))`. The two exceptions are the single largest table
-(whose data is pushed to the next 2 KiB boundary) and one file with a
-one-byte skew. In the largest table, 822 of 1,053 gaps are exactly 4 bytes.
-
-No text magic exists in any file. The format is identified by structure
-only.
-
-Evidence class: derived (strong) for the floor and the length rule.
-
-## Payload
-
-The payload is mixed, not a single homogeneous array:
-
-- **Packed integer records.** A small count, an `0xFFFFFFFF` marker, a
-  `0x0064xxxx` triple repeated three times, and a following small value.
-  The `0x64` (100) constant recurs across unrelated files, which suggests a
-  fixed-point scale. Meaning UNKNOWN.
-- **Smooth float runs.** Strictly increasing, bounded to `0..360`, with
-  steps well below 30. A 0.5 -> 70.4 ramp with roughly 6.7 per sample was
-  reproduced on a small prop. 156/227 files contain at least one such run;
-  count per file ranges 0..323 (median 1); 71 files have none.
-
-Negative tests (all ran clean-room on the census):
-
-| Test | Result | Consequence |
-|---|---|---|
-| Quaternion array (4-float window, norm in `0.9..=1.1`) | 3.2% of windows - near chance | no contiguous quaternion track |
-| Parent array (`u16` in `1..=127`) | longest run = 8 | no 128-slot hierarchy |
-| Index array (`u32` in `1..=255`) | longest run = 15 | no 128-entry index table |
-| Name table (printable runs) | 107 files show runs, all float-bit noise on inspection | no names |
-
-Evidence class: observed for the tests and run maxima; derived (strong) for
-the curve-run shape; inferred (not proven) that the runs are rotation
-angles in degrees.
+This supersedes the 2026-10-27 census in this same file. That pass found the
+header and the float runs but treated the payload as undifferentiated. This pass
+resolves the payload into a **record directory plus typed records** and runs the
+decisive cross-check against the actor clip-set trios; the verdict is still
+NO-GO for playback, now for a sharper reason.
 
 ## Verdict
 
-- **Hierarchy: NO.** No parent indices, no child lists, no bone names, no
-  contiguous small-index array anywhere in 227 payloads.
-- **Clips: NO catalog.** No clip name, count, duration, or frame-rate field
-  survives a cross-file check. Curves exist, but with no clip boundary and
-  no time base they are an undifferentiated stream.
-- **Binding to `.SRM`: NO.** `.SRA` names do not track `.SRM` names
-  (1/227) and no bone-index field was found, so a curve cannot be attached
-  to a joint slot without inventing the mapping.
+| Question | Answer | Confidence |
+|---|---|---|
+| 1. Container kind | **Two-level offset-indexed record container** (not a `.SRM`-style chunk table, not a flat record array) | CONFIRMED (227/227) |
+| 2. What it contains | **Variable-length typed sub-resource records**: a directory plus records tagged `0x6464640n`, `0x0FACE0FF` and others, carrying dense `f32` runs | CONFIRMED (shape) / UNKNOWN (meaning) |
+| 3. 24-clip cross-check | **FAILS**: record count is below the maximum clip-set id for all 21 actor-family files; only one file (a non-player) has exactly 24 records | CONFIRMED |
+| 4. Bone binding | **NONE**: no name table, no index array, no per-record joint field | CONFIRMED (absence) |
+| 5. Keyframe encoding / time base | **NOT ESTABLISHED**: no unit-quaternion runs, values exceed `360`, no duration or frame-rate field | CONFIRMED (negative) |
+| 6. Pose from files alone? | **NO** | CONFIRMED |
 
-**Consequence.** One-bone posing cannot be generalized to real animation
-from these files. Any claim that a `.SRA` curve rotates bone `k` would be
-fabricated. This is a documented no-go.
+The decisive new result is the cross-check. The actor block stores **8 rows x 3
+one-byte clip-set ids** (24 values in `0..66`,
+`docs/notes/actor-behaviour-data.md`). If a model's `.SRA` were the clip table
+those ids index, its record count would have to exceed the largest id it is
+indexed by. It never does. That is a systematic falsification, not a
+not-found-yet.
+
+## Quick path
+
+1. Read section 1 for the container (what is confirmed).
+2. Read section 3 for the cross-check table (the decisive evidence).
+3. Read section 6 for the answer to "can we animate from files alone".
+4. Treat everything under UNKNOWN as open; do not fill it by inference.
+
+## 1. Container structure
+
+`.SRA` is a **two-level offset container**. Both levels are plain ascending
+`u32` offset lists; there is no text magic anywhere in the 227 files.
+
+```text
+[ preamble ]                         file start
+  u32  preamble_count
+  u32  0
+  u32  offsets[preamble_count - 1]   ascending, names record starts
+  u32  0                             terminator
+[ zero padding to a 2 KiB boundary ] (larger for oversized preamble tables)
+[ payload directory ]                at the 2 KiB boundary
+  u32  offsets[K]                    ascending, relative to the boundary
+  u32  0xFFFFFFFF                    terminator
+[ K records ]                        variable length, last runs to EOF
+```
+
+| Part | Shape | Confidence |
+|---|---|---|
+| Preamble count | `u32` at file start; observed `2..1054` | observed |
+| Preamble table | `preamble_count - 1` ascending `u32` offsets, closed by `0` | observed (227/227) |
+| Padding | payload starts at `max(2 KiB, next 2 KiB >= preamble size)` | derived (strong) |
+| Payload directory | `K` ascending `u32` offsets relative to the boundary, closed by `0xFFFFFFFF` | CONFIRMED (227/227) |
+| Record count `K` | number of payload-directory offsets; range `1..230`, median `2` | CONFIRMED (227/227) |
+| Records | `K` variable-length spans; last ends at EOF | CONFIRMED (227/227) |
+
+Two facts make the payload directory load-bearing:
+
+- **227/227 files parse** with the invariant "ascending offsets, `0xFFFFFFFF`
+  terminator, every offset inside the file". The earlier census parsed the
+  preamble only; this directory is a new, stronger structural fact.
+- Both the preamble and the payload directory name the **same record starts**,
+  but under different bases. The preamble also carries extra leading entries and
+  a constant base bias relative to the payload directory. Why the two indexes
+  disagree on base and why the preamble has extra entries is **UNKNOWN**. Use
+  the payload directory as the authoritative record list.
+
+Record-count distribution across the 227 files: `1` record in 83 files, `2` in
+35, `3` in 20, `4-5` in 17, `6-10` in 9, `11-20` in 48, `21-30` in 8, `31-60`
+in 6, and one file above 60. The set is dominated by tiny prop/effect files;
+large counts occur only on character/prop animation-ish assets.
+
+## 2. Record shape (best effort)
+
+Records are a **tagged union**. Two tag families are confirmed by sampling many
+files:
+
+| Record head | Byte pattern | Files | Confidence |
+|---|---|---|---|
+| `0x64646401` / `0x64646402` / `0x64646403` | ASCII-ish tag, low byte 1..3 | 204 / 227 | CONFIRMED (tag present) |
+| `0x0FACE0FF` | engine resource marker | 43 / 227 | CONFIRMED (tag present) |
+
+40 files carry both families; 20 carry neither (other tags, not decoded). The
+`0x0FACE0FF` marker is the same tag the engine's generic `0x32` resource-table
+post-processor expects (`docs/notes/anim-binding.md`, A7), so at least some
+`.SRA` files are shaped like a resource table rather than an animation track.
+
+Best-effort `0x6464640n` record head, from a small but consistent sample:
+
+| Field | Observation | Confidence |
+|---|---|---|
+| tag | `0x6464640n`, `n` in `1..3` | observed |
+| next three words | an identical `u32` triple (values vary per record) | observed (sample) |
+| following word | `0` | observed (sample) |
+| next word | an integer `B` (e.g. `36`, `56`, `96`, `308`, `480`) | observed (sample) |
+| rest of head | variable; sometimes a `0xCD…` uninitialized fill, sometimes a packed sub-block | UNKNOWN |
+| payload | dense little-endian `f32` in many records | observed |
+
+The `0x0FACE0FF` family sampled differently: a 12-byte record of
+`[0x0FACE0FF][id][constant]`, where `id` increments across adjacent records.
+Some `.SRA` files (e.g. one wraith sibling) are 26 such 12-byte records back to
+back. The meaning of `id` and the constant is **UNKNOWN**.
+
+Payload statistics over sampled records (f32 interpreted over the whole record):
+
+| File (record | floats in range | min | max | unit-quaternion windows |
+|---|---|---|---|
+| door prop, record 0 | 46 | -2040.7 | 2049.4 | 0 / 52 |
+| door prop, record 4 | 661 | -1265.5 | 1188.1 | 6 / 764 |
+| statue prop, records 0-1 | 2178 | -1230.6 | 1242.8 | 0 / 2205 |
+| character, record 0 | 684 | -511.5 | 422.6 | 0 / 753 |
+| character, record 0 | 213 | -807.3 | 5.5e5 | 4 / 249 |
+| character (large), first span | 3821 | -1907.5 | 5656 | 10 / 4477 |
+
+Two negative results follow directly:
+
+- **No quaternion track.** A 4-float window is unit-norm in 0-1.6% of sampled
+  windows, i.e. chance. There is no contiguous normalized-quaternion array.
+- **Not degrees-bounded.** Values span `±~2000` and occasionally far higher.
+  The 2026-10-27 note inferred "rotation angles in degrees" from runs bounded
+  to `0..360`; that bound does not hold across the corpus. The earlier
+  inference is **not supported** and is retracted here.
+
+## 3. Clip-count cross-check (decisive)
+
+The actor block's 8x3 trios are 24 one-byte **clip-set ids** in `0..66`
+(`docs/notes/actor-behaviour-data.md` section 5.1). The falsifiable prediction
+is: if a model's `.SRA` is the clip table those ids index, the `.SRA` record
+count `K` must be greater than the largest id used by that actor.
+
+| Actor | `.SRA` records `K` | max trio id | distinct ids | `K >= max id` |
+|---|---:|---:|---:|:---:|
+| aluka | 55 | 66 | 19 | no |
+| alukabss | 12 | 29 | 14 | no |
+| hunter | 30 | 39 | 20 | no |
+| kain | 21 | 36 | 16 | no |
+| morboss | 14 | 48 | 18 | no |
+| morlock | 41 | 51 | 18 | no |
+| priests | 17 | 29 | 16 | no |
+| ronin | 44 | 54 | 18 | no |
+| roninbss | 20 | 36 | 15 | no |
+| skinbos | 19 | 43 | 18 | no |
+| skinner | 42 | 55 | 18 | no |
+| sluagh | 23 | 25 | 16 | no |
+| soul | 1 | 20 | 4 | no |
+| vlgra | 26 | 36 | 19 | no |
+| vlgrb | 26 | 35 | 19 | no |
+| vlgrc | 26 | 35 | 19 | no |
+| vwraith | 24 | 35 | 17 | no |
+| walbosb | 9 | 20 | 6 | no |
+| walboss | 20 | 28 | 12 | no |
+| wallcr | 53 | 62 | 19 | no |
+| wrshp | 39 | 62 | 19 | no |
+
+`K >= max id` is **no for all 21**. The `.SRA` record list cannot be the
+per-actor clip table indexed by the trio ids. Additional falsifiers:
+
+- Only **one** of the 227 files has exactly 24 records (a wraith, and its max
+  trio id is 35, so even that coincidence fails the index test). A per-actor
+  "24 clips" signature does **not** appear.
+- The only file with more than 66 records is the **player** `raziel` (230
+  records), which has no trio table at all. It is not a shared clip library.
+- The trio ids overlap between actors (`2d`/`2e`, `30`-`33`, max `66`), which the
+  behaviour note reads as a **shared global id space**, not a per-actor one.
+
+Conclusion: the trios most likely index a **global animation/action list that
+does not live in the per-model `.SRA` files**, or the ids are not animation-clip
+indices at all. Either way, `.SRA` is not the per-actor clip catalog.
+
+## 4. Bone binding
+
+There is no binding mechanism in `.SRA`:
+
+- No name table (apparent ASCII runs are float-bit noise or the short
+  `0x0FACE0FF` constant, not bone names).
+- No contiguous small-index array: longest `u16` run in `1..=127` is 8 and
+  longest `u32` run in `1..=255` is 15 across the census (prior pass,
+  reproduced in shape by the tag/record scan here).
+- No per-record joint field; records carry `f32` runs and `0x0FACE0FF` nodes,
+  not `(joint, value)` pairs.
+
+The model side is a flat 128-slot joint pool with **no hierarchy**
+(`docs/notes/srm-bone-block.md`), so even a hypothetical `.SRA` channel would
+have to name a joint slot. Nothing in the payload does.
+
+Corroboration from the binary: the only consumer of the `.SRA` buffer on the
+loader path is a `RET 0` stub, and the animation runtime is a separate spline
+system fed from elsewhere (`docs/notes/anim-binding.md`, A1-A11). Even the
+`0x0FACE0FF` post-processor (A7) builds a resource table, not a player.
+
+## 5. Time base and keyframe encoding
+
+Not established:
+
+- **No duration or frame-rate field** survives a cross-file check. Files have a
+  record count and per-record lengths, but no time unit.
+- **No rotation representation** is confirmed: not unit quaternions (section 2),
+  not `0..360` degrees (values exceed that), and no `3x3` matrix run was found.
+- **No sample-rate or key-count field** was identified. Candidate head integers
+  (`B` in the `0x6464640n` head) do not correlate with payload float counts in
+  the samples (e.g. `B = 96` with ~740 floats, `B = 56` with ~47 floats).
+
+A "reconstruct at time t" step therefore has no time axis to evaluate against.
+
+## 6. Can a pose be reconstructed from file data alone?
+
+**NO.** The minimal algorithm would be: pick a clip, get its duration and sample
+rate, evaluate each joint's rotation/translation at `t`, and blend with the
+`.SRM` per-vertex weights. Every input that algorithm needs is missing or
+unbound:
+
+| Needed | Status |
+|---|---|
+| Clip identity / duration / sample rate | absent (section 3, 5) |
+| Joint or bone reference per channel | absent (section 4) |
+| Rotation encoding (quaternion/euler/matrix) | not established; not quaternions, not degrees (section 2) |
+| Hierarchy (parent/child) for a full-body pose | absent in `.SRM`; absent in `.SRA` (section 4) |
+| Time axis `t` | absent (section 5) |
+
+This is a **documented no-go**, not gate-able by playtesting: there is no
+honest mapping from a `.SRA` record to a joint rotation. Claiming one would be
+fabrication. Full-body posing needs a different asset (the per-object spline key
+table, or `.SRL`), not a larger reading of `.SRA`.
 
 ## What stays UNKNOWN
 
-1. Channel-to-joint binding.
-2. Time base, frame rate, and the meaning of `N` (frames, blocks, clips).
-3. Clip boundaries and any per-clip record.
-4. The packed header fields (small count, `0xFFFFFFFF`, `0x0064xxxx`).
-5. Why the largest file's table overflows the 2 KiB floor and pads to the
-   next boundary.
-6. `.SRL` record semantics (see below).
+1. The meaning of the preamble's extra entries and its constant base bias
+   relative to the payload directory.
+2. The `0x6464640n` head fields (the identical triple, `B`, the `0xCD…` word).
+3. The `0x0FACE0FF` record's `id` and constant word, and whether these records
+   are resource nodes or key data.
+4. The meaning of the `f32` payload: coordinate/UV/profile vs. any time series.
+   The ranges (`±~2000`) and symmetric shapes suggest spatial data, but this is
+   INFERRED, not proven.
+5. The 20 files with neither known tag, and any other tag family.
+6. The exact relationship between the preamble count (`2..1054`) and `K`.
+7. `.SRL` record semantics (60 files, `SRL.` magic, ~1200-byte stride) and
+   whether it carries the global clip list the trios may index.
+8. Whether `0x0FACE0FF` records are the "child tables" the `0x32`
+   post-processor copies; sampled large files do not carry the tag, so the
+   processor's coverage is partial.
 
-## Sibling formats (census only)
+## Falsification notes
 
-- **`.SRL` (60 files, 2.8 KiB - 1.7 MiB).** ASCII magic `SRL.`, a second
-  word of `1`, a count word, and a fixed record stride: size is
-  approximately `count * 1200` (1,418 records -> 1,701,620 bytes). No name
-  overlap with `.SRA` or `.SRM`; no readable strings. Consistent with a
-  placement/record array, not a skeleton. Out of scope.
-- **`.PCM` (29 files).** Not probed. Community tools read the original-game
-  `.pcm`, not this remaster variant.
-- **`.SRM` (349).** Already decoded: flat 128-slot joint pool, no
-  hierarchy, no keyframes (see `srm-bone-block.md`).
+This verdict is a no-go for *skeletal playback from `.SRA`*. It would be
+overturned only by evidence of:
 
-## Community tools (exact URLs + licenses)
+1. A per-record joint index paired with a rotation, repeated over a time axis,
+   in a file whose record count exceeds that actor's max trio id.
+2. A global `.SRA` (or `.SRL`) table with ≥67 entries that the trio ids index
+   and that carries joint-bound channels.
+3. A head field that reproducibly equals a key/frame count and a sample rate
+   across several actors.
 
-| Tool | URL | License | Reads `.SRA`? | Fields documented |
-|---|---|---|---|---|
-| io_scene_xrm | https://github.com/TheDodylectableX/io_scene_xrm | No LICENSE file (raw fetch 404; repo metadata reports none) | No | `.SRM`/`.CHR`/`.TMT`/`.TRM` import. Source contains zero mentions of SRA, animation, parent, hierarchy, or keyframe; it builds unparented bones from the 48-byte records |
-| ModelEx | https://github.com/TheSerioliOfNosgoth/ModelEx | LICENSE present, composite (GitHub classifies NOASSERTION) | No | Original `.drm`/`.pcm` only; README has zero SRA/animation mentions |
-| Recombobulator | https://github.com/TheSerioliOfNosgoth/Recombobulator | GPL-3.0 | No | Original `.pcm`/room files; no animation structs for this remaster |
-| AsunderNoMore | https://github.com/TheSerioliOfNosgoth/AsunderNoMore | MIT | No | Bigfile packer; no model or animation |
+The refuted claims from the earlier pass are: "rotation angles in degrees"
+(contradicted by values far outside `0..360`) and "undifferentiated payload"
+(contradicted by the description, directory and tags in section 1-2).
 
-No documented remaster `.SRA` parser or animation importer was found. The
-session's web-search provider returned HTTP 403, so the check above was run
-against GitHub raw files and repository trees directly (reproducible from
-the URLs). Absence in those four tools is evidence of absence in the
-public tool set as of this probe, not proof that no private tool exists.
+## Sibling formats and community tools (unchanged from the 2026-10-27 census)
 
-## Next candidates
+- `.SRL` (60 files): ASCII `SRL.` magic, a count, ~1200-byte stride; no name
+  overlap with `.SRA`/`.SRM`. Still the most likely place for a global list.
+- `.PCM` (29 loose files): the object-model container
+  (`docs/notes/object-models.md`); not animation.
+- `.SRM` (349 files): flat 128-slot joint pool, no hierarchy, no clips
+  (`docs/notes/srm-bone-block.md`).
+- Community tools (io_scene_xrm, ModelEx, Recombobulator, AsunderNoMore) do not
+  read remaster `.SRA`; the 2026-10-27 note records the exact URLs and licenses.
+  No public remaster `.SRA` parser was found.
 
-1. **`.SRL` scoping** - magic, count, ~1200-byte records. If it is a
-   placement/scene format it unblocks scene assembly, not animation. Cheap
-   to scope.
-2. **Ghidra on the loader** - the only route left for the `.SRA` header
-   semantics and channel binding. Deferred by the repo rule until
-   community formats are exhausted; this probe exhausts them.
-3. **SR2 parity** - the SR2 install may ship the same `.SRA` family with a
-   documented difference; not probed here.
-4. **`.PCM`** - 29 files, undecoded; low animation value.
+## Method and legal
 
-## Legal
-
-Counts, field shapes, run lengths, and aggregate statistics only. No game
-bytes, no absolute install paths, no per-file coordinates, no hashes, no
-dumps, no listings. Game data was read in memory and never written.
+- Three read-only passes: full 227-file record-directory parse; per-record tag
+  and payload statistics on sampled files of each size class; the trio/record
+  cross-check against `docs/notes/actor-behaviour-data.md`.
+- Tags `0x6464640n` and `0x0FACE0FF`, the `0xFFFFFFFF` directory terminator, and
+  the 2 KiB alignment are format constants (the same class of fact as the
+  `0x80000000` `.SRM` sentinel), not data dumps.
+- Counts, shapes and small ids only. No addresses, no absolute offsets, no game
+  bytes, no install paths, no disassembly. The install was read-only; scratch
+  was in `%TEMP%` and not committed.
+- No production code changed; no CLI shipped. The record interior is not
+  confirmed enough ("zero contradictions") to justify a `--sra-info` command,
+  so the earlier proposal's diagnostic remains intentionally unshipped.
