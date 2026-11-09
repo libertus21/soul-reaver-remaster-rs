@@ -218,3 +218,115 @@ counters and live set did not change.
 - `cargo test` is green at 451 tests.
 - Every absent subsystem is either a named no-op stage or an explicit typed
   unsupported path. None is a silent placeholder.
+
+## Post-milestone
+
+This section records everything confirmed after the milestone above. It extends
+the history; the numbers in the body stay as the milestone snapshot. All counts
+and digests below were re-run read-only against the user's own copy.
+
+### Verified current state
+
+- `cargo test`: **554 passed, 0 failed** (synthetic bytes only).
+- `--help`: **34 capabilities in six groups** (the five legacy groups plus
+  `game`).
+- 60-tick headless `under1`, twice:
+  `engine unit=under1 rooms=1 placed=95 admitted=3 tracked=3 skipped_markers=92 inert=0 unresolved=0 live=3 ticks=60 digest=ede39c540a10ee39`.
+- 60-tick headless `skinnr1`, twice:
+  `engine unit=skinnr1 rooms=1 placed=83 admitted=41 tracked=15 skipped_markers=42 inert=0 unresolved=0 live=41 ticks=60 digest=398d1870a463fd7a`.
+
+The current determinism constants are refreshed in
+`docs/notes/determinism.md`; the gate table above is the milestone snapshot.
+
+### Engine capabilities added
+
+- Windowed `--play` with `orbit`, `fly` and `player` cameras; `Esc` exits 0.
+- Headless `--play --headless --ticks N` with the one-line contract and the
+  canonical FNV-1a 64 digest.
+- Room collision: a deterministic fixed-point horizontal sweep and slide.
+- Gravity and ground detection.
+- Jump with ceiling blocking.
+- The Z-up correction, end to end.
+
+The authored placed-object seed pass is shared by both windowed and headless
+mode, so both show the same live world.
+
+### Axis findings
+
+- The world is **Z-up** (corpus evidence: 372 units / 573,739 faces / 6,142
+  placed objects; `docs/notes/up-axis.md`).
+- The object-model local up axis is **also Z-up**: 9/9 humanoids on three
+  independent checks, and Z is the **least** dominant normal axis, which is the
+  signature of a vertical axis (`docs/notes/object-up-axis.md`).
+- Placement therefore needs no rotation: `OBJECT_UP == UP`.
+- The **facing/yaw axis remains UNKNOWN**.
+- The legacy viewers were aligned to Z-up while the object-model viewers were
+  kept Y-up pending the object axis, then unified once it was confirmed
+  (`docs/notes/legacy-viewers-up-axis.md`).
+
+### Class dispatch
+
+The exact classifier is confirmed and implemented in `src/engine/class.rs`:
+class-flags bit 18 forces `physical` (checked first), bit 19 forces `monster_`,
+otherwise the padded prototype is compared **exactly** against the six-row
+table. It is resolved at load-complete, before the slot is reused as the
+parameter-program pointer.
+
+### Runtime capture verdict
+
+A read-only Frida session on the live game produced:
+
+- hooks armed with **0 failures**;
+- the spline **set selector fired 53 times** across all live objects;
+- the spline **sampler fired ZERO times** in the entire session;
+- `font` was the **only** object with a non-null spline set; every actor
+  (`raziel`, `sluagh`, `soul`, ...) resolved an **empty** set;
+- clip ids ARE populated (`raziel` clip=1, `sluagh` clip=1/2, `EAGGOT` clip=5)
+  but ranges stay `0..0` and `playto=0`;
+- the live class codes agreed with our engine's classifier exactly: `raziel`=0
+  (Raziel), `glphicon`=2, `hint`=3 (Physical), `soul`=4 (Monster), `sluagh`=4
+  (Monster), `undhost`/`tranhst`/`genva`=-1 (Unclassified).
+
+**Conclusion:** the original SR1 spline animation system is **not driving actor
+animation in the remaster**; it is effectively dead except for `font`. That
+explains why the file-side census found zero spline descriptors in all 21 actor
+containers: they are not used. This closes the spline line of inquiry with
+evidence, not speculation.
+
+### Animation asset map
+
+| Asset | Count | Finding |
+|---|---:|---|
+| `.SRM` | 349 | Meshes with 128 slots and no hierarchy. |
+| `.SRA` | 227 | Tagged containers; no coherent key runs under a detector validated on the known `font` positive. |
+| `.PCM` | 214 | Levels plus object containers; 0 of the 397 object containers carry spline descriptors. |
+| `.SRL` | 60 | Dialogue/facial lip-sync with a CONFIRMED format (`SRL\x02`, 20-byte header, frame-major 48-byte 3x4 affine cells, `len == 20 + tracks*frames*48` on 60/60). |
+| animation extension | 0 | No animation file extension exists anywhere in the tree. |
+
+### Animation status
+
+Body animation is **NOT available**. The runtime capture shows the spline
+selector firing 53 times while the sampler never fires once in the whole
+session, and only `font` carries a non-null spline set; every actor resolves an
+empty set even though its clip id is populated. The file side agrees: all 21
+actor containers carry zero spline descriptors, `.SRA` has no coherent channel
+under a detector calibrated on the one known positive (`font`), `.SRM` has a
+flat 128-slot joint pool with no hierarchy, and `.SRL` is dialogue/facial
+lip-sync with no channel-to-bone table. There is therefore no confirmed source
+that can drive an actor's body pose, and no decoder is invented to fill the gap.
+
+### Updated gaps carried forward
+
+| Gap | Detail | Disposition |
+|---|---|---|
+| Body animation source | The spline system does not drive actors in the remaster (selector 53, sampler 0, `font` only) and no animation asset carries an actor channel. | UNKNOWN; the spline line is closed by evidence. |
+| Facing / yaw axis | The local facing axis is one of X or Y but is not separated; the level record carries no orientation. | UNKNOWN. |
+| `.SRL` track-to-bone binding | The 3x4 per-frame stream is confirmed, but there is no channel-to-bone table. | UNKNOWN. |
+| `RunError::Scene` exit code | A non-texture scene failure still exits 1, not 2. | Open; documented, not changed. |
+| Digest scope | Same-platform, same-build; the path fold uses the OS-native encoding. | Open; ASCII paths are identical everywhere. |
+| Free list | The live arena is LIFO and is unproven against the original allocator. | UNKNOWN. |
+| Alternate-state sentinel | The on-disk not-set sentinel is UNKNOWN; represented as `Option<u8>`. | UNKNOWN. |
+| Parameter program | Memory-only; there is no file form. | UNKNOWN. |
+
+The milestone-era gaps not listed above (single-unit `--play`, no input script,
+render runtime outside CI, and the rest) keep their recorded disposition.

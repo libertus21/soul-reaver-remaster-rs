@@ -35,7 +35,7 @@ your own install; nothing is bundled.
 | `.SRL` clip summary | `cargo run -- --srl-info <FILE.SRL>` | Parses the 20-byte `.SRL` header and prints track count, frame count, fps and derived duration, asserting `len = 20 + tracks*frames*48`. The cells are per-frame 48-byte 3x4 transforms; the track-to-bone binding stays UNKNOWN (`docs/notes/srl-animation.md`). |
 | `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --entry <INDEX>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --group under [--objects] [--textures <TEXTURES.BIG>]` | Renders room geometry, flat or textured from `TEXTURES.BIG`. Orbit, wheel zoom, pan, `R` reset; `F` enters a first-person fly camera. `--objects` adds each placed object's real archived model at its world position; `--textures` textures both rooms and models. |
 | Level reachability | `cargo run -- --level-reach --bigfile <BIGFILE.DAT> [--start <UNIT>] [--names]` | BFS from `under1` over the decoded link graph, then groups reachable, in-degree islands and inbound-but-unreachable units. `--names` lists each island unit. Corrected reader: 372 discovered / 334 reachable / 38 unreachable / 1 island (`push1`). |
-| Engine play mode | `cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG>` / `cargo run -- --play --headless --bigfile <BIGFILE.DAT> --ticks <N>` | Opens a deterministic engine window (orbit, fly or player camera; player mode is `WASD`, `Space` jumps, `F` cycles the camera, `Esc` exits 0), or prints one headless acceptance line with the FNV-1a 64 state digest. Fixed 60 Hz clock, 48-slot tracker, name-keyed spawning, 18-stage frame loop, solid room walls, Z-up gravity with ground/landing, ceiling blocking, a synthetic ground-only jump and a Z-up third-person player camera. Still no AI, animation, scripts or audio. |
+| Engine play mode | `cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG>` / `cargo run -- --play --headless --bigfile <BIGFILE.DAT> --ticks <N>` | Opens a deterministic engine window (orbit, fly or player camera; player mode is `WASD`, `Space` jumps, `F` cycles the camera, `Esc` exits 0), or prints one headless acceptance line with the FNV-1a 64 state digest. Fixed 60 Hz clock, 48-slot tracker, name-keyed spawning, 18-stage frame loop, solid room walls, Z-up gravity with ground/landing, ceiling blocking, a synthetic ground-only jump and a Z-up third-person player camera. The authored placed-object seed pass runs in both windowed and headless modes. Still no AI, body animation, scripts or audio. Current 60-tick digests: `under1` `ede39c540a10ee39`, `skinnr1` `398d1870a463fd7a`. |
 | Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 34 capabilities in six groups; grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
 
 `<PATH>` accepts a `.PCM` file or a room directory. The level arms also accept
@@ -73,8 +73,9 @@ local vertical is confirmed to be `+Z`, the same as the world
 ## Play mode (engine skeleton)
 
 `--play` runs the deterministic engine skeleton on one archive unit. It is a
-skeleton, not a playable game: actor AI, animation, scripts, audio, streaming,
-particles, menus, warps and save are absent. The close-out is in
+skeleton, not a playable game: actor AI, body animation, scripts, audio,
+streaming, particles, menus, warps and save are absent. The close-out and the
+post-milestone consolidation are in
 `docs/changes/engine-skeleton/milestone-report.md`. Room collision runs on the
 horizontal `X`/`Y` plane of the **Z-up** world, with gravity and the player
 camera on `Z` (`docs/notes/up-axis.md`, `docs/notes/engine-collision.md`).
@@ -87,11 +88,12 @@ cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG> --camera p
 ```
 
 The window draws the unit's room geometry and the player's live model. The
-authored placed-object seeding pass runs only in headless mode in this
-milestone, so other placements are not spawned in the window. Camera mode is
-set with `--camera`: `fly` is the default, `orbit` circles the unit, and
-`player` is a third-person camera behind and above `raziel` that follows it.
-`Esc` exits 0. A missing texture page fails loud before the window opens.
+authored placed-object seed pass is shared by both modes and runs before the
+window opens, so the window shows the same live world as the headless run.
+Camera mode is set with `--camera`: `fly` is the default, `orbit` circles the
+unit, and `player` is a third-person camera behind and above `raziel` that
+follows it. `Esc` exits 0. A missing texture page fails loud before the window
+opens.
 
 In player camera, `W`/`A`/`S`/`D` drive `raziel` on the horizontal `X`/`Y`
 plane of the Z-up world. Walls
@@ -106,6 +108,17 @@ line, then exits 0:
 engine unit=<name> rooms=<R> placed=<P> admitted=<A> tracked=<T> skipped_markers=<M> inert=<I> unresolved=<U> live=<L> ticks=<N> digest=<16-lowercase-hex>
 ```
 
+Two read-only 60-tick runs on the shipped corpus print exactly these lines and
+repeat byte for byte on a second run:
+
+```text
+cargo run -- --play --headless --bigfile <BIGFILE.DAT> --unit under1 --ticks 60
+engine unit=under1 rooms=1 placed=95 admitted=3 tracked=3 skipped_markers=92 inert=0 unresolved=0 live=3 ticks=60 digest=ede39c540a10ee39
+
+cargo run -- --play --headless --bigfile <BIGFILE.DAT> --unit skinnr1 --ticks 60
+engine unit=skinnr1 rooms=1 placed=83 admitted=41 tracked=15 skipped_markers=42 inert=0 unresolved=0 live=41 ticks=60 digest=398d1870a463fd7a
+```
+
 `digest` is FNV-1a 64 over the tick count and, in live-list order, each live
 object's class byte, integer position and visible byte, plus, when the object
 carries an actor runtime, its relation and four state bytes (`current`,
@@ -117,17 +130,26 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
 
 ## What's missing / known limits
 
-- **No skeletal animation.** `.SRA` is not parsed by this build (the loader callback is a
-  `RET 0` stub); a font-calibrated search for the confirmed spline key shapes
-  found no coherent channel in its payloads (`docs/notes/sra-key-search.md`), and
-  `.SRM` has no hierarchy, so `--pose` is a local cluster
-  rotation only and the mesh tears at cluster seams. `.SRL` is decoded as a
-  **voice-line animation container** (header, frame count, fps, duration and
-  48-byte per-frame 3x4 cells confirmed; `docs/notes/srl-animation.md`), but it
-  has no channel-to-bone table, so it cannot drive a skeletal pose. `.PMF`
+- **No body animation.** Body animation is **NOT available**. The original SR1
+  spline system does not drive actors in the remaster: a read-only Frida capture
+  on the live game armed its hooks with zero failures, the spline set selector
+  fired 53 times across the live objects, and the sampler fired **zero** times
+  for the whole session; `font` was the only object with a non-null spline set,
+  while every actor (`raziel`, `sluagh`, `soul`, ...) resolved an empty set with
+  clip ids populated but ranges stuck at `0..0`
+  (`docs/changes/engine-skeleton/milestone-report.md`, "Post-milestone"). The
+  file-side census agrees: zero spline
+  descriptors in all 21 actor containers
+  (`docs/notes/actor-spline-census.md`). `.SRA` is not parsed by this build (the
+  loader callback is a `RET 0` stub) and a font-calibrated key-shape search
+  found no coherent channel in its payloads (`docs/notes/sra-key-search.md`);
+  `.SRM` has no hierarchy, so `--pose` is a local cluster rotation only and the
+  mesh tears at cluster seams. `.SRL` is a confirmed **voice-line animation
+  container** (header, frame count, fps, duration and 48-byte per-frame 3x4
+  cells; `docs/notes/srl-animation.md`) but has no channel-to-bone table. `.PMF`
   remains undecoded.
 - **No game logic.** `--play` is a deterministic skeleton: no actor AI,
-  animation, scripts, audio, streaming, particles, menus, warps or save. Room
+  body animation, scripts, audio, streaming, particles, menus, warps or save. Room
   walls are solid, gravity lands the player on floors, ceilings block upward
   motion and a ground-only jump works (synthetic constants), but there is no
   step-height climbing and no water/lava. This is not a playable engine.
@@ -140,7 +162,8 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
   type or the `+0x26` code (see `docs/notes/object-behaviour.md`). The
   `TextureFT3` attribute and colour-blend meanings remain UNKNOWN.
 - **Object records carry no orientation.** There is no rotation field; the
-  `+0x18` triple is a cross-level offset, not angles.
+  `+0x18` triple is a cross-level offset, not angles. The object-model local
+  vertical is confirmed Z-up, but the facing/yaw axis remains UNKNOWN.
 - **Room textures are implemented, with a small unresolved tail.** 99.76% of
   faces address their 12-byte UV record; the 214 `0xFFFF` and 1,160 non-aligned
   tails are counted and drawn flat, never dropped. Face attribute `+0x08` stays
@@ -184,7 +207,7 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
 | Game data | Read-only at runtime from the user's install; paths via CLI args/env only, never committed. |
 | Legal guardrails | Whitelist `.gitignore` verified every commit; single-player/offline owned copy only; community work credited in `THIRD-PARTY-NOTICES.md` once reuse starts. |
 | Process | Small chained slices (≤400 changed lines each); proposal → spec → tasks → code → playtest report. |
-| Tests | `cargo test` — 503 tests on synthetic bytes only; no game files in the suite. |
+| Tests | `cargo test` — 554 tests on synthetic bytes only; no game files in the suite. |
 
 ## Further reading
 
