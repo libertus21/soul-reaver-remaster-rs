@@ -5,6 +5,16 @@ Date: 2026-11-09. Slices: `feat/engine-collision` (base `main` at `2f1f0c9`),
 `main` at `4d42001`). All numbers below are behaviour and counts; no game bytes,
 no decompiled text and no install paths live in this repository.
 
+> **Axis correction (engine-up-axis, 2026-11-09).** This note was written when
+> the engine assumed `Y` was up. Phase-1 evidence
+> (`docs/notes/up-axis.md`) **CONFIRMS the shipped data is Z-up** (`UP = 2`,
+> `+Z` up; horizontal is X/Y). Every `Y`-as-vertical statement below is now
+> historical: the code reads `engine::axis` and resolves the horizontal sweep in
+> X/Y and the vertical step in Z. The math and constants are unchanged; only the
+> axis they act on is corrected. The real no-input digests moved with the fix
+> (`under1` `def409846ff3a2cf` -> `ede39c540a10ee39`; `skinnr1`
+> `131ce9555e923980` -> `398d1870a463fd7a`). See `up-axis.md`.
+
 ## Verdict
 
 The player can no longer walk through walls, falls onto the level floor instead
