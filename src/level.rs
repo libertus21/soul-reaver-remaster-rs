@@ -467,14 +467,24 @@ fn geometry_report(data: &[u8]) -> Result<GeometryReport, LevelError> {
     Ok(report)
 }
 
-/// CPU mesh behind header slot `0x00`: the same record and bounds rule as
-/// [`geometry_report`], with positions widened to `f32` and every face index
-/// range-checked instead of counted.
-fn room_mesh(data: &[u8]) -> Result<RoomMesh, LevelError> {
+/// Integer room triangles behind header slot `0x00`: the same record, bounds
+/// rule and face-index validation as [`room_mesh`], but kept as `i32` world
+/// positions and grouped `[u32; 3]` faces. The collision mesh consumes this;
+/// no normal, UV or transform is derived.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RoomTriangles {
+    pub vertices: Vec<[i32; 3]>,
+    pub faces: Vec<[u32; 3]>,
+}
+
+/// Room triangles as integers. This is the single parse step shared by the
+/// renderer mesh and the collision mesh: [`room_mesh`] widens these positions
+/// 1:1 to `f32` instead of reading the arrays a second time.
+fn room_triangles(data: &[u8]) -> Result<RoomTriangles, LevelError> {
     let room_offset =
         read_u32(data, 4 * SLOT_ROOM_RECORD).ok_or(LevelError::GeometryRecordOutOfRange)?;
     if room_offset == 0 {
-        return Ok(RoomMesh::default());
+        return Ok(RoomTriangles::default());
     }
     let record = room_offset as usize;
     if record.checked_add(ROOM_FACE_OFFSET + 4).is_none_or(|end| end > data.len()) {
@@ -489,24 +499,45 @@ fn room_mesh(data: &[u8]) -> Result<RoomMesh, LevelError> {
     let (face_start, face_end) =
         array_range(data.len(), field(ROOM_FACE_OFFSET), faces, FACE_STRIDE)
             .ok_or(LevelError::GeometryArrayOutOfRange)?;
-    let mut mesh = RoomMesh::default();
+    let mut triangles = RoomTriangles::default();
     for at in (vertex_start..vertex_end).step_by(VERTEX_STRIDE) {
-        let mut xyz = [0.0f32; 3];
+        let mut xyz = [0i32; 3];
         for (axis, value) in xyz.iter_mut().enumerate() {
             let raw = read_i16(data, at + 2 * axis).ok_or(LevelError::GeometryArrayOutOfRange)?;
-            *value = f32::from(raw);
+            *value = i32::from(raw);
         }
-        mesh.vertices.push(xyz);
+        triangles.vertices.push(xyz);
     }
     for at in (face_start..face_end).step_by(FACE_STRIDE) {
-        for slot in 0..3 {
+        let mut face = [0u32; 3];
+        for (slot, value) in face.iter_mut().enumerate() {
             let index = read_u16(data, at + 2 * slot).ok_or(LevelError::GeometryArrayOutOfRange)?;
             if u32::from(index) >= vertices {
                 return Err(LevelError::GeometryArrayOutOfRange);
             }
-            mesh.indices.push(u32::from(index));
+            *value = u32::from(index);
         }
+        triangles.faces.push(face);
     }
+    Ok(triangles)
+}
+
+/// CPU mesh behind header slot `0x00`: the same record and bounds rule as
+/// [`geometry_report`], with positions widened 1:1 to `f32` and every face
+/// index range-checked instead of counted.
+fn room_mesh(data: &[u8]) -> Result<RoomMesh, LevelError> {
+    let triangles = room_triangles(data)?;
+    let mut mesh = RoomMesh::default();
+    mesh.vertices = triangles
+        .vertices
+        .iter()
+        .map(|vertex| [vertex[0] as f32, vertex[1] as f32, vertex[2] as f32])
+        .collect();
+    mesh.indices = triangles
+        .faces
+        .iter()
+        .flat_map(|face| face.iter().copied())
+        .collect();
     Ok(mesh)
 }
 
