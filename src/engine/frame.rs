@@ -13,9 +13,14 @@
 //!
 //! Stage 8 (the four-step player move/collide/commit solver) stays a named
 //! no-op: the original's exact solver is UNKNOWN and is not claimed. The
-//! deterministic horizontal sweep lives beside the movement it resolves, in
-//! stage 9, so the two cannot drift apart. That sweep is a correct
-//! sweep-and-slide, not a reproduction of the original.
+//! deterministic horizontal sweep and the gravity/ground resolver live beside
+//! the movement they resolve, in stage 9, so the two cannot drift apart. That
+//! resolver is a correct deterministic implementation, not a reproduction of the
+//! original.
+//!
+//! Gravity acts only when the loaded collision mesh carries walkable floor
+//! triangles. A synthetic or geometry-free world has no ground plane, so stage 9
+//! leaves `Y` untouched and the synthetic determinism goldens stay stable.
 //!
 //! The player is updated twice per tick, exactly as documented: first by the
 //! direct player path (stage 9) and again as an ordinary live object in the
@@ -282,6 +287,11 @@ pub struct FrameState {
     events: EventQueue,
     current_input: InputFrame,
     player: Option<LiveId>,
+    /// Downward vertical velocity in fixed-point subunits per tick. Negative is
+    /// falling; zero is grounded. Not part of the canonical fold.
+    player_vertical_velocity: i64,
+    /// Whether the player ended the last tick resting on a walkable floor.
+    player_grounded: bool,
     view: CullView,
     stats: FrameStats,
     scratch: FrameScratch,
@@ -309,6 +319,8 @@ impl FrameState {
             events: EventQueue::new(),
             current_input: InputFrame::NONE,
             player: None,
+            player_vertical_velocity: 0,
+            player_grounded: false,
             view: CullView::default(),
             stats: FrameStats::default(),
             scratch: FrameScratch::default(),
@@ -371,6 +383,20 @@ impl FrameState {
         self.player
             .and_then(|id| self.live.get(id).ok())
             .map(|object| object.position)
+    }
+
+    /// Whether the player ended the last tick resting on a walkable floor.
+    ///
+    /// This is a diagnostic, not part of the canonical digest. A world with no
+    /// floor geometry always reports `false` because `Y` is not resolved there.
+    pub fn player_grounded(&self) -> bool {
+        self.player_grounded
+    }
+
+    /// The player's downward vertical velocity in fixed-point subunits per tick.
+    /// Negative is falling; zero is grounded. Diagnostic only.
+    pub fn player_vertical_velocity(&self) -> i64 {
+        self.player_vertical_velocity
     }
 
     pub fn stats(&self) -> FrameStats {
@@ -653,33 +679,51 @@ impl FrameState {
     /// next to the translation it resolves.
     fn stage_player_solver(&mut self) {}
 
-    /// Stage 9 - player input to movement through the deterministic sweep.
+    /// Stage 9 - player input to movement through the deterministic sweep and
+    /// the gravity/ground resolver.
     ///
     /// The sampled input becomes an integer `X`/`Z` delta and is resolved
     /// against the world's [`CollisionMesh`](crate::engine::collision::CollisionMesh).
-    /// A zero axis performs no movement and no collision query, so a no-input
-    /// tick cannot change the position or the digest. The sweep stops before
-    /// walls and slides along them; it is a correct sweep-and-slide, not the
-    /// original four-step solver.
+    /// A zero axis performs no horizontal movement and no collision query, so a
+    /// no-input tick cannot change the position on its own. The sweep stops
+    /// before walls and slides along them.
+    ///
+    /// Vertical motion is resolved after the horizontal sweep, at the resulting
+    /// `X`/`Z`: gravity accumulates downward velocity, and the player lands
+    /// exactly on the highest floor at or below the feet. A world with no floor
+    /// triangles leaves `Y` untouched. This is a correct deterministic resolver,
+    /// not the original four-step solver.
     fn stage_player_movement(&mut self) {
         let Some(player) = self.player else {
             return;
         };
         self.stats.direct_player_ticks = self.stats.direct_player_ticks.saturating_add(1);
+
         let [x, y] = self.current_input.move_axis();
-        if x == 0 && y == 0 {
-            return;
+        if x != 0 || y != 0 {
+            let delta = [
+                x.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK),
+                0,
+                y.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK),
+            ];
+            let collision = &self.world.collision;
+            if let Ok(object) = self.live.get_mut(player) {
+                object.position = collision.sweep(object.position, delta, PLAYER_RADIUS_UNITS);
+            }
         }
-        let delta = [
-            x.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK),
-            0,
-            y.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK),
-        ];
-        let collision = &self.world.collision;
-        let Ok(object) = self.live.get_mut(player) else {
+
+        let Ok(position) = self.live.get(player).map(|object| object.position) else {
             return;
         };
-        object.position = collision.sweep(object.position, delta, PLAYER_RADIUS_UNITS);
+        let step = self
+            .world
+            .collision
+            .vertical_step(position, self.player_vertical_velocity);
+        self.player_vertical_velocity = step.velocity_subunits;
+        self.player_grounded = step.grounded;
+        if let Ok(object) = self.live.get_mut(player) {
+            object.position[1] = step.y;
+        }
     }
 
     /// Stage 10 - pairwise contact broad phase and resolver. Documented no-op
@@ -1012,6 +1056,35 @@ mod tests {
         let faces = vec![[0u32, 1, 2], [0, 2, 3]];
         world.collision = CollisionMesh::from_room_triangles(&vertices, &faces);
         assert!(!world.collision.is_empty(), "the test wall must be a barrier");
+        world
+    }
+
+    /// A collision mesh made of upward-facing floor quads. Each tuple is
+    /// `(y, x0, x1, z0, z1)`.
+    fn floor_mesh(quads: &[(i32, i32, i32, i32, i32)]) -> CollisionMesh {
+        let mut vertices = Vec::new();
+        let mut faces = Vec::new();
+        for &(y, x0, x1, z0, z1) in quads {
+            let base = vertices.len() as u32;
+            vertices.extend([[x0, y, z0], [x0, y, z1], [x1, y, z1], [x1, y, z0]]);
+            faces.push([base, base + 1, base + 2]);
+            faces.push([base, base + 2, base + 3]);
+        }
+        CollisionMesh::from_room_triangles(&vertices, &faces)
+    }
+
+    /// The raziel world plus one walkable floor at `floor_y`, with the player
+    /// spawned at `player_y`.
+    fn world_with_floor(floor_y: i32, player_y: i16) -> World {
+        let report = ObjectReport {
+            room_offset: 0,
+            count: 1,
+            array_offset: 0,
+            objects: vec![record("raziel", [0, player_y, 0])],
+        };
+        let mut world = World::from_report("test".to_string(), 1, &report);
+        world.collision = floor_mesh(&[(floor_y, -500, 500, -500, 500)]);
+        assert!(world.collision.has_ground(), "the fixture must carry ground");
         world
     }
 
@@ -1369,6 +1442,117 @@ mod tests {
             world_state_hash(&plain.world_state()),
             "a wall must not change a no-input run"
         );
+    }
+
+    #[test]
+    fn a_player_spawned_above_the_floor_falls_and_lands_on_it() {
+        let mut frame = FrameState::new(world_with_floor(0, 50));
+        let mut landed = false;
+        for index in 0..200 {
+            tick(&mut frame, index);
+            let position = frame.player_position().expect("the player is bound");
+            assert!(
+                position[1] >= 0,
+                "the player must never pass through the floor: {position:?}"
+            );
+            if frame.player_grounded() {
+                landed = true;
+                break;
+            }
+        }
+        assert!(landed, "gravity must land the player on the floor");
+        assert_eq!(frame.player_position().expect("the player is bound")[1], 0);
+        assert_eq!(frame.player_vertical_velocity(), 0);
+    }
+
+    #[test]
+    fn a_grounded_player_rests_without_jitter_or_sinking_over_300_ticks() {
+        let mut frame = FrameState::new(world_with_floor(0, 0));
+        for index in 0..300 {
+            tick(&mut frame, index);
+            assert_eq!(
+                frame.player_position().expect("the player is bound")[1],
+                0,
+                "the resting height moved on tick {index}"
+            );
+            assert!(frame.player_grounded(), "the player lost the ground on tick {index}");
+            assert_eq!(frame.player_vertical_velocity(), 0);
+        }
+    }
+
+    #[test]
+    fn walking_off_a_ledge_starts_a_fall_and_landing_stops_it() {
+        let report = ObjectReport {
+            room_offset: 0,
+            count: 1,
+            array_offset: 0,
+            objects: vec![record("raziel", [0, 0, 0])],
+        };
+        let mut world = World::from_report("test".to_string(), 1, &report);
+        // Upper floor y = 0 for x in -500..=100; lower floor y = -100 for
+        // x in 100..=500.
+        world.collision = floor_mesh(&[
+            (0, -500, 100, -500, 500),
+            (-100, 100, 500, -500, 500),
+        ]);
+        let mut frame = FrameState::new(world);
+        frame.queue_input(InputEvent::press(InputButton::Right));
+
+        let mut fell = false;
+        let mut landed_low = false;
+        for index in 0..300 {
+            tick(&mut frame, index);
+            let position = frame.player_position().expect("the player is bound");
+            assert!(position[1] >= -100, "fell through the lower floor: {position:?}");
+            if !frame.player_grounded() {
+                fell = true;
+            }
+            if fell && frame.player_grounded() {
+                landed_low = true;
+                assert_eq!(position[1], -100, "must land on the lower floor");
+                break;
+            }
+        }
+        assert!(fell, "walking off the ledge must start a fall");
+        assert!(landed_low, "the fall must stop on the lower floor");
+        assert!(frame.player_position().expect("the player is bound")[0] > 100);
+        assert_eq!(frame.player_vertical_velocity(), 0);
+    }
+
+    #[test]
+    fn zero_input_after_landing_keeps_a_stable_position() {
+        let mut frame = FrameState::new(world_with_floor(0, 50));
+        for index in 0..200 {
+            tick(&mut frame, index);
+            if frame.player_grounded() {
+                break;
+            }
+        }
+        assert!(frame.player_grounded());
+        let settled = frame.player_position();
+        for index in 200..260 {
+            tick(&mut frame, index);
+            assert_eq!(frame.player_position(), settled, "tick {index} oscillated");
+        }
+    }
+
+    #[test]
+    fn the_same_gravity_run_twice_yields_the_same_positions_and_digest() {
+        fn run() -> (Vec<[i32; 3]>, u64) {
+            let mut frame = FrameState::new(world_with_floor(0, 50));
+            frame.queue_input(InputEvent::press(InputButton::Right));
+            let mut positions = Vec::new();
+            for index in 0..120 {
+                tick(&mut frame, index);
+                positions.push(frame.player_position().expect("the player is bound"));
+            }
+            (positions, world_state_hash(&frame.world_state()))
+        }
+
+        let first = run();
+        let second = run();
+        assert_eq!(first.0, second.0, "the same gravity run must replay positions");
+        assert_eq!(first.1, second.1, "the same gravity run must fold the same digest");
     }
 
     #[test]
