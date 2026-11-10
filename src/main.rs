@@ -59,6 +59,9 @@ mod object_texture;
 // Pure one-bone pose math, wired into the `--mesh --pose` arm below.
 mod pose;
 mod render;
+// Pure descriptor-array parser; not wired into the viewer yet.
+#[allow(dead_code)]
+mod slot_descriptor;
 mod slot_texture;
 mod tex_hd_map;
 // Transitional: Task 2 wires the mesh arm; until then the parser is
