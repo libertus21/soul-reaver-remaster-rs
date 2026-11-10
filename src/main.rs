@@ -23,6 +23,10 @@
 //! `cargo run -- --mesh <FILE.SRM> --pose <bone>:<degrees>` additionally
 //! rotates exactly one decoded `extra = 0` bone's weighted vertices in
 //! mesh space and shows the deformed mesh through the same path.
+//! `cargo run -- --object-mesh --bigfile <DAT> --entry <INDEX> --pose <FILE>`
+//! deforms an archived object model with one 13-float slot pose per bone
+//! (bone-local vertices, so each bone's range is placed by its own pose) and
+//! prints the skinned bounds before the window opens.
 //! `cargo run -- --mesh-textured <FILE.SRM> --tex-dir <TEX>` parses the
 //! same mesh plus UVs, material indices, and material records, loads
 //! the three DDS textures per material from `<TEX>`, and shows it
@@ -229,6 +233,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --object-info --bigfile <BIGFILE.DAT> --entry <INDEX> [--actors]");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --textures <TEXTURES.BIG>");
+        eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --pose <FILE>");
         eprintln!("   or: soul-reaver-remaster-rs --srl-info <FILE.SRL>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
@@ -721,10 +726,15 @@ fn mesh_usage_error(args: &[String]) -> String {
     )
 }
 
-/// Refuse `--pose` anywhere except as the second word of the mesh mode,
-/// before any file is opened or any window is created.
+/// Refuse `--pose` anywhere except the mesh modes, before any file is opened
+/// or any window is created. `--mesh` takes `<bone>:<degrees>`; `--object-mesh`
+/// takes a pose file (one 13-float slot pose per bone).
 fn pose_mode_conflict(args: &[String]) -> Option<String> {
-    if args.first().is_some_and(|a| a == "--mesh") || !args.iter().any(|a| a == "--pose") {
+    if args
+        .first()
+        .is_some_and(|a| a == "--mesh" || a == "--object-mesh")
+        || !args.iter().any(|a| a == "--pose")
+    {
         return None;
     }
     let other = args
@@ -734,9 +744,9 @@ fn pose_mode_conflict(args: &[String]) -> Option<String> {
         .or_else(|| args.first().filter(|a| is_mode_flag(a)));
     Some(match other {
         Some(flag) => format!(
-            "error: --pose cannot be combined with {flag}; --pose is only valid as `--mesh <FILE.SRM> --pose <bone>:<degrees>`"
+            "error: --pose cannot be combined with {flag}; --pose is only valid as `--mesh <FILE.SRM> --pose <bone>:<degrees>` or `--object-mesh --bigfile <DAT> --entry <INDEX> --pose <FILE>`"
         ),
-        None => "error: --pose is only valid as `--mesh <FILE.SRM> --pose <bone>:<degrees>`".to_string(),
+        None => "error: --pose is only valid as `--mesh <FILE.SRM> --pose <bone>:<degrees>` or `--object-mesh --bigfile <DAT> --entry <INDEX> --pose <FILE>`".to_string(),
     })
 }
 
@@ -1557,30 +1567,75 @@ fn run_object_mesh(args: &[String]) -> ExitCode {
     })
 }
 
+/// `--pose` routes the archived, bone-local vertices through the skinning path
+/// instead of the plain rest translation (see [`pose::skin_positions`]).
 fn run_object_mesh_with(
     args: &[String],
     render: impl Fn(&[[f32; 3]], &[u32], &str) -> Result<(), String>,
 ) -> ExitCode {
-    let usage = "expected --object-mesh --bigfile <DAT> --entry <INDEX>";
-    match object_input(args, usage).and_then(|(dat, index)| object::read_entry(Path::new(dat), index))
-    {
-        Ok(model) => {
-            let (positions, indices) = object::triangle_mesh(&model);
-            outln!("object {} vertices={} faces={}", model.name, positions.len(), indices.len() / 3);
-            let title = format!("object {}", model.name);
-            match render(&positions, &indices, &title) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    ExitCode::from(1)
-                }
-            }
-        }
+    let usage = "expected --object-mesh --bigfile <DAT> --entry <INDEX> [--pose <FILE>]";
+    let (dat, index, pose_file) = match object_input(args, usage) {
+        Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("error: {error}");
-            ExitCode::from(error.exit_code())
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let model = match object::read_entry(Path::new(dat), index) {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let positions = match pose_file {
+        None => object::rest_positions(&model),
+        Some(path) => match posed_positions(&model, Path::new(path)) {
+            Ok(positions) => positions,
+            Err(message) => {
+                eprintln!("error: {message}");
+                return ExitCode::from(1);
+            }
+        },
+    };
+    let indices = object::polygon_indices(&model);
+    outln!("object {} vertices={} faces={}", model.name, positions.len(), indices.len() / 3);
+    let title = format!("object {}", model.name);
+    match render(&positions, &indices, &title) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
         }
     }
+}
+
+/// Read, parse and skin one archived object container with a pose file. The
+/// printed bounds are the runtime witness for the deformation: they equal the
+/// rest-pose bounds for an identity pose and change for a rotation or
+/// translation. No window has been created yet when this line is emitted.
+fn posed_positions(model: &object::ObjectModel, path: &Path) -> Result<Vec<[f32; 3]>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read pose file {}: {error}", path.display()))?;
+    let poses = pose::parse_pose_lines(&text)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let positions = pose::skin_positions(model, &poses);
+    let moved = pose::skin(model, &poses)
+        .iter()
+        .zip(pose::skin(model, &[]))
+        .filter(|(posed, rest)| posed.0 != rest.0)
+        .count();
+    if let Some((minimum, maximum)) = pose::bounds(&positions) {
+        outln!(
+            "pose bones={} supplied={} moved={} bbox min=({},{},{}) max=({},{},{})",
+            model.bones.len(),
+            poses.len(),
+            moved,
+            minimum[0], minimum[1], minimum[2],
+            maximum[0], maximum[1], maximum[2]
+        );
+    }
+    Ok(positions)
 }
 
 /// `--bigfile <DAT> --entry <INDEX> --textures <BIG>`, in any order.
@@ -1856,8 +1911,8 @@ fn object_info_input<'a>(args: &'a [String], usage: &'static str) -> Result<(&'a
 fn object_input<'a>(
     args: &'a [String],
     usage: &'static str,
-) -> Result<(&'a str, usize), object::ObjectError> {
-    let (mut dat, mut index) = (None, None);
+) -> Result<(&'a str, usize, Option<&'a str>), object::ObjectError> {
+    let (mut dat, mut index, mut pose_file) = (None, None, None);
     let mut at = 0;
     while at + 1 < args.len() {
         match args[at].as_str() {
@@ -1869,12 +1924,13 @@ fn object_input<'a>(
                         .map_err(|_| object::ObjectError::Usage(usage))?,
                 )
             }
+            "--pose" => pose_file = Some(args[at + 1].as_str()),
             _ => return Err(object::ObjectError::Usage(usage)),
         }
         at += 2;
     }
     match (dat, index, at == args.len()) {
-        (Some(dat), Some(index), true) => Ok((dat, index)),
+        (Some(dat), Some(index), true) => Ok((dat, index, pose_file)),
         _ => Err(object::ObjectError::Usage(usage)),
     }
 }
@@ -2713,6 +2769,54 @@ mod cli_tests {
         let missing = vec!["--bigfile".to_string(), dat, "--entry".to_string(), "9".to_string()];
         assert_eq!(run_object_mesh(&missing), ExitCode::from(1));
         assert_eq!(run_object_mesh(&[]), ExitCode::from(1));
+    }
+
+    #[test]
+    fn object_mesh_pose_file_skins_the_bone_ranges() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let dat = write_tmp(
+            &tmp,
+            "BIGFILE.DAT",
+            &synthetic_archive(&[crate::object::synthetic_bone_model()]),
+        );
+        let pose = write_tmp(
+            &tmp,
+            "POSE.TXT",
+            b"1 0 0 0 1 0 0 0 1 1 0 0 0\n1 0 0 0 0 -1 0 1 0 1 0 0 0\n",
+        );
+        let captured = Rc::new(std::cell::RefCell::new(None));
+        let sink = Rc::clone(&captured);
+        let args = vec![
+            "--bigfile".to_string(),
+            dat.clone(),
+            "--entry".to_string(),
+            "0".to_string(),
+            "--pose".to_string(),
+            pose,
+        ];
+        let code = run_object_mesh_with(&args, move |positions, indices, _| {
+            *sink.borrow_mut() = Some((positions.to_vec(), indices.len()));
+            Ok(())
+        });
+        assert_eq!(code, ExitCode::SUCCESS);
+        let (positions, indices) = captured.borrow_mut().take().expect("render must be reached");
+        assert_eq!(indices, 15, "a pose never changes topology");
+        assert_eq!(&positions[..2], &[[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]]);
+        assert_eq!(positions[2], [0.0, 10.0, 20.0], "bone 1 rotates about its rest origin");
+        let bad = write_tmp(&tmp, "BAD.TXT", b"1 2 3\n");
+        let args = vec![
+            "--bigfile".to_string(),
+            dat,
+            "--entry".to_string(),
+            "0".to_string(),
+            "--pose".to_string(),
+            bad,
+        ];
+        assert_eq!(
+            run_object_mesh_with(&args, |_, _, _| Ok(())),
+            ExitCode::from(1),
+            "a short pose line must be loud, not a window"
+        );
     }
 
     #[test]

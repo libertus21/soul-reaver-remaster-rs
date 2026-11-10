@@ -369,18 +369,23 @@ pub fn rest_positions(model: &ObjectModel) -> Vec<[f32; 3]> {
     positions.into_iter().map(|p| [p[0] as f32, p[1] as f32, p[2] as f32]).collect()
 }
 
+/// Triangle indices in polygon order: every polygon contributes its three
+/// `u16` corners as one triangle. Shared by the rest-pose and posed viewers so
+/// a pose can never change topology.
+pub fn polygon_indices(model: &ObjectModel) -> Vec<u32> {
+    model
+        .polygons
+        .iter()
+        .flat_map(|(corners, _, _, _)| corners.iter().map(|&corner| u32::from(corner)))
+        .collect()
+}
+
 /// Rest-pose model-space triangle mesh: bone-local `i16` positions are
 /// translated by the bone table and widened 1:1, and every polygon contributes
 /// its three `u16` indices as one triangle. Double-sided faces stay as two
 /// opposite-winding triangles; both are real draw calls.
 pub fn triangle_mesh(model: &ObjectModel) -> (Vec<[f32; 3]>, Vec<u32>) {
-    let positions = rest_positions(model);
-    let indices = model
-        .polygons
-        .iter()
-        .flat_map(|(corners, _, _, _)| corners.iter().map(|&corner| u32::from(corner)))
-        .collect();
-    (positions, indices)
+    (rest_positions(model), polygon_indices(model))
 }
 
 /// Rest-pose triangle mesh with per-face UVs: every polygon contributes three

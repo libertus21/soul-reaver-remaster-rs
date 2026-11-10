@@ -216,6 +216,10 @@ mod tests {
                 &["--object-info", "--bigfile", "BIGFILE.DAT", "--entry", "66"],
             ),
             (
+                &["mesh", "object-mesh", "--bigfile", "BIGFILE.DAT", "--entry", "66", "--pose", "POSE.TXT"],
+                &["--object-mesh", "--bigfile", "BIGFILE.DAT", "--entry", "66", "--pose", "POSE.TXT"],
+            ),
+            (
                 &["mesh", "object-info-actors", "--bigfile", "BIGFILE.DAT", "--entry", "66"],
                 &["--object-info", "--bigfile", "BIGFILE.DAT", "--entry", "66", "--actors"],
             ),
