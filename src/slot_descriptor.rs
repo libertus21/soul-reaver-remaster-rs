@@ -37,6 +37,10 @@
 //! reported in `docs/notes/aim-stream-bounds.md`; a sub-slice is **not** a whole
 //! number of 3-i16 triples.
 //!
+//! The aim shorts are fixed-point. [`FixedPoint`] uses the remaster's documented
+//! animation scale (`4096 == 1.0`, `>>12`); the aim-specific magnitude and the
+//! absolute direction-vs-angle meaning remain PARTLY and are documented.
+//!
 //! Pure in-memory parsing: no I/O, no engine wiring, no rotation math.
 
 /// Byte length of one descriptor record in the archived file form.
@@ -56,6 +60,16 @@ pub const TRACK_ENTRY_LEN: usize = 16;
 pub const TRACK_TAIL_LEN: usize = 8;
 /// Highest frame count accepted from a per-slot track header (corpus max 62).
 pub const MAX_TRACK_FRAMES: u32 = 4096;
+/// The remaster's documented animation fixed-point scale: `4096 == 1.0`, `>>12`.
+///
+/// `docs/notes/spline-animation.md` section 2.1 documents the only animation
+/// fixed-point shift in the remaster: every animation short is converted with a
+/// right shift of 12. The aim shorts are described as fixed-point in
+/// `docs/notes/animation-loader-trace.md`; the aim-specific magnitude and the
+/// absolute meaning stay PARTLY (see `docs/notes/aim-stream-bounds.md`).
+pub const Q12_SHIFT: u32 = 12;
+/// Raw value of `1.0` in the documented animation fixed-point scale.
+pub const Q12_ONE: i32 = 1 << Q12_SHIFT;
 
 const SENTINEL_AT_6: usize = 6;
 const SENTINEL_AT_10: usize = 10;
@@ -290,6 +304,45 @@ pub struct TrackEntry {
     /// others; no stable role (candidate divisor) is established.
     pub raw_tail: [u8; TRACK_TAIL_LEN],
 }
+
+/// The engine's animation fixed-point value, Q12 (`4096 == 1.0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedPoint(i32);
+
+impl FixedPoint {
+    /// Zero.
+    pub const ZERO: Self = Self(0);
+    /// One (`4096` raw).
+    pub const ONE: Self = Self(Q12_ONE);
+
+    /// Wrap a raw signed short from the aim stream.
+    pub fn from_raw(raw: i16) -> Self {
+        Self(i32::from(raw))
+    }
+
+    /// Wrap an already-scaled raw value.
+    pub fn from_q12(raw: i32) -> Self {
+        Self(raw)
+    }
+
+    /// The raw Q12 integer.
+    pub fn raw(self) -> i32 {
+        self.0
+    }
+
+    /// Convert to `f32` with the documented `>>12` scale.
+    pub fn to_f32(self) -> f32 {
+        self.0 as f32 / Q12_ONE as f32
+    }
+
+    /// Convert from `f32`, rounding to the nearest Q12 integer.
+    pub fn from_f32(value: f32) -> Self {
+        Self((value * Q12_ONE as f32).round() as i32)
+    }
+}
+
+/// The best-supported aim scale: Q12 (`4096 == 1.0`), see the module docs.
+pub const AIM_UNIT: FixedPoint = FixedPoint::ONE;
 
 /// Read the per-slot track headers that follow the descriptor array.
 ///
@@ -741,6 +794,20 @@ mod tests {
         assert_eq!(slices[0].termination, AimTermination::NextOffset);
         assert_eq!(slices[1].termination, AimTermination::HeaderOnly);
         assert_eq!(slices[1].bytes.len(), AIM_HEADER_LEN);
+    }
+
+    #[test]
+    fn fixed_point_uses_the_documented_q12_scale() {
+        assert_eq!(Q12_SHIFT, 12);
+        assert_eq!(Q12_ONE, 4096);
+        assert_eq!(FixedPoint::from_raw(4096).to_f32(), 1.0);
+        assert_eq!(FixedPoint::from_raw(2048).to_f32(), 0.5);
+        assert_eq!(FixedPoint::from_raw(-2048).to_f32(), -0.5);
+        assert_eq!(FixedPoint::from_f32(1.0).raw(), Q12_ONE);
+        assert_eq!(FixedPoint::from_f32(-0.5).raw(), -Q12_ONE / 2);
+        assert_eq!(AIM_UNIT.to_f32(), 1.0);
+        assert_eq!(FixedPoint::ZERO.raw(), 0);
+        assert_eq!(FixedPoint::from_q12(123).raw(), 123);
     }
 
     #[test]

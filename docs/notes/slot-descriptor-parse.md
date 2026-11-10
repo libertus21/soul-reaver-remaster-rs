@@ -13,6 +13,11 @@ Evidence classes per claim: **CONFIRMED** (observed bytes with a falsifiable
 shape), **PARTLY** (structure observed, one side open), **UNKNOWN** (not
 established).
 
+> Update (2026-11-09): `docs/notes/aim-stream-bounds.md` delimits the aim
+> sub-slices (24-byte header + `count * 20`-byte frames), decodes the 16-byte
+> per-slot track header, and pins the Q12 fixed-point unit. The aim-length
+> UNKNOWN below is superseded by that note.
+
 ## Headline
 
 The block is the model's **24-byte bone/descriptor table**: each record carries
