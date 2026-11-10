@@ -54,6 +54,12 @@ pub const AIM_HEADER_LEN: usize = 24;
 /// Byte length of one aim keyframe. Each sub-slice holds
 /// `AIM_HEADER_LEN + frame_count * AIM_FRAME_LEN` bytes.
 pub const AIM_FRAME_LEN: usize = 20;
+/// Signed 16-bit words in one 20-byte aim keyframe.
+///
+/// This is the evidence-backed element count: the frame is `20 / 2` signed
+/// shorts, all ten carrying small fixed-point-like values (see [`Frame`]).
+/// The internal grouping of the ten words stays UNKNOWN.
+pub const AIM_FRAME_WORDS: usize = 10;
 /// Byte length of one per-slot track header (count, destination offset, tail).
 pub const TRACK_ENTRY_LEN: usize = 16;
 /// Byte length of the unresolved tail of a [`TrackEntry`].
@@ -343,6 +349,89 @@ impl FixedPoint {
 
 /// The best-supported aim scale: Q12 (`4096 == 1.0`), see the module docs.
 pub const AIM_UNIT: FixedPoint = FixedPoint::ONE;
+
+/// One 20-byte aim keyframe, read as ten signed 16-bit words.
+///
+/// # Evidence
+///
+/// - **CONFIRMED (shape):** the frame is [`AIM_FRAME_WORDS`] little-endian
+///   `i16` words. On the corpus, every word position carries the same small
+///   bidirectional band; reading the bytes as five `u32` mixes a negative high
+///   half (`0xFFFF....`) and is not a component reading. The tenth word is
+///   active, so the frame is not "three triples plus two padding bytes".
+/// - **INFERRED (unit):** the words are Q12 fixed point via [`FixedPoint`]; the
+///   measured magnitudes sit inside the aim band (`|word| << 4096`).
+/// - **UNKNOWN (meaning):** how the ten words group (e.g. axis triples), and
+///   whether any word is a time, frame index or weight. No word position is a
+///   monotone counter and no lane is a bounded weight, but that is a negative
+///   observation, not a decoded field.
+///
+/// Only the raw word positions are named; no semantic field is invented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Frame {
+    /// The ten signed words in file order.
+    pub words: [i16; AIM_FRAME_WORDS],
+}
+
+impl Frame {
+    /// Parse one exactly-20-byte frame; a shorter or longer slice is refused.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != AIM_FRAME_LEN {
+            return None;
+        }
+        let mut words = [0i16; AIM_FRAME_WORDS];
+        for (index, word) in words.iter_mut().enumerate() {
+            let at = index * 2;
+            *word = i16::from_le_bytes([bytes[at], bytes[at + 1]]);
+        }
+        Some(Self { words })
+    }
+
+    /// The ten words converted with the Q12 scale (`INFERRED`, see the type
+    /// docs). The conversion itself is exact; the *unit* is inferred.
+    pub fn units(&self) -> [f32; AIM_FRAME_WORDS] {
+        self.words.map(|word| FixedPoint::from_raw(word).to_f32())
+    }
+
+    /// The leading three words as a Q12 triplet.
+    ///
+    /// The animation trace names a per-slot "three signed shorts" aim vector,
+    /// so the first three words are the natural candidate. Their grouping stays
+    /// `INFERRED`; this helper is a candidate accessor, not a decoded field.
+    pub fn leading_triplet(&self) -> [FixedPoint; 3] {
+        [
+            FixedPoint::from_raw(self.words[0]),
+            FixedPoint::from_raw(self.words[1]),
+            FixedPoint::from_raw(self.words[2]),
+        ]
+    }
+}
+
+/// Parse the whole frames of one slot out of its bounded aim sub-slice.
+///
+/// `payload` must begin at the descriptor-array base, exactly like
+/// [`aim_slices`]. A slot with no aim data, a `HeaderOnly` slice, or an
+/// incomplete trailing frame yields no frame for that remainder (the tail is
+/// ignored, never padded into a fabricated frame). The `24 + count * 20` layout
+/// is CONFIRMED; the field meanings of each [`Frame`] are not.
+pub fn frames(descriptors: &[SlotDescriptor], payload: &[u8], slot: usize) -> Vec<Frame> {
+    let Some(descriptor) = descriptors.get(slot) else {
+        return Vec::new();
+    };
+    if descriptor.aim_offset == 0 {
+        return Vec::new();
+    }
+    let Some(slice) = aim_slices(descriptors, payload)
+        .into_iter()
+        .find(|slice| slice.slot == slot)
+    else {
+        return Vec::new();
+    };
+    let body = slice.bytes.get(AIM_HEADER_LEN..).unwrap_or(&[]);
+    body.chunks_exact(AIM_FRAME_LEN)
+        .filter_map(Frame::parse)
+        .collect()
+}
 
 /// Read the per-slot track headers that follow the descriptor array.
 ///
@@ -821,4 +910,75 @@ mod tests {
         assert_eq!(locate_descriptor_array(&payload[..FILE_RECORD_LEN], 2), None);
         assert_eq!(locate_descriptor_array(&payload[..10], 1), None);
     }
+
+    /// Encode one frame's ten words back into its little-endian 20 bytes.
+    fn frame_bytes(words: [i16; AIM_FRAME_WORDS]) -> [u8; AIM_FRAME_LEN] {
+        let mut bytes = [0u8; AIM_FRAME_LEN];
+        for (index, word) in words.iter().enumerate() {
+            bytes[index * 2..index * 2 + 2].copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn frame_parse_reads_ten_signed_words_and_the_q12_units() {
+        let words = [-4096, 2048, -1, 0, 1, -2, 3, -4, 5, 4096];
+        let frame = Frame::parse(&frame_bytes(words)).expect("20 bytes must parse");
+        assert_eq!(frame.words, words);
+        let units = frame.units();
+        assert_eq!(units[0], -1.0);
+        assert_eq!(units[1], 0.5);
+        assert_eq!(units[9], 1.0);
+        assert_eq!(units[2], -1.0 / Q12_ONE as f32);
+        assert_eq!(frame.leading_triplet().map(FixedPoint::raw), [-4096, 2048, -1]);
+    }
+
+    #[test]
+    fn frame_parse_refuses_any_other_length() {
+        assert!(Frame::parse(&[0u8; 19]).is_none());
+        assert!(Frame::parse(&[0u8; 21]).is_none());
+        assert!(Frame::parse(&[]).is_none());
+        assert!(Frame::parse(&[0u8; AIM_FRAME_LEN]).is_some());
+    }
+
+    #[test]
+    fn frames_parse_two_whole_frames_after_the_24_byte_header() {
+        let mut payload = vec![0u8; 152];
+        payload[..FILE_RECORD_LEN].copy_from_slice(&active_record(0, 64));
+        payload[FILE_RECORD_LEN..2 * FILE_RECORD_LEN].copy_from_slice(&active_record(1, 128));
+        let first = [1i16, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let second = [11i16, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+        // Slot 0's sub-slice is [64, 128): a 24-byte header then two 20-byte frames.
+        payload[64 + AIM_HEADER_LEN..64 + AIM_HEADER_LEN + AIM_FRAME_LEN]
+            .copy_from_slice(&frame_bytes(first));
+        payload[64 + AIM_HEADER_LEN + AIM_FRAME_LEN..64 + AIM_HEADER_LEN + 2 * AIM_FRAME_LEN]
+            .copy_from_slice(&frame_bytes(second));
+
+        let descriptors = parse_descriptor_array(&payload, 0, 2).expect("records must parse");
+        let parsed = frames(&descriptors, &payload, 0);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].words, first);
+        assert_eq!(parsed[1].words, second);
+    }
+
+    #[test]
+    fn frames_are_empty_for_an_absent_slot() {
+        let payload: Vec<u8> = (0..2).flat_map(|index| active_record(index, 0)).collect();
+        let descriptors = parse_descriptor_array(&payload, 0, 2).expect("records must parse");
+        assert!(frames(&descriptors, &payload, 0).is_empty());
+        assert!(frames(&descriptors, &payload, 9).is_empty());
+    }
+
+    #[test]
+    fn frames_ignore_an_incomplete_trailing_frame() {
+        let mut payload = vec![0u8; 124];
+        payload[..FILE_RECORD_LEN].copy_from_slice(&active_record(0, 48));
+        payload[FILE_RECORD_LEN..2 * FILE_RECORD_LEN].copy_from_slice(&active_record(1, 100));
+        let descriptors = parse_descriptor_array(&payload, 0, 2).expect("records must parse");
+        // Slot 0 is bounded by the next offset at 100: [48, 100) = 52 bytes, i.e.
+        // the 24-byte header plus one whole 20-byte frame and an 8-byte tail.
+        assert_eq!(aim_slices(&descriptors, &payload)[0].bytes.len(), 52);
+        assert_eq!(frames(&descriptors, &payload, 0).len(), 1, "the 8-byte tail is not a frame");
+    }
+
 }
