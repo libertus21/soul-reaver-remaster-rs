@@ -15,6 +15,7 @@
 //! the animation semantics that produce the pose; see
 //! `docs/notes/object-models.md` for the slot layout and the two UNKNOWN terms.
 
+use crate::bone_hierarchy::{BoneHierarchy, ROOT};
 use crate::object::{ObjectModel, Vertex};
 
 pub use crate::srm::JOINT_SLOTS;
@@ -267,6 +268,143 @@ pub fn slot_pose_matrix(pose: &SlotPose) -> Result<PoseMatrix, String> {
     })
 }
 
+/// `3x3` product `a * b`, row-major.
+fn mat3_mul(a: Mat3, b: Mat3) -> Mat3 {
+    let mut out = [[0.0f32; 3]; 3];
+    for (row, out_row) in out.iter_mut().enumerate() {
+        for col in 0..3 {
+            out_row[col] =
+                a[row][0] * b[0][col] + a[row][1] * b[1][col] + a[row][2] * b[2][col];
+        }
+    }
+    out
+}
+
+impl PoseMatrix {
+    /// The no-op pose: identity rotation, zero translation, unit scale.
+    pub fn identity() -> Self {
+        Self {
+            rotation: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            scale: 1.0,
+            translation: [0.0; 3],
+            scale_marker: 0.0,
+        }
+    }
+
+    /// The affine this pose contributes, row-major `[R | t]`.
+    #[allow(dead_code)]
+    pub fn transform(&self) -> Transform {
+        let s = self.scale;
+        let r = self.rotation;
+        [
+            r[0][0] * s, r[0][1] * s, r[0][2] * s, self.translation[0],
+            r[1][0] * s, r[1][1] * s, r[1][2] * s, self.translation[1],
+            r[2][0] * s, r[2][1] * s, r[2][2] * s, self.translation[2],
+        ]
+    }
+
+    /// Compose `self` (a parent world matrix) with a child's local matrix:
+    /// `world * local`, i.e. rotation `R_w * R_l` and translation
+    /// `R_w * t_l + t_w`.
+    pub fn then(&self, local: &PoseMatrix) -> PoseMatrix {
+        let rotation = mat3_mul(self.rotation, local.rotation);
+        let scaled = [
+            local.translation[0] * self.scale,
+            local.translation[1] * self.scale,
+            local.translation[2] * self.scale,
+        ];
+        let t = rotate(self.rotation, scaled);
+        PoseMatrix {
+            rotation,
+            scale: self.scale * local.scale,
+            translation: [
+                t[0] + self.translation[0],
+                t[1] + self.translation[1],
+                t[2] + self.translation[2],
+            ],
+            scale_marker: local.scale_marker,
+        }
+    }
+}
+
+/// Resolve `world[child] = world[parent] * local[child]` from the root down.
+///
+/// Locals are supplied directly; `compose` and [`compose_with_locals`] build
+/// them from a pose slice. The walk is bounded by the bone count and never
+/// panics: a bone whose parent is out of range, or a bone inside a parent
+/// cycle, keeps its own local matrix instead of blocking composition.
+fn compose_locals(hierarchy: &BoneHierarchy, locals: &[PoseMatrix]) -> Vec<PoseMatrix> {
+    let len = hierarchy.len();
+    let mut world = locals.to_vec();
+    let mut resolved = vec![false; len];
+    for bone in 0..len {
+        let parent = hierarchy.parent_of(bone).unwrap_or(ROOT);
+        let usable = parent >= 0 && (parent as usize) < len && parent as usize != bone;
+        if !usable {
+            resolved[bone] = true;
+        }
+    }
+    for _ in 0..len {
+        let mut changed = false;
+        for bone in 0..len {
+            if resolved[bone] {
+                continue;
+            }
+            let parent = hierarchy.parent_of(bone).unwrap_or(ROOT);
+            if parent >= 0 && (parent as usize) < len && resolved[parent as usize] {
+                world[bone] = world[parent as usize].then(&locals[bone]);
+                resolved[bone] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    world
+}
+
+/// Compose a pose-only tree: `world[child] = world[parent] * local[child]`.
+///
+/// Poses are indexed by bone; the slice's order is the bone order, and the
+/// result does not depend on the hierarchy's storage order (children stored
+/// before parents resolve on a later pass). A missing or non-finite pose is the
+/// identity local, never a panic. This is the pure pose composition; skinning
+/// uses [`compose_with_locals`], which also folds in each bone's rest offset.
+#[allow(dead_code)]
+pub fn compose(hierarchy: &BoneHierarchy, poses: &[SlotPose]) -> Vec<PoseMatrix> {
+    compose_with_locals(hierarchy, poses, &[])
+}
+
+/// Compose the tree while giving each bone its own rest offset:
+/// `local[bone] = pose * translate(rest_offset)`, so an all-identity pose
+/// reproduces the rest translation chain.
+///
+/// This is the matrix the hierarchical skin applies to bone-local vertices.
+/// Every bone still rotates about its own origin: the offset is the distance
+/// from the parent bone's origin, exactly like [`crate::object`]'s rest chain.
+pub fn compose_with_locals(
+    hierarchy: &BoneHierarchy,
+    poses: &[SlotPose],
+    locals: &[[f32; 3]],
+) -> Vec<PoseMatrix> {
+    let local_matrices: Vec<PoseMatrix> = (0..hierarchy.len())
+        .map(|bone| {
+            let mut matrix = poses
+                .get(bone)
+                .and_then(|pose| slot_pose_matrix(pose).ok())
+                .unwrap_or_else(PoseMatrix::identity);
+            if let Some(offset) = locals.get(bone) {
+                for axis in 0..3 {
+                    matrix.translation[axis] += offset[axis];
+                }
+            }
+            matrix
+        })
+        .collect();
+    compose_locals(hierarchy, &local_matrices)
+}
+
 /// Parse the documented pose-file shape: one 13-float [`SlotPose`] per bone, in
 /// bone order. Blank lines and `#` comments are skipped; every other line must
 /// hold exactly 13 finite floats.
@@ -396,6 +534,64 @@ pub fn skin(model: &ObjectModel, poses: &[SlotPose]) -> Vec<Vertex> {
 
 fn quantize(position: [f32; 3]) -> [i16; 3] {
     position.map(|value| value.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16)
+}
+
+/// Hierarchical skin: each bone-local vertex is placed by that bone's
+/// **composed** world matrix, not its local pose alone.
+///
+/// ```text
+/// world[child] = world[parent] * (pose[child] * translate(bone.rest_local))
+/// posed[v]     = world[bone(v)] * vertex[v]
+/// ```
+///
+/// So a root rotation carries every descendant's frame with it, while a leaf
+/// rotation moves only its own vertex range. An all-identity pose reproduces
+/// [`crate::object::rest_positions`] exactly. The hierarchy must describe the
+/// same bone count as the model; a mismatch is a loud error, not a silent
+/// partial pose. Missing poses stay identity (`compose_with_locals`), and this
+/// path never panics.
+#[allow(dead_code)]
+pub fn skin_positions_hierarchical(
+    model: &ObjectModel,
+    hierarchy: &BoneHierarchy,
+    poses: &[SlotPose],
+) -> Result<Vec<[f32; 3]>, String> {
+    if hierarchy.len() != model.bones.len() {
+        return Err(format!(
+            "hierarchy has {} bones but the model has {}",
+            hierarchy.len(),
+            model.bones.len()
+        ));
+    }
+    let locals: Vec<[f32; 3]> = model
+        .bones
+        .iter()
+        .map(|bone| bone.local.map(f32::from))
+        .collect();
+    let world = compose_with_locals(hierarchy, poses, &locals);
+    let mut positions: Vec<[f32; 3]> = model
+        .vertices
+        .iter()
+        .map(|(position, _)| position.map(f32::from))
+        .collect();
+    if positions.is_empty() {
+        return Ok(positions);
+    }
+    for (index, bone) in model.bones.iter().enumerate() {
+        if bone.first_vertex == u16::MAX || bone.last_vertex == u16::MAX {
+            continue;
+        }
+        let first = bone.first_vertex as usize;
+        let last = (bone.last_vertex as usize).min(positions.len() - 1);
+        if first > last {
+            continue;
+        }
+        let matrix = world[index].transform();
+        for position in &mut positions[first..=last] {
+            *position = affine(matrix, *position);
+        }
+    }
+    Ok(positions)
 }
 
 /// Axis-aligned bounds of `positions`, or `None` when there are none.
@@ -665,5 +861,107 @@ mod tests {
         let (minimum, maximum) = bounds(&[[1.0, -2.0, 3.0], [-4.0, 5.0, -6.0]]).expect("bounds");
         assert_eq!(minimum, [-4.0, -2.0, -6.0]);
         assert_eq!(maximum, [1.0, 5.0, 3.0]);
+    }
+
+    const R_Z90: Mat3 = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+    const IDENTITY: Mat3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+    /// Three-bone chain: root at the origin, a middle bone 10 along X and a
+    /// leaf 10 along Y, so a parent rotation visibly carries the child frames.
+    fn chain_model() -> crate::object::ObjectModel {
+        use crate::object::Bone;
+        crate::object::ObjectModel {
+            vertices: vec![([5, 0, 0], 0), ([0, 0, 0], 0), ([1, 0, 0], 0), ([0, 1, 0], 0)],
+            bones: vec![
+                Bone { first_vertex: 0, last_vertex: 0, local: [0, 0, 0], parent: u16::MAX },
+                Bone { first_vertex: 1, last_vertex: 1, local: [10, 0, 0], parent: 0 },
+                Bone { first_vertex: 2, last_vertex: 3, local: [0, 10, 0], parent: 1 },
+            ],
+            ..crate::object::ObjectModel::default()
+        }
+    }
+
+    #[test]
+    fn composing_a_chain_carries_the_child_world_origin_with_the_parent() {
+        let hierarchy = BoneHierarchy::from_parents(vec![-1, 0]);
+        let locals = [[0.0, 0.0, 0.0], [0.0, 10.0, 0.0]];
+        let world = compose_with_locals(&hierarchy, &[slot_pose(R_Z90, [0.0; 3]), IDENTITY_SLOT], &locals);
+        assert_eq!(world[0].rotation, R_Z90);
+        assert_eq!(world[1].rotation, R_Z90, "the child frame inherits the parent rotation");
+        close(world[1].translation, [-10.0, 0.0, 0.0]);
+        // The pose-only composer carries a child pose translation the same way.
+        let poses = [
+            slot_pose(R_Z90, [0.0; 3]),
+            slot_pose(IDENTITY, [0.0, 10.0, 0.0]),
+        ];
+        close(compose(&hierarchy, &poses)[1].translation, [-10.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn composition_resolves_by_index_not_array_or_slice_order() {
+        // Child stored before its parent; poses indexed by bone, not by order.
+        let hierarchy = BoneHierarchy::from_parents(vec![1, -1]);
+        let poses = [IDENTITY_SLOT, slot_pose(R_Z90, [0.0; 3])];
+        let locals = [[0.0, 10.0, 0.0], [0.0, 0.0, 0.0]];
+        let world = compose_with_locals(&hierarchy, &poses, &locals);
+        assert_eq!(world[1].rotation, R_Z90);
+        close(world[0].translation, [-10.0, 0.0, 0.0]);
+        // Pose index 1 drives bone 1; bone 0's identity pose leaves it alone.
+        let forward = compose(&BoneHierarchy::from_parents(vec![-1, 0]), &poses);
+        assert_eq!(forward[0].rotation, IDENTITY);
+        assert_eq!(forward[1].rotation, R_Z90);
+    }
+
+    #[test]
+    fn a_root_rotation_moves_the_whole_model_and_a_leaf_only_its_range() {
+        let model = chain_model();
+        let hierarchy = BoneHierarchy::from_parents(vec![-1, 0, 1]);
+        let rest = crate::object::rest_positions(&model);
+        let root_pose = [slot_pose(R_Z90, [0.0; 3]), IDENTITY_SLOT, IDENTITY_SLOT];
+        let posed = skin_positions_hierarchical(&model, &hierarchy, &root_pose).expect("root pose");
+        for (before, after) in rest.iter().zip(&posed) {
+            assert_ne!(before, after, "a root rotation must move every vertex");
+        }
+        let leaf_pose = [IDENTITY_SLOT, IDENTITY_SLOT, slot_pose(R_Z90, [0.0; 3])];
+        let posed = skin_positions_hierarchical(&model, &hierarchy, &leaf_pose).expect("leaf pose");
+        assert_eq!(&posed[..2], &rest[..2], "only the leaf range may move");
+        assert_eq!(posed.iter().zip(&rest).filter(|(a, b)| a != b).count(), 2);
+    }
+
+    #[test]
+    fn identity_and_missing_hierarchical_poses_reproduce_the_rest_pose() {
+        let model = chain_model();
+        let hierarchy = BoneHierarchy::from_parents(vec![-1, 0, 1]);
+        let rest = crate::object::rest_positions(&model);
+        assert_eq!(
+            skin_positions_hierarchical(&model, &hierarchy, &[IDENTITY_SLOT; 3]).expect("identity"),
+            rest
+        );
+        assert_eq!(
+            skin_positions_hierarchical(&model, &hierarchy, &[]).expect("no poses"),
+            rest
+        );
+        assert_eq!(
+            skin_positions_hierarchical(&model, &hierarchy, &[IDENTITY_SLOT]).expect("short"),
+            rest
+        );
+    }
+
+    #[test]
+    fn a_single_root_bone_skins_hierarchically() {
+        let model = single_bone_model();
+        let hierarchy = BoneHierarchy::from_parents(vec![-1]);
+        let posed = skin_positions_hierarchical(&model, &hierarchy, &[slot_pose(R_X90, [0.0; 3])])
+            .expect("single root");
+        assert_eq!(posed, vec![[11.0, -3.0, 2.0], [14.0, -6.0, 5.0]]);
+    }
+
+    #[test]
+    fn composition_is_cycle_safe_without_validation() {
+        let world = compose(&BoneHierarchy::from_parents(vec![1, 0]), &[IDENTITY_SLOT; 2]);
+        assert_eq!(world.len(), 2, "an unvalidated cycle must not hang");
+        let model = chain_model();
+        let short = BoneHierarchy::from_parents(vec![-1, 0]);
+        assert!(skin_positions_hierarchical(&model, &short, &[]).is_err());
     }
 }
