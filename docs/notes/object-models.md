@@ -222,6 +222,17 @@ position[v] += world[b] for firstVertex <= v <= lastVertex
 This is a pure translation chain (no rotation/scale in the archived object
 model). `raziel`: 58/66 bones carry ranges; `morlock`: 34/37.
 
+**Correction (2026-11-10).** The `+18` word is a **signed `i16` parent index**
+(`-1` = root), not an opaque slot word, so the archived object model **does carry
+a real bone hierarchy**. The older shorthand that these models have "no hierarchy"
+is wrong for the archived `.PCM` objects; it describes loose `.SRM`, whose joint
+pool is a flat 128 slots. Verified: `raziel` forms one root, depth 9, 0
+topological violations and 0 cycles; the corpus census is 199/394 (50.5%)
+strict-valid, with 194 one-bone props storing a self-parent `0` (a second,
+UNKNOWN convention) and one two-root model (`matsrevr`). The composed tree drives
+hierarchical skinning as `world[child] = world[parent] * local[child]`. See
+`docs/notes/bone-hierarchy.md`.
+
 Vertices are duplicated for hard shading, so a surface check must weld equal
 rest-pose positions first. Faces are also duplicated with opposite winding for
 two-sided drawing; a surface check must merge those pairs. Both normalisations
@@ -346,7 +357,9 @@ record carries no rotation). Unresolved names fall back to the existing cube
 marker. A summary line reports the mesh/marker split; without `--objects` the
 render output is unchanged.
 
-Rendering, textures, material interior, bones and animation are not decoded.
+Rendering, textures and the material interior are not decoded; the 24-byte bone
+table and its parent hierarchy **are** decoded (§2.5 above and
+`docs/notes/bone-hierarchy.md`). Animation semantics remain out of scope.
 Object-local up is now confirmed `+Z` (`docs/notes/object-up-axis.md`), so
 placement is a translation with no rotation; the facing/yaw remains undecoded.
 

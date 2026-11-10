@@ -330,3 +330,45 @@ that can drive an actor's body pose, and no decoder is invented to fill the gap.
 
 The milestone-era gaps not listed above (single-unit `--play`, no input script,
 render runtime outside CI, and the rest) keep their recorded disposition.
+
+### Post-milestone: animation investigation
+
+This section extends the history above; it does not rewrite it. The definitive
+account, with every eliminated carrier and its counts, is
+`docs/notes/animation-conclusion.md`.
+
+The animation line closed with evidence, not speculation: **the remaster does not
+author skeletal body animation.** Bodies are oriented procedurally (mode bits +
+authored aim corrections + object transform + world target). The only authored aim
+data is 1-2 correction poses on 3 of 66 `raziel` slots. Decoding further frames
+cannot produce walking legs, because the data does not exist.
+
+What the investigation settled (all runtime-verified on the shipped corpus):
+
+- **Skeleton and skinning.** The descriptor record is the model's 24-byte bone
+  table, located 394/394 through the bone-table pointer. `+18` is a signed `i16`
+  parent index (`-1` = root); `raziel` has one root, depth 9, 0 topological
+  violations and 0 cycles. This **corrects** the older claim that archived object
+  models have no bone hierarchy (that claim is true only for loose `.SRM`).
+  Corpus: 199/394 (50.5%) validate under the strict `-1` rule; 194 fail `no_root`
+  because one-bone props store a self-parent `0` (a second convention, UNKNOWN);
+  one model (`matsrevr`) has two roots; 0 out-of-range parents and 0 cycles.
+  Hierarchical skinning composes `world[child] = world[parent] * local[child]`,
+  root-first and cycle-safe, and was verified on real data: `raziel` root rotation
+  moves 299/299 vertices and a leaf moves 8; `skinner` root moves 173/173 and a
+  leaf moves 4.
+- **Animation data chain.** `+20` is the aim offset; a sub-slice is a 24-byte
+  header plus `frame_count` 20-byte frames (validated 64/65 gaps). A frame is ten
+  `i16` words in Q12 (`4096 == 1.0`), observed magnitudes 0.005-0.055. `raziel`
+  has 3 slots with data (frame counts 2/1/1); 63 of 66 slots carry none.
+- **Eliminated carriers.** `.SRA`: 0 orthonormal windows in 3,744,114 3x3 and
+  3,717,786 3x4 positions. `.PCM`: no flat `bones x 32` descriptor array. `.SRM`:
+  0 windows below 0.05 among 26,647,603 3x3 windows; the 147 sub-0.05 3x4 hits
+  are all inside the known HD-matrix block; `run52 = 0` in 349/349 files. `.SRL`:
+  facial/HD only. No animation file extension exists.
+
+Verified current state at this checkpoint: `cargo test` **603 passed, 0 failed**;
+`--help` lists **35 capabilities in six groups** (PR #141 added the
+`--bone-hierarchy` census to the earlier 34); the 60-tick production digests are
+unchanged - `under1` `ede39c540a10ee39` and `skinnr1` `398d1870a463fd7a`, both
+repeat byte for byte.

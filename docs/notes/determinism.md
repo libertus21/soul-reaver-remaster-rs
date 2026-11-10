@@ -183,6 +183,15 @@ The current real no-input 60-tick production digests are `under1`
 `ede39c540a10ee39` and `skinnr1` `398d1870a463fd7a`. They are simulation output,
 not goldens, and both repeat byte for byte on a second run.
 
+### Animation investigation (docs-only, goldens unchanged)
+
+The skeletal/animation investigation consolidated in
+`docs/notes/animation-conclusion.md` is documentation only: it added no engine
+code, no decoder and no CLI arm. The nine golden constants in the table above and
+the two production digests are therefore **unchanged** - `under1`
+`ede39c540a10ee39` and `skinnr1` `398d1870a463fd7a`, each reproduced byte for byte
+on a second 60-tick headless run. `cargo test` stays at 603 passed.
+
 `tracker_hash` folds all 48 slots, empty ones included, so a release is
 observable and a name's slot index is part of the contract, not just its
 presence. `GOLDEN_TRACKER_HASH` pins that byte stream; it is a new constant and
