@@ -164,15 +164,24 @@ slice, not part of this gate.
 
 The harness keeps independent folds, because "how the engine was launched",
 "what the simulation is" and "how the tracker allocated slots" are different
-questions:
+questions. The constants below are the **current** values the suite pins today;
+the per-slice sections further down record when and why each moved.
 
-| Golden | Fold | Guards |
-|---|---|---|
-| `options_hash` / `error_hash` | parsed `PlayOptions`, typed error text | **Regression gate**: argv parsing, fold order, field set, error tags. No simulation state. |
-| `world_state_hash` | tick count, live-list order, per-entry class, position, visible, actor presence, actor relation and the four actor state bytes (`current`, `queued`, `alternate` presence+value, `entry_action`) | **Canonical state gate** and the production `--play --headless` digest: the simulation contract from `spec.md`. Independent of the options fold. |
-| `tracker_hash` | each slot in index order: index, state code, name | **Tracker gate**: acquisition, duplicate-name sharing and lowest-free reuse. Independent of both folds above. |
-| `classification_hash` | the five name lists in documented order: list id, exact count, then per name the name bytes, admission code, load-role code and asset-tree code | **Name-table gate**: the exact membership and roles of the spawn policy. Independent of every fold above; lives in `src/engine/spawn.rs` tests. |
-| `actor_runtime_hash` | profile kind, the eight trios, entry-array kind, entry ids; then relation, the four state bytes, target and flags | **Actor-runtime gate**: the data-keyed AI initial state. No name is folded. Independent of every fold above; lives in `src/engine/determinism.rs` tests. |
+| Gate | Constant | Fold | Guards |
+|---|---|---|---|
+| Options | `0x27e6_be15_9907_b55c` | parsed `PlayOptions` | **Regression gate**: argv parsing, fold order, field set. No simulation state. |
+| Errors | `0xf7df_8b2c_3041_7acf` | typed error text | Typed error variants and exact message text. |
+| World state | `0x043f_f933_4dfe_3b58` | tick count, live-list order, per-entry class, position, visible, actor presence, actor relation and the four actor state bytes (`current`, `queued`, `alternate` presence+value, `entry_action`) | **Canonical state gate** and the production `--play --headless` digest: the simulation contract from `spec.md`. Independent of the options fold. |
+| Tracker | `0x4fb9_0f56_bbe9_c0f9` | each slot in index order: index, state code, name | **Tracker gate**: acquisition, duplicate-name sharing and lowest-free reuse. Independent of both folds above. |
+| Actor runtime | `0xd7d6_0c24_050a_d833` | profile kind, the eight trios, entry-array kind, entry ids; then relation, the four state bytes, target and flags | **Actor-runtime gate**: the data-keyed AI initial state. No name is folded. Independent of every fold above; lives in `src/engine/determinism.rs` tests. |
+| Classification | `0x9bec_a441_2d97_8281` | the five name lists in documented order: list id, exact count, then per name the name bytes, admission code, load-role code and asset-tree code | **Name-table gate**: the exact membership and roles of the spawn policy. Independent of every fold above; lives in `src/engine/spawn.rs` tests. |
+| Frame stages | 18 `(code, name)` pairs | stage numbers and names | **Stage-order gate**: the exact stage order; swapping two stages fails. |
+| Frame state | `0x9c68_230a_4907_fbe2` | the final state of a 40-tick scripted replay | **Frame gate**: per-tick stage trace, input sampling, player translation, cull, scene and post-frame bookkeeping. |
+| Headless digest | `0x56d6_79ea_3c48_6e14` | the full CLI-path acceptance run over a synthetic archive | **End-to-end gate**: the headless contract from argv to printed line; lives in `src/engine/play_acceptance.rs`. |
+
+The current real no-input 60-tick production digests are `under1`
+`ede39c540a10ee39` and `skinnr1` `398d1870a463fd7a`. They are simulation output,
+not goldens, and both repeat byte for byte on a second run.
 
 `tracker_hash` folds all 48 slots, empty ones included, so a release is
 observable and a name's slot index is part of the contract, not just its
