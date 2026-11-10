@@ -320,7 +320,10 @@ pub fn read_entry(path: &Path, index: usize) -> Result<ObjectModel, ObjectError>
 /// Accumulated bone translation for each bone: its own `local` offset plus
 /// every ancestor's, exactly once. A bone that lists itself as parent ends the
 /// chain; `0xFFFF` marks an unparented (root) bone.
-fn bone_world_offsets(bones: &[Bone]) -> Vec<[i32; 3]> {
+///
+/// Shared with [`crate::pose::skin_positions`], which re-adds this rest
+/// translation after a pose rotates the bone-local vertices.
+pub(crate) fn bone_world_offsets(bones: &[Bone]) -> Vec<[i32; 3]> {
     bones.iter().enumerate().map(|(index, _)| {
         let mut offset = [0i32; 3];
         let mut cursor = index;
