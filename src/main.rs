@@ -46,6 +46,10 @@
 
 mod actor;
 mod bigfile;
+// Bone hierarchy parsed from the descriptor `+18` word; the census command and
+// `--object-mesh --hierarchy` consume it. Some pure accessors stay test-only.
+#[allow(dead_code)]
+mod bone_hierarchy;
 mod cli_argv;
 mod cli_catalog;
 mod cli_out;
@@ -66,7 +70,8 @@ mod pose;
 #[allow(dead_code)]
 mod pose_slot;
 mod render;
-// Pure descriptor-array parser; not wired into the viewer yet.
+// Pure descriptor-array parser; the `--bone-hierarchy` arm and the hierarchical
+// pose path use the locator and parser, the aim helpers stay test-only.
 #[allow(dead_code)]
 mod slot_descriptor;
 mod slot_texture;
@@ -192,6 +197,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--actor-census") {
         return run_actor_census(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--bone-hierarchy") {
+        return run_bone_hierarchy(&args[1..]);
+    }
     if args.first().is_some_and(|a| a == "--object-info") {
         return run_object_info(&args[1..]);
     }
@@ -233,10 +241,11 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-objects --bigfile <BIGFILE.DAT> --group <PREFIX>");
         eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file> --objects [--textures <TEXTURES.BIG>]");
         eprintln!("   or: soul-reaver-remaster-rs --actor-census --bigfile <BIGFILE.DAT> [--objects-dir <DIR>]");
+        eprintln!("   or: soul-reaver-remaster-rs --bone-hierarchy --bigfile <BIGFILE.DAT> [--entry <INDEX>]");
         eprintln!("   or: soul-reaver-remaster-rs --object-info --bigfile <BIGFILE.DAT> --entry <INDEX> [--actors]");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --textures <TEXTURES.BIG>");
-        eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --pose <FILE>");
+        eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --pose <FILE> [--hierarchy] [--bounds]");
         eprintln!("   or: soul-reaver-remaster-rs --srl-info <FILE.SRL>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
@@ -1576,24 +1585,42 @@ fn run_object_mesh_with(
     args: &[String],
     render: impl Fn(&[[f32; 3]], &[u32], &str) -> Result<(), String>,
 ) -> ExitCode {
-    let usage = "expected --object-mesh --bigfile <DAT> --entry <INDEX> [--pose <FILE>]";
-    let (dat, index, pose_file) = match object_input(args, usage) {
+    let usage = "expected --object-mesh --bigfile <DAT> --entry <INDEX> [--pose <FILE>] [--hierarchy] [--bounds]";
+    let (dat, index, pose_file, hierarchical, bounds_only) = match object_input(args, usage) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("error: {error}");
             return ExitCode::from(error.exit_code());
         }
     };
-    let model = match object::read_entry(Path::new(dat), index) {
+    let bytes = match object::read_entry_bytes(Path::new(dat), index) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let model = match object::parse_object(&bytes) {
         Ok(model) => model,
         Err(error) => {
             eprintln!("error: {error}");
             return ExitCode::from(error.exit_code());
         }
     };
-    let positions = match pose_file {
-        None => object::rest_positions(&model),
-        Some(path) => match posed_positions(&model, Path::new(path)) {
+    let positions = match (pose_file, hierarchical) {
+        (None, false) => object::rest_positions(&model),
+        (None, true) => {
+            eprintln!("error: --hierarchy needs a --pose <FILE>");
+            return ExitCode::from(1);
+        }
+        (Some(path), false) => match posed_positions(&model, Path::new(path)) {
+            Ok(positions) => positions,
+            Err(message) => {
+                eprintln!("error: {message}");
+                return ExitCode::from(1);
+            }
+        },
+        (Some(path), true) => match posed_positions_hierarchical(&model, &bytes, Path::new(path)) {
             Ok(positions) => positions,
             Err(message) => {
                 eprintln!("error: {message}");
@@ -1603,6 +1630,16 @@ fn run_object_mesh_with(
     };
     let indices = object::polygon_indices(&model);
     outln!("object {} vertices={} faces={}", model.name, positions.len(), indices.len() / 3);
+    if bounds_only {
+        if let Some((minimum, maximum)) = pose::bounds(&positions) {
+            outln!(
+                "bounds min=({},{},{}) max=({},{},{})",
+                minimum[0], minimum[1], minimum[2],
+                maximum[0], maximum[1], maximum[2]
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
     let title = format!("object {}", model.name);
     match render(&positions, &indices, &title) {
         Ok(()) => ExitCode::SUCCESS,
@@ -1632,6 +1669,47 @@ fn posed_positions(model: &object::ObjectModel, path: &Path) -> Result<Vec<[f32;
         outln!(
             "pose bones={} supplied={} moved={} bbox min=({},{},{}) max=({},{},{})",
             model.bones.len(),
+            poses.len(),
+            moved,
+            minimum[0], minimum[1], minimum[2],
+            maximum[0], maximum[1], maximum[2]
+        );
+    }
+    Ok(positions)
+}
+
+/// `--pose --hierarchy`: compose the descriptor parent tree and skin each bone
+/// with its composed world matrix. The printed line names the validated tree
+/// and the resulting bounds; a missing tree or a structurally invalid one is a
+/// loud error before any window opens.
+fn posed_positions_hierarchical(
+    model: &object::ObjectModel,
+    entry_bytes: &[u8],
+    path: &Path,
+) -> Result<Vec<[f32; 3]>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read pose file {}: {error}", path.display()))?;
+    let poses = pose::parse_pose_lines(&text)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let base = slot_descriptor::locate_descriptor_array(entry_bytes, model.bones.len())
+        .ok_or_else(|| format!("no per-slot descriptor array for {} bones", model.bones.len()))?;
+    let descriptors =
+        slot_descriptor::parse_descriptor_array(entry_bytes, base, model.bones.len())
+            .ok_or("the per-slot descriptor array is truncated")?;
+    let raw = bone_hierarchy::BoneHierarchy::from_descriptors(&descriptors);
+    let hierarchy = raw
+        .validate()
+        .map_err(|error| format!("bone hierarchy: {error}"))?;
+    let positions = pose::skin_positions_hierarchical(model, &raw, &poses)?;
+    let rest = object::rest_positions(model);
+    let moved = positions.iter().zip(&rest).filter(|(posed, rest)| posed != rest).count();
+    if let Some((minimum, maximum)) = pose::bounds(&positions) {
+        outln!(
+            "hierarchy bones={} root={} depth={} topological={} supplied={} moved={} bbox min=({},{},{}) max=({},{},{})",
+            hierarchy.len(),
+            hierarchy.root(),
+            hierarchy.depth(),
+            hierarchy.topological(),
             poses.len(),
             moved,
             minimum[0], minimum[1], minimum[2],
@@ -1837,6 +1915,133 @@ fn actor_census_input<'a>(args: &'a [String], usage: &'static str) -> Result<(&'
     dat.map(|dat| (dat, directory)).ok_or(object::ObjectError::Usage(usage))
 }
 
+fn bone_hierarchy_input<'a>(
+    args: &'a [String],
+    usage: &'static str,
+) -> Result<(&'a str, Option<usize>), object::ObjectError> {
+    let (mut dat, mut entry) = (None, None);
+    let mut at = 0;
+    while at < args.len() {
+        let value = || {
+            args.get(at + 1)
+                .map(String::as_str)
+                .ok_or(object::ObjectError::Usage(usage))
+        };
+        match args[at].as_str() {
+            "--bigfile" => {
+                dat = Some(value()?);
+                at += 2;
+            }
+            "--entry" => {
+                entry = Some(value()?.parse().map_err(|_| object::ObjectError::Usage(usage))?);
+                at += 2;
+            }
+            _ => return Err(object::ObjectError::Usage(usage)),
+        }
+    }
+    dat.map(|dat| (dat, entry)).ok_or(object::ObjectError::Usage(usage))
+}
+
+/// Locate and parse one object container's descriptor hierarchy. `None` means
+/// the entry carries no locatable per-slot array; the caller decides whether
+/// that is a census skip or a loud error.
+fn hierarchy_of(
+    bytes: &[u8],
+    model: &object::ObjectModel,
+) -> Option<bone_hierarchy::BoneHierarchy> {
+    if model.bones.is_empty() {
+        return None;
+    }
+    let base = slot_descriptor::locate_descriptor_array(bytes, model.bones.len())?;
+    let descriptors = slot_descriptor::parse_descriptor_array(bytes, base, model.bones.len())?;
+    Some(bone_hierarchy::BoneHierarchy::from_descriptors(&descriptors))
+}
+
+/// `--bone-hierarchy --bigfile <DAT> [--entry <INDEX>]`: one entry's validated
+/// tree, or the corpus-wide validate/fail census. Read-only; prints counts only.
+fn run_bone_hierarchy(args: &[String]) -> ExitCode {
+    let usage = "expected --bone-hierarchy --bigfile <DAT> [--entry <INDEX>]";
+    let (dat, entry) = match bone_hierarchy_input(args, usage) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let entries = match bigfile::load_index(Path::new(dat)) {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(3);
+        }
+    };
+    if let Some(index) = entry {
+        let Some(entry) = entries.get(index) else {
+            eprintln!(
+                "error: entry index {index} is out of range (archive has {} entries)",
+                entries.len()
+            );
+            return ExitCode::from(1);
+        };
+        let bytes = match bigfile::read_entry(Path::new(dat), entry) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(3);
+            }
+        };
+        let model = match object::parse_object(&bytes) {
+            Ok(model) => model,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(error.exit_code());
+            }
+        };
+        let Some(raw) = hierarchy_of(&bytes, &model) else {
+            eprintln!("error: object {} has no per-slot descriptor array", model.name);
+            return ExitCode::from(2);
+        };
+        match raw.validate() {
+            Ok(hierarchy) => outln!(
+                "hierarchy object={} entry={} bones={} roots={} root={} depth={} topological={} valid",
+                model.name,
+                index,
+                hierarchy.len(),
+                hierarchy.roots().len(),
+                hierarchy.root(),
+                hierarchy.depth(),
+                hierarchy.topological()
+            ),
+            Err(error) => outln!(
+                "hierarchy object={} entry={} bones={} invalid: {error}",
+                model.name,
+                index,
+                model.bones.len()
+            ),
+        }
+        return ExitCode::SUCCESS;
+    }
+    let mut census = bone_hierarchy::HierarchyCensus::default();
+    for entry in &entries {
+        let bytes = match bigfile::read_entry(Path::new(dat), entry) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(3);
+            }
+        };
+        let Ok(model) = object::parse_object(&bytes) else {
+            continue;
+        };
+        if model.bones.is_empty() {
+            continue;
+        }
+        census.record(hierarchy_of(&bytes, &model).as_ref());
+    }
+    outln!("{}", census.summary_line());
+    ExitCode::SUCCESS
+}
+
 fn run_object_info(args: &[String]) -> ExitCode {
     match object_info_input(args, object::USAGE).and_then(|(dat, index, actors)| {
         let bytes = object::read_entry_bytes(Path::new(dat), index)?;
@@ -1909,31 +2114,48 @@ fn object_info_input<'a>(args: &'a [String], usage: &'static str) -> Result<(&'a
     dat.zip(index).map(|(dat, index)| (dat, index, actors)).ok_or(object::ObjectError::Usage(usage))
 }
 
-/// Exactly `--bigfile <DAT> --entry <INDEX>`, in either order. Any other shape
-/// is the arm's own usage error.
+/// `--bigfile <DAT> --entry <INDEX>` plus the optional `--pose <FILE>`,
+/// `--hierarchy` and `--bounds` flags, in any order. Any other shape is the
+/// arm's own usage error.
 fn object_input<'a>(
     args: &'a [String],
     usage: &'static str,
-) -> Result<(&'a str, usize, Option<&'a str>), object::ObjectError> {
+) -> Result<(&'a str, usize, Option<&'a str>, bool, bool), object::ObjectError> {
     let (mut dat, mut index, mut pose_file) = (None, None, None);
+    let (mut hierarchical, mut bounds_only) = (false, false);
     let mut at = 0;
-    while at + 1 < args.len() {
+    while at < args.len() {
+        let value = || {
+            args.get(at + 1)
+                .map(String::as_str)
+                .ok_or(object::ObjectError::Usage(usage))
+        };
         match args[at].as_str() {
-            "--bigfile" => dat = Some(args[at + 1].as_str()),
-            "--entry" => {
-                index = Some(
-                    args[at + 1]
-                        .parse()
-                        .map_err(|_| object::ObjectError::Usage(usage))?,
-                )
+            "--bigfile" => {
+                dat = Some(value()?);
+                at += 2;
             }
-            "--pose" => pose_file = Some(args[at + 1].as_str()),
+            "--entry" => {
+                index = Some(value()?.parse().map_err(|_| object::ObjectError::Usage(usage))?);
+                at += 2;
+            }
+            "--pose" => {
+                pose_file = Some(value()?);
+                at += 2;
+            }
+            "--hierarchy" => {
+                hierarchical = true;
+                at += 1;
+            }
+            "--bounds" => {
+                bounds_only = true;
+                at += 1;
+            }
             _ => return Err(object::ObjectError::Usage(usage)),
         }
-        at += 2;
     }
-    match (dat, index, at == args.len()) {
-        (Some(dat), Some(index), true) => Ok((dat, index, pose_file)),
+    match (dat, index) {
+        (Some(dat), Some(index)) => Ok((dat, index, pose_file, hierarchical, bounds_only)),
         _ => Err(object::ObjectError::Usage(usage)),
     }
 }
@@ -1962,7 +2184,8 @@ fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
 mod cli_tests {
     use super::run_level_info;
     use super::{
-        list_report, pose_mode_conflict, resolve_texture_name, run_actor_census, run_audio, run_bigfile,
+        bone_hierarchy_input, list_report, object_input, pose_mode_conflict, resolve_texture_name,
+        run_actor_census, run_audio, run_bigfile,
         dispatch, run_level_links, run_level_records, run_level_structure, run_mesh, run_mesh_all,
         run_level_geometry, run_level_objects, run_level_render, run_mesh_textured, run_mesh_with,
         run_object_info, run_object_mesh, run_object_mesh_with, run_textures,
@@ -2772,6 +2995,31 @@ mod cli_tests {
         let missing = vec!["--bigfile".to_string(), dat, "--entry".to_string(), "9".to_string()];
         assert_eq!(run_object_mesh(&missing), ExitCode::from(1));
         assert_eq!(run_object_mesh(&[]), ExitCode::from(1));
+    }
+
+    #[test]
+    fn hierarchy_and_object_inputs_accept_the_new_flags() {
+        let argv = |items: &[&str]| items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            bone_hierarchy_input(&argv(&["--bigfile", "A.DAT"]), "u"),
+            Ok(("A.DAT", None))
+        );
+        assert_eq!(
+            bone_hierarchy_input(&argv(&["--entry", "7", "--bigfile", "A.DAT"]), "u"),
+            Ok(("A.DAT", Some(7)))
+        );
+        assert!(bone_hierarchy_input(&argv(&["--entry", "7"]), "u").is_err());
+        assert_eq!(
+            object_input(
+                &argv(&["--bigfile", "A.DAT", "--entry", "3", "--pose", "P", "--hierarchy", "--bounds"]),
+                "u"
+            ),
+            Ok(("A.DAT", 3, Some("P"), true, true))
+        );
+        assert_eq!(
+            object_input(&argv(&["--bigfile", "A.DAT", "--entry", "3"]), "u"),
+            Ok(("A.DAT", 3, None, false, false))
+        );
     }
 
     #[test]

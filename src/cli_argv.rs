@@ -232,6 +232,14 @@ mod tests {
                 &["--actor-census", "--bigfile", "BIGFILE.DAT", "--objects-dir", "OBJECT"],
             ),
             (
+                &["mesh", "bone-hierarchy", "--bigfile", "BIGFILE.DAT"],
+                &["--bone-hierarchy", "--bigfile", "BIGFILE.DAT"],
+            ),
+            (
+                &["mesh", "bone-hierarchy", "--bigfile", "BIGFILE.DAT", "--entry", "66"],
+                &["--bone-hierarchy", "--bigfile", "BIGFILE.DAT", "--entry", "66"],
+            ),
+            (
                 &["audio", "list", "bank.SND"],
                 &["--audio", "bank.SND", "--alist"],
             ),

@@ -17,10 +17,16 @@
 //! +12 u16     raw word
 //! +14 u16     raw word
 //! +16 u16     raw word
-//! +18 u16     slot parent; 0xFFFF or a smaller slot index
+//! +18 i16     parent bone index; -1 (the same bytes as 0xFFFF) is a root
 //! +20 u16     base-relative aim offset (0 = none)
 //! +22 u16     fixed zero (observed on every slot)
 //! ```
+//!
+//! `+18` is a **signed** parent index, not an opaque slot word: a live body
+//! dump shows exactly one `-1` record and every other parent below its own
+//! index. [`BoneHierarchy`](crate::bone_hierarchy::BoneHierarchy) is the
+//! separate validator/composer for that tree; this module only exposes the raw
+//! word as signed.
 //!
 //! Only `aim_offset` is named by the descriptor spec; the other words stay raw
 //! except for the observed shape described above. On a live raziel dump the
@@ -104,6 +110,13 @@ pub struct SlotDescriptor {
     pub word18: u16,
     pub aim_offset: u16,
     pub word22: u16,
+}
+
+impl SlotDescriptor {
+    /// The `+18` word as a signed parent bone index (`-1` is a root).
+    pub fn parent_index(&self) -> i16 {
+        self.word18 as i16
+    }
 }
 
 fn read_u16(bytes: &[u8], at: usize) -> Option<u16> {
@@ -644,6 +657,7 @@ mod tests {
         assert_eq!(slot.word14, 12);
         assert_eq!(slot.word16, 13);
         assert_eq!(slot.word18, 14);
+        assert_eq!(slot.parent_index(), 14, "the parent word is signed");
         assert_eq!(slot.aim_offset, 0x0080);
         assert_eq!(slot.word22, 0);
     }
