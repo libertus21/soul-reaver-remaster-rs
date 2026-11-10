@@ -50,6 +50,10 @@ pub const AIM_HEADER_LEN: usize = 24;
 /// Byte length of one aim keyframe. Each sub-slice holds
 /// `AIM_HEADER_LEN + frame_count * AIM_FRAME_LEN` bytes.
 pub const AIM_FRAME_LEN: usize = 20;
+/// Byte length of one per-slot track header (count, destination offset, tail).
+pub const TRACK_ENTRY_LEN: usize = 16;
+/// Byte length of the unresolved tail of a [`TrackEntry`].
+pub const TRACK_TAIL_LEN: usize = 8;
 /// Highest frame count accepted from a per-slot track header (corpus max 62).
 pub const MAX_TRACK_FRAMES: u32 = 4096;
 
@@ -269,15 +273,32 @@ fn active_aim_slots(descriptors: &[SlotDescriptor]) -> Vec<(usize, u16)> {
     slots
 }
 
-/// Read the per-slot frame counts that follow the descriptor array.
+/// One 16-byte per-slot track header.
+///
+/// The header is 16 bytes, but headers are **not** a fixed-stride array: each
+/// header sits at the start of its slot's record block, whose length equals the
+/// slot's aim sub-slice length. Only the first two fields are evidence-backed;
+/// the tail stays UNKNOWN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackEntry {
+    /// Number of `AIM_FRAME_LEN` frames. Corpus test: for every non-last slot,
+    /// `aim_next - aim == AIM_HEADER_LEN + frame_count * AIM_FRAME_LEN`.
+    pub frame_count: u32,
+    /// Base-relative start of the first frame (`aim_offset + AIM_HEADER_LEN`).
+    pub frame_offset: u32,
+    /// UNKNOWN: the remaining 8 bytes. Zero on some entries and non-zero on
+    /// others; no stable role (candidate divisor) is established.
+    pub raw_tail: [u8; TRACK_TAIL_LEN],
+}
+
+/// Read the per-slot track headers that follow the descriptor array.
 ///
 /// `payload` must begin at the descriptor-array base. The header block starts
 /// after the array plus a 0/8/16-byte preamble; each header then sits at the
 /// start of its slot's block, and blocks advance by the slot's aim gap. Returns
-/// one count per active aim slot, in ascending offset order, stopping at the
+/// one entry per active aim slot, in ascending offset order, stopping at the
 /// first malformed header (a partial list is honest, not padded).
-fn aim_frame_counts(descriptors: &[SlotDescriptor], payload: &[u8]) -> Vec<u32> {
-    const HEADER_LEN: usize = 16;
+pub fn track_entries(descriptors: &[SlotDescriptor], payload: &[u8]) -> Vec<TrackEntry> {
     let active = active_aim_slots(descriptors);
     let Some(&(_, first_aim)) = active.first() else {
         return Vec::new();
@@ -289,7 +310,7 @@ fn aim_frame_counts(descriptors: &[SlotDescriptor], payload: &[u8]) -> Vec<u32> 
         return Vec::new();
     };
     let expected = u32::from(first_aim).saturating_add(AIM_HEADER_LEN as u32);
-    let scan_end = region.len().saturating_sub(HEADER_LEN).min(64);
+    let scan_end = region.len().saturating_sub(TRACK_ENTRY_LEN).min(64);
     let Some(first) = (0..scan_end).step_by(4).find(|&at| {
         read_u32(region, at + 4) == Some(expected)
             && read_u32(region, at).is_some_and(|count| (1..=MAX_TRACK_FRAMES).contains(&count))
@@ -297,7 +318,7 @@ fn aim_frame_counts(descriptors: &[SlotDescriptor], payload: &[u8]) -> Vec<u32> 
         return Vec::new();
     };
 
-    let mut counts = Vec::new();
+    let mut entries = Vec::new();
     let mut pos = region_start.saturating_add(first);
     for (index, &(_, aim)) in active.iter().enumerate() {
         let Some(count) = read_u32(payload, pos) else {
@@ -311,13 +332,30 @@ fn aim_frame_counts(descriptors: &[SlotDescriptor], payload: &[u8]) -> Vec<u32> 
         {
             break;
         }
-        counts.push(count);
+        let Some(tail) = payload.get(pos + 8..pos + TRACK_ENTRY_LEN) else {
+            break;
+        };
+        let mut raw_tail = [0u8; TRACK_TAIL_LEN];
+        raw_tail.copy_from_slice(tail);
+        entries.push(TrackEntry {
+            frame_count: count,
+            frame_offset,
+            raw_tail,
+        });
         let Some(&(_, next_aim)) = active.get(index + 1) else {
             break;
         };
         pos = pos.saturating_add(usize::from(next_aim).saturating_sub(usize::from(aim)));
     }
-    counts
+    entries
+}
+
+/// Frame counts aligned with [`active_aim_slots`].
+fn aim_frame_counts(descriptors: &[SlotDescriptor], payload: &[u8]) -> Vec<u32> {
+    track_entries(descriptors, payload)
+        .into_iter()
+        .map(|entry| entry.frame_count)
+        .collect()
 }
 
 /// Delimit every per-slot aim sub-slice.
@@ -663,6 +701,33 @@ mod tests {
                 AIM_HEADER_LEN + 2 * AIM_FRAME_LEN
             );
         }
+    }
+
+    #[test]
+    fn track_headers_expose_count_offset_and_raw_tail() {
+        let (payload, aims) = aim_fixture(&[1u32, 2], 8);
+        let descriptors = parse_descriptor_array(&payload, 0, 2).expect("records");
+        let entries = track_entries(&descriptors, &payload);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].frame_count, 1);
+        assert_eq!(entries[1].frame_count, 2);
+        assert_eq!(entries[0].frame_offset, u32::from(aims[0]) + 24);
+        assert_eq!(entries[1].frame_offset, u32::from(aims[1]) + 24);
+        assert_eq!(entries[0].raw_tail[0], 0);
+        assert_eq!(entries[1].raw_tail[0], 1);
+    }
+
+    #[test]
+    fn track_entries_stop_at_a_malformed_header() {
+        let counts = [1u32, 1, 1];
+        let (mut payload, _aims) = aim_fixture(&counts, 8);
+        let region_start = 3 * FILE_RECORD_LEN;
+        let second = region_start + 8 + AIM_HEADER_LEN + AIM_FRAME_LEN;
+        payload[second + 4..second + 8].copy_from_slice(&0u32.to_le_bytes());
+        let descriptors = parse_descriptor_array(&payload, 0, 3).expect("records");
+        let entries = track_entries(&descriptors, &payload);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].frame_count, 1);
     }
 
     #[test]
