@@ -54,7 +54,7 @@ pub const CAPABILITIES: [Capability; 34] = [
     Capability { group: "mesh", name: "textured", legacy: "--mesh-textured <SRM> --tex-dir <TEX>", summary: "Show one .SRM with its material textures.", window: true },
     Capability { group: "mesh", name: "gallery", legacy: "--mesh-all <DIR> --tex-dir <TEX>", summary: "Browse a directory of .SRM meshes.", window: true },
     Capability { group: "mesh", name: "object-info", legacy: "--object-info --bigfile <DAT> --entry <INDEX>", summary: "Print one archived object container's counts and validation.", window: false },
-    Capability { group: "mesh", name: "object-mesh", legacy: "--object-mesh --bigfile <DAT> --entry <INDEX> [--textures <BIG>]", summary: "Show one archived object container's model.", window: true },
+    Capability { group: "mesh", name: "object-mesh", legacy: "--object-mesh --bigfile <DAT> --entry <INDEX> [--textures <BIG>] [--pose <FILE>]", summary: "Show one archived object container's model, optionally skinned by a slot-pose file.", window: true },
     Capability { group: "mesh", name: "object-info-actors", legacy: "--object-info --bigfile <DAT> --entry <INDEX> --actors", summary: "Print one object container's counts and actor block.", window: false },
     Capability { group: "mesh", name: "actor-census", legacy: "--actor-census --bigfile <DAT> [--objects-dir <DIR>]", summary: "Print every actor container's entries, ids and state trios.", window: false },
     Capability { group: "mesh", name: "srl-info", legacy: "--srl-info <FILE.SRL>", summary: "Print one .SRL clip's tracks, frames, fps and duration.", window: false },

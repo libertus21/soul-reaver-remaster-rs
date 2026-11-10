@@ -333,6 +333,12 @@ renders each polygon as one triangle from its three `u16` indices. Refusals
 happen before the window. Without the bone step the triangles are connected but
 every part sits at its bone origin, which reads as a chaotic blob.
 
+`--object-mesh --bigfile <DAT> --entry <I> --pose <FILE>` replaces the rest
+translation with the skinning path (section 8): every bone's contiguous vertex
+range is placed by that bone's 13-float slot pose, and the skinned model-space
+bounds are printed before the window. Without `--pose` the same arm keeps the
+rest-pose behaviour above.
+
 `--level-render --bigfile <DAT> --group <PREFIX> --objects` builds a name index
 from the archive's 4th index dword once per run, resolves each placed object to
 its real model, and translates that model by the record's world position (the
@@ -344,7 +350,91 @@ Rendering, textures, material interior, bones and animation are not decoded.
 Object-local up is now confirmed `+Z` (`docs/notes/object-up-axis.md`), so
 placement is a translation with no rotation; the facing/yaw remains undecoded.
 
-## 8. Legal
+## 8. Skeletal skinning (deformation only)
+
+This is the **deformation pipeline**, not animation semantics. How the runtime
+chooses a frame, what the mode bits mean and where the pose comes from are
+UNKNOWN and deliberately absent; that question is tracked separately from this
+pipeline.
+
+### 8.1 Slot pose and matrix
+
+One runtime slot pose is 13 `f32` values:
+
+```text
+[ r00 r01 r02   r10 r11 r12   r20 r21 r22 | scale marker | tx ty tz ]
+```
+
+`pose::slot_pose_matrix` copies the first nine floats as a row-major 3x3
+rotation, keeps the tenth as `scale_marker`, and the last three as a
+translation. The rotation is used as supplied: only finiteness is checked, not
+orthonormality (the runtime built it).
+
+**The scale marker's meaning is UNKNOWN.** No corpus or trace evidence says
+whether it is a uniform scale, an animation flag or padding, so the matrix
+carries it for inspection but applies `scale = 1.0`. Treating it as a scale
+would invent semantics this slice does not have.
+
+### 8.2 Composition with the rest pose: pose over rest, added
+
+Archived vertices are bone-local and `rest_positions` is a pure translation
+chain (`world[b] = local + world[parent]`). A bone pose therefore transforms
+its range as:
+
+```text
+posed = scale * R * local + rest_offset + translation
+```
+
+The translation is **added** to the bone's accumulated rest translation; the
+pose does not replace it. Two facts force that choice:
+
+1. An identity pose (`R = I`, `translation = 0`) must reproduce the rest pose
+   byte for byte. Adding does; replacing would collapse every part onto its
+   bone origin (the known "triangle jumble").
+2. The established mesh-space path (`pose::transform_for_joint`) rotates about
+   a joint head and re-adds it (`t = head - R * head`). The bone's rest
+   translation *is* that head here, so `R * local + rest_offset` is the same
+   composition expressed in bone-local coordinates.
+
+A translation moves a bone's range by exactly its delta; a rotation pivots that
+range about the bone's rest origin.
+
+### 8.3 Pose file
+
+`--object-mesh --bigfile <DAT> --entry <INDEX> --pose <FILE>` reads a text file
+with **one pose per bone, in bone order**:
+
+```text
+# bone 0: identity
+1 0 0 0 1 0 0 0 1 1 0 0 0
+# bone 1: +90 degrees about X
+1 0 0 0 0 -1 0 1 0 1 0 0 0
+```
+
+Blank lines and `#` comments are skipped; every other line must hold exactly 13
+finite floats. Fewer lines than bones leave the missing bones at rest; extra
+lines are ignored. The arm prints one witness line before the window:
+
+```text
+pose bones=66 supplied=2 moved=37 bbox min=(...) max=(...)
+```
+
+An identity pose or an empty file reproduces the rest-pose bounds exactly; a
+rotation on one range changes only the bounds that range can reach. `--pose`
+combines with the flat renderer only (not `--textures`).
+
+### 8.4 Vertex shape and tests
+
+`pose::skin_positions` returns model-space `f32` positions (the renderer's
+input). `pose::skin` returns the archived 8-byte shape with the normal id
+preserved, rounding to the nearest integer and clamping to `i16`; the posed
+topology is unchanged because the viewer reuses `object::polygon_indices`.
+
+Tests cover the byte-identical identity pose, a single-range rotation, an exact
+translation delta, fewer and more poses than bones, a one-bone model, and the
+pose-file parser's refusals.
+
+## 9. Legal
 
 Behaviour and format facts only: entry indices, field offsets, counts, array
 strides and short asset names. No game bytes, no decompiled text, no listings,

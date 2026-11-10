@@ -7,6 +7,15 @@
 //! (`docs/changes/animation/design.md`, P5); vertices are already mesh space.
 //! Weights blend linearly and are divided by the actual weight sum. Tests use
 //! synthetic data only.
+//!
+//! The same module also owns the archived object-model skinning path
+//! ([`skin`] / [`skin_positions`]). Those vertices are **bone-local** and each
+//! bone owns a contiguous vertex range, so a 13-float runtime slot pose becomes
+//! one affine per bone. The deformation pipeline is deliberately separate from
+//! the animation semantics that produce the pose; see
+//! `docs/notes/object-models.md` for the slot layout and the two UNKNOWN terms.
+
+use crate::object::{ObjectModel, Vertex};
 
 pub use crate::srm::JOINT_SLOTS;
 
@@ -213,6 +222,195 @@ pub fn apply(positions: &[[f32; 3]], bone_indices: &[[u8; 3]], bone_weights: &[[
     apply_joint_rotation(positions, bone_indices, bone_weights, mesh_joints, spec.bone, rotation)
 }
 
+/// One runtime slot pose exactly as the loader supplies it: row-major 3x3
+/// rotation at indices `0..=8`, one scale marker at index `9`, and a
+/// translation at indices `10..=12`.
+///
+/// This is a deformation input only. The animation semantics that produce the
+/// 13 floats (frame selection, mode bits, composition order) are out of scope
+/// and UNKNOWN here.
+pub type SlotPose = [f32; 13];
+
+/// The affine one [`SlotPose`] contributes to one bone.
+///
+/// - `rotation` is the first nine floats, copied row-major and applied as
+///   given. Only finiteness is checked; an authored pose is trusted to be the
+///   rotation the runtime built.
+/// - `translation` is the last three floats, added after the rotation.
+/// - `scale` is **always `1.0`**. Index 9 is the scale marker, but what the
+///   marker means is UNKNOWN (`docs/notes/object-models.md`), so it is
+///   preserved in `scale_marker` for inspection and never multiplies vertices.
+///   Treating it as a scale would invent semantics the corpus does not support.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PoseMatrix {
+    pub rotation: Mat3,
+    pub scale: f32,
+    pub translation: [f32; 3],
+    pub scale_marker: f32,
+}
+
+/// Build the [`PoseMatrix`] for one [`SlotPose`]. Every float must be finite;
+/// the rotation is not re-orthonormalised and the scale marker is not applied.
+pub fn slot_pose_matrix(pose: &SlotPose) -> Result<PoseMatrix, String> {
+    if pose.iter().any(|value| !value.is_finite()) {
+        return Err("slot pose contains a non-finite value".to_string());
+    }
+    Ok(PoseMatrix {
+        rotation: [
+            [pose[0], pose[1], pose[2]],
+            [pose[3], pose[4], pose[5]],
+            [pose[6], pose[7], pose[8]],
+        ],
+        scale: 1.0,
+        translation: [pose[10], pose[11], pose[12]],
+        scale_marker: pose[9],
+    })
+}
+
+/// Parse the documented pose-file shape: one 13-float [`SlotPose`] per bone, in
+/// bone order. Blank lines and `#` comments are skipped; every other line must
+/// hold exactly 13 finite floats.
+///
+/// Extra lines are accepted and ignored by [`skin`] (more poses than bones);
+/// fewer lines leave the missing bones at rest. Nothing here knows the bone
+/// count, so the same file can be reused against different models.
+pub fn parse_pose_lines(text: &str) -> Result<Vec<SlotPose>, String> {
+    let mut poses = Vec::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut values = [0.0f32; 13];
+        let mut count = 0;
+        for token in line.split_whitespace() {
+            let value: f32 = token
+                .parse()
+                .map_err(|_| format!("pose line {}: {token:?} is not a number", index + 1))?;
+            if !value.is_finite() {
+                return Err(format!("pose line {}: {token:?} is not finite", index + 1));
+            }
+            if count == values.len() {
+                return Err(format!(
+                    "pose line {} has more than 13 values",
+                    index + 1
+                ));
+            }
+            values[count] = value;
+            count += 1;
+        }
+        if count != values.len() {
+            return Err(format!(
+                "pose line {} has {count} values, expected 13",
+                index + 1
+            ));
+        }
+        poses.push(values);
+    }
+    Ok(poses)
+}
+
+/// Deform `model` with one [`SlotPose`] per bone, in model space.
+///
+/// Archived object vertices are bone-local and every bone owns
+/// `first_vertex..=last_vertex`, so a bone's pose is applied in that local
+/// frame and the bone's rest translation (its accumulated ancestor chain,
+/// exactly as [`crate::object::rest_positions`] computes it) is added back:
+///
+/// ```text
+/// posed = scale * R * local + rest_offset + translation
+/// ```
+///
+/// The decision is **pose over rest, added**: a bone pose does not replace the
+/// rest translation, it rotates the bone-local vertices about the bone's rest
+/// origin and then offsets them. Two reasons, both from the existing code:
+///
+/// 1. [`crate::object::rest_positions`] is a pure translation chain with no
+///    rotation, so an identity pose at zero translation must land exactly on
+///    the rest pose. Adding keeps that true; replacing would collapse every
+///    part onto its bone origin.
+/// 2. The existing mesh-space path ([`transform_for_joint`]) rotates about the
+///    joint head and re-adds it (`t = head - R * head`). Here the bone's rest
+///    translation *is* that head, so `R * local + rest_offset` is the same
+///    composition.
+///
+/// A bone without a pose (fewer poses than bones) uses the rest pose; poses
+/// past the bone count are ignored. A pose with any non-finite float is
+/// treated as absent rather than poisoning a vertex. Nothing panics and no
+/// missing bone is silently zeroed.
+pub fn skin_positions(model: &ObjectModel, poses: &[SlotPose]) -> Vec<[f32; 3]> {
+    let mut positions: Vec<[f32; 3]> = model.vertices.iter().map(|(p, _)| p.map(f32::from)).collect();
+    if positions.is_empty() {
+        return positions;
+    }
+    let offsets = crate::object::bone_world_offsets(&model.bones);
+    for (index, bone) in model.bones.iter().enumerate() {
+        if bone.first_vertex == u16::MAX || bone.last_vertex == u16::MAX {
+            continue;
+        }
+        let first = bone.first_vertex as usize;
+        let last = (bone.last_vertex as usize).min(positions.len() - 1);
+        if first > last {
+            continue;
+        }
+        let matrix = poses.get(index).and_then(|pose| slot_pose_matrix(pose).ok());
+        let offset = offsets
+            .get(index)
+            .copied()
+            .unwrap_or([0; 3])
+            .map(|value| value as f32);
+        for position in &mut positions[first..=last] {
+            *position = match matrix {
+                Some(matrix) => {
+                    let rotated = rotate(matrix.rotation, *position);
+                    [
+                        rotated[0] * matrix.scale + offset[0] + matrix.translation[0],
+                        rotated[1] * matrix.scale + offset[1] + matrix.translation[1],
+                        rotated[2] * matrix.scale + offset[2] + matrix.translation[2],
+                    ]
+                }
+                None => [
+                    position[0] + offset[0],
+                    position[1] + offset[1],
+                    position[2] + offset[2],
+                ],
+            };
+        }
+    }
+    positions
+}
+
+/// [`skin_positions`] in the archived 8-byte vertex shape, with the normal id
+/// preserved. Positions are model-space now, so they are rounded to the nearest
+/// integer and clamped to the `i16` range of the stored shape; renderers should
+/// consume [`skin_positions`], which keeps full `f32` precision.
+pub fn skin(model: &ObjectModel, poses: &[SlotPose]) -> Vec<Vertex> {
+    let positions = skin_positions(model, poses);
+    model
+        .vertices
+        .iter()
+        .zip(positions)
+        .map(|((_, normal), position)| (quantize(position), *normal))
+        .collect()
+}
+
+fn quantize(position: [f32; 3]) -> [i16; 3] {
+    position.map(|value| value.round().clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16)
+}
+
+/// Axis-aligned bounds of `positions`, or `None` when there are none.
+pub fn bounds(positions: &[[f32; 3]]) -> Option<([f32; 3], [f32; 3])> {
+    let mut minimum = [f32::INFINITY; 3];
+    let mut maximum = [f32::NEG_INFINITY; 3];
+    for position in positions {
+        for axis in 0..3 {
+            minimum[axis] = minimum[axis].min(position[axis]);
+            maximum[axis] = maximum[axis].max(position[axis]);
+        }
+    }
+    (minimum[0] <= maximum[0]).then_some((minimum, maximum))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +530,140 @@ mod tests {
     fn mat4_extraction_takes_the_upper_basis() {
         let m = [[1.0, 2.0, 3.0, 0.0], [4.0, 5.0, 6.0, 0.0], [7.0, 8.0, 9.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
         assert_eq!(mat3_from_mat4(&m), [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]);
+    }
+
+    const IDENTITY_SLOT: SlotPose = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+
+    fn slot_pose(rotation: Mat3, translation: [f32; 3]) -> SlotPose {
+        [
+            rotation[0][0], rotation[0][1], rotation[0][2],
+            rotation[1][0], rotation[1][1], rotation[1][2],
+            rotation[2][0], rotation[2][1], rotation[2][2],
+            1.0, translation[0], translation[1], translation[2],
+        ]
+    }
+
+    fn single_bone_model() -> crate::object::ObjectModel {
+        crate::object::ObjectModel {
+            vertices: vec![([1, 2, 3], 7), ([4, 5, 6], 9)],
+            bones: vec![crate::object::Bone {
+                first_vertex: 0,
+                last_vertex: 1,
+                local: [10, 0, 0],
+                parent: u16::MAX,
+            }],
+            ..crate::object::ObjectModel::default()
+        }
+    }
+
+    #[test]
+    fn slot_pose_matrix_copies_the_rotation_and_translation_but_not_the_marker() {
+        let pose = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 2.5, 10.0, 20.0, 30.0];
+        let matrix = slot_pose_matrix(&pose).expect("finite pose");
+        assert_eq!(matrix.rotation, [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]);
+        assert_eq!(matrix.translation, [10.0, 20.0, 30.0]);
+        assert_eq!(matrix.scale_marker, 2.5, "the raw marker stays observable");
+        assert_eq!(matrix.scale, 1.0, "the unknown marker must not scale");
+        assert!(slot_pose_matrix(&[f32::NAN; 13]).is_err());
+    }
+
+    #[test]
+    fn identity_slot_pose_reproduces_the_rest_pose_exactly() {
+        let model = crate::object::parse_object(&crate::object::synthetic_bone_model())
+            .expect("bone model must parse");
+        let poses = vec![IDENTITY_SLOT; model.bones.len()];
+        let rest = crate::object::rest_positions(&model);
+        assert_eq!(skin_positions(&model, &poses), rest);
+        let mut marked = IDENTITY_SLOT;
+        marked[9] = 37.5;
+        assert_eq!(
+            skin_positions(&model, &vec![marked; model.bones.len()]),
+            rest,
+            "the unknown scale marker must not deform the rest pose"
+        );
+        let skinned = skin(&model, &poses);
+        let positions: Vec<[f32; 3]> = skinned.iter().map(|(p, _)| p.map(f32::from)).collect();
+        let normals: Vec<u16> = skinned.iter().map(|(_, n)| *n).collect();
+        assert_eq!(positions, rest, "the archived shape keeps the rest positions");
+        assert_eq!(normals, model.vertices.iter().map(|(_, n)| *n).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn one_bone_rotation_changes_only_its_range() {
+        let model = crate::object::parse_object(&crate::object::synthetic_bone_model())
+            .expect("bone model must parse");
+        let rest = crate::object::rest_positions(&model);
+        let poses = [IDENTITY_SLOT, slot_pose(R_X90, [0.0; 3])];
+        let posed = skin_positions(&model, &poses);
+        assert_eq!(&posed[..2], &rest[..2], "bone 0 must stay untouched");
+        assert_eq!(posed[2], [0.0, 10.0, 20.0], "bone 1 rotates about its rest origin");
+        assert_eq!(posed[3], [0.0, 0.0, 10.0], "a vertex at the pivot stays put");
+    }
+
+    #[test]
+    fn one_bone_translation_moves_only_its_range_by_the_delta() {
+        let model = crate::object::parse_object(&crate::object::synthetic_bone_model())
+            .expect("bone model must parse");
+        let rest = crate::object::rest_positions(&model);
+        let delta = [5.0, -3.0, 2.0];
+        let posed = skin_positions(&model, &[IDENTITY_SLOT, slot_pose([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], delta)]);
+        assert_eq!(&posed[..2], &rest[..2]);
+        for index in 2..4 {
+            assert_eq!(
+                posed[index],
+                [rest[index][0] + delta[0], rest[index][1] + delta[1], rest[index][2] + delta[2]]
+            );
+        }
+    }
+
+    #[test]
+    fn missing_poses_fall_back_to_rest_and_extra_poses_are_ignored() {
+        let model = crate::object::parse_object(&crate::object::synthetic_bone_model())
+            .expect("bone model must parse");
+        let rest = crate::object::rest_positions(&model);
+        assert_eq!(skin_positions(&model, &[]), rest, "no poses at all is the rest pose");
+        assert_eq!(
+            skin_positions(&model, &[IDENTITY_SLOT]),
+            rest,
+            "the second bone must keep the rest pose"
+        );
+        let mut poisoned = IDENTITY_SLOT;
+        poisoned[0] = f32::NAN;
+        assert_eq!(skin_positions(&model, &[poisoned]), rest, "a non-finite pose is absent, not fatal");
+        let extras = [IDENTITY_SLOT, IDENTITY_SLOT, [9.0; 13], [f32::NAN; 13]];
+        assert_eq!(skin_positions(&model, &extras), rest, "poses past the bone count are ignored");
+    }
+
+    #[test]
+    fn a_single_bone_model_skins_through_the_same_path() {
+        let model = single_bone_model();
+        assert_eq!(
+            skin_positions(&model, &[IDENTITY_SLOT]),
+            vec![[11.0, 2.0, 3.0], [14.0, 5.0, 6.0]]
+        );
+        let posed = skin_positions(&model, &[slot_pose(R_X90, [0.0; 3])]);
+        assert_eq!(posed, vec![[11.0, -3.0, 2.0], [14.0, -6.0, 5.0]]);
+        assert_eq!(skin(&model, &[IDENTITY_SLOT]).iter().map(|(_, n)| *n).collect::<Vec<_>>(), vec![7, 9]);
+    }
+
+    #[test]
+    fn pose_lines_parse_one_row_per_bone_and_refuse_the_rest() {
+        let text = "# identity pose\n\n1 0 0 0 1 0 0 0 1 1 0 0 0\n";
+        assert_eq!(parse_pose_lines(text), Ok(vec![IDENTITY_SLOT]));
+        let short = "1 0 0 0 1 0 0 0 1 1 0 0";
+        let long = "1 0 0 0 1 0 0 0 1 1 0 0 0 0";
+        let text = "1 0 0 0 1 0 0 0 1 1 0 0 x";
+        let infinite = "1 0 0 0 1 0 0 0 1 1 0 0 inf";
+        for bad in [short, long, text, infinite] {
+            assert!(parse_pose_lines(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn bounds_cover_every_axis_and_an_empty_mesh_has_none() {
+        assert_eq!(bounds(&[]), None);
+        let (minimum, maximum) = bounds(&[[1.0, -2.0, 3.0], [-4.0, 5.0, -6.0]]).expect("bounds");
+        assert_eq!(minimum, [-4.0, -2.0, -6.0]);
+        assert_eq!(maximum, [1.0, 5.0, 3.0]);
     }
 }
