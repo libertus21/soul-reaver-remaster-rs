@@ -12,6 +12,11 @@ resolves the payload into a **record directory plus typed records** and runs the
 decisive cross-check against the actor clip-set trios; the verdict is still
 NO-GO for playback, now for a sharper reason.
 
+A third pass tested the runtime slot-pose hypothesis directly (payload =
+`header + frames x slots x 52`, 13 floats per slot) against the live per-object
+slot counts: `docs/notes/sra-slot-pose.md`. That layout is falsified; the
+runtime slot count is the model bone count, not an `.SRA` field.
+
 ## Verdict
 
 | Question | Answer | Confidence |

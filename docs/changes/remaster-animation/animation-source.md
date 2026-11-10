@@ -139,6 +139,43 @@ Ordered by cost:
    per-slot pose at time `t`, then the palette, then the existing `.SRM` skin
    weights.
 
+## Palette-hook correction (2026-11-09)
+
+The prepared capture reported `palette=0` while `pose=627` and `track=9454`
+fired. Read that correctly: the palette-assembler hook did not fire. It does
+**not** mean the palette assembler is absent, and the earlier shorthand of
+"palette=0" must not be read as "no palette". The pose builder and the track
+selector being observed confirms the rest of the chain was live; only the
+palette hook missed.
+
+The palette assembler is re-pinned here **by identity, not by name or call
+site.** Its distinguishing behaviour is the whole sequence:
+
+1. reads the model's 128 rest translations;
+2. reads the 128 activation flags;
+3. reads the per-slot 13-float pose;
+4. writes one 12-float, row-major 3x4 matrix per active slot into a global
+   palette;
+5. publishes the written count.
+
+A routine that does not do all five is not this role. The count is the number of
+slots whose activation flag is set, so "assembler ran, all flags clear" and
+"assembler never ran" are different observations and must be reported apart.
+
+The probe (outside the repository, since it carries module-relative offsets) was
+corrected accordingly:
+
+- the palette role is identified by that behaviour signature, so a hook that
+  fires with a zero published count is labelled `assembler-ran-empty` and a hook
+  that never fires is labelled `unobserved` — the ambiguous `palette=0` is gone;
+- the per-call dumps were replaced with de-duplicated per-object signatures plus
+  periodic summaries, because the previous run exhausted its line cap on
+  repeated per-call dumps instead of recording distinct events.
+
+The capture was **not** re-run in this slice. Role identity is CONFIRMED from the
+static writer chain above; the runtime hit rate of the palette assembler and the
+specific reason the earlier hook missed it remain UNOBSERVED.
+
 ## Method and legal
 
 - Static pass on the shipped SR1 module with headless Ghidra, read-only; the
