@@ -46,6 +46,10 @@
 
 mod actor;
 mod bigfile;
+// Bone hierarchy parsed from the descriptor `+18` word; validator first, then
+// wired into composition and the viewer by the next commits.
+#[allow(dead_code)]
+mod bone_hierarchy;
 mod cli_argv;
 mod cli_catalog;
 mod cli_out;
