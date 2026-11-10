@@ -29,9 +29,17 @@
 //! therefore reads the model header's own bone-table base first (no hardcoded
 //! offset) and keeps the `0xFFFF` run as the headerless signature path.
 //!
-//! The record stride is fixed at the file level even though the referenced
-//! per-slot aim data has no established length, so [`aim_record`] returns an
-//! explicit [`AimRecord::UnknownLength`] instead of inventing one.
+//! Each slot with a non-zero `aim_offset` owns one contiguous sub-slice of a
+//! shared aim stream. The sub-slice starts with a 24-byte header and is followed
+//! by `frame_count` 20-byte frames; the count is read from the per-slot track
+//! header that sits in the record region immediately after the descriptor array.
+//! [`aim_slices`] returns those real bounds. The corpus-wide gap distribution is
+//! reported in `docs/notes/aim-stream-bounds.md`; a sub-slice is **not** a whole
+//! number of 3-i16 triples.
+//!
+//! The aim shorts are fixed-point. [`FixedPoint`] uses the remaster's documented
+//! animation scale (`4096 == 1.0`, `>>12`); the aim-specific magnitude and the
+//! absolute direction-vs-angle meaning remain PARTLY and are documented.
 //!
 //! Pure in-memory parsing: no I/O, no engine wiring, no rotation math.
 
@@ -41,6 +49,27 @@ pub const FILE_RECORD_LEN: usize = 24;
 pub const MEMORY_RECORD_LEN: usize = 32;
 /// The word observed at `+6`/`+10` on inactive slots; the headerless signature.
 pub const SENTINEL: u16 = 0xFFFF;
+/// Byte length of the per-slot aim header at the start of every aim sub-slice.
+pub const AIM_HEADER_LEN: usize = 24;
+/// Byte length of one aim keyframe. Each sub-slice holds
+/// `AIM_HEADER_LEN + frame_count * AIM_FRAME_LEN` bytes.
+pub const AIM_FRAME_LEN: usize = 20;
+/// Byte length of one per-slot track header (count, destination offset, tail).
+pub const TRACK_ENTRY_LEN: usize = 16;
+/// Byte length of the unresolved tail of a [`TrackEntry`].
+pub const TRACK_TAIL_LEN: usize = 8;
+/// Highest frame count accepted from a per-slot track header (corpus max 62).
+pub const MAX_TRACK_FRAMES: u32 = 4096;
+/// The remaster's documented animation fixed-point scale: `4096 == 1.0`, `>>12`.
+///
+/// `docs/notes/spline-animation.md` section 2.1 documents the only animation
+/// fixed-point shift in the remaster: every animation short is converted with a
+/// right shift of 12. The aim shorts are described as fixed-point in
+/// `docs/notes/animation-loader-trace.md`; the aim-specific magnitude and the
+/// absolute meaning stay PARTLY (see `docs/notes/aim-stream-bounds.md`).
+pub const Q12_SHIFT: u32 = 12;
+/// Raw value of `1.0` in the documented animation fixed-point scale.
+pub const Q12_ONE: i32 = 1 << Q12_SHIFT;
 
 const SENTINEL_AT_6: usize = 6;
 const SENTINEL_AT_10: usize = 10;
@@ -207,56 +236,244 @@ pub fn parse_descriptor_array(
     block.chunks_exact(FILE_RECORD_LEN).map(parse_record).collect()
 }
 
+/// How the end of an [`AimSlice`] was established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AimTermination {
+    /// Bounded by the next larger aim offset of the same model.
+    NextOffset,
+    /// Last slot: bounded by its track header's frame count.
+    FrameCount(u32),
+    /// Last slot with no resolvable track header: only the 24-byte header is
+    /// bounded. The frame region stays UNKNOWN rather than invented.
+    HeaderOnly,
+}
+
+/// One delimited sub-slice of the shared aim stream.
+///
+/// `bytes` covers `offset .. offset + AIM_HEADER_LEN + frame_count * AIM_FRAME_LEN`
+/// when the end is established, or the next offset when it is not the last slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AimSlice<'a> {
+    /// Descriptor index of the slot that owns this sub-slice.
+    pub slot: usize,
+    /// Base-relative aim offset carried by the descriptor (`+20`).
+    pub offset: u16,
+    /// How the end bound was established.
+    pub termination: AimTermination,
+    /// The bounded raw bytes.
+    pub bytes: &'a [u8],
+}
+
 /// A per-slot aim reference and its bounded raw bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AimRecord<'a> {
     /// The slot carries no per-slot aim data (`+20 == 0`).
     Absent,
-    /// The slot references data at `array_base + offset`, but no evidence
-    /// establishes the record length. `bytes` is bounded by the next larger
-    /// aim offset in `descriptors`, or by the end of `payload`. An empty
-    /// `bytes` with a non-zero `offset` means the offset lies outside
-    /// `payload`; it is not an invented length.
-    UnknownLength { offset: u16, bytes: &'a [u8] },
+    /// The slot references a bounded aim sub-slice.
+    Bounded(AimSlice<'a>),
 }
 
-/// Return the raw, bounded aim slice for `slot`. Never invents a record length.
+/// Active aim slots, sorted by ascending offset. Descriptor order is monotonic
+/// across the corpus, but sorting keeps the bound rule independent of order.
+fn active_aim_slots(descriptors: &[SlotDescriptor]) -> Vec<(usize, u16)> {
+    let mut slots: Vec<(usize, u16)> = descriptors
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, descriptor)| {
+            (descriptor.aim_offset != 0).then_some((slot, descriptor.aim_offset))
+        })
+        .collect();
+    slots.sort_by_key(|&(_, offset)| offset);
+    slots
+}
+
+/// One 16-byte per-slot track header.
 ///
-/// The known offsets do not share a fixed stride and the referenced data has no
-/// length prefix, count byte, or `0xFFFF`/`0` terminator, so the length stays
-/// explicitly unknown. The slice stops at the next known aim offset, or at the
-/// end of `payload`.
+/// The header is 16 bytes, but headers are **not** a fixed-stride array: each
+/// header sits at the start of its slot's record block, whose length equals the
+/// slot's aim sub-slice length. Only the first two fields are evidence-backed;
+/// the tail stays UNKNOWN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackEntry {
+    /// Number of `AIM_FRAME_LEN` frames. Corpus test: for every non-last slot,
+    /// `aim_next - aim == AIM_HEADER_LEN + frame_count * AIM_FRAME_LEN`.
+    pub frame_count: u32,
+    /// Base-relative start of the first frame (`aim_offset + AIM_HEADER_LEN`).
+    pub frame_offset: u32,
+    /// UNKNOWN: the remaining 8 bytes. Zero on some entries and non-zero on
+    /// others; no stable role (candidate divisor) is established.
+    pub raw_tail: [u8; TRACK_TAIL_LEN],
+}
+
+/// The engine's animation fixed-point value, Q12 (`4096 == 1.0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedPoint(i32);
+
+impl FixedPoint {
+    /// Zero.
+    pub const ZERO: Self = Self(0);
+    /// One (`4096` raw).
+    pub const ONE: Self = Self(Q12_ONE);
+
+    /// Wrap a raw signed short from the aim stream.
+    pub fn from_raw(raw: i16) -> Self {
+        Self(i32::from(raw))
+    }
+
+    /// Wrap an already-scaled raw value.
+    pub fn from_q12(raw: i32) -> Self {
+        Self(raw)
+    }
+
+    /// The raw Q12 integer.
+    pub fn raw(self) -> i32 {
+        self.0
+    }
+
+    /// Convert to `f32` with the documented `>>12` scale.
+    pub fn to_f32(self) -> f32 {
+        self.0 as f32 / Q12_ONE as f32
+    }
+
+    /// Convert from `f32`, rounding to the nearest Q12 integer.
+    pub fn from_f32(value: f32) -> Self {
+        Self((value * Q12_ONE as f32).round() as i32)
+    }
+}
+
+/// The best-supported aim scale: Q12 (`4096 == 1.0`), see the module docs.
+pub const AIM_UNIT: FixedPoint = FixedPoint::ONE;
+
+/// Read the per-slot track headers that follow the descriptor array.
+///
+/// `payload` must begin at the descriptor-array base. The header block starts
+/// after the array plus a 0/8/16-byte preamble; each header then sits at the
+/// start of its slot's block, and blocks advance by the slot's aim gap. Returns
+/// one entry per active aim slot, in ascending offset order, stopping at the
+/// first malformed header (a partial list is honest, not padded).
+pub fn track_entries(descriptors: &[SlotDescriptor], payload: &[u8]) -> Vec<TrackEntry> {
+    let active = active_aim_slots(descriptors);
+    let Some(&(_, first_aim)) = active.first() else {
+        return Vec::new();
+    };
+    let Some(region_start) = descriptors.len().checked_mul(FILE_RECORD_LEN) else {
+        return Vec::new();
+    };
+    let Some(region) = payload.get(region_start..) else {
+        return Vec::new();
+    };
+    let expected = u32::from(first_aim).saturating_add(AIM_HEADER_LEN as u32);
+    let scan_end = region.len().saturating_sub(TRACK_ENTRY_LEN).min(64);
+    let Some(first) = (0..scan_end).step_by(4).find(|&at| {
+        read_u32(region, at + 4) == Some(expected)
+            && read_u32(region, at).is_some_and(|count| (1..=MAX_TRACK_FRAMES).contains(&count))
+    }) else {
+        return Vec::new();
+    };
+
+    let mut entries = Vec::new();
+    let mut pos = region_start.saturating_add(first);
+    for (index, &(_, aim)) in active.iter().enumerate() {
+        let Some(count) = read_u32(payload, pos) else {
+            break;
+        };
+        let Some(frame_offset) = read_u32(payload, pos + 4) else {
+            break;
+        };
+        if frame_offset != u32::from(aim).saturating_add(AIM_HEADER_LEN as u32)
+            || !(1..=MAX_TRACK_FRAMES).contains(&count)
+        {
+            break;
+        }
+        let Some(tail) = payload.get(pos + 8..pos + TRACK_ENTRY_LEN) else {
+            break;
+        };
+        let mut raw_tail = [0u8; TRACK_TAIL_LEN];
+        raw_tail.copy_from_slice(tail);
+        entries.push(TrackEntry {
+            frame_count: count,
+            frame_offset,
+            raw_tail,
+        });
+        let Some(&(_, next_aim)) = active.get(index + 1) else {
+            break;
+        };
+        pos = pos.saturating_add(usize::from(next_aim).saturating_sub(usize::from(aim)));
+    }
+    entries
+}
+
+/// Frame counts aligned with [`active_aim_slots`].
+fn aim_frame_counts(descriptors: &[SlotDescriptor], payload: &[u8]) -> Vec<u32> {
+    track_entries(descriptors, payload)
+        .into_iter()
+        .map(|entry| entry.frame_count)
+        .collect()
+}
+
+/// Delimit every per-slot aim sub-slice.
+///
+/// `payload` must begin at the descriptor-array base, so `aim_offset` indexes
+/// into it directly. Bounds:
+///
+/// - non-last slot: `[offset, next larger offset)`;
+/// - last slot with a track header: `[offset, offset + 24 + count * 20)`;
+/// - last slot without a resolvable header: `[offset, offset + 24)`.
+///
+/// A slice whose `offset` lies outside `payload` yields empty `bytes`; no length
+/// is invented.
+pub fn aim_slices<'a>(descriptors: &[SlotDescriptor], payload: &'a [u8]) -> Vec<AimSlice<'a>> {
+    let active = active_aim_slots(descriptors);
+    let counts = aim_frame_counts(descriptors, payload);
+    let mut slices = Vec::with_capacity(active.len());
+    for (index, &(slot, offset)) in active.iter().enumerate() {
+        let start = usize::from(offset);
+        let (end, termination) = match active.get(index + 1) {
+            Some(&(_, next)) => (usize::from(next), AimTermination::NextOffset),
+            None => match counts.get(index) {
+                Some(&count) if count > 0 => {
+                    let len = AIM_HEADER_LEN.saturating_add(count as usize * AIM_FRAME_LEN);
+                    (start.saturating_add(len), AimTermination::FrameCount(count))
+                }
+                _ => (
+                    start.saturating_add(AIM_HEADER_LEN),
+                    AimTermination::HeaderOnly,
+                ),
+            },
+        };
+        let end = end.min(payload.len()).max(start.min(payload.len()));
+        let bytes = payload.get(start..end).unwrap_or(&[]);
+        slices.push(AimSlice {
+            slot,
+            offset,
+            termination,
+            bytes,
+        });
+    }
+    slices
+}
+
+/// Return the bounded aim slice for `slot`.
+///
+/// Thin wrapper over [`aim_slices`] for callers that hold the whole entry and
+/// the located `array_base`.
 pub fn aim_record<'a>(
     payload: &'a [u8],
     descriptors: &[SlotDescriptor],
     array_base: usize,
     slot: usize,
 ) -> AimRecord<'a> {
-    let Some(descriptor) = descriptors.get(slot) else {
-        return AimRecord::Absent;
-    };
-    let offset = descriptor.aim_offset;
-    if offset == 0 {
+    if descriptors.get(slot).is_none_or(|descriptor| descriptor.aim_offset == 0) {
         return AimRecord::Absent;
     }
-    let start = array_base.saturating_add(usize::from(offset));
-    let next = descriptors
-        .iter()
-        .filter_map(|other| {
-            (other.aim_offset > offset)
-                .then_some(array_base.saturating_add(usize::from(other.aim_offset)))
-        })
-        .filter(|&bound| bound > start)
-        .min()
-        .unwrap_or(payload.len())
-        .min(payload.len());
-    let end = if start < payload.len() && next > start {
-        next
-    } else {
-        start
+    let Some(relative) = payload.get(array_base..) else {
+        return AimRecord::Absent;
     };
-    let bytes = payload.get(start..end).unwrap_or(&[]);
-    AimRecord::UnknownLength { offset, bytes }
+    aim_slices(descriptors, relative)
+        .into_iter()
+        .find(|slice| slice.slot == slot)
+        .map(AimRecord::Bounded)
+        .unwrap_or(AimRecord::Absent)
 }
 
 #[cfg(test)]
@@ -393,19 +610,67 @@ mod tests {
         assert_eq!(locate_descriptor_array(&payload, 1), Some(0));
     }
 
+    /// Build an array-relative payload: `n` descriptors, a track-header region
+    /// with `preamble` leading bytes, and one contiguous aim sub-slice per slot.
+    /// Own values only; never game bytes.
+    fn aim_fixture(counts: &[u32], preamble: usize) -> (Vec<u8>, Vec<u16>) {
+        let n = counts.len();
+        let region_start = n * FILE_RECORD_LEN;
+        let block_lens: Vec<usize> = counts
+            .iter()
+            .map(|&count| AIM_HEADER_LEN + count as usize * AIM_FRAME_LEN)
+            .collect();
+        let table_end = region_start + preamble + block_lens.iter().sum::<usize>();
+        let mut aims = Vec::with_capacity(n);
+        let mut cursor = table_end + 16;
+        for &len in &block_lens {
+            aims.push(cursor as u16);
+            cursor += len;
+        }
+        let mut payload = vec![0u8; cursor];
+        for (index, &aim) in aims.iter().enumerate() {
+            let at = index * FILE_RECORD_LEN;
+            payload[at..at + FILE_RECORD_LEN].copy_from_slice(&active_record(index as u16, aim));
+        }
+        let mut pos = region_start + preamble;
+        for (index, &count) in counts.iter().enumerate() {
+            payload[pos..pos + 4].copy_from_slice(&count.to_le_bytes());
+            payload[pos + 4..pos + 8]
+                .copy_from_slice(&(u32::from(aims[index]) + 24).to_le_bytes());
+            for byte in 0..8 {
+                payload[pos + 8 + byte] = (index as u8).wrapping_add(byte as u8);
+            }
+            pos += block_lens[index];
+        }
+        for (index, &aim) in aims.iter().enumerate() {
+            let start = aim as usize;
+            for byte in 0..AIM_HEADER_LEN {
+                payload[start + byte] = 0x40 ^ (index as u8);
+            }
+            for frame in 0..counts[index] as usize {
+                for byte in 0..AIM_FRAME_LEN {
+                    payload[start + AIM_HEADER_LEN + frame * AIM_FRAME_LEN + byte] =
+                        (index as u8).wrapping_mul(7).wrapping_add(byte as u8);
+                }
+            }
+        }
+        (payload, aims)
+    }
+
     #[test]
-    fn offset_zero_is_absent_and_nonzero_is_unknown_length() {
+    fn offset_zero_is_absent_and_nonzero_is_bounded() {
         let mut payload: Vec<u8> = (0..3).flat_map(|index| active_record(index, 0)).collect();
         payload[FILE_RECORD_LEN + 20..FILE_RECORD_LEN + 22].copy_from_slice(&0x20u16.to_le_bytes());
         let descriptors = parse_descriptor_array(&payload, 0, 3).expect("records must parse");
         assert_eq!(aim_record(&payload, &descriptors, 0, 0), AimRecord::Absent);
         assert_eq!(aim_record(&payload, &descriptors, 0, 2), AimRecord::Absent);
         match aim_record(&payload, &descriptors, 0, 1) {
-            AimRecord::UnknownLength { offset, bytes } => {
-                assert_eq!(offset, 0x20);
-                assert_eq!(bytes.len(), payload.len() - 0x20);
+            AimRecord::Bounded(slice) => {
+                assert_eq!(slice.offset, 0x20);
+                assert_eq!(slice.termination, AimTermination::HeaderOnly);
+                assert_eq!(slice.bytes.len(), AIM_HEADER_LEN);
             }
-            other => panic!("expected UnknownLength, got {other:?}"),
+            other => panic!("expected Bounded, got {other:?}"),
         }
     }
 
@@ -417,11 +682,12 @@ mod tests {
             .copy_from_slice(&0x30u16.to_le_bytes());
         let descriptors = parse_descriptor_array(&payload, 0, 3).expect("records must parse");
         match aim_record(&payload, &descriptors, 0, 0) {
-            AimRecord::UnknownLength { offset, bytes } => {
-                assert_eq!(offset, 0x20);
-                assert_eq!(bytes.len(), 0x10);
+            AimRecord::Bounded(slice) => {
+                assert_eq!(slice.offset, 0x20);
+                assert_eq!(slice.termination, AimTermination::NextOffset);
+                assert_eq!(slice.bytes.len(), 0x10);
             }
-            other => panic!("expected UnknownLength, got {other:?}"),
+            other => panic!("expected Bounded, got {other:?}"),
         }
     }
 
@@ -432,12 +698,116 @@ mod tests {
         let descriptors = parse_descriptor_array(&payload, 0, 1).expect("record must parse");
         assert_eq!(aim_record(&payload, &descriptors, 0, 9), AimRecord::Absent);
         match aim_record(&payload, &descriptors, 0, 0) {
-            AimRecord::UnknownLength { offset, bytes } => {
-                assert_eq!(offset, 0xFFFF);
-                assert!(bytes.is_empty(), "an out-of-range offset yields no bytes");
+            AimRecord::Bounded(slice) => {
+                assert_eq!(slice.offset, 0xFFFF);
+                assert_eq!(slice.termination, AimTermination::HeaderOnly);
+                assert!(slice.bytes.is_empty(), "an out-of-range offset yields no bytes");
             }
-            other => panic!("expected UnknownLength, got {other:?}"),
+            other => panic!("expected Bounded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn aim_slices_use_next_offset_then_frame_count() {
+        let counts = [2u32, 1, 3];
+        let (payload, aims) = aim_fixture(&counts, 8);
+        let descriptors = parse_descriptor_array(&payload, 0, counts.len()).expect("records");
+        let slices = aim_slices(&descriptors, &payload);
+        assert_eq!(slices.len(), 3);
+        for (index, slice) in slices.iter().enumerate() {
+            assert_eq!(slice.slot, index);
+            assert_eq!(slice.offset, aims[index]);
+            let expected = AIM_HEADER_LEN + counts[index] as usize * AIM_FRAME_LEN;
+            assert_eq!(slice.bytes.len(), expected, "slice {index}");
+        }
+        assert_eq!(slices[0].termination, AimTermination::NextOffset);
+        assert_eq!(slices[1].termination, AimTermination::NextOffset);
+        assert_eq!(slices[2].termination, AimTermination::FrameCount(3));
+        // The non-last bound is the next offset, not the payload end.
+        assert_eq!(slices[0].bytes.len(), usize::from(aims[1] - aims[0]));
+        assert_eq!(slices[1].bytes.len(), usize::from(aims[2] - aims[1]));
+    }
+
+    #[test]
+    fn last_slice_is_bounded_by_its_frame_count_not_the_payload_end() {
+        let counts = [1u32, 1];
+        let (payload, aims) = aim_fixture(&counts, 8);
+        let descriptors = parse_descriptor_array(&payload, 0, 2).expect("records");
+        let slices = aim_slices(&descriptors, &payload);
+        let last = slices.last().expect("two slices");
+        assert_eq!(last.offset, aims[1]);
+        assert_eq!(last.bytes.len(), AIM_HEADER_LEN + AIM_FRAME_LEN);
+        assert_eq!(last.termination, AimTermination::FrameCount(1));
+        assert!(aims[1] as usize + last.bytes.len() <= payload.len());
+    }
+
+    #[test]
+    fn frame_count_bound_tolerates_the_observed_preambles() {
+        for preamble in [0usize, 8, 16] {
+            let (payload, _aims) = aim_fixture(&[1u32, 2], preamble);
+            let descriptors = parse_descriptor_array(&payload, 0, 2).expect("records");
+            let slices = aim_slices(&descriptors, &payload);
+            assert_eq!(slices.len(), 2, "preamble {preamble}");
+            assert_eq!(slices[1].termination, AimTermination::FrameCount(2));
+            assert_eq!(
+                slices[1].bytes.len(),
+                AIM_HEADER_LEN + 2 * AIM_FRAME_LEN
+            );
+        }
+    }
+
+    #[test]
+    fn track_headers_expose_count_offset_and_raw_tail() {
+        let (payload, aims) = aim_fixture(&[1u32, 2], 8);
+        let descriptors = parse_descriptor_array(&payload, 0, 2).expect("records");
+        let entries = track_entries(&descriptors, &payload);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].frame_count, 1);
+        assert_eq!(entries[1].frame_count, 2);
+        assert_eq!(entries[0].frame_offset, u32::from(aims[0]) + 24);
+        assert_eq!(entries[1].frame_offset, u32::from(aims[1]) + 24);
+        assert_eq!(entries[0].raw_tail[0], 0);
+        assert_eq!(entries[1].raw_tail[0], 1);
+    }
+
+    #[test]
+    fn track_entries_stop_at_a_malformed_header() {
+        let counts = [1u32, 1, 1];
+        let (mut payload, _aims) = aim_fixture(&counts, 8);
+        let region_start = 3 * FILE_RECORD_LEN;
+        let second = region_start + 8 + AIM_HEADER_LEN + AIM_FRAME_LEN;
+        payload[second + 4..second + 8].copy_from_slice(&0u32.to_le_bytes());
+        let descriptors = parse_descriptor_array(&payload, 0, 3).expect("records");
+        let entries = track_entries(&descriptors, &payload);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].frame_count, 1);
+    }
+
+    #[test]
+    fn last_slice_falls_back_to_the_header_without_a_track_header() {
+        let counts = [1u32, 2];
+        let (mut payload, _aims) = aim_fixture(&counts, 8);
+        let region_start = 2 * FILE_RECORD_LEN;
+        payload[region_start + 8 + 4..region_start + 8 + 8].copy_from_slice(&0u32.to_le_bytes());
+        let descriptors = parse_descriptor_array(&payload, 0, 2).expect("records");
+        let slices = aim_slices(&descriptors, &payload);
+        assert_eq!(slices[0].termination, AimTermination::NextOffset);
+        assert_eq!(slices[1].termination, AimTermination::HeaderOnly);
+        assert_eq!(slices[1].bytes.len(), AIM_HEADER_LEN);
+    }
+
+    #[test]
+    fn fixed_point_uses_the_documented_q12_scale() {
+        assert_eq!(Q12_SHIFT, 12);
+        assert_eq!(Q12_ONE, 4096);
+        assert_eq!(FixedPoint::from_raw(4096).to_f32(), 1.0);
+        assert_eq!(FixedPoint::from_raw(2048).to_f32(), 0.5);
+        assert_eq!(FixedPoint::from_raw(-2048).to_f32(), -0.5);
+        assert_eq!(FixedPoint::from_f32(1.0).raw(), Q12_ONE);
+        assert_eq!(FixedPoint::from_f32(-0.5).raw(), -Q12_ONE / 2);
+        assert_eq!(AIM_UNIT.to_f32(), 1.0);
+        assert_eq!(FixedPoint::ZERO.raw(), 0);
+        assert_eq!(FixedPoint::from_q12(123).raw(), 123);
     }
 
     #[test]
