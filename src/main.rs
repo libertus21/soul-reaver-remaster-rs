@@ -58,6 +58,9 @@ mod object;
 mod object_texture;
 // Pure one-bone pose math, wired into the `--mesh --pose` arm below.
 mod pose;
+// Pure procedural-slot rotation composition; not wired into the viewer yet.
+#[allow(dead_code)]
+mod pose_slot;
 mod render;
 // Pure descriptor-array parser; not wired into the viewer yet.
 #[allow(dead_code)]
