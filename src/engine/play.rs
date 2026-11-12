@@ -33,7 +33,7 @@ use crate::engine::determinism::world_state_hash;
 use crate::engine::frame::{FrameError, FrameState, PLAYER_NAME};
 use crate::engine::input::{InputButton, InputEvent};
 use crate::engine::render_backend::RenderBackend;
-use crate::engine::scene::{CameraView, SceneAssets};
+use crate::engine::scene::{CameraView, PlayerFacing, SceneAssets};
 use crate::engine::spawn::{Admission, EngineNameTable};
 use crate::engine::world::{World, WorldError};
 use crate::object_texture::PageBank;
@@ -706,6 +706,14 @@ impl PlayApp {
             .unwrap_or(1.0)
     }
 
+    /// The player's produced root facing for the scene builder, if it has moved.
+    fn player_facing(&self) -> Option<PlayerFacing> {
+        Some(PlayerFacing {
+            player: self.frame.player()?,
+            yaw_binary: self.frame.player_yaw_binary()?,
+        })
+    }
+
     fn camera_view(&mut self, aspect: f32) -> CameraView {
         match self.mode {
             CameraMode::Orbit => {
@@ -892,7 +900,9 @@ impl ApplicationHandler for PlayApp {
             WindowEvent::RedrawRequested => {
                 let aspect = self.aspect();
                 let camera = self.camera_view(aspect);
-                let scene = self.assets.build(self.frame.live(), camera);
+                let facing = self.player_facing();
+                let live = self.frame.live();
+                let scene = self.assets.build_with_facing(live, camera, facing);
                 if let Some(backend) = &mut self.backend {
                     if let Err(error) = backend.draw(&scene) {
                         self.init_error = Some(error.to_string());

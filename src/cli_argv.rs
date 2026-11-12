@@ -328,6 +328,15 @@ mod tests {
                 &["level", "reach", "--bigfile", "BIGFILE.DAT"],
                 &["--level-reach", "--bigfile", "BIGFILE.DAT"],
             ),
+            (
+                &[
+                    "game", "facing", "--bigfile", "BIGFILE.DAT", "--entry", "66", "--direction",
+                    "0:1",
+                ],
+                &[
+                    "--facing", "--bigfile", "BIGFILE.DAT", "--entry", "66", "--direction", "0:1",
+                ],
+            ),
         ];
         for (input, expected) in cases {
             assert_dispatch(input, expected);

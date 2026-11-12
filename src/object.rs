@@ -8,7 +8,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::bigfile;
+use crate::bone_hierarchy::BoneHierarchy;
 use crate::level;
+use crate::pose;
 
 pub const VERTEX_STRIDE: usize = 8;
 pub const POLYGON_STRIDE: usize = 12;
@@ -415,7 +417,20 @@ pub(crate) fn page_material(pages: &mut Vec<u16>, page: u16) -> u8 {
 /// Per-face textured mesh in rest pose. Untextured faces stay as flat
 /// material 1 so no geometry is dropped.
 pub fn textured_mesh(model: &ObjectModel) -> TexturedMesh {
-    let positions = rest_positions(model);
+    textured_mesh_with_positions(model, &rest_positions(model))
+}
+
+/// Per-face textured mesh built from caller-supplied model-space positions.
+///
+/// UVs, material indices, pages and topology come from `model`; only the
+/// position of each polygon corner is taken from `positions` (indexed like
+/// [`ObjectModel::vertices`]). The skinning path uses this so a produced pose
+/// reaches the exact vertices the renderer draws, including the per-face
+/// duplication.
+pub fn textured_mesh_with_positions(
+    model: &ObjectModel,
+    positions: &[[f32; 3]],
+) -> TexturedMesh {
     let mut out = TexturedMesh::default();
     for ((corners, _, _, _), texture) in model.polygons.iter().zip(&model.textures) {
         let base = out.positions.len() as u32;
@@ -448,6 +463,7 @@ pub struct ModelResolver {
     by_suffix: HashMap<[u8; 4], Vec<usize>>,
     cache: HashMap<String, Option<(Vec<[f32; 3]>, Vec<u32>)>>,
     textured_cache: HashMap<String, Option<TexturedMesh>>,
+    model_cache: HashMap<String, Option<ObjectModel>>,
 }
 
 impl ModelResolver {
@@ -458,13 +474,20 @@ impl ModelResolver {
         for (index, entry) in entries.iter().enumerate() {
             by_suffix.entry(entry.suffix).or_default().push(index);
         }
-        Ok(Self { path: path.to_path_buf(), entries, by_suffix, cache: HashMap::new(), textured_cache: HashMap::new() })
+        Ok(Self {
+            path: path.to_path_buf(),
+            entries,
+            by_suffix,
+            cache: HashMap::new(),
+            textured_cache: HashMap::new(),
+            model_cache: HashMap::new(),
+        })
     }
 
     /// Model-space mesh for `name`, or `None` when no container matches.
     pub fn mesh(&mut self, name: &str) -> Option<(Vec<[f32; 3]>, Vec<u32>)> {
         if !self.cache.contains_key(name) {
-            let mesh = self.lookup(name).map(|model| triangle_mesh(&model));
+            let mesh = self.model(name).map(triangle_mesh);
             self.cache.insert(name.to_string(), mesh);
         }
         self.cache.get(name).cloned().flatten()
@@ -473,13 +496,38 @@ impl ModelResolver {
     /// Per-face textured mesh for `name`, cached separately from the flat mesh.
     pub fn textured(&mut self, name: &str) -> Option<TexturedMesh> {
         if !self.textured_cache.contains_key(name) {
-            let mesh = self.lookup(name).map(|model| textured_mesh(&model));
+            let mesh = self.model(name).map(textured_mesh);
             self.textured_cache.insert(name.to_string(), mesh);
         }
         self.textured_cache.get(name).cloned().flatten()
     }
 
-    fn lookup(&self, name: &str) -> Option<ObjectModel> {
+    /// Per-face textured mesh for `name` with every vertex skinned by one root
+    /// yaw. The root pose is produced with [`pose::pose_from_yaw`] and applied
+    /// through [`pose::skin_positions_hierarchical`], the same path the
+    /// hierarchy viewer uses. The tree comes from each bone's `+18` parent word;
+    /// that record block is the array `slot_descriptor::locate_descriptor_array`
+    /// resolves from the model header's bone-table base.
+    ///
+    /// Only the player consumes this today. Level-placed objects carry no
+    /// rotation field in the authored record, so they keep the rest mesh.
+    pub fn posed_textured(&mut self, name: &str, yaw_binary: f32) -> Option<TexturedMesh> {
+        let model = self.model(name)?;
+        let hierarchy = BoneHierarchy::from_parents(bone_parents(&model.bones));
+        let poses = pose::pose_from_yaw(model.bones.len(), yaw_binary, [0.0; 3]);
+        let positions = pose::skin_positions_hierarchical(model, &hierarchy, &poses).ok()?;
+        Some(textured_mesh_with_positions(model, &positions))
+    }
+
+    fn model(&mut self, name: &str) -> Option<&ObjectModel> {
+        if !self.model_cache.contains_key(name) {
+            let model = self.read_model(name);
+            self.model_cache.insert(name.to_string(), model);
+        }
+        self.model_cache.get(name).and_then(Option::as_ref)
+    }
+
+    fn read_model(&self, name: &str) -> Option<ObjectModel> {
         for &index in self.by_suffix.get(&suffix_key(name)?)? {
             let Some(entry) = self.entries.get(index) else { continue };
             let Ok(bytes) = bigfile::read_entry(&self.path, entry) else { continue };
@@ -491,6 +539,21 @@ impl ModelResolver {
         }
         None
     }
+}
+
+/// The parent word of every bone as [`BoneHierarchy::from_parents`] expects it:
+/// `0xFFFF` (no parent) becomes `-1`, every other index is kept.
+fn bone_parents(bones: &[Bone]) -> Vec<i16> {
+    bones
+        .iter()
+        .map(|bone| {
+            if bone.parent == u16::MAX {
+                -1
+            } else {
+                bone.parent as i16
+            }
+        })
+        .collect()
 }
 
 /// Lines for `--object-info`: counts, both boundary identities and the index
@@ -751,6 +814,41 @@ mod tests {
         assert_eq!(resolver.mesh("raziel").map(|(v, _)| v.len()), Some(3), "cached");
         assert!(resolver.mesh("campath").is_none(), "suffix LOCK does not match ZIEL");
         assert!(resolver.mesh("raz").is_none(), "names shorter than four characters do not map");
+    }
+
+    #[test]
+    fn posed_textured_rotates_the_rendered_vertices_by_the_root_yaw() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let path = tmp.path().join("BIGFILE.DAT");
+        std::fs::write(&path, archive(*b"ZIEL", synthetic_bone_model()))
+            .expect("synthetic archive");
+        let mut resolver = ModelResolver::load(&path).expect("index must load");
+
+        let rest = resolver.textured("raziel").expect("rest textured mesh");
+        let zero = resolver
+            .posed_textured("raziel", 0.0)
+            .expect("zero yaw textured mesh");
+        assert_eq!(zero, rest, "a zero yaw must reproduce the rendered rest mesh");
+
+        let quarter = resolver
+            .posed_textured("raziel", pose::BINARY_ANGLE_UNITS_PER_TURN / 4.0)
+            .expect("quarter-turn textured mesh");
+        assert_eq!(
+            quarter.indices, rest.indices,
+            "a produced pose never changes rendered topology"
+        );
+        assert_ne!(quarter.positions, rest.positions, "the root yaw must move vertices");
+        assert!(
+            !quarter.positions.iter().any(|p| *p == [10.0, 0.0, 0.0]),
+            "the rest vertex at +10 X must have rotated away"
+        );
+        assert!(
+            quarter
+                .positions
+                .iter()
+                .any(|p| p[0].abs() < 1e-4 && (p[1] - 10.0).abs() < 1e-4 && p[2].abs() < 1e-4),
+            "+10 X must land on +10 Y for a quarter turn"
+        );
     }
 
     #[test]

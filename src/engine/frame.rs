@@ -49,6 +49,7 @@ use crate::engine::input::{InputButton, InputEvent, InputFrame, InputQueue};
 use crate::engine::live::{LiveArena, LiveId, LiveObject};
 use crate::engine::tracker::{ObjectTracker, TrackerError};
 use crate::engine::world::World;
+use crate::pose;
 
 /// The player's authored placed name. The spawn policy binds this record.
 pub const PLAYER_NAME: &str = "raziel";
@@ -303,6 +304,13 @@ pub struct FrameState {
     player_vertical_velocity: i64,
     /// Whether the player ended the last tick resting on a walkable floor.
     player_grounded: bool,
+    /// The facing yaw last produced from a non-zero horizontal movement delta.
+    /// `None` until the player first moves; a zero delta keeps the previous
+    /// value. Presentation state only: it never enters the canonical fold.
+    player_yaw: Option<pose::Mat3>,
+    /// The binary yaw (`4096` units per turn) behind [`Self::player_yaw`], so the
+    /// scene can rebuild the same root pose through [`pose::pose_from_yaw`].
+    player_yaw_binary: Option<f32>,
     view: CullView,
     stats: FrameStats,
     scratch: FrameScratch,
@@ -332,6 +340,8 @@ impl FrameState {
             player: None,
             player_vertical_velocity: 0,
             player_grounded: false,
+            player_yaw: None,
+            player_yaw_binary: None,
             view: CullView::default(),
             stats: FrameStats::default(),
             scratch: FrameScratch::default(),
@@ -394,6 +404,23 @@ impl FrameState {
         self.player
             .and_then(|id| self.live.get(id).ok())
             .map(|object| object.position)
+    }
+
+    /// The player's facing yaw, produced by
+    /// [`pose::yaw_rotation_from_direction`] from the committed movement delta.
+    ///
+    /// `None` until the player first moves. It is presentation state, not part
+    /// of the canonical digest; standing still preserves the last value.
+    pub fn player_yaw(&self) -> Option<pose::Mat3> {
+        self.player_yaw
+    }
+
+    /// The binary angle (`4096` units per turn) behind [`Self::player_yaw`].
+    ///
+    /// This is the exact input [`pose::pose_from_yaw`] consumes, so the scene can
+    /// rebuild the same root rotation without re-deriving it from a matrix.
+    pub fn player_yaw_binary(&self) -> Option<f32> {
+        self.player_yaw_binary
     }
 
     /// Whether the player ended the last tick resting on a walkable floor.
@@ -714,6 +741,11 @@ impl FrameState {
     /// falling player lands exactly on the highest floor at or below the feet. A
     /// world with no floor triangles leaves `Z` untouched. This is a correct
     /// deterministic resolver, not the original four-step solver.
+    ///
+    /// The committed horizontal delta also produces the player's facing yaw:
+    /// the requested input is not used directly, so a blocked player keeps the
+    /// previous facing and a slide faces along the wall. The delta is integer,
+    /// so the produced rotation is deterministic.
     fn stage_player_movement(&mut self) {
         let Some(player) = self.player else {
             return;
@@ -721,14 +753,26 @@ impl FrameState {
         self.stats.direct_player_ticks = self.stats.direct_player_ticks.saturating_add(1);
 
         let [right, forward] = self.current_input.move_axis();
+        let mut horizontal_delta = None;
         if right != 0 || forward != 0 {
             let mut delta = [0i32; 3];
             delta[HORIZONTAL_A] = right.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK);
             delta[HORIZONTAL_B] = forward.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK);
             let collision = &self.world.collision;
             if let Ok(object) = self.live.get_mut(player) {
+                let before = object.position;
                 object.position = collision.sweep(object.position, delta, PLAYER_RADIUS_UNITS);
+                horizontal_delta = Some([
+                    object.position[HORIZONTAL_A] - before[HORIZONTAL_A],
+                    object.position[HORIZONTAL_B] - before[HORIZONTAL_B],
+                ]);
             }
+        }
+        if let Some([dx, dy]) = horizontal_delta
+            && let Some(rotation) = pose::yaw_rotation_from_direction(dx as f32, dy as f32)
+        {
+            self.player_yaw = Some(rotation);
+            self.player_yaw_binary = pose::binary_yaw_from_direction(dx as f32, dy as f32);
         }
 
         if self.player_grounded && self.current_input.is_pressed(InputButton::Jump) {
@@ -1878,6 +1922,43 @@ mod tests {
             before_hash,
             "moving the player must change the canonical state"
         );
+    }
+
+    fn assert_facing_x(rotation: crate::pose::Mat3, expected: [f32; 3]) {
+        let local_x = [rotation[0][0], rotation[1][0], rotation[2][0]];
+        for axis in 0..3 {
+            assert!(
+                (local_x[axis] - expected[axis]).abs() < 1e-5,
+                "local +X maps to {local_x:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn facing_follows_the_committed_movement_and_survives_standing_still() {
+        let mut frame = frame();
+        assert_eq!(frame.player_yaw(), None, "no facing before the first move");
+
+        frame.queue_input(InputEvent::press(InputButton::Forward));
+        tick(&mut frame, 0);
+        let forward = frame.player_yaw().expect("forward movement sets the facing");
+        assert_facing_x(forward, [0.0, 1.0, 0.0]);
+        assert!(frame.player_yaw_binary().is_some());
+
+        frame.queue_input(InputEvent::release(InputButton::Forward));
+        tick(&mut frame, 1);
+        assert_eq!(
+            frame.player_yaw(),
+            Some(forward),
+            "standing still preserves the previous facing"
+        );
+        assert_eq!(frame.player_position(), Some([0, 4, 0]));
+
+        frame.queue_input(InputEvent::press(InputButton::Right));
+        tick(&mut frame, 2);
+        let right = frame.player_yaw().expect("right movement sets the facing");
+        assert_facing_x(right, [1.0, 0.0, 0.0]);
+        assert_ne!(right, forward, "a different direction produces a different rotation");
     }
 
     #[test]
