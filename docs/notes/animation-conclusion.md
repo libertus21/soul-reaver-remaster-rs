@@ -10,9 +10,10 @@ reader does not repeat the search. Two findings now sit together:
    the slot format is confirmed at **13 floats**.
 
 The producer is named: the two sibling **orientation constructors** that write
-each slot's rotation block. What is still unknown is the three input floats those
-constructors consume. This note records the correction instead of deleting the
-older claims silently.
+each slot's rotation block. The arithmetic from their three input floats to the
+rotation block is now also solved (`docs/notes/rotation-model.md`). What is still
+unknown is the **source** of those three angle values. This note records the
+correction instead of deleting the older claims silently.
 
 Every number below is either reproduced by a shipped command (and listed with it)
 or cited from the evidence note that established it. Nothing was written to the
@@ -35,7 +36,7 @@ are kept here so the history is visible.
 | "Bodies are oriented procedurally" as a vague hand-wave | The producer is **named**: the two sibling **orientation constructors**, called per active slot per frame from the pose builders. | `docs/notes/pose-writer-identity.md` |
 | The pose slot format was a static inference | The runtime slot is **confirmed**: 13 `f32`, stride 52 bytes, row-major 3x3 at indices 0..8, scale field at 9, translation at 10..12. | `docs/notes/pose-format-confirmed.md` |
 | "Body motion is root/actor motion plus procedural limb orientation" | The **per-slot rotation block itself animates**. A same-slot walking series sweeps a Z-axis rotation while standing still stays identity. | Four-sample series in `pose-format-confirmed.md` |
-| The constructor inputs are radians consumed directly | **UNPROVEN.** The three sampled floats reach an absolute maximum of 5951, have no Q12 quantization, and read like a position or look-target. | `SEMANTIC-NOTE` in the runtime probe |
+| The constructor inputs are radians consumed directly | **Corrected twice.** They are not radians, but they **are angles**: `4096` units per turn, composed `Rz(c)·Ry(b)·Rx(a)`. The "position or look-target" reading is also superseded. | `docs/notes/rotation-model.md` (336/336 rows) |
 
 Everything below that describes carrier elimination still stands unchanged.
 
@@ -45,8 +46,8 @@ Everything below that describes carrier elimination still stands unchanged.
 > keyframe clip to decode. Body motion exists and is **procedural**: per active
 > slot, per frame, the two named orientation constructors compute a rotation from
 > three scalar inputs into a **confirmed 13-float slot**. The slot's rotation
-> block animates on a walking actor. The remaining UNKNOWN is the semantics of the
-> constructor's three input floats.
+> block animates on a walking actor. The remaining UNKNOWN is the **source** of
+> the constructor's three angle values, not their arithmetic.
 >
 > Decoding further frames cannot produce walking legs, because the authored
 > per-bone data does not exist. Reproducing the motion is a runtime/procedural
@@ -160,6 +161,26 @@ three scalar inputs. They compute rather than copy. They are called from the
 per-object pose builders, per active slot, per frame, into the object's own
 per-frame pose array. See `docs/notes/pose-writer-identity.md`.
 
+### The rotation construction is solved
+
+An atomic capture paired each call's three input floats with the 3x3 block that
+same call returned, then fitted a closed family of 192 rotation models. The fit
+is `UNIQUE` on **336/336** usable rows:
+
+```text
+M = Rz(c · K) · Ry(b · K) · Rx(a · K)      K = 2π / 4096
+```
+
+The three floats are **angles**, `4096` units per turn, composed **X first,
+then Y, then Z** in row-major form. The earlier negative-sign reading was an
+extraction artifact and is marked superseded; the correct pairing gives a
+positive sign. Evidence, the equivalence class and the correction are in
+`docs/notes/rotation-model.md`.
+
+The producer chain is therefore complete **up to the angle source**: the call,
+the unit, the order and the output slot are known. How the three angles are
+derived (aim/face mode, object transform, world target) is still partly open.
+
 ### The authored data is tiny and aim-only
 
 The static animation data chain was parsed end to end:
@@ -206,23 +227,24 @@ consistent.
 
 - The observable "body motion" is **procedural per-slot rotation** plus root and
   actor motion, not a skin clip.
-- The producer of that rotation is named: the two orientation constructors.
-- A faithful body replay needs the **constructor inputs and the composition
-  order**, not more frame decoding. The authored data stops at a few aim
-  corrections.
+- The producer of that rotation is named: the two orientation constructors, and
+  their angle-to-matrix construction is solved (`docs/notes/rotation-model.md`).
+- A faithful body replay needs the **source of the three angles**, not more frame
+  decoding. The authored data stops at a few aim corrections.
 - Do **not** start another keyframe hunt in `.SRA`, `.SRM`, `.PCM` or `.SRL`.
   Those are closed with the counts above.
 
 ## What remains UNKNOWN (explicit)
 
-1. **The constructor's three input floats.** The output slot is confirmed, but
-   the three inputs have `abs_max = 5951`, `min_step = 0.0224`, `shape =
-   neither`, `quant_frac = 0`. They are not radians and not Q12; they behave like
-   a position or look-target. `radians-direct` is **UNPROVEN**
-   (`docs/notes/pose-format-confirmed.md`).
-2. **How the three inputs are derived.** The caller-side conversion between the
-   object aim triple, the descriptor triple and the sampled channel frames and
-   the constructor inputs is not fully decoded.
+1. **The source of the constructor's three angles.** The arithmetic is solved:
+   the three floats are angles in `4096`-units-per-turn form, composed
+   `Rz(c)·Ry(b)·Rx(a)` (`docs/notes/rotation-model.md`). What produced those
+   three angles is only partly established.
+2. **How the three angles are derived.** The caller-side conversion between the
+   object aim triple, the descriptor triple, the sampled channel frames and the
+   constructor angles is not fully decoded. The earlier probe measurements
+   (`abs_max = 5951`, `min_step = 0.0224`, `quant_frac = 0`) remain valid; the
+   "position/look-target" reading is superseded.
 3. **The mode bits.** The four named descriptor words `+4`, `+8`, `+12`, `+16`
    could not be partitioned into an authored mode bit; `+4` is always zero and the
    others are broad per-bone fields. The mode that selects procedural aim/face
@@ -242,16 +264,19 @@ The body-animation question is answered at two levels. The **file side** is
 closed: no authored clip exists, the carriers are eliminated with counts, and the
 skeleton, hierarchy and skinning are real and verified. The **runtime side** is
 characterised: the slot format is confirmed (13 floats), the producer is named
-(orientation constructors), and the rotation block demonstrably animates. What is
-left is **procedural**: the constructor's input semantics and the composition
-order. That is a runtime/math problem, not a file-format hunt.
+(orientation constructors), the rotation construction is solved
+(`docs/notes/rotation-model.md`), and the rotation block demonstrably animates.
+What is left is **procedural**: the source of the three angles. That is a
+runtime/math problem, not a file-format hunt.
 
 Do not re-open `.SRA`, `.SRM`, `.PCM` or `.SRL` looking for a walking clip.
 
 ## Related notes
 
-- `docs/notes/pose-format-confirmed.md` - the 13-float layout, the walking series
-  and the constructor-input UNKNOWN.
+- `docs/notes/rotation-model.md` - the solved angle-to-matrix construction, its
+  336/336 evidence and the corrected sign.
+- `docs/notes/pose-format-confirmed.md` - the 13-float layout and the walking
+  series.
 - `docs/notes/pose-writer-identity.md` - the two orientation constructors and
   their callers.
 - `docs/changes/runtime-capture/angle-input-plan.md` - the probe design.
