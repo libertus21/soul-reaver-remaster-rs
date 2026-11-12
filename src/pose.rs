@@ -283,13 +283,18 @@ fn mat3_mul(a: Mat3, b: Mat3) -> Mat3 {
 /// One full turn in the runtime's binary angle unit: `4096` units `== 360`
 /// degrees. This is a turn-based unit, not radians and not a `1.0 == 4096`
 /// fraction.
-#[allow(dead_code)]
 pub const BINARY_ANGLE_UNITS_PER_TURN: f32 = 4096.0;
 
 /// Convert one binary angle (`4096` units per turn) to radians.
-#[allow(dead_code)]
 pub fn binary_angle_to_radians(value: f32) -> f32 {
     value * (std::f32::consts::TAU / BINARY_ANGLE_UNITS_PER_TURN)
+}
+
+/// Convert radians to the runtime's binary angle unit: the inverse of
+/// [`binary_angle_to_radians`]. Sign and multiple turns are preserved, so a
+/// caller can round-trip an angle without normalising it into `0..4096`.
+pub fn binary_angle_from_radians(radians: f32) -> f32 {
+    radians * (BINARY_ANGLE_UNITS_PER_TURN / std::f32::consts::TAU)
 }
 
 /// Build the rotation the runtime orientation constructors produce for one
@@ -299,10 +304,8 @@ pub fn binary_angle_to_radians(value: f32) -> f32 {
 /// unique on the captured corpus; the formula and its evidence are in
 /// `docs/notes/rotation-model.md`.
 ///
-/// This helper is additive. `slot_pose_matrix` keeps copying the stored 3x3
-/// exactly as the loader supplies it, so no existing CLI behaviour changes and
-/// nothing consumes this function yet.
-#[allow(dead_code)]
+/// The engine uses this to **produce** the player's root yaw instead of copying
+/// a stored matrix: see [`yaw_rotation_from_direction`] and [`pose_from_yaw`].
 pub fn rotation_from_binary_angles(a: f32, b: f32, c: f32) -> Mat3 {
     let (sa, ca) = binary_angle_to_radians(a).sin_cos();
     let (sb, cb) = binary_angle_to_radians(b).sin_cos();
@@ -311,6 +314,59 @@ pub fn rotation_from_binary_angles(a: f32, b: f32, c: f32) -> Mat3 {
     let ry = [[cb, 0.0, sb], [0.0, 1.0, 0.0], [-sb, 0.0, cb]];
     let rz = [[cc, -sc, 0.0], [sc, cc, 0.0], [0.0, 0.0, 1.0]];
     mat3_mul(mat3_mul(rz, ry), rx)
+}
+
+/// The binary yaw (`4096` units per turn) that faces a world XY direction.
+///
+/// The world is **Z-up** (`docs/notes/up-axis.md`), so the horizontal plane is
+/// world `X`/`Y` and the model's `Rz` factor is its yaw. The convention is: the
+/// model's local forward is `+X`, and the produced rotation maps it onto
+/// `(dx, dy)`. Therefore `theta = atan2(dy, dx)`, measured counter-clockwise
+/// from world `+X`.
+///
+/// A zero-length or non-finite direction returns `None`, so callers keep their
+/// previous facing instead of inventing one. This is the movement-delta source
+/// the engine consumes: the delta is integer, so the result is deterministic.
+pub fn binary_yaw_from_direction(dx: f32, dy: f32) -> Option<f32> {
+    let length_squared = dx * dx + dy * dy;
+    if !length_squared.is_finite() || length_squared <= EPS * EPS {
+        return None;
+    }
+    Some(binary_angle_from_radians(dy.atan2(dx)))
+}
+
+/// Build `Rz(yaw)` for a world XY direction through
+/// [`rotation_from_binary_angles`], so the produced rotation uses exactly the
+/// runtime's binary-angle formula (`docs/notes/rotation-model.md`).
+///
+/// The axis convention matches [`binary_yaw_from_direction`]: world is Z-up,
+/// `Rz` is the yaw, and local `+X` rotates onto `(dx, dy)`. `None` is a
+/// zero-length or non-finite direction.
+pub fn yaw_rotation_from_direction(dx: f32, dy: f32) -> Option<Mat3> {
+    let yaw = binary_yaw_from_direction(dx, dy)?;
+    Some(rotation_from_binary_angles(0.0, 0.0, yaw))
+}
+
+/// Build `rest_slots` slot poses for one root yaw: slot `0` carries
+/// `Rz(yaw_binary)` and `translation`; every other slot is the identity.
+///
+/// This is the pose-side input to [`skin_positions_hierarchical`]. The root pose
+/// is produced from binary angles, not copied from a stored file. Fewer slots
+/// than the model's bone count leave the remaining bones at rest, exactly like a
+/// short pose file.
+pub fn pose_from_yaw(rest_slots: usize, yaw_binary: f32, translation: [f32; 3]) -> Vec<SlotPose> {
+    let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+    let mut poses = vec![identity; rest_slots];
+    if let Some(root) = poses.first_mut() {
+        let rotation = rotation_from_binary_angles(0.0, 0.0, yaw_binary);
+        *root = [
+            rotation[0][0], rotation[0][1], rotation[0][2],
+            rotation[1][0], rotation[1][1], rotation[1][2],
+            rotation[2][0], rotation[2][1], rotation[2][2],
+            0.0, translation[0], translation[1], translation[2],
+        ];
+    }
+    poses
 }
 
 impl PoseMatrix {
@@ -325,7 +381,6 @@ impl PoseMatrix {
     }
 
     /// The affine this pose contributes, row-major `[R | t]`.
-    #[allow(dead_code)]
     pub fn transform(&self) -> Transform {
         let s = self.scale;
         let r = self.rotation;
@@ -583,7 +638,6 @@ fn quantize(position: [f32; 3]) -> [i16; 3] {
 /// same bone count as the model; a mismatch is a loud error, not a silent
 /// partial pose. Missing poses stay identity (`compose_with_locals`), and this
 /// path never panics.
-#[allow(dead_code)]
 pub fn skin_positions_hierarchical(
     model: &ObjectModel,
     hierarchy: &BoneHierarchy,
@@ -1117,5 +1171,98 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn binary_angle_from_radians_round_trips_over_several_turns_including_negative() {
+        let turns = [-3.5f32, -2.0, -1.0, -0.25, 0.0, 0.25, 1.0, 2.0, 3.0];
+        for turn in turns {
+            let radians = turn * std::f32::consts::TAU;
+            let binary = binary_angle_from_radians(radians);
+            let recovered = binary_angle_to_radians(binary);
+            assert!(
+                (recovered - radians).abs() < 1e-4,
+                "turn {turn}: {recovered} != {radians}"
+            );
+        }
+        assert!((binary_angle_from_radians(std::f32::consts::FRAC_PI_2) - 1024.0).abs() < 1e-3);
+        assert!((binary_angle_from_radians(-std::f32::consts::FRAC_PI_2) + 1024.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn yaw_direction_refuses_a_zero_length_or_non_finite_direction() {
+        assert_eq!(binary_yaw_from_direction(0.0, 0.0), None);
+        assert_eq!(yaw_rotation_from_direction(0.0, 0.0), None);
+        assert_eq!(yaw_rotation_from_direction(f32::NAN, 1.0), None);
+        assert_eq!(yaw_rotation_from_direction(1.0, f32::INFINITY), None);
+    }
+
+    #[test]
+    fn yaw_direction_quarter_turns_swap_the_expected_axes() {
+        matrix_close(
+            yaw_rotation_from_direction(1.0, 0.0).expect("+X is a direction"),
+            IDENTITY,
+            1e-6,
+        );
+        matrix_close(
+            yaw_rotation_from_direction(0.0, 1.0).expect("+Y is a direction"),
+            R_Z90,
+            1e-6,
+        );
+        matrix_close(
+            yaw_rotation_from_direction(-1.0, 0.0).expect("-X is a direction"),
+            [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
+            1e-6,
+        );
+        matrix_close(
+            yaw_rotation_from_direction(0.0, -1.0).expect("-Y is a direction"),
+            [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            1e-6,
+        );
+    }
+
+    #[test]
+    fn yaw_direction_agrees_with_the_angle_helper_for_eight_compass_directions() {
+        let d = std::f32::consts::FRAC_1_SQRT_2;
+        let directions = [
+            [1.0f32, 0.0],
+            [d, d],
+            [0.0, 1.0],
+            [-d, d],
+            [-1.0, 0.0],
+            [-d, -d],
+            [0.0, -1.0],
+            [d, -d],
+        ];
+        for [dx, dy] in directions {
+            let produced = yaw_rotation_from_direction(dx, dy).expect("compass direction");
+            let expected =
+                rotation_from_binary_angles(0.0, 0.0, binary_angle_from_radians(dy.atan2(dx)));
+            matrix_close(produced, expected, 1e-6);
+            // Local +X must land on the requested direction.
+            close(
+                [produced[0][0], produced[1][0], produced[2][0]],
+                [dx, dy, 0.0],
+            );
+        }
+    }
+
+    #[test]
+    fn pose_from_yaw_builds_the_documented_slots_and_perturbs_only_the_root() {
+        let translation = [3.0, -4.0, 5.0];
+        let poses = pose_from_yaw(4, 2048.0, translation);
+        assert_eq!(poses.len(), 4, "one slot per requested bone");
+        let root = slot_pose_matrix(&poses[0]).expect("finite root pose");
+        matrix_close(
+            root.rotation,
+            [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]],
+            1e-6,
+        );
+        assert_eq!(root.translation, translation);
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
+        for slot in &poses[1..] {
+            assert_eq!(*slot, identity, "only slot 0 may carry the yaw");
+        }
+        assert!(pose_from_yaw(0, 1024.0, [0.0; 3]).is_empty());
     }
 }

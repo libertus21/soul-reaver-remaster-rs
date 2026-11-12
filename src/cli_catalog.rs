@@ -27,6 +27,8 @@ impl Capability {
             );
         }
         matches!(token, "--map" | "--pose" | "--tex-dir" | "--out")
+            || (self.name == "facing"
+                && matches!(token, "--bigfile" | "--entry" | "--direction"))
             || (self.name == "play"
                 && matches!(token, "--bigfile" | "--unit" | "--ticks" | "--camera"))
             || ((self.name.ends_with("-entry")
@@ -43,7 +45,7 @@ impl Capability {
 pub const GROUPS: [&str; 6] = ["texture", "archive", "mesh", "audio", "level", "game"];
 
 /// Every existing mode, exactly once. This is the single source for help.
-pub const CAPABILITIES: [Capability; 35] = [
+pub const CAPABILITIES: [Capability; 36] = [
     Capability { group: "texture", name: "list", legacy: "--textures <BIG> --tlist [--map <MAP>]", summary: "List the remaster .BIG header and slot classes.", window: false },
     Capability { group: "texture", name: "show", legacy: "--textures <BIG> --tshow <SEL> [--map <MAP>]", summary: "Show one slot as its raw 256x256 image.", window: true },
     Capability { group: "texture", name: "file", legacy: "<FILE.DDS>", summary: "Show one .DDS texture file.", window: true },
@@ -79,6 +81,7 @@ pub const CAPABILITIES: [Capability; 35] = [
     Capability { group: "level", name: "links-group", legacy: "--level-links --bigfile <DAT> --group <PREFIX>", summary: "Print every archive level family member's link table.", window: false },
     Capability { group: "level", name: "reach", legacy: "--level-reach --bigfile <DAT> [--start <UNIT>]", summary: "BFS the archived level graph, then group reachable, island and inbound-but-unreachable units.", window: false },
         Capability { group: "game", name: "play", legacy: "--play --bigfile <DAT> [--textures <BIG>] [--unit <NAME>] [--ticks <N>] [--camera <MODE>]", summary: "Run the engine on an archive: a deterministic headless acceptance line with --headless, or a textured window.", window: true },
+    Capability { group: "game", name: "facing", legacy: "--facing --bigfile <DAT> --entry <INDEX> --direction <DX>:<DY>", summary: "Print the yaw produced for a movement direction and the first skinned vertices.", window: false },
 ];
 
 /// The capability table.
@@ -126,7 +129,7 @@ pub fn render_help(group: Option<&str>) -> String {
 mod tests {
     use super::{catalog, is_known_group, render_help, GROUPS};
 
-    const EXPECTED: [(&str, &str); 35] = [
+    const EXPECTED: [(&str, &str); 36] = [
         ("texture", "list"),
         ("texture", "show"),
         ("texture", "file"),
@@ -162,6 +165,7 @@ mod tests {
         ("level", "links-group"),
         ("level", "reach"),
         ("game", "play"),
+        ("game", "facing"),
     ];
 
     #[test]
@@ -219,10 +223,11 @@ mod tests {
     }
 
     #[test]
-    fn game_group_lists_only_play() {
+    fn game_group_lists_its_commands() {
         let text = render_help(Some("game"));
         assert!(text.contains("[game]"));
         assert!(text.contains("game play -> --play"));
+        assert!(text.contains("game facing -> --facing"));
         for cap in catalog().iter().filter(|cap| cap.group != "game") {
             assert!(!text.contains(&format!("{} {} ->", cap.group, cap.name)));
         }

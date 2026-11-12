@@ -16,7 +16,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::engine::class::RenderClass;
-use crate::engine::live::LiveArena;
+use crate::engine::live::{LiveArena, LiveId};
 use crate::level::{self, LevelError};
 use crate::object::{self, ModelResolver, ObjectError};
 use crate::object_texture::{self, PageBank};
@@ -248,6 +248,15 @@ impl fmt::Display for SceneError {
 
 impl std::error::Error for SceneError {}
 
+/// The per-frame root facing the scene builder applies to the player mesh.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlayerFacing {
+    /// The live player whose mesh is re-skinned this frame.
+    pub player: LiveId,
+    /// The binary yaw (`4096` units per turn) the frame produced.
+    pub yaw_binary: f32,
+}
+
 /// Static scene assets plus the memoized object-model cache.
 ///
 /// The cache is memoization only: it never changes the scene produced by the
@@ -324,6 +333,25 @@ impl SceneAssets {
 
     /// Build the deterministic scene for `live`.
     pub fn build(&mut self, live: &LiveArena, camera: CameraView) -> RenderScene {
+        self.build_with_facing(live, camera, None)
+    }
+
+    /// [`SceneAssets::build`] plus the player's produced root facing.
+    ///
+    /// Only the live object named by [`PlayerFacing::player`] is re-skinned with
+    /// a root yaw (through the same [`crate::pose::skin_positions_hierarchical`]
+    /// path the hierarchy viewer uses). Every other object keeps the authored
+    /// rest mesh: the level's placed-object record carries **no rotation**
+    /// field, so applying one would invent data the level does not hold.
+    ///
+    /// Passing `None`, an unresolved model or a non-player id is the rest mesh,
+    /// so the same state always builds the same scene.
+    pub fn build_with_facing(
+        &mut self,
+        live: &LiveArena,
+        camera: CameraView,
+        facing: Option<PlayerFacing>,
+    ) -> RenderScene {
         let mut material_pages: Vec<Option<u16>> = vec![None];
         let mut page_indices: BTreeMap<u16, u16> = BTreeMap::new();
         let mut meshes = vec![remap_mesh(
@@ -339,16 +367,20 @@ impl SceneAssets {
         }];
 
         let mut handles: BTreeMap<String, MeshHandle> = BTreeMap::new();
-        for (_, object) in live.iter() {
+        for (id, object) in live.iter() {
             let handle = match handles.get(&object.name) {
                 Some(handle) => *handle,
                 None => {
-                    let data = match self.object_mesh(&object.name) {
+                    let posed = facing
+                        .filter(|facing| facing.player == id)
+                        .and_then(|facing| self.posed_mesh(&object.name, facing.yaw_binary))
+                        .map(|mesh| remap_mesh(&mesh, &mut material_pages, &mut page_indices));
+                    let data = posed.unwrap_or_else(|| match self.object_mesh(&object.name) {
                         Some(mesh) => {
                             remap_mesh(&mesh, &mut material_pages, &mut page_indices)
                         }
                         None => MeshData::default(),
-                    };
+                    });
                     let handle = MeshHandle(meshes.len() as u32);
                     meshes.push(data);
                     handles.insert(object.name.clone(), handle);
@@ -370,6 +402,14 @@ impl SceneAssets {
             meshes,
             material_pages,
         }
+    }
+
+    fn posed_mesh(&mut self, name: &str, yaw_binary: f32) -> Option<SourceMesh> {
+        let mesh = self
+            .resolver
+            .as_mut()
+            .and_then(|resolver| resolver.posed_textured(name, yaw_binary))?;
+        Some(SourceMesh::from_textured(mesh))
     }
 
     fn object_mesh(&mut self, name: &str) -> Option<SourceMesh> {
@@ -445,7 +485,7 @@ fn remap_mesh(
 
 #[cfg(test)]
 mod tests {
-    use super::{CameraView, MeshHandle, RenderScene, SceneAssets, SourceMesh};
+    use super::{CameraView, MeshHandle, PlayerFacing, RenderScene, SceneAssets, SourceMesh};
     use crate::engine::class::{RenderClass, classify};
     use crate::engine::live::{LiveArena, LiveObject};
 
@@ -598,6 +638,30 @@ mod tests {
                 .collect(),
             scene.material_pages.clone(),
         )
+    }
+
+    #[test]
+    fn a_facing_without_a_resolved_model_falls_back_to_the_rest_mesh() {
+        let live = arena();
+        let player = live
+            .iter()
+            .find(|(_, object)| object.name == "raziel__player")
+            .map(|(id, _)| id)
+            .expect("the fixture places the player");
+        let mut assets = assets();
+        let rest = assets.build(&live, CameraView::identity());
+        let faced = assets.build_with_facing(
+            &live,
+            CameraView::identity(),
+            Some(PlayerFacing {
+                player,
+                yaw_binary: 1024.0,
+            }),
+        );
+        assert_eq!(
+            faced, rest,
+            "the test assets carry no model resolver, so the player keeps the rest mesh"
+        );
     }
 
     #[test]

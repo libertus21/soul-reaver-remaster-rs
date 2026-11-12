@@ -148,6 +148,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--play") {
         return run_play(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--facing") {
+        return run_facing(&args[1..]);
+    }
     if let Some(message) = pose_mode_conflict(args) {
         eprintln!("{message}");
         return ExitCode::from(1);
@@ -246,6 +249,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --textures <TEXTURES.BIG>");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --pose <FILE> [--hierarchy] [--bounds]");
+        eprintln!("   or: soul-reaver-remaster-rs --facing --bigfile <BIGFILE.DAT> --entry <INDEX> --direction <DX>:<DY>");
         eprintln!("   or: soul-reaver-remaster-rs --srl-info <FILE.SRL>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
@@ -308,6 +312,136 @@ fn run_play(args: &[String]) -> ExitCode {
             ExitCode::from(error.exit_code())
         }
     }
+}
+
+/// `--facing --bigfile <DAT> --entry <INDEX> --direction <DX>:<DY>`: produce the
+/// root yaw the engine derives from a movement direction, skin the container
+/// with it and print the yaw plus the first three posed vertices.
+///
+/// This is the headless witness for the world-driven pose path. It consumes the
+/// same [`pose::pose_from_yaw`] + [`pose::skin_positions_hierarchical`] pair the
+/// render scene uses, so the produced rotation is checkable without a window.
+fn run_facing(args: &[String]) -> ExitCode {
+    let (dat, index, direction) = match facing_input(args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let (dx, dy) = match parse_direction(direction) {
+        Ok(direction) => direction,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let bytes = match object::read_entry_bytes(Path::new(dat), index) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let model = match object::parse_object(&bytes) {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    match facing_report(&model, dx, dy) {
+        Ok(line) => {
+            outln!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn facing_input(args: &[String]) -> Result<(&str, usize, &str), String> {
+    let usage = "expected --facing --bigfile <DAT> --entry <INDEX> --direction <DX>:<DY>";
+    let (mut dat, mut index, mut direction) = (None, None, None);
+    let mut at = 0;
+    while at + 1 < args.len() {
+        match args[at].as_str() {
+            "--bigfile" => dat = Some(args[at + 1].as_str()),
+            "--entry" => {
+                index = Some(args[at + 1].parse::<usize>().map_err(|_| usage.to_string())?)
+            }
+            "--direction" => direction = Some(args[at + 1].as_str()),
+            _ => return Err(usage.to_string()),
+        }
+        at += 2;
+    }
+    if at != args.len() {
+        return Err(usage.to_string());
+    }
+    match (dat, index, direction) {
+        (Some(dat), Some(index), Some(direction)) => Ok((dat, index, direction)),
+        _ => Err(usage.to_string()),
+    }
+}
+
+fn parse_direction(text: &str) -> Result<(f32, f32), String> {
+    let mut parts = text.split(':');
+    let (Some(dx), Some(dy), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(format!("direction must be <DX>:<DY>, got {text:?}"));
+    };
+    let dx: f32 = dx
+        .parse()
+        .map_err(|_| format!("direction X must be a number, got {dx:?}"))?;
+    let dy: f32 = dy
+        .parse()
+        .map_err(|_| format!("direction Y must be a number, got {dy:?}"))?;
+    if !dx.is_finite() || !dy.is_finite() {
+        return Err(format!("direction must be finite, got {text:?}"));
+    }
+    Ok((dx, dy))
+}
+
+/// The pure core of `--facing`: direction -> binary yaw -> root pose -> skinned
+/// positions. No window, no clock, no game state: the same input always produces
+/// the same line.
+fn facing_report(model: &object::ObjectModel, dx: f32, dy: f32) -> Result<String, String> {
+    let yaw_binary = pose::binary_yaw_from_direction(dx, dy)
+        .ok_or_else(|| "direction must have a non-zero horizontal length".to_string())?;
+    let parents: Vec<i16> = model
+        .bones
+        .iter()
+        .map(|bone| if bone.parent == u16::MAX { -1 } else { bone.parent as i16 })
+        .collect();
+    let hierarchy = bone_hierarchy::BoneHierarchy::from_parents(parents);
+    let poses = pose::pose_from_yaw(model.bones.len(), yaw_binary, [0.0; 3]);
+    let positions = pose::skin_positions_hierarchical(model, &hierarchy, &poses)?;
+    let rest = object::rest_positions(model);
+    let moved = positions
+        .iter()
+        .zip(&rest)
+        .filter(|(posed, rest)| posed != rest)
+        .count();
+    let first: Vec<String> = positions
+        .iter()
+        .take(3)
+        .map(|position| {
+            format!(
+                "{:.3},{:.3},{:.3}",
+                position[0], position[1], position[2]
+            )
+        })
+        .collect();
+    Ok(format!(
+        "facing model={} bones={} yaw_binary={:.3} yaw_deg={:.3} moved={} first={}",
+        model.name,
+        model.bones.len(),
+        yaw_binary,
+        yaw_binary * 360.0 / pose::BINARY_ANGLE_UNITS_PER_TURN,
+        moved,
+        first.join(";")
+    ))
 }
 
 /// Render one decoded texture through the EXISTING window (CPU BC7 or
@@ -2184,11 +2318,11 @@ fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
 mod cli_tests {
     use super::run_level_info;
     use super::{
-        bone_hierarchy_input, list_report, object_input, pose_mode_conflict, resolve_texture_name,
-        run_actor_census, run_audio, run_bigfile,
-        dispatch, run_level_links, run_level_records, run_level_structure, run_mesh, run_mesh_all,
-        run_level_geometry, run_level_objects, run_level_render, run_mesh_textured, run_mesh_with,
-        run_object_info, run_object_mesh, run_object_mesh_with, run_textures,
+        bone_hierarchy_input, facing_input, facing_report, list_report, object_input,
+        parse_direction, pose_mode_conflict, resolve_texture_name, run_actor_census, run_audio,
+        run_bigfile, dispatch, run_level_links, run_level_records, run_level_structure, run_mesh,
+        run_mesh_all, run_level_geometry, run_level_objects, run_level_render, run_mesh_textured,
+        run_mesh_with, run_object_info, run_object_mesh, run_object_mesh_with, run_textures,
         strip_launcher_noops, tshow_suffix,
     };
     use std::process::ExitCode;
@@ -3020,6 +3154,50 @@ mod cli_tests {
             object_input(&argv(&["--bigfile", "A.DAT", "--entry", "3"]), "u"),
             Ok(("A.DAT", 3, None, false, false))
         );
+    }
+
+    #[test]
+    fn facing_reports_the_produced_yaw_and_the_first_skinned_vertices() {
+        let model = crate::object::parse_object(&crate::object::synthetic_bone_model())
+            .expect("the synthetic bone model must parse");
+
+        let forward = facing_report(&model, 0.0, 1.0).expect("+Y is a direction");
+        assert!(forward.contains("yaw_binary=1024.000"), "{forward}");
+        assert!(forward.contains("yaw_deg=90.000"), "{forward}");
+        assert!(
+            forward.contains("moved=2"),
+            "the two upper vertices rotate; the one on the Z axis is yaw-invariant: {forward}"
+        );
+        assert!(forward.contains("first="), "{forward}");
+
+        let identity = facing_report(&model, 1.0, 0.0).expect("+X is a direction");
+        assert!(identity.contains("yaw_binary=0.000"), "{identity}");
+        assert!(identity.contains("moved=0"), "zero yaw is the rest pose: {identity}");
+
+        assert!(
+            facing_report(&model, 0.0, 0.0).is_err(),
+            "a zero-length direction must be loud, not an invented facing"
+        );
+    }
+
+    #[test]
+    fn facing_input_and_direction_are_validated_before_any_file_read() {
+        let argv = |items: &[&str]| items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            facing_input(&argv(&[
+                "--bigfile", "A.DAT", "--entry", "3", "--direction", "0:1"
+            ])),
+            Ok(("A.DAT", 3, "0:1"))
+        );
+        assert!(facing_input(&argv(&["--bigfile", "A.DAT", "--entry", "3"])).is_err());
+        assert!(facing_input(&argv(&[
+            "--bigfile", "A.DAT", "--entry", "x", "--direction", "0:1"
+        ]))
+        .is_err());
+        assert_eq!(parse_direction("0:1"), Ok((0.0, 1.0)));
+        assert!(parse_direction("0").is_err());
+        assert!(parse_direction("0:1:2").is_err());
+        assert!(parse_direction("nan:1").is_err());
     }
 
     #[test]

@@ -44,8 +44,34 @@ Rx(t) = [[1, 0, 0], [0, cos t, -sin t], [0, sin t, cos t]]
   `docs/notes/pose-format-confirmed.md`.
 - **Code:** `pose::BINARY_ANGLE_UNITS_PER_TURN`,
   `pose::binary_angle_to_radians` and `pose::rotation_from_binary_angles` in
-  `src/pose.rs` implement exactly this. The helpers are additive: the CLI still
-  copies the stored 3x3, so no existing behaviour changes.
+  `src/pose.rs` implement exactly this. Pose files still copy their stored 3x3
+  through `slot_pose_matrix`; the engine additionally **produces** a root
+  rotation from a movement direction (see "Now consumed by" below).
+
+## Now consumed by
+
+The formula is no longer test-only. The engine produces a pose instead of only
+copying a stored matrix:
+
+| Step | Producer | What it does |
+|---|---|---|
+| 1 | `engine::frame` stage 9 | Takes the **committed** horizontal movement delta (after the collision sweep), so a blocked player keeps its facing and a slide faces along the wall. Zero delta keeps the previous yaw. |
+| 2 | `pose::yaw_rotation_from_direction` | Turns `(dx, dy)` into `Rz(atan2(dy, dx))` through `rotation_from_binary_angles(0, 0, yaw)`. Convention: world is Z-up, `Rz` is the yaw, local `+X` rotates onto the direction. |
+| 3 | `pose::pose_from_yaw` | Builds one slot pose per bone: slot 0 carries the produced yaw, every other slot is identity. |
+| 4 | `pose::skin_positions_hierarchical` | Composes the bone tree and skins the vertices, the same path `--object-mesh --hierarchy` uses. `object::ModelResolver::posed_textured` expands the result to the per-face rendered mesh. |
+
+`engine::scene` applies step 4 only to the live player object. Level-placed
+objects stay at identity: their authored record carries no rotation field, so
+giving them one would invent data the level does not hold.
+
+`--facing --bigfile <DAT> --entry <INDEX> --direction <DX>:<DY>` is the headless
+witness: it prints the produced binary yaw, the yaw in degrees, how many
+vertices moved and the first three posed vertices. It is deterministic (integer
+direction in, fixed formatting out) and opens no window.
+
+Facing is presentation state: it is not part of the canonical determinism fold,
+and the world-state, frame-state and headless digests are unchanged by this
+integration.
 
 ## Evidence: 336 of 336 rows
 
