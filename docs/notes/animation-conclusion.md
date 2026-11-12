@@ -1,29 +1,56 @@
-# animation-conclusion - the remaster does not author skeletal body animation (2026-11-10)
+# animation-conclusion - body motion is procedural, and no authored clip exists (updated 2026-11-12)
 
 This is the definitive answer to the body-animation question, written so a future
-reader does not repeat the search. The remaster **does not author skeletal body
-animation**: there is no per-bone keyframe clip to decode. Bodies are oriented
-procedurally, and the only authored pose data is a handful of aim corrections.
+reader does not repeat the search. Two findings now sit together:
+
+1. The remaster **does not author a per-bone keyframe clip** to decode. That
+   negative stands on explicit carrier counts.
+2. The body **does** move, and the motion is **computed at runtime**. A probe has
+   now measured the per-slot rotation block changing while an actor walks, and
+   the slot format is confirmed at **13 floats**.
+
+The producer is named: the two sibling **orientation constructors** that write
+each slot's rotation block. What is still unknown is the three input floats those
+constructors consume. This note records the correction instead of deleting the
+older claims silently.
+
 Every number below is either reproduced by a shipped command (and listed with it)
 or cited from the evidence note that established it. Nothing was written to the
 game install; no game bytes, decompiled listings, file-position offsets or
 absolute install paths appear here.
 
-Evidence classes per claim: **CONFIRMED** (observed bytes or a shipped-command
-witness), **PARTLY** (structure observed, one side open), **UNKNOWN** (not
-established).
+Evidence classes: **CONFIRMED** (observed bytes, a shipped-command witness, or a
+runtime measurement), **PARTLY** (structure observed, one side open), **UNKNOWN**
+(not established).
+
+## Superseded claims (2026-11-12)
+
+The earlier version of this note said the orientation story was the whole story.
+Parts of that are now corrected by runtime evidence. The superseded statements
+are kept here so the history is visible.
+
+| Superseded claim (before 2026-11-12) | Corrected statement | Evidence |
+|---|---|---|
+| "The remaster does not author skeletal body animation" was read as "there is no body motion to explain" | **No authored clip exists, but body motion exists and is computed.** The distinction is data versus production. | Runtime dump: `VERDICT ANGLES_ANIMATE`, `changed_slots 3756` |
+| "Bodies are oriented procedurally" as a vague hand-wave | The producer is **named**: the two sibling **orientation constructors**, called per active slot per frame from the pose builders. | `docs/notes/pose-writer-identity.md` |
+| The pose slot format was a static inference | The runtime slot is **confirmed**: 13 `f32`, stride 52 bytes, row-major 3x3 at indices 0..8, scale field at 9, translation at 10..12. | `docs/notes/pose-format-confirmed.md` |
+| "Body motion is root/actor motion plus procedural limb orientation" | The **per-slot rotation block itself animates**. A same-slot walking series sweeps a Z-axis rotation while standing still stays identity. | Four-sample series in `pose-format-confirmed.md` |
+| The constructor inputs are radians consumed directly | **UNPROVEN.** The three sampled floats reach an absolute maximum of 5951, have no Q12 quantization, and read like a position or look-target. | `SEMANTIC-NOTE` in the runtime probe |
+
+Everything below that describes carrier elimination still stands unchanged.
 
 ## The conclusion
 
-> The remaster does not author skeletal body animation. Bodies are oriented
-> procedurally (mode bits + authored aim corrections + object transform + world
-> target). The authored aim data is 1-2 correction poses on 3 of 66 slots.
-> Decoding further frames cannot produce walking legs, because the data does not
-> exist.
-
-That sentence is the payoff of the whole investigation. The sections below show
-how it was reached, what was ruled out with counts, and what genuinely remains
-open.
+> The remaster does not author skeletal body animation: there is no per-bone
+> keyframe clip to decode. Body motion exists and is **procedural**: per active
+> slot, per frame, the two named orientation constructors compute a rotation from
+> three scalar inputs into a **confirmed 13-float slot**. The slot's rotation
+> block animates on a walking actor. The remaining UNKNOWN is the semantics of the
+> constructor's three input floats.
+>
+> Decoding further frames cannot produce walking legs, because the authored
+> per-bone data does not exist. Reproducing the motion is a runtime/procedural
+> problem, not a file-format hunt.
 
 ## Quick path (what to run to see the parts that are provable)
 
@@ -45,7 +72,9 @@ The chain that a body pose would need, end to end:
 3. an **authored animation clip** - per-bone keyframes over time - in some file
    family.
 
-Steps 1 and 2 were found and verified. Step 3 does not exist.
+Steps 1 and 2 are found and verified. Step 3 does not exist. The runtime now also
+confirms what step 2 looks like in memory (13 floats), which is the point the
+static pass could not settle.
 
 ## What was found
 
@@ -91,7 +120,7 @@ bone's vertex range. A 30-degree Z rotation on the root versus a leaf, with ever
 other bone at rest, gives a falsifiable witness:
 
 | Model | Bones | Rest bbox `min` / `max` | Root rotation | Leaf rotation |
-|---|---:|---|---|---|
+|---|---|---:|---|---|
 | `raziel` | 66 | `(-90,-86,3)` / `(90,284,509)` | moves **299/299** vertices | bone 9 moves **8** |
 | `skinner` | 35 | `(-98,-79,1)` / `(100,35,569)` | moves **173/173** vertices | bone 7 moves **4** |
 
@@ -99,9 +128,41 @@ A root rotation carries every descendant frame and moves the whole model; a leaf
 rotation moves only its own small range. This is the whole skeleton/skinning
 achievement, and it is verified, not inferred.
 
-### The authored animation data is tiny and aim-only
+### The runtime slot is 13 floats, and it animates
 
-The animation data chain was parsed end to end:
+The runtime probe hooked the two orientation constructors and dumped complete
+slots. The layout is confirmed:
+
+```text
+[0..8]   3x3 rotation, row-major
+[9]      scale field (observed 0.0 throughout)
+[10..12] translation, world units
+```
+
+with a measured **stride of 52 bytes** (exactly 13 `f32`), exact for **99.26%**
+of writes. On the same slot, while walking, the rotation's upper-left 2x2 block
+sweeps `(cos, sin; -sin, cos)` about the Z axis over four consecutive samples,
+and the translation traverses the level. Standing still gives the identity
+rotation and a constant translation. The engine's `PoseMatrix` already models
+this exact layout, so the runtime **confirms** the engine rather than correcting
+it. Full numbers: `docs/notes/pose-format-confirmed.md`.
+
+Because the observed scale field is `0.0` throughout, it cannot be a
+multiplicative scale; the engine's decision to keep it as an inspection marker
+and apply unit scale is validated.
+
+### The producer is named
+
+Both writers reached by the live write-watch are the **two sibling orientation
+constructors**: each writes one slot's nine-float rotation block as an identity
+followed by three in-place axis rotations, and each derives every value from
+three scalar inputs. They compute rather than copy. They are called from the
+per-object pose builders, per active slot, per frame, into the object's own
+per-frame pose array. See `docs/notes/pose-writer-identity.md`.
+
+### The authored data is tiny and aim-only
+
+The static animation data chain was parsed end to end:
 
 - The descriptor `+20` word is a `u16` offset into one shared aim region. An
   active slot's sub-slice is `[offset, offset + 24 + frame_count * 20)`: a 24-byte
@@ -114,7 +175,9 @@ The animation data chain was parsed end to end:
   **63 of 66 slots have none**. Two same-slot frames change every word, so they
   read as independent state samples, not a temporal clip.
 
-That is a set of small aim-correction poses, not a body animation.
+That is a set of small aim-correction poses, not a body animation. It stands:
+**the walking motion is not in these frames; it is computed by the procedural
+path.**
 
 ## What was eliminated (with the numbers, so nobody re-does it)
 
@@ -123,7 +186,7 @@ is a hard negative with its count:
 
 | Carrier | Scope | Result |
 |---|---|---|
-| `.SRA` | 227 files | **0** orthonormal `f32` 3x3 or 3x4 windows in **3,744,114** / **3,717,786** positions. The 52-byte slot-pose layout is falsified; slot counts are model bone counts, not `.SRA` fields. |
+| `.SRA` | 227 files | **0** orthonormal `f32` 3x3 or 3x4 windows in **3,744,114** / **3,717,786** positions. The 52-byte slot-pose layout is falsified **as an authored-file layout**; slot counts are model bone counts, not `.SRA` fields. |
 | `.SRA` + `.SRM` (i16/Q12) | 227 + 349 files | **1** isolated Q12 3x3 hit in **30,478,374** windows and **0** runs; **0** Q12 3x4 hits; Q15 hits are below their matched baseline. The i16 element-type blind spot is closed (`i16-animation-scan.md`). |
 | `.PCM` object containers | 394 | **No** flat `bones x 32` descriptor array and no 4-float track table. The two smallest decidable models (`eggfx`, `hint`) are fully byte-accounted with no such block. |
 | `.SRM` | 349 files, 25.4 MB | **26,647,603** 3x3 windows with **0** below 0.05; **26,643,415** 3x4 windows with **147** below 0.05, all inside the known HD-matrix block; `run52 = 0` in **349/349** files. It is mesh + 128-slot pool + optional HD matrices only. |
@@ -134,50 +197,64 @@ The static loader trace independently agrees: the animation record's data is a
 procedural-orientation problem, not a hidden keyframe clip
 (`docs/notes/animation-loader-trace.md`).
 
+Note the one correction of wording: the 52-byte layout is now **confirmed as the
+runtime slot**, so the `.SRA` negative means it is not an authored *file* layout,
+not that the layout is wrong. The runtime measurement and the file negative are
+consistent.
+
 ## What the finding means
 
-- The observable "body motion" in play is **root/actor motion plus procedural
-  limb orientation**, not a skin clip.
-- A faithful body replay needs the **mode bits, the object transform and the
-  world target** - not more frame decoding. The authored data simply stops at a
-  few aim corrections.
+- The observable "body motion" is **procedural per-slot rotation** plus root and
+  actor motion, not a skin clip.
+- The producer of that rotation is named: the two orientation constructors.
+- A faithful body replay needs the **constructor inputs and the composition
+  order**, not more frame decoding. The authored data stops at a few aim
+  corrections.
 - Do **not** start another keyframe hunt in `.SRA`, `.SRM`, `.PCM` or `.SRL`.
   Those are closed with the counts above.
 
 ## What remains UNKNOWN (explicit)
 
-1. **The mode bits.** The four named descriptor words `+4`, `+8`, `+12`, `+16`
+1. **The constructor's three input floats.** The output slot is confirmed, but
+   the three inputs have `abs_max = 5951`, `min_step = 0.0224`, `shape =
+   neither`, `quant_frac = 0`. They are not radians and not Q12; they behave like
+   a position or look-target. `radians-direct` is **UNPROVEN**
+   (`docs/notes/pose-format-confirmed.md`).
+2. **How the three inputs are derived.** The caller-side conversion between the
+   object aim triple, the descriptor triple and the sampled channel frames and
+   the constructor inputs is not fully decoded.
+3. **The mode bits.** The four named descriptor words `+4`, `+8`, `+12`, `+16`
    could not be partitioned into an authored mode bit; `+4` is always zero and the
-   others are broad per-bone fields with no separating low-bit value. The mode
-   that selects procedural aim/face orientation is not located in the file form.
-2. **The aim-to-rotation composition.** The identity path is confirmed (static, or
-   a zero aim triplet, yields identity). The object transform is the best-supported
-   rotation base (**INFERRED**); the local aim term and the world-target term are
-   the **UNKNOWN** procedure, deliberately not invented.
-3. **The record length of the remaining 8 header bytes.** The 16-byte track header
-   has a confirmed `frame_count`, a `frame_offset` (always `aim_offset + 24`) and
-   an 8-byte tail whose role is **UNKNOWN**.
-4. **The one-bone `parent = 0` convention.** 194 one-bone props store a self-parent
-   `0` rather than `-1`; whether that is a distinct encoding or a defect is
-   **UNKNOWN**.
-5. **`matsrevr`'s second root.** The only multi-bone model with two `-1` roots; the
-   second root's meaning is **UNKNOWN** (it is reported, never repaired).
+   others are broad per-bone fields. The mode that selects procedural aim/face
+   orientation is not located in the file form.
+4. **The record length of the remaining 8 header bytes.** The 16-byte track
+   header has a confirmed `frame_count`, a `frame_offset` (always `aim_offset +
+   24`) and an 8-byte tail whose role is **UNKNOWN**.
+5. **The one-bone `parent = 0` convention.** 194 one-bone props store a
+   self-parent `0` rather than `-1`; whether that is a distinct encoding or a
+   defect is **UNKNOWN**.
+6. **`matsrevr`'s second root.** The only multi-bone model with two `-1` roots;
+   the second root's meaning is **UNKNOWN** (it is reported, never repaired).
 
-## Why a future reader should stop searching
+## Why a future reader should stop searching files
 
-The body-animation question is answered: the data does not exist to decode. The
-skeleton, the hierarchy and the skinning are real and verified; the authored
-animation is three aim poses on `raziel` and nothing else on the corpus. The only
-remaining work is procedural (mode bits and composition), and that is a
-runtime/math problem, not a file-format hunt.
+The body-animation question is answered at two levels. The **file side** is
+closed: no authored clip exists, the carriers are eliminated with counts, and the
+skeleton, hierarchy and skinning are real and verified. The **runtime side** is
+characterised: the slot format is confirmed (13 floats), the producer is named
+(orientation constructors), and the rotation block demonstrably animates. What is
+left is **procedural**: the constructor's input semantics and the composition
+order. That is a runtime/math problem, not a file-format hunt.
 
-The i16 element-type gap is also closed: re-scanning `.SRA` and `.SRM` with the
-engine's actual fixed point (Q12/Q15) found one isolated window in 30.5 million
-and no runs, so the older `f32`-only negative was not hiding a fixed-point
-matrix.
+Do not re-open `.SRA`, `.SRM`, `.PCM` or `.SRL` looking for a walking clip.
 
 ## Related notes
 
+- `docs/notes/pose-format-confirmed.md` - the 13-float layout, the walking series
+  and the constructor-input UNKNOWN.
+- `docs/notes/pose-writer-identity.md` - the two orientation constructors and
+  their callers.
+- `docs/changes/runtime-capture/angle-input-plan.md` - the probe design.
 - `docs/notes/bone-hierarchy.md` - the `+18` tree, composition and skinning.
 - `docs/notes/slot-descriptor-parse.md` - the descriptor array is the 24-byte bone
   table.
@@ -193,7 +270,7 @@ matrix.
 
 ## Legal
 
-Read-only. No game process was launched or instrumented for this consolidation.
-No game file was written, no game bytes were copied into the repository, and no
-disassembly, address, file-position offset or install path appears here. Only
-structure, field roles, format constants and corpus counts are recorded.
+Read-only. No game file was written, no game bytes were copied into the
+repository, and no disassembly, address, file-position offset or install path
+appears here. Only structure, field roles, format constants and corpus counts are
+recorded.
