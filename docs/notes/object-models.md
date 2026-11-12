@@ -378,6 +378,12 @@ One runtime slot pose is 13 `f32` values:
 [ r00 r01 r02   r10 r11 r12   r20 r21 r22 | scale marker | tx ty tz ]
 ```
 
+**Runtime-confirmed (2026-11-12).** A read-only probe measured the slot stride
+at **52 bytes (exactly 13 `f32`)** and read the rotation block, the scale field
+and the translation at these positions. The scale field was observed as `0.0`
+throughout, so it cannot be a multiplicative scale. Full evidence:
+`docs/notes/pose-format-confirmed.md`.
+
 `pose::slot_pose_matrix` copies the first nine floats as a row-major 3x3
 rotation, keeps the tenth as `scale_marker`, and the last three as a
 translation. The rotation is used as supplied: only finiteness is checked, not
@@ -386,7 +392,9 @@ orthonormality (the runtime built it).
 **The scale marker's meaning is UNKNOWN.** No corpus or trace evidence says
 whether it is a uniform scale, an animation flag or padding, so the matrix
 carries it for inspection but applies `scale = 1.0`. Treating it as a scale
-would invent semantics this slice does not have.
+would invent semantics this slice does not have. The runtime observation that the
+field stays `0.0` supports applying unit scale: a literal `0.0` scale would
+collapse the model.
 
 ### 8.2 Composition with the rest pose: pose over rest, added
 
