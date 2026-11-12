@@ -4,9 +4,10 @@ A read-only Frida probe hooked the two orientation constructors and dumped full
 runtime pose slots. The dump **confirms the 13-float slot format** the engine
 already models and shows that the **rotation block itself changes while an actor
 walks**. This note is the evidence-first record of that confirmation. It does not
-claim the animation system is fully solved: the producer is named, the output
-format is confirmed, and the constructor's three input floats remain an explicit
-UNKNOWN.
+claim the animation system is fully solved: the producer is named and the output
+format is confirmed, while the constructor's three input floats were an explicit
+UNKNOWN *at this slice*. A later atomic fit solved their construction
+(`docs/notes/rotation-model.md`); the source of the angles remains partly open.
 
 Everything here is behaviour and format evidence. No addresses, module-relative
 numbers, disassembly listings, raw game bytes or absolute install paths appear.
@@ -20,7 +21,8 @@ observations agree), **PARTLY KNOWN** (structure pinned on one side), **UNKNOWN*
 1. Read "The confirmed layout" - the 13-float table and the stride-52 evidence.
 2. Read "The animation proof" - the four-sample walking series.
 3. Read "The engine already matches" - the struct the runtime now confirms.
-4. Read "What remains UNKNOWN" - the constructor's three input floats.
+4. Read "The constructor's three input floats" - measured first, then solved in
+   construction by `docs/notes/rotation-model.md`.
 5. Read "Falsification ledger" before quoting anything.
 
 ## The confirmed layout
@@ -133,7 +135,7 @@ was right not to apply it.
 No engine code is changed by this note. The model was already correct; the
 runtime caught up with proof.
 
-## What remains UNKNOWN: the constructor's three input floats
+## The constructor's three input floats: measured, then solved
 
 The output slot is confirmed. The **three floats passed into the orientation
 constructor** are not. The probe sampled them and reported:
@@ -153,21 +155,43 @@ Two readings are ruled out by those numbers:
 - **Not Q12 fixed point.** `quant_frac = 0` means the values are not multiples of
   a `1/4096` step; a fixed-point angle would show exactly that quantization.
 
-The values behave like a **position or a look-target**, not a set of Euler
-angles. The probe therefore emits a `SEMANTIC-NOTE`: treat "radians-direct" as
-**UNPROVEN**. The earlier static reading that the constructors consume three
-radians directly is now an open question, not a fact.
+**SUPERSEDED 2026-11-12.** The readings above are still correct about what the
+values are *not* (radians, or Q12 of `1.0`), but the interpretation "position or
+look-target, not angles" no longer holds. The three floats **are angles in a
+turn-based binary unit**: `4096` units is one full turn. `abs_max = 5951` is
+about `1.45` turns, and `quant_frac = 0` only tested the `1.0 == 4096`
+fraction, which is a different unit. See "The construction is solved" below and
+`docs/notes/rotation-model.md`.
 
-Honest statement of the boundary:
+Honest statement of the boundary at this slice:
 
 - The **slot** is confirmed: 13 floats, stride 52, rows 0..8, translation 10..12.
 - The **producer** is named: the two sibling orientation constructors.
 - The **rotation animates**: measured on the same slot while walking.
-- The **inputs** are unknown: the three constructor floats are not radians and
-  not Q12 by measurement.
+- The **inputs** were unknown here: this note established that they are not
+  radians and not Q12 of `1.0`, but not what they are. The next slice solved the
+  construction; the **source** of the angles stays partly open.
 
-This note does **not** claim to explain how the three inputs are derived, nor
-that the full animation system is solved.
+## The construction is solved (2026-11-12)
+
+A later atomic capture paired each call's input triplet with the slot returned by
+that same call, then fitted a closed family of 192 rotation models. The result is
+`UNIQUE` on **336/336** usable rows:
+
+```text
+M = Rz(c · K) · Ry(b · K) · Rx(a · K)      K = 2π / 4096
+```
+
+Row-major 3x3, X innermost/first-applied and Z outermost. The unit is `4096`
+units per turn; the sign is positive. The two tying parameterizations are
+algebraically identical (`R(-θ) = R(θ)ᵀ`), so the verdict is one model class, not
+two candidates.
+
+What this closes: the arithmetic from the three floats to the rotation block.
+What it does **not** close: how the engine derives the three angles (aim/face
+mode, object transform, world target), and the meaning of the scale field at
+index `9`. The producer chain is now complete **up to the angle source**. Full
+evidence and the corrected sign: `docs/notes/rotation-model.md`.
 
 ## Falsification ledger
 
@@ -196,6 +220,8 @@ inputs.**
 
 ## Related notes
 
+- `docs/notes/rotation-model.md` - the solved construction: formula, unit, order,
+  336/336 evidence and the corrected sign.
 - `docs/notes/pose-writer-identity.md` - the two orientation constructors and
   their callers.
 - `docs/changes/runtime-capture/angle-input-plan.md` - the probe design that

@@ -280,6 +280,39 @@ fn mat3_mul(a: Mat3, b: Mat3) -> Mat3 {
     out
 }
 
+/// One full turn in the runtime's binary angle unit: `4096` units `== 360`
+/// degrees. This is a turn-based unit, not radians and not a `1.0 == 4096`
+/// fraction.
+#[allow(dead_code)]
+pub const BINARY_ANGLE_UNITS_PER_TURN: f32 = 4096.0;
+
+/// Convert one binary angle (`4096` units per turn) to radians.
+#[allow(dead_code)]
+pub fn binary_angle_to_radians(value: f32) -> f32 {
+    value * (std::f32::consts::TAU / BINARY_ANGLE_UNITS_PER_TURN)
+}
+
+/// Build the rotation the runtime orientation constructors produce for one
+/// `(a, b, c)` binary-angle triple: `Rz(c) * Ry(b) * Rx(a)`, row-major.
+///
+/// X is the innermost (first-applied) factor and Z the outermost. The fit is
+/// unique on the captured corpus; the formula and its evidence are in
+/// `docs/notes/rotation-model.md`.
+///
+/// This helper is additive. `slot_pose_matrix` keeps copying the stored 3x3
+/// exactly as the loader supplies it, so no existing CLI behaviour changes and
+/// nothing consumes this function yet.
+#[allow(dead_code)]
+pub fn rotation_from_binary_angles(a: f32, b: f32, c: f32) -> Mat3 {
+    let (sa, ca) = binary_angle_to_radians(a).sin_cos();
+    let (sb, cb) = binary_angle_to_radians(b).sin_cos();
+    let (sc, cc) = binary_angle_to_radians(c).sin_cos();
+    let rx = [[1.0, 0.0, 0.0], [0.0, ca, -sa], [0.0, sa, ca]];
+    let ry = [[cb, 0.0, sb], [0.0, 1.0, 0.0], [-sb, 0.0, cb]];
+    let rz = [[cc, -sc, 0.0], [sc, cc, 0.0], [0.0, 0.0, 1.0]];
+    mat3_mul(mat3_mul(rz, ry), rx)
+}
+
 impl PoseMatrix {
     /// The no-op pose: identity rotation, zero translation, unit scale.
     pub fn identity() -> Self {
@@ -963,5 +996,126 @@ mod tests {
         let model = chain_model();
         let short = BoneHierarchy::from_parents(vec![-1, 0]);
         assert!(skin_positions_hierarchical(&model, &short, &[]).is_err());
+    }
+
+    fn matrix_close(actual: Mat3, expected: Mat3, tolerance: f32) {
+        for row in 0..3 {
+            for col in 0..3 {
+                assert!(
+                    (actual[row][col] - expected[row][col]).abs() <= tolerance,
+                    "[{row}][{col}]: {} != {} (tolerance {tolerance})",
+                    actual[row][col],
+                    expected[row][col]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binary_angle_units_are_4096_per_turn() {
+        assert_eq!(binary_angle_to_radians(0.0), 0.0);
+        let quarter = binary_angle_to_radians(1024.0);
+        assert!((quarter - std::f32::consts::FRAC_PI_2).abs() < 1e-6, "{quarter}");
+        let half = binary_angle_to_radians(2048.0);
+        assert!((half - std::f32::consts::PI).abs() < 1e-6, "{half}");
+        let turn = binary_angle_to_radians(4096.0);
+        assert!((turn - std::f32::consts::TAU).abs() < 1e-5, "{turn}");
+        assert!((binary_angle_to_radians(-4096.0) + std::f32::consts::TAU).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rotation_from_binary_angles_is_identity_at_zero() {
+        assert_eq!(rotation_from_binary_angles(0.0, 0.0, 0.0), IDENTITY);
+    }
+
+    #[test]
+    fn rotation_from_binary_angles_matches_each_single_axis_closed_form() {
+        for units in [-1536.0f32, -512.0, 128.0, 1024.0, 2047.0] {
+            let (s, c) = binary_angle_to_radians(units).sin_cos();
+            let tolerance = 1e-6;
+            matrix_close(
+                rotation_from_binary_angles(units, 0.0, 0.0),
+                [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]],
+                tolerance,
+            );
+            matrix_close(
+                rotation_from_binary_angles(0.0, units, 0.0),
+                [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]],
+                tolerance,
+            );
+            matrix_close(
+                rotation_from_binary_angles(0.0, 0.0, units),
+                [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]],
+                tolerance,
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_from_binary_angles_advances_monotonically_per_axis() {
+        let mut previous_x = -1.0f32;
+        let mut previous_y = -1.0f32;
+        let mut previous_z = -1.0f32;
+        for units in 0..=1024 {
+            let angle = binary_angle_to_radians(units as f32);
+            let x = rotation_from_binary_angles(units as f32, 0.0, 0.0);
+            let y = rotation_from_binary_angles(0.0, units as f32, 0.0);
+            let z = rotation_from_binary_angles(0.0, 0.0, units as f32);
+            let recovered = [
+                x[2][1].atan2(x[1][1]),
+                y[0][2].atan2(y[0][0]),
+                z[1][0].atan2(z[0][0]),
+            ];
+            for (index, value) in recovered.iter().enumerate() {
+                let previous = [previous_x, previous_y, previous_z][index];
+                assert!(*value > previous, "axis {index} stopped advancing at {units} units");
+                assert!((value - angle).abs() < 1e-5, "axis {index} at {units} units");
+            }
+            previous_x = recovered[0];
+            previous_y = recovered[1];
+            previous_z = recovered[2];
+        }
+    }
+
+    #[test]
+    fn rotation_from_binary_angles_matches_observed_runtime_matrices() {
+        // Observed triples and their runtime 3x3 blocks. The capture records six
+        // decimals, so the tolerance is 1e-5; the fitted model agrees with the
+        // unrounded runtime matrices to about 5e-7 (docs/notes/rotation-model.md).
+        let rows: [([f32; 3], [f32; 9]); 3] = [
+            (
+                [-286.230957, -146.703003, -83.153755],
+                [
+                    0.966866, 0.209233, -0.146261, -0.124003, 0.885725, 0.447341, 0.223145,
+                    -0.414382, 0.882323,
+                ],
+            ),
+            (
+                [-869.289001, 19.552134, 66.055061],
+                [
+                    0.994423, -0.052780, -0.091305, 0.101108, 0.230948, 0.967698, -0.029988,
+                    -0.971534, 0.234996,
+                ],
+            ),
+            (
+                [-104.001480, 703.635010, 103.602119],
+                [
+                    0.465944, -0.294541, 0.834351, 0.074679, 0.952694, 0.294614, -0.881657,
+                    -0.074965, 0.465898,
+                ],
+            ),
+        ];
+        for (row, (triple, expected)) in rows.iter().enumerate() {
+            let m = rotation_from_binary_angles(triple[0], triple[1], triple[2]);
+            let flat = [
+                m[0][0], m[0][1], m[0][2], m[1][0], m[1][1], m[1][2], m[2][0], m[2][1], m[2][2],
+            ];
+            for (index, (actual, expected)) in flat.iter().zip(expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() < 1e-5,
+                    "row {row} element {index}: {actual} != {expected}"
+                );
+            }
+        }
     }
 }

@@ -210,7 +210,7 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
 | Game data | Read-only at runtime from the user's install; paths via CLI args/env only, never committed. |
 | Legal guardrails | Whitelist `.gitignore` verified every commit; single-player/offline owned copy only; community work credited in `THIRD-PARTY-NOTICES.md` once reuse starts. |
 | Process | Small chained slices (≤400 changed lines each); proposal → spec → tasks → code → playtest report. |
-| Tests | `cargo test` — 603 tests on synthetic bytes only; no game files in the suite. |
+| Tests | `cargo test` — 608 tests on synthetic bytes only; no game files in the suite. |
 
 ## Further reading
 
