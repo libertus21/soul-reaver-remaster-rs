@@ -123,7 +123,8 @@ is a hard negative with its count:
 
 | Carrier | Scope | Result |
 |---|---|---|
-| `.SRA` | 227 files | **0** orthonormal 3x3 or 3x4 windows in **3,744,114** / **3,717,786** positions. The 52-byte slot-pose layout is falsified; slot counts are model bone counts, not `.SRA` fields. |
+| `.SRA` | 227 files | **0** orthonormal `f32` 3x3 or 3x4 windows in **3,744,114** / **3,717,786** positions. The 52-byte slot-pose layout is falsified; slot counts are model bone counts, not `.SRA` fields. |
+| `.SRA` + `.SRM` (i16/Q12) | 227 + 349 files | **1** isolated Q12 3x3 hit in **30,478,374** windows and **0** runs; **0** Q12 3x4 hits; Q15 hits are below their matched baseline. The i16 element-type blind spot is closed (`i16-animation-scan.md`). |
 | `.PCM` object containers | 394 | **No** flat `bones x 32` descriptor array and no 4-float track table. The two smallest decidable models (`eggfx`, `hint`) are fully byte-accounted with no such block. |
 | `.SRM` | 349 files, 25.4 MB | **26,647,603** 3x3 windows with **0** below 0.05; **26,643,415** 3x4 windows with **147** below 0.05, all inside the known HD-matrix block; `run52 = 0` in **349/349** files. It is mesh + 128-slot pool + optional HD matrices only. |
 | `.SRL` | 60 files | Facial/HD only - 3x4 `f32` tracks whose track counts are `{1,7,17,25,26}`. No channel-to-bone table. |
@@ -170,6 +171,11 @@ animation is three aim poses on `raziel` and nothing else on the corpus. The onl
 remaining work is procedural (mode bits and composition), and that is a
 runtime/math problem, not a file-format hunt.
 
+The i16 element-type gap is also closed: re-scanning `.SRA` and `.SRM` with the
+engine's actual fixed point (Q12/Q15) found one isolated window in 30.5 million
+and no runs, so the older `f32`-only negative was not hiding a fixed-point
+matrix.
+
 ## Related notes
 
 - `docs/notes/bone-hierarchy.md` - the `+18` tree, composition and skinning.
@@ -182,6 +188,8 @@ runtime/math problem, not a file-format hunt.
 - `docs/notes/sra-slot-pose.md`, `docs/notes/pcm-animation-record.md`,
   `docs/notes/procedural-slot-pose-gate.md`, `docs/notes/srm-animation-scan.md`,
   `docs/notes/srl-animation.md` - the eliminated carriers in detail.
+- `docs/notes/i16-animation-scan.md` - the i16/Q12 element-type rescan and its
+  matched-histogram baselines.
 
 ## Legal
 
