@@ -12,6 +12,14 @@ Evidence classes: **CONFIRMED** (code and data agree, or two independent
 observations agree), **INFERRED** (code reading or structural inference, one side
 unobserved), **UNKNOWN** (not established).
 
+> Update (2026-11-12): `docs/notes/producer-selector.md` locates the three
+> producers and their runtime dispatch. The quaternion track is now **excluded**
+> for these four bodies by two independent observations, so the 110
+> UNCLASSIFIED slots become the **STAGING** superclass rather than an open
+> bucket. The per-slot packed-versus-mode split stays UNKNOWN. The table below is
+> the pre-update result and is kept for the record; see "Update" near the end for
+> the refined distribution.
+
 ## Headline
 
 **Limb interior slots are not shown to be PACKED_CHANNEL; the three-way census is
@@ -281,6 +289,35 @@ show that they are purely procedural either.
 | All non-aim slots are driven | a non-aim slot that stays at identity for the whole capture | Refuted: all 66 raziel slots change |
 | `+6`/`+10` = inactive sentinel | an aim-bearing or child-bearing slot with both words at 65535 | Refuted: slot 1 is exactly that |
 | The body has no quaternion track table | a raziel track-table pointer in a clean dump | One dump says none; the track selector fires elsewhere |
+
+## Update (2026-11-12): the quaternion producer is excluded, the staging class is named
+
+`docs/notes/producer-selector.md` resolves the dispatch this census left open.
+Two independent observations agree that the quaternion track cannot be sourced
+from file data for these four bodies:
+
+- A corpus scan of the container's track descriptors finds **zero rotation
+  tracks** on raziel, skinner, sluagh and morlock (and only two models in the
+  whole corpus carry one).
+- The runtime descriptor dump records **no track-table pointer** for raziel.
+
+The remaining slots therefore take the sampler's staging route, whose two
+writers are located: the packed-channel decoder (angle form) and the channel
+mode applier. They are **not** relabelled PACKED, because which channel covers a
+given slot is decided by runtime records that are not readable from the file.
+
+| Actor | Slots | AIM_MODE | STAGING (packed/mode) | QUATERNION_TRACK | UNCLASSIFIED |
+|---|---:|---:|---:|---:|---:|
+| raziel (player) | 66 | 4 | 62 | 0 | 0 |
+| skinner | 35 | 5 | 30 | 0 | 0 |
+| sluagh | 24 | 6 | 18 | 0 | 0 |
+| **total (three)** | **125** | **15** | **110** | **0** | **0** |
+| morlock (extra) | 37 | 5 | 32 | 0 | 0 |
+
+The `AIM_MODE` split, the per-slot aim indices, the bone-record evidence table
+and the `+6`/`+10` correction above are unchanged. `PACKED_CHANNEL` remains
+unassigned per slot; the per-slot packed-versus-mode split needs the runtime
+channel hook named as that note's next probe.
 
 ## Method and legal
 
