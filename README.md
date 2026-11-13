@@ -150,7 +150,11 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
   cells; `docs/notes/srl-animation.md`) but has no channel-to-bone table. `.PMF`
   remains undecoded. The consolidated verdict - what was searched, every carrier
   ruled out with its counts, and why the authored data simply does not exist - is
-  in `docs/notes/animation-conclusion.md`.
+  in `docs/notes/animation-conclusion.md`. A pure file-form **packed-channel
+  decoder** now exists in `src/packed_channel.rs` (frame header, bit planes,
+  palette/literal stream, per-slot angle rotations), but it is not yet wired
+  into the frame pipeline; the frame-index wrap is a named `Saturate` policy
+  because the engine branch is UNKNOWN (`docs/notes/packed-channel-format.md`).
 - **Body-angle provenance is mode-dependent.** The per-slot constructor input is
   a per-frame staging record filled by the animation sampler from the
   object-container animation record; the root uses the object's live aim words.
