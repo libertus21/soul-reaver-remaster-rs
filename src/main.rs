@@ -64,6 +64,9 @@ mod menu;
 mod mesh_entry;
 mod object;
 mod object_texture;
+// Pure packed-channel frame-table decoder; not wired into the viewer yet.
+#[allow(dead_code)]
+mod packed_channel;
 // Pure one-bone pose math, wired into the `--mesh --pose` arm below.
 mod pose;
 // Pure procedural-slot rotation composition; not wired into the viewer yet.

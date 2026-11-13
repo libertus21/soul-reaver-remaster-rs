@@ -213,6 +213,24 @@ The engine pre-writes the scale (`4096.0`) and the descriptor translation before
 the stream runs; a set scale or translation bit overrides those lanes. For the
 angle-only decode, only lanes 0-2 and the angle plane are needed.
 
+## Now implemented in
+
+The decoder above is implemented in `src/packed_channel.rs` (pure, no I/O, not
+wired into canonical frame state):
+
+- `parse_header` parses and bounds-checks `table_count`, `frame_count` and
+  `divisor`.
+- `select_frame_index` applies an explicit `FrameIndexPolicy`. The default
+  `FRAME_INDEX_POLICY` is `Saturate`; the UNKNOWN wrap branch is available as
+  `Wrap` but is never implicit.
+- `PackedFrameTable::parse` / `BitPlanes::parse` / `BitPlanes::slot_mask` parse
+  the offset array, the flags byte and the per-slot 3-bit plane groups.
+- `ValueStream::next_value` walks the palette/literal blocks in ascending lane
+  order.
+- `decode_slot_angles` returns one slot's angle triple;
+  `DecodedChannel` / `decode_channel_range` / `decode_channel` return the angles
+  and their `rotation_from_binary_angles` matrix for a whole channel window.
+
 ## Validation
 
 ### Live capture
