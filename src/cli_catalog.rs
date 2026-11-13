@@ -32,7 +32,7 @@ impl Capability {
             || (self.name == "animate"
                 && matches!(token, "--sra" | "--bigfile" | "--entry" | "--frame" | "--time"))
             || (self.name == "play"
-                && matches!(token, "--bigfile" | "--unit" | "--ticks" | "--camera"))
+                && matches!(token, "--bigfile" | "--unit" | "--ticks" | "--camera" | "--sra"))
             || ((self.name.ends_with("-entry")
                 || matches!(self.name, "object-info" | "object-info-actors" | "object-mesh" | "bone-hierarchy"))
                 && matches!(token, "--bigfile" | "--entry"))
@@ -82,7 +82,7 @@ pub const CAPABILITIES: [Capability; 37] = [
     Capability { group: "level", name: "links-entry", legacy: "--level-links --bigfile <DAT> --entry <INDEX>", summary: "Print one archive entry's decoded link table.", window: false },
     Capability { group: "level", name: "links-group", legacy: "--level-links --bigfile <DAT> --group <PREFIX>", summary: "Print every archive level family member's link table.", window: false },
     Capability { group: "level", name: "reach", legacy: "--level-reach --bigfile <DAT> [--start <UNIT>]", summary: "BFS the archived level graph, then group reachable, island and inbound-but-unreachable units.", window: false },
-        Capability { group: "game", name: "play", legacy: "--play --bigfile <DAT> [--textures <BIG>] [--unit <NAME>] [--ticks <N>] [--camera <MODE>]", summary: "Run the engine on an archive: a deterministic headless acceptance line with --headless, or a textured window.", window: true },
+        Capability { group: "game", name: "play", legacy: "--play --bigfile <DAT> [--textures <BIG>] [--unit <NAME>] [--ticks <N>] [--camera <MODE>] [--sra <FILE>]", summary: "Run the engine on an archive: a deterministic headless acceptance line with --headless, or a textured window; --sra animates the player mesh.", window: true },
     Capability { group: "game", name: "facing", legacy: "--facing --bigfile <DAT> --entry <INDEX> --direction <DX>:<DY>", summary: "Print the yaw produced for a movement direction and the first skinned vertices.", window: false },
     Capability { group: "game", name: "animate", legacy: "--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>]", summary: "Decode one .SRA frame and print the first slot angles and skinned vertices.", window: false },
 ];

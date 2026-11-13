@@ -502,19 +502,48 @@ impl ModelResolver {
         self.textured_cache.get(name).cloned().flatten()
     }
 
+    /// Bone count of `name`'s archived model, or `None` when it does not resolve.
+    ///
+    /// The animation slot count is the model's bone count, not an `.SRA` field
+    /// (`docs/notes/sra-slot-pose.md`).
+    pub fn bone_count(&mut self, name: &str) -> Option<usize> {
+        self.model(name).map(|model| model.bones.len())
+    }
+
     /// Per-face textured mesh for `name` with every vertex skinned by one root
-    /// yaw. The root pose is produced with [`pose::pose_from_yaw`] and applied
-    /// through [`pose::skin_positions_hierarchical`], the same path the
-    /// hierarchy viewer uses. The tree comes from each bone's `+18` parent word;
-    /// that record block is the array `slot_descriptor::locate_descriptor_array`
-    /// resolves from the model header's bone-table base.
+    /// yaw plus an optional decoded animation pose list.
+    ///
+    /// Without `animation` the root pose is produced with
+    /// [`pose::pose_from_yaw`] and applied through
+    /// [`pose::skin_positions_hierarchical`], the same path the hierarchy viewer
+    /// uses. The tree comes from each bone's `+18` parent word; that record
+    /// block is the array `slot_descriptor::locate_descriptor_array` resolves
+    /// from the model header's bone-table base.
+    ///
+    /// When `animation` is present, the produced root yaw is pre-multiplied onto
+    /// slot `0` ([`pose::compose_root_yaw`]) so the movement facing still turns
+    /// the animated body. Missing slots stay at rest, exactly like a short pose
+    /// file; extra slots are ignored.
     ///
     /// Only the player consumes this today. Level-placed objects carry no
     /// rotation field in the authored record, so they keep the rest mesh.
-    pub fn posed_textured(&mut self, name: &str, yaw_binary: f32) -> Option<TexturedMesh> {
+    pub fn posed_textured_with_poses(
+        &mut self,
+        name: &str,
+        yaw_binary: f32,
+        animation: Option<&[pose::SlotPose]>,
+    ) -> Option<TexturedMesh> {
         let model = self.model(name)?;
         let hierarchy = BoneHierarchy::from_parents(bone_parents(&model.bones));
-        let poses = pose::pose_from_yaw(model.bones.len(), yaw_binary, [0.0; 3]);
+        let mut poses = match animation {
+            Some(poses) => poses.to_vec(),
+            None => pose::pose_from_yaw(model.bones.len(), yaw_binary, [0.0; 3]),
+        };
+        if animation.is_some() {
+            if let Some(root) = poses.first_mut() {
+                pose::compose_root_yaw(root, yaw_binary);
+            }
+        }
         let positions = pose::skin_positions_hierarchical(model, &hierarchy, &poses).ok()?;
         Some(textured_mesh_with_positions(model, &positions))
     }
@@ -826,12 +855,12 @@ mod tests {
 
         let rest = resolver.textured("raziel").expect("rest textured mesh");
         let zero = resolver
-            .posed_textured("raziel", 0.0)
+            .posed_textured_with_poses("raziel", 0.0, None)
             .expect("zero yaw textured mesh");
         assert_eq!(zero, rest, "a zero yaw must reproduce the rendered rest mesh");
 
         let quarter = resolver
-            .posed_textured("raziel", pose::BINARY_ANGLE_UNITS_PER_TURN / 4.0)
+            .posed_textured_with_poses("raziel", pose::BINARY_ANGLE_UNITS_PER_TURN / 4.0, None)
             .expect("quarter-turn textured mesh");
         assert_eq!(
             quarter.indices, rest.indices,
@@ -848,6 +877,35 @@ mod tests {
                 .iter()
                 .any(|p| p[0].abs() < 1e-4 && (p[1] - 10.0).abs() < 1e-4 && p[2].abs() < 1e-4),
             "+10 X must land on +10 Y for a quarter turn"
+        );
+    }
+
+    #[test]
+    fn posed_textured_with_poses_applies_animation_slots() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let path = tmp.path().join("BIGFILE.DAT");
+        std::fs::write(&path, archive(*b"ZIEL", synthetic_bone_model()))
+            .expect("synthetic archive");
+        let mut resolver = ModelResolver::load(&path).expect("index must load");
+
+        let rest = resolver.textured("raziel").expect("rest textured mesh");
+        let rotation = pose::rotation_from_binary_angles(1024.0, 0.0, 0.0);
+        let mut animated_root = [0.0f32; 13];
+        for row in 0..3 {
+            for col in 0..3 {
+                animated_root[row * 3 + col] = rotation[row][col];
+            }
+        }
+        animated_root[9] = 1.0;
+        let identity = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+        let animated = resolver
+            .posed_textured_with_poses("raziel", 0.0, Some(&[animated_root, identity]))
+            .expect("animated textured mesh");
+
+        assert_eq!(animated.indices, rest.indices, "animation never changes topology");
+        assert_ne!(
+            animated.positions, rest.positions,
+            "the decoded root slot must reach the rendered vertices"
         );
     }
 
