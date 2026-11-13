@@ -36,7 +36,7 @@ your own install; nothing is bundled.
 | `.SRL` clip summary | `cargo run -- --srl-info <FILE.SRL>` | Parses the 20-byte `.SRL` header and prints track count, frame count, fps and derived duration, asserting `len = 20 + tracks*frames*48`. The cells are per-frame 48-byte 3x4 transforms; the track-to-bone binding stays UNKNOWN (`docs/notes/srl-animation.md`). |
 | `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --entry <INDEX>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --group under [--objects] [--textures <TEXTURES.BIG>]` | Renders room geometry, flat or textured from `TEXTURES.BIG`. Orbit, wheel zoom, pan, `R` reset; `F` enters a first-person fly camera. `--objects` adds each placed object's real archived model at its world position; `--textures` textures both rooms and models. |
 | Level reachability | `cargo run -- --level-reach --bigfile <BIGFILE.DAT> [--start <UNIT>] [--names]` | BFS from `under1` over the decoded link graph, then groups reachable, in-degree islands and inbound-but-unreachable units. `--names` lists each island unit. Corrected reader: 372 discovered / 334 reachable / 38 unreachable / 1 island (`push1`). |
-| Engine play mode | `cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG>` / `cargo run -- --play --headless --bigfile <BIGFILE.DAT> --ticks <N>` | Opens a deterministic engine window (orbit, fly or player camera; player mode is `WASD`, `Space` jumps, `F` cycles the camera, `Esc` exits 0), or prints one headless acceptance line with the FNV-1a 64 state digest. Fixed 60 Hz clock, 48-slot tracker, name-keyed spawning, 18-stage frame loop, solid room walls, Z-up gravity with ground/landing, ceiling blocking, a synthetic ground-only jump and a Z-up third-person player camera. The authored placed-object seed pass runs in both windowed and headless modes. Still no AI, body animation, scripts or audio. Current 60-tick digests: `under1` `ede39c540a10ee39`, `skinnr1` `398d1870a463fd7a`. |
+| Engine play mode | `cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG>` / `cargo run -- --play --headless --bigfile <BIGFILE.DAT> --ticks <N>` | Opens a deterministic engine window (orbit, fly or player camera; player mode is `WASD`, `Space` jumps, `F` cycles the camera, `Esc` exits 0), or prints one headless acceptance line with the FNV-1a 64 state digest. Fixed 60 Hz clock, 48-slot tracker, name-keyed spawning, 18-stage frame loop, solid room walls, Z-up gravity with ground/landing, ceiling blocking, a synthetic ground-only jump and a Z-up third-person player camera. The authored placed-object seed pass runs in both windowed and headless modes. `--sra <FILE>` optionally animates the player mesh from the shipped packed-channel table (presentation only; default 50 fps, `--anim-fps <N>`, `--anim-once`). Still no AI, scripts or audio. Current 60-tick digests: `under1` `ede39c540a10ee39`, `skinnr1` `398d1870a463fd7a`. |
 | Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 37 capabilities in six groups (`texture` 4, `archive` 2, `mesh` 9, `audio` 2, `level` 17, `game` 3); grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
 
 `<PATH>` accepts a `.PCM` file or a room directory. The level arms also accept
@@ -143,24 +143,28 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
   descriptors in all 21 actor containers
   (`docs/notes/actor-spline-census.md`). `.SRA` is now read for its
   **packed-channel frame table**: `cargo run -- --animate --sra <FILE>
-  --bigfile <DAT> --entry <INDEX>` decodes one frame and skins the archived
-  model. Non-player actors and the spline/keyed producers remain unwired;
-  `.SRM` has no hierarchy, so `--pose` is a local cluster rotation only and the
+  --bigfile <DAT> --entry <INDEX>` decodes one frame, and `--play ... --sra
+  <FILE>` skins the player mesh from the canonical tick count through an
+  explicit integer playback clock (default 50 fps; `--anim-fps <N>`,
+  `--anim-once`). Non-player
+  actors and the spline/keyed producers remain unwired; `.SRM` has no
+  hierarchy, so `--pose` is a local cluster rotation only and the
   mesh tears at cluster seams. `.SRL` is a confirmed **voice-line animation
   container** (header, frame count, fps, duration and 48-byte per-frame 3x4
   cells; `docs/notes/srl-animation.md`) but has no channel-to-bone table. `.PMF`
   remains undecoded. The consolidated verdict - what was searched, every carrier
   ruled out with its counts, and why the authored data simply does not exist - is
-  in `docs/notes/animation-conclusion.md`. The frame-index wrap is a named
-  `Saturate` policy because the engine branch is UNKNOWN
-  (`docs/notes/packed-channel-format.md`).
+  in `docs/notes/animation-conclusion.md`. The decoder keeps the conservative
+  named `Saturate` policy; playback chooses `Loop`/`Once` explicitly because the
+  authored wall-clock rate is UNKNOWN (`docs/notes/packed-channel-format.md`).
 - **Body-angle provenance is mode-dependent.** The per-slot constructor input is
   a per-frame staging record filled by the animation sampler from the
   object-container animation record; the root uses the object's live aim words.
   The staging array is not loadable at rest, and the per-slot producer split is
   still UNKNOWN; see `docs/notes/angle-array-source.md`.
 - **No game logic.** `--play` is a deterministic skeleton: no actor AI,
-  body animation, scripts, audio, streaming, particles, menus, warps or save. Room
+  scripts, audio, streaming, particles, menus, warps or save. Only the player
+  mesh can animate (`--sra`). Room
   walls are solid, gravity lands the player on floors, ceilings block upward
   motion and a ground-only jump works (synthetic constants), but there is no
   step-height climbing and no water/lava. This is not a playable engine.

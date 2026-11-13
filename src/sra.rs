@@ -38,6 +38,74 @@ pub const TANGENT_MAX: i64 = 1_000_000;
 const PAYLOAD_ALIGN: usize = 2048;
 const MAX_COUNT: usize = 1 << 20;
 
+/// Presentation playback rate, in palette frames per second of simulation.
+///
+/// The authored wall-clock rate is **UNKNOWN**. The live capture fixes only the
+/// source-side unit: `frame_index = floor(frame_time / divisor)`, with
+/// `frame_time = 2400` and divisor `100` selecting frame `24`. It says nothing
+/// about how many frames the game draws per second. This value is therefore an
+/// explicit presentation choice, not a measured engine constant.
+///
+/// `50` is chosen because the validated table has 50 frames, so one full
+/// palette pass lasts one second of simulation, and it is close to the fixed
+/// 60 Hz tick (one palette frame every ~1.2 ticks). Change it with
+/// `--anim-fps <N>`; the clock itself stays integer-only and deterministic.
+pub const ANIMATION_FPS: u32 = 50;
+
+/// How a playback clock handles a frame index past the last palette frame.
+///
+/// This is a presentation choice, separate from the decoder's conservative
+/// [`FRAME_INDEX_POLICY`] (`Saturate`). Playback passes its own policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlaybackLoop {
+    /// Wrap modulo `frame_count`: gameplay looping. The default.
+    #[default]
+    Loop,
+    /// Saturate at `frame_count - 1`: one pass, then hold the last frame.
+    Once,
+}
+
+/// Map one canonical 60 Hz tick to a palette frame index for presentation.
+///
+/// The mapping is integer-only and deterministic: `frames_elapsed = tick * fps
+/// / 60`, then `frames_elapsed % frame_count` ([`PlaybackLoop::Loop`]) or a
+/// clamp to `frame_count - 1` ([`PlaybackLoop::Once`]). No float and no wall
+/// clock is involved.
+///
+/// `divisor` is the table's source-side frame unit. It is validated here for
+/// consistency with the decoder, but it does **not** set the presentation rate:
+/// the authored rate is UNKNOWN (see [`ANIMATION_FPS`]). The arithmetic is
+/// `u64` throughout, so large tick counts cannot hit the `u16` frame-time
+/// ceiling that used to freeze playback.
+pub fn frame_index_for_playback(
+    tick: u64,
+    fps: u32,
+    divisor: i16,
+    frame_count: usize,
+    policy: PlaybackLoop,
+) -> Result<usize, String> {
+    if fps == 0 {
+        return Err("sra playback: fps 0 cannot advance the animation".to_string());
+    }
+    if divisor <= 0 {
+        return Err(format!(
+            "sra playback: divisor {divisor} must be positive to select a frame"
+        ));
+    }
+    if frame_count == 0 {
+        return Err("sra playback: frame count 0 cannot select a frame".to_string());
+    }
+    let frame_count = u64::try_from(frame_count)
+        .map_err(|_| format!("sra playback: frame count {frame_count} does not fit u64"))?;
+    let frames_elapsed = tick.saturating_mul(u64::from(fps)) / 60;
+    let index = match policy {
+        PlaybackLoop::Loop => frames_elapsed % frame_count,
+        PlaybackLoop::Once => frames_elapsed.min(frame_count - 1),
+    };
+    usize::try_from(index)
+        .map_err(|_| format!("sra playback: frame index {index} does not fit this platform"))
+}
+
 /// One maximal run of consecutive key-shaped records at a fixed stride.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyRun {
@@ -480,16 +548,19 @@ impl SraAnimation {
         self.header.divisor
     }
 
-    /// Palette frame index for one canonical tick.
+    /// Palette frame index for one canonical tick under an explicit playback
+    /// clock and loop policy.
     ///
-    /// One tick advances the frame time by one unit, which is the unit the live
-    /// capture recorded (`time = 2400` selected frame `24` at divisor `100`).
-    /// The mapping is saturated at `u16::MAX` and the index follows
-    /// [`FRAME_INDEX_POLICY`] (`Saturate`), so it is monotonic and never wraps
-    /// past the evidence.
-    pub fn frame_index_for_tick(&self, tick: u64) -> Result<usize, String> {
-        let frame_time = u16::try_from(tick.min(u64::from(u16::MAX))).unwrap_or(u16::MAX);
-        self.frame_index_for_time(frame_time)
+    /// See [`frame_index_for_playback`]. The source divisor comes from the
+    /// located table; the rate and wrap choice are supplied by the caller, so
+    /// the presentation clock is never a silent guess.
+    pub fn frame_index_for_tick(
+        &self,
+        tick: u64,
+        fps: u32,
+        policy: PlaybackLoop,
+    ) -> Result<usize, String> {
+        frame_index_for_playback(tick, fps, self.header.divisor, self.frame_count(), policy)
     }
 
     /// Palette frame index for one explicit frame-time unit.
@@ -519,9 +590,14 @@ impl SraAnimation {
         self.decode_index(self.frame_index_for_time(frame_time)?)
     }
 
-    /// Decode the frame selected by one canonical tick.
-    pub fn decode_tick(&self, tick: u64) -> Result<SraFrame, String> {
-        self.decode_index(self.frame_index_for_tick(tick)?)
+    /// Decode the frame selected by one canonical tick under the playback clock.
+    pub fn decode_tick(
+        &self,
+        tick: u64,
+        fps: u32,
+        policy: PlaybackLoop,
+    ) -> Result<SraFrame, String> {
+        self.decode_index(self.frame_index_for_tick(tick, fps, policy)?)
     }
 
     /// The slot-pose list for `frame`, ready for the hierarchical skinner.
@@ -529,9 +605,14 @@ impl SraAnimation {
         poses_from_angles(&frame.angles)
     }
 
-    /// Decode the frame selected by one canonical tick and build its poses.
-    pub fn poses_for_tick(&self, tick: u64) -> Result<Vec<SlotPose>, String> {
-        let frame = self.decode_tick(tick)?;
+    /// Decode the tick's frame under the playback clock and build its poses.
+    pub fn poses_for_tick(
+        &self,
+        tick: u64,
+        fps: u32,
+        policy: PlaybackLoop,
+    ) -> Result<Vec<SlotPose>, String> {
+        let frame = self.decode_tick(tick, fps, policy)?;
         Ok(self.poses(&frame))
     }
 
@@ -785,26 +866,120 @@ mod tests {
     }
 
     #[test]
-    fn frame_index_advances_monotonically_with_tick_count_and_saturates() {
-        let container = synthetic_animation_container(&[0x001], 50, 100, &[0.0]);
-        let animation = SraAnimation::load(container, 1).expect("synthetic table must locate");
-        assert_eq!(animation.frame_index_for_tick(0), Ok(0));
-        assert_eq!(animation.frame_index_for_tick(99), Ok(0));
-        assert_eq!(animation.frame_index_for_tick(100), Ok(1));
-        assert_eq!(animation.frame_index_for_tick(2400), Ok(24));
-        assert_eq!(animation.frame_index_for_tick(4900), Ok(49));
-        assert_eq!(animation.frame_index_for_tick(5000), Ok(49));
-        assert_eq!(animation.frame_index_for_tick(u64::MAX), Ok(49));
+    fn playback_clock_advances_about_fifty_times_per_second_at_fifty_fps() {
         let mut previous = 0;
-        for tick in (0..=5000u64).step_by(37) {
-            let index = animation.frame_index_for_tick(tick).expect("clock");
+        for tick in 0..=120u64 {
+            let index =
+                frame_index_for_playback(tick, ANIMATION_FPS, 100, 1000, PlaybackLoop::Loop)
+                    .expect("clock");
             assert!(index >= previous, "index went backwards at tick {tick}");
-            assert!(index < animation.frame_count());
             previous = index;
         }
         assert_eq!(
-            animation.decode_tick(2400).expect("frame 24").frame_index,
-            24
+            frame_index_for_playback(60, ANIMATION_FPS, 100, 1000, PlaybackLoop::Loop),
+            Ok(50),
+            "60 ticks at 50 fps is 50 palette frames"
+        );
+        let advances = (1..=60u64)
+            .filter(|&tick| {
+                let now = frame_index_for_playback(
+                    tick,
+                    ANIMATION_FPS,
+                    100,
+                    1000,
+                    PlaybackLoop::Loop,
+                )
+                .expect("clock");
+                let before = frame_index_for_playback(
+                    tick - 1,
+                    ANIMATION_FPS,
+                    100,
+                    1000,
+                    PlaybackLoop::Loop,
+                )
+                .expect("clock");
+                now > before
+            })
+            .count();
+        assert_eq!(advances, 50, "one advance per palette frame in one second");
+    }
+
+    #[test]
+    fn playback_clock_with_divisor_100_and_50_frames_matches_first_transitions() {
+        let indices: Vec<usize> = (0..=8u64)
+            .map(|tick| {
+                frame_index_for_playback(tick, 50, 100, 50, PlaybackLoop::Loop).expect("clock")
+            })
+            .collect();
+        assert_eq!(indices, vec![0, 0, 1, 2, 3, 4, 5, 5, 6]);
+        assert_eq!(
+            frame_index_for_playback(60, 50, 100, 50, PlaybackLoop::Loop),
+            Ok(0),
+            "the 50th advance wraps back to frame 0"
+        );
+    }
+
+    #[test]
+    fn playback_loop_wraps_at_frame_count_and_does_not_saturate() {
+        assert_eq!(
+            frame_index_for_playback(600, 50, 100, 50, PlaybackLoop::Loop),
+            Ok(0)
+        );
+        assert_eq!(
+            frame_index_for_playback(601, 50, 100, 50, PlaybackLoop::Loop),
+            Ok(0)
+        );
+        assert_eq!(
+            frame_index_for_playback(602, 50, 100, 50, PlaybackLoop::Loop),
+            Ok(1)
+        );
+    }
+
+    #[test]
+    fn playback_once_saturates_at_the_last_frame() {
+        assert_eq!(
+            frame_index_for_playback(59, 50, 100, 50, PlaybackLoop::Once),
+            Ok(49)
+        );
+        assert_eq!(
+            frame_index_for_playback(60, 50, 100, 50, PlaybackLoop::Once),
+            Ok(49)
+        );
+        assert_eq!(
+            frame_index_for_playback(10_000_000, 50, 100, 50, PlaybackLoop::Once),
+            Ok(49)
+        );
+    }
+
+    #[test]
+    fn large_tick_counts_keep_advancing_past_the_u16_ceiling() {
+        let huge =
+            frame_index_for_playback(10_000_000, 50, 100, 50, PlaybackLoop::Loop).expect("clock");
+        let next = frame_index_for_playback(10_000_001, 50, 100, 50, PlaybackLoop::Loop)
+            .expect("clock");
+        assert_eq!((huge, next), (33, 34));
+        assert_ne!(huge, 49, "a large tick must not freeze on the last frame");
+        assert_ne!(
+            frame_index_for_playback(65_535, 50, 100, 50, PlaybackLoop::Loop),
+            frame_index_for_playback(10_000_000, 50, 100, 50, PlaybackLoop::Loop),
+            "the clock does not saturate at the u16 frame-time ceiling"
+        );
+        assert!(frame_index_for_playback(0, 0, 100, 50, PlaybackLoop::Loop)
+            .unwrap_err()
+            .contains("fps"));
+    }
+
+    #[test]
+    fn animation_playback_clock_does_not_freeze_on_a_large_tick() {
+        let container = synthetic_animation_container(&[0x001], 50, 100, &[0.0]);
+        let animation = SraAnimation::load(container, 1).expect("synthetic table must locate");
+        let frame = animation
+            .decode_tick(10_000_000, ANIMATION_FPS, PlaybackLoop::Loop)
+            .expect("a large tick still decodes");
+        assert_eq!(frame.frame_index, 33);
+        assert_eq!(
+            animation.frame_index_for_tick(10_000_000, ANIMATION_FPS, PlaybackLoop::Loop),
+            frame_index_for_playback(10_000_000, ANIMATION_FPS, 100, 50, PlaybackLoop::Loop)
         );
     }
 

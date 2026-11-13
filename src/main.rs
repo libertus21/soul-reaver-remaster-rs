@@ -258,7 +258,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --textures <TEXTURES.BIG>");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --pose <FILE> [--hierarchy] [--bounds]");
         eprintln!("   or: soul-reaver-remaster-rs --facing --bigfile <BIGFILE.DAT> --entry <INDEX> --direction <DX>:<DY>");
-        eprintln!("   or: soul-reaver-remaster-rs --animate --sra <FILE.SRA> --bigfile <BIGFILE.DAT> --entry <INDEX> [--frame <N>] [--time <T>]");
+        eprintln!("   or: soul-reaver-remaster-rs --animate --sra <FILE.SRA> --bigfile <BIGFILE.DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--anim-fps <N>] [--anim-once]");
         eprintln!("   or: soul-reaver-remaster-rs --srl-info <FILE.SRL>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
@@ -454,12 +454,16 @@ fn facing_report(model: &object::ObjectModel, dx: f32, dy: f32) -> Result<String
 }
 
 /// Which frame `--animate` decodes: an explicit palette index, a frame-time
-/// unit, or the first frame.
+/// unit, or the playback clock (which `--anim-fps`/`--anim-once` shape).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameChoice {
     Index(usize),
     Time(u16),
-    Default,
+    Playback {
+        tick: u64,
+        fps: u32,
+        policy: sra::PlaybackLoop,
+    },
 }
 
 struct AnimateInput<'a> {
@@ -468,11 +472,15 @@ struct AnimateInput<'a> {
     entry: usize,
     frame: Option<usize>,
     time: Option<u16>,
+    anim_fps: u32,
+    anim_once: bool,
 }
 
 /// `--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>]
-/// [--time <T>]`: decode one frame, skin the archived model and print a bounded
-/// acceptance line. The slot count is the model's bone count, not a file field.
+/// [--time <T>] [--anim-fps <N>] [--anim-once]`: decode one frame, skin the
+/// archived model and print a bounded acceptance line. The slot count is the
+/// model's bone count, not a file field. An explicit `--frame` wins over the
+/// playback clock.
 fn run_animate(args: &[String]) -> ExitCode {
     let input = match animate_input(args) {
         Ok(input) => input,
@@ -509,12 +517,10 @@ fn run_animate(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let choice = match (input.frame, input.time) {
-        (Some(index), None) => FrameChoice::Index(index),
-        (None, Some(time)) => FrameChoice::Time(time),
-        (None, None) => FrameChoice::Default,
-        (Some(_), Some(_)) => {
-            eprintln!("error: --animate accepts --frame or --time, not both");
+    let choice = match animate_choice(input.frame, input.time, input.anim_fps, input.anim_once) {
+        Ok(choice) => choice,
+        Err(error) => {
+            eprintln!("error: {error}");
             return ExitCode::from(1);
         }
     };
@@ -535,30 +541,75 @@ fn run_animate(args: &[String]) -> ExitCode {
     }
 }
 
-fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
-    let usage = "expected --animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>]";
-    let (mut sra, mut dat, mut entry, mut frame, mut time) = (None, None, None, None, None);
-    let mut at = 0;
-    while at + 1 < args.len() {
-        let value = args[at + 1].as_str();
-        match args[at].as_str() {
-            "--sra" => sra = Some(value),
-            "--bigfile" => dat = Some(value),
-            "--entry" => {
-                entry = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
-            }
-            "--frame" => {
-                frame = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
-            }
-            "--time" => {
-                time = Some(value.parse::<u16>().map_err(|_| usage.to_string())?);
-            }
-            _ => return Err(usage.to_string()),
-        }
-        at += 2;
+/// Resolve the frame `--animate` prints. An explicit `--frame` wins, then an
+/// explicit `--time`; only when neither is present does the playback clock
+/// apply (at tick 0, so the default frame is still the first palette frame).
+fn animate_choice(
+    frame: Option<usize>,
+    time: Option<u16>,
+    anim_fps: u32,
+    anim_once: bool,
+) -> Result<FrameChoice, String> {
+    match (frame, time) {
+        (Some(index), None) => Ok(FrameChoice::Index(index)),
+        (None, Some(time)) => Ok(FrameChoice::Time(time)),
+        (None, None) => Ok(FrameChoice::Playback {
+            tick: 0,
+            fps: anim_fps,
+            policy: if anim_once {
+                sra::PlaybackLoop::Once
+            } else {
+                sra::PlaybackLoop::Loop
+            },
+        }),
+        (Some(_), Some(_)) => Err("--animate accepts --frame or --time, not both".to_string()),
     }
-    if at != args.len() {
-        return Err(usage.to_string());
+}
+
+fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
+    let usage = "expected --animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--anim-fps <N>] [--anim-once]";
+    let (mut sra, mut dat, mut entry, mut frame, mut time) = (None, None, None, None, None);
+    let mut anim_fps = sra::ANIMATION_FPS;
+    let mut anim_once = false;
+    let mut at = 0;
+    while at < args.len() {
+        match args[at].as_str() {
+            "--anim-once" => {
+                anim_once = true;
+                at += 1;
+            }
+            token => {
+                let Some(value) = args.get(at + 1).map(String::as_str) else {
+                    return Err(usage.to_string());
+                };
+                match token {
+                    "--sra" => sra = Some(value),
+                    "--bigfile" => dat = Some(value),
+                    "--entry" => {
+                        entry = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
+                    }
+                    "--frame" => {
+                        frame = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
+                    }
+                    "--time" => {
+                        time = Some(value.parse::<u16>().map_err(|_| usage.to_string())?);
+                    }
+                    "--anim-fps" => {
+                        let fps = value
+                            .parse::<u32>()
+                            .map_err(|_| usage.to_string())?;
+                        if !(1..=240).contains(&fps) {
+                            return Err(format!(
+                                "invalid value '{value}' for --anim-fps: expected an integer in 1..=240"
+                            ));
+                        }
+                        anim_fps = fps;
+                    }
+                    _ => return Err(usage.to_string()),
+                }
+                at += 2;
+            }
+        }
     }
     match (sra, dat, entry) {
         (Some(sra), Some(dat), Some(entry)) => Ok(AnimateInput {
@@ -567,13 +618,16 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
             entry,
             frame,
             time,
+            anim_fps,
+            anim_once,
         }),
         _ => Err(usage.to_string()),
     }
 }
 
 /// The pure core of `--animate`: one decoded frame, the slot poses it produces
-/// and the same hierarchical skin the facing path uses. No clock, no window.
+/// and the same hierarchical skin the facing path uses. No window; the optional
+/// playback clock is integer-only and tick-driven.
 fn animate_report(
     model: &object::ObjectModel,
     animation: &sra::SraAnimation,
@@ -591,7 +645,9 @@ fn animate_report(
             animation.decode_index(index)?
         }
         FrameChoice::Time(time) => animation.decode_time(time)?,
-        FrameChoice::Default => animation.decode_index(0)?,
+        FrameChoice::Playback { tick, fps, policy } => {
+            animation.decode_tick(tick, fps, policy)?
+        }
     };
     let poses = animation.poses(&frame);
     let parents: Vec<i16> = model
@@ -2524,12 +2580,13 @@ fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
 mod cli_tests {
     use super::run_level_info;
     use super::{
-        animate_input, animate_report, bone_hierarchy_input, facing_input, facing_report,
-        list_report, object_input, parse_direction, pose_mode_conflict, resolve_texture_name,
-        run_actor_census, run_audio, run_bigfile, dispatch, run_level_links, run_level_records,
-        run_level_structure, run_mesh, run_mesh_all, run_level_geometry, run_level_objects,
-        run_level_render, run_mesh_textured, run_mesh_with, run_object_info, run_object_mesh,
-        run_object_mesh_with, run_textures, strip_launcher_noops, tshow_suffix, FrameChoice,
+        animate_choice, animate_input, animate_report, bone_hierarchy_input, facing_input,
+        facing_report, list_report, object_input, parse_direction, pose_mode_conflict,
+        resolve_texture_name, run_actor_census, run_audio, run_bigfile, dispatch, run_level_links,
+        run_level_records, run_level_structure, run_mesh, run_mesh_all, run_level_geometry,
+        run_level_objects, run_level_render, run_mesh_textured, run_mesh_with, run_object_info,
+        run_object_mesh, run_object_mesh_with, run_textures, strip_launcher_noops, tshow_suffix,
+        FrameChoice,
     };
     use std::process::ExitCode;
     use std::rc::Rc;
@@ -3406,6 +3463,21 @@ mod cli_tests {
             (parsed.sra, parsed.dat, parsed.entry, parsed.frame, parsed.time),
             ("R.SRA", "B.DAT", 66, Some(24), None)
         );
+        assert_eq!((parsed.anim_fps, parsed.anim_once), (crate::sra::ANIMATION_FPS, false));
+
+        let flagged_argv = argv(&[
+            "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "66", "--anim-fps", "20",
+            "--anim-once",
+        ]);
+        let flagged = animate_input(&flagged_argv).expect("playback flags must parse");
+        assert_eq!((flagged.anim_fps, flagged.anim_once), (20, true));
+
+        assert!(matches!(
+            animate_input(&argv(&[
+                "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "66", "--anim-fps", "241",
+            ])),
+            Err(message) if message.contains("1..=240")
+        ));
         assert!(animate_input(&argv(&["--sra", "R.SRA", "--bigfile", "B.DAT"])).is_err());
         assert!(
             animate_input(&argv(&["--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "x"])).is_err()
@@ -3416,6 +3488,29 @@ mod cli_tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn animate_frame_override_wins_over_the_playback_clock() {
+        assert_eq!(animate_choice(Some(24), None, 1, true), Ok(FrameChoice::Index(24)));
+        assert_eq!(animate_choice(None, Some(100), 1, true), Ok(FrameChoice::Time(100)));
+        assert_eq!(
+            animate_choice(None, None, 1, false),
+            Ok(FrameChoice::Playback {
+                tick: 0,
+                fps: 1,
+                policy: crate::sra::PlaybackLoop::Loop,
+            })
+        );
+        assert_eq!(
+            animate_choice(None, None, 1, true),
+            Ok(FrameChoice::Playback {
+                tick: 0,
+                fps: 1,
+                policy: crate::sra::PlaybackLoop::Once,
+            })
+        );
+        assert!(animate_choice(Some(1), Some(2), 50, false).is_err());
     }
 
     #[test]

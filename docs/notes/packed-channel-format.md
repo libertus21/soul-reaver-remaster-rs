@@ -240,12 +240,41 @@ The decoder is wired into the shipped `.SRA`:
   decodes one frame and prints slot count, channel count, frame index, the first
   populated angle triples and the first three skinned vertices. Slot count is
   the model's bone count, not an `.SRA` field.
+- `--play ... --sra <FILE>` decodes one frame per canonical tick and skins the
+  player mesh through `pose::skin_positions_hierarchical`. It is presentation
+  only: no animation state enters `FrameState` and no golden digest moves.
 
 Two file-form facts are CONFIRMED by that replay: the inline stream begins at
 `align4(bit_plane_base + 1 + present * stride_bytes)` (not at the `+0x14`
 offsets, which still point elsewhere), and one contiguous stream carries every
 slot in slot order. At frame 24, slot 6 decodes to exactly
 `(-595.240, -101.331, 52.838)`.
+
+### Playback clock
+
+The capture above fixes the **source-side** frame unit (`divisor` and
+`frame_index = floor(frame_time / divisor)`), but it does **not** establish how
+many palette frames the game draws per second. The authored wall-clock rate is
+therefore **UNKNOWN**. The renderer treats the presentation rate as an explicit
+choice in `src/sra.rs`:
+
+```text
+frames_elapsed = tick * fps / 60
+index          = frames_elapsed % frame_count      (PlaybackLoop::Loop)
+index          = min(frames_elapsed, frame_count-1) (PlaybackLoop::Once)
+```
+
+The arithmetic is integer-only (`u64`, no float, no wall clock) and narrows only
+at the end, so a large tick count cannot hit the old `u16` frame-time ceiling
+that froze playback. `ANIMATION_FPS` defaults to **50**: the validated table has
+50 frames, so one full palette pass lasts one second of simulation, and one
+palette frame lasts about 1.2 ticks at the fixed 60 Hz rate. This is a
+presentation default, not a measured engine constant.
+
+Change it with `--anim-fps <N>` (accepted range `1..=240`); add `--anim-once`
+for a single pass that holds the last frame instead of wrapping. In `--animate`,
+an explicit `--frame <N>` overrides the playback clock. The clock is
+presentation-only: it never enters `FrameState` and no determinism golden moves.
 
 ## Validation
 

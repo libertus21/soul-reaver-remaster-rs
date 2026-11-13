@@ -43,7 +43,7 @@ fn route_group(group: &str, rest: &[String]) -> Route {
     else {
         return Route::Error(command_error(group, Some(action)));
     };
-    match parse_operands(cap, &rest[1..]).and_then(|(p, o)| build(cap, &p, &o)) {
+    match parse_operands(cap, &rest[1..]).and_then(|(p, o, f)| build(cap, &p, &o, &f)) {
         Ok(argv) => Route::Dispatch(argv),
         Err(message) => Route::Error(message),
     }
@@ -66,13 +66,17 @@ fn command_error(group: &str, action: Option<&str>) -> String {
 fn parse_operands<'a>(
     cap: &Capability,
     rest: &'a [String],
-) -> Result<(Vec<&'a str>, Vec<(&'a str, &'a str)>), String> {
+) -> Result<(Vec<&'a str>, Vec<(&'a str, &'a str)>, Vec<&'a str>), String> {
     let mut positional = Vec::new();
     let mut options = Vec::new();
+    let mut flags = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         let token = rest[i].as_str();
-        if cap.takes_value(token) {
+        if cap.takes_flag(token) {
+            flags.push(token);
+            i += 1;
+        } else if cap.takes_value(token) {
             let Some(value) = rest.get(i + 1) else {
                 return Err(format!("error: option '{token}' needs a value\n{}", usage(cap)));
             };
@@ -90,13 +94,14 @@ fn parse_operands<'a>(
             i += 1;
         }
     }
-    Ok((positional, options))
+    Ok((positional, options, flags))
 }
 
 fn build(
     cap: &Capability,
     positional: &[&str],
     options: &[(&str, &str)],
+    flags: &[&str],
 ) -> Result<Vec<String>, String> {
     let tokens: Vec<&str> = cap.legacy.split_whitespace().collect();
     let mut argv = Vec::new();
@@ -114,7 +119,11 @@ fn build(
                     break;
                 }
             }
-            if let Some(value) = option(options, group[0]) {
+            if group.len() == 1 && cap.takes_flag(group[0]) {
+                if flags.contains(&group[0]) {
+                    argv.push(group[0].to_string());
+                }
+            } else if let Some(value) = option(options, group[0]) {
                 argv.push(group[0].to_string());
                 argv.push(value.to_string());
             }
@@ -345,6 +354,26 @@ mod tests {
                 &[
                     "--animate", "--sra", "RAZIEL.SRA", "--bigfile", "BIGFILE.DAT", "--entry",
                     "66", "--frame", "24",
+                ],
+            ),
+            (
+                &[
+                    "game", "animate", "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "66",
+                    "--anim-once", "--anim-fps", "20",
+                ],
+                &[
+                    "--animate", "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "66",
+                    "--anim-fps", "20", "--anim-once",
+                ],
+            ),
+            (
+                &[
+                    "game", "play", "--bigfile", "B.DAT", "--sra", "R.SRA", "--anim-fps", "25",
+                    "--anim-once",
+                ],
+                &[
+                    "--play", "--bigfile", "B.DAT", "--sra", "R.SRA", "--anim-fps", "25",
+                    "--anim-once",
                 ],
             ),
         ];
