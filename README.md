@@ -37,7 +37,7 @@ your own install; nothing is bundled.
 | `--level-render` (orbit + fly) | `cargo run -- --level-render <PATH>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --entry <INDEX>` / `cargo run -- --level-render --bigfile <BIGFILE.DAT> --group under [--objects] [--textures <TEXTURES.BIG>]` | Renders room geometry, flat or textured from `TEXTURES.BIG`. Orbit, wheel zoom, pan, `R` reset; `F` enters a first-person fly camera. `--objects` adds each placed object's real archived model at its world position; `--textures` textures both rooms and models. |
 | Level reachability | `cargo run -- --level-reach --bigfile <BIGFILE.DAT> [--start <UNIT>] [--names]` | BFS from `under1` over the decoded link graph, then groups reachable, in-degree islands and inbound-but-unreachable units. `--names` lists each island unit. Corrected reader: 372 discovered / 334 reachable / 38 unreachable / 1 island (`push1`). |
 | Engine play mode | `cargo run -- --play --bigfile <BIGFILE.DAT> --textures <TEXTURES.BIG>` / `cargo run -- --play --headless --bigfile <BIGFILE.DAT> --ticks <N>` | Opens a deterministic engine window (orbit, fly or player camera; player mode is `WASD`, `Space` jumps, `F` cycles the camera, `Esc` exits 0), or prints one headless acceptance line with the FNV-1a 64 state digest. Fixed 60 Hz clock, 48-slot tracker, name-keyed spawning, 18-stage frame loop, solid room walls, Z-up gravity with ground/landing, ceiling blocking, a synthetic ground-only jump and a Z-up third-person player camera. The authored placed-object seed pass runs in both windowed and headless modes. Still no AI, body animation, scripts or audio. Current 60-tick digests: `under1` `ede39c540a10ee39`, `skinnr1` `398d1870a463fd7a`. |
-| Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 35 capabilities in six groups (`texture` 4, `archive` 2, `mesh` 9, `audio` 2, `level` 17, `game` 1); grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
+| Unified CLI | `cargo run -- --help` / `cargo run -- menu` / `cargo run -- texture list <BIG>` | `--help` lists the 37 capabilities in six groups (`texture` 4, `archive` 2, `mesh` 9, `audio` 2, `level` 17, `game` 3); grouped commands rewrite to the exact legacy argv; `menu` is a numbered terminal picker (`q` quits). |
 
 `<PATH>` accepts a `.PCM` file or a room directory. The level arms also accept
 `--bigfile <DAT> --entry <INDEX>` or `--bigfile <DAT> --group <PREFIX>`.
@@ -131,7 +131,7 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
 
 ## What's missing / known limits
 
-- **No body animation.** Body animation is **NOT available**. The original SR1
+- **Body animation is player-only, from the packed channel.** The original SR1
   spline system does not drive actors in the remaster: a read-only Frida capture
   on the live game armed its hooks with zero failures, the spline set selector
   fired 53 times across the live objects, and the sampler fired **zero** times
@@ -141,20 +141,19 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
   (`docs/changes/engine-skeleton/milestone-report.md`, "Post-milestone"). The
   file-side census agrees: zero spline
   descriptors in all 21 actor containers
-  (`docs/notes/actor-spline-census.md`). `.SRA` is not parsed by this build (the
-  loader callback is a `RET 0` stub) and a font-calibrated key-shape search
-  found no coherent channel in its payloads (`docs/notes/sra-key-search.md`);
+  (`docs/notes/actor-spline-census.md`). `.SRA` is now read for its
+  **packed-channel frame table**: `cargo run -- --animate --sra <FILE>
+  --bigfile <DAT> --entry <INDEX>` decodes one frame and skins the archived
+  model. Non-player actors and the spline/keyed producers remain unwired;
   `.SRM` has no hierarchy, so `--pose` is a local cluster rotation only and the
   mesh tears at cluster seams. `.SRL` is a confirmed **voice-line animation
   container** (header, frame count, fps, duration and 48-byte per-frame 3x4
   cells; `docs/notes/srl-animation.md`) but has no channel-to-bone table. `.PMF`
   remains undecoded. The consolidated verdict - what was searched, every carrier
   ruled out with its counts, and why the authored data simply does not exist - is
-  in `docs/notes/animation-conclusion.md`. A pure file-form **packed-channel
-  decoder** now exists in `src/packed_channel.rs` (frame header, bit planes,
-  palette/literal stream, per-slot angle rotations), but it is not yet wired
-  into the frame pipeline; the frame-index wrap is a named `Saturate` policy
-  because the engine branch is UNKNOWN (`docs/notes/packed-channel-format.md`).
+  in `docs/notes/animation-conclusion.md`. The frame-index wrap is a named
+  `Saturate` policy because the engine branch is UNKNOWN
+  (`docs/notes/packed-channel-format.md`).
 - **Body-angle provenance is mode-dependent.** The per-slot constructor input is
   a per-frame staging record filled by the animation sampler from the
   object-container animation record; the root uses the object's live aim words.

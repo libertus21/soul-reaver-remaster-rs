@@ -231,6 +231,22 @@ wired into canonical frame state):
   `DecodedChannel` / `decode_channel_range` / `decode_channel` return the angles
   and their `rotation_from_binary_angles` matrix for a whole channel window.
 
+## Now consumed by
+
+The decoder is wired into the shipped `.SRA`:
+
+- `--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>]
+  [--time <T>]` locates the first structurally valid table in a payload record,
+  decodes one frame and prints slot count, channel count, frame index, the first
+  populated angle triples and the first three skinned vertices. Slot count is
+  the model's bone count, not an `.SRA` field.
+
+Two file-form facts are CONFIRMED by that replay: the inline stream begins at
+`align4(bit_plane_base + 1 + present * stride_bytes)` (not at the `+0x14`
+offsets, which still point elsewhere), and one contiguous stream carries every
+slot in slot order. At frame 24, slot 6 decodes to exactly
+`(-595.240, -101.331, 52.838)`.
+
 ## Validation
 
 ### Live capture

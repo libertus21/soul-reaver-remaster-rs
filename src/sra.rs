@@ -20,6 +20,11 @@
 
 use std::ops::Range;
 
+use crate::packed_channel::{
+    self, FRAME_INDEX_POLICY, FrameHeader, PackedFrameTable, TableForm,
+};
+use crate::pose::{SlotPose, rotation_from_binary_angles};
+
 pub const ROTATION_SOURCE_STRIDE: usize = 0x0a;
 pub const ROTATION_RUNTIME_STRIDE: usize = 0x1c;
 pub const POSITION_SOURCE_STRIDE: usize = 0x20;
@@ -383,6 +388,229 @@ pub fn encode_single_record_container(record: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// One decoded animation frame: per-slot binary-angle triples (`X`, `Y`, `Z`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SraFrame {
+    /// Palette frame index used for this decode.
+    pub frame_index: usize,
+    /// Number of frames in the table.
+    pub frame_count: usize,
+    /// Number of value streams the table header declares.
+    pub channel_count: usize,
+    /// One angle triple per slot, in slot order.
+    pub angles: Vec<[f32; 3]>,
+}
+
+/// A located packed-channel table inside one `.SRA` payload record.
+///
+/// [`SraAnimation::load`] scans the container's payload records in file order
+/// for the first structurally valid table whose whole-slot inline stream
+/// decodes for `slot_count` slots. The validated `RAZIEL.SRA` body table is the
+/// first such record. Decoding is on demand, so the animation frame is a pure
+/// function of the table and the requested index; no clock or wall time is
+/// stored here.
+#[derive(Debug, Clone)]
+pub struct SraAnimation {
+    bytes: Vec<u8>,
+    table: Range<usize>,
+    header: FrameHeader,
+    slot_count: usize,
+}
+
+impl SraAnimation {
+    /// Locate the table and bind it to a model's slot count.
+    ///
+    /// The slot count is the model's bone count, not an `.SRA` field
+    /// (`docs/notes/sra-slot-pose.md`). A container that does not parse, or a
+    /// payload with no table that decodes for that many slots, is a loud error.
+    pub fn load(bytes: Vec<u8>, slot_count: usize) -> Result<Self, String> {
+        if slot_count == 0 {
+            return Err("sra animation: slot count 0 cannot size the bit planes".to_string());
+        }
+        let container = parse_container(&bytes).ok_or_else(|| {
+            "sra animation: the .SRA container directory did not parse".to_string()
+        })?;
+        for record in &container.records {
+            let slice = &bytes[record.clone()];
+            for at in 0..slice.len() {
+                let Ok(table) = PackedFrameTable::parse(&slice[at..], TableForm::File) else {
+                    continue;
+                };
+                let Ok(planes) = table.bit_planes(slot_count) else {
+                    continue;
+                };
+                if planes.flags() & 0x01 == 0 {
+                    continue;
+                }
+                if packed_channel::decode_inline_channel(&table, slot_count, 0).is_err() {
+                    continue;
+                }
+                let header = table.header();
+                let table = record.start + at..record.end;
+                return Ok(Self {
+                    bytes,
+                    table,
+                    header,
+                    slot_count,
+                });
+            }
+        }
+        Err(format!(
+            "sra animation: no packed frame table decoded for {slot_count} slots"
+        ))
+    }
+
+    /// Number of slots this animation decodes.
+    pub fn slot_count(&self) -> usize {
+        self.slot_count
+    }
+
+    /// Number of frames in the located table.
+    pub fn frame_count(&self) -> usize {
+        usize::from(self.header.frame_count)
+    }
+
+    /// Number of value streams the table header declares.
+    pub fn channel_count(&self) -> usize {
+        usize::from(self.header.table_count)
+    }
+
+    /// The table's frame-clock divisor.
+    pub fn divisor(&self) -> i16 {
+        self.header.divisor
+    }
+
+    /// Palette frame index for one canonical tick.
+    ///
+    /// One tick advances the frame time by one unit, which is the unit the live
+    /// capture recorded (`time = 2400` selected frame `24` at divisor `100`).
+    /// The mapping is saturated at `u16::MAX` and the index follows
+    /// [`FRAME_INDEX_POLICY`] (`Saturate`), so it is monotonic and never wraps
+    /// past the evidence.
+    pub fn frame_index_for_tick(&self, tick: u64) -> Result<usize, String> {
+        let frame_time = u16::try_from(tick.min(u64::from(u16::MAX))).unwrap_or(u16::MAX);
+        self.frame_index_for_time(frame_time)
+    }
+
+    /// Palette frame index for one explicit frame-time unit.
+    pub fn frame_index_for_time(&self, frame_time: u16) -> Result<usize, String> {
+        packed_channel::select_frame_index(
+            frame_time,
+            self.header.divisor,
+            self.header.frame_count,
+            FRAME_INDEX_POLICY,
+        )
+    }
+
+    /// Decode one palette frame.
+    pub fn decode_index(&self, frame_index: usize) -> Result<SraFrame, String> {
+        let table = self.table()?;
+        let decoded = packed_channel::decode_inline_channel(&table, self.slot_count, frame_index)?;
+        Ok(SraFrame {
+            frame_index: decoded.frame_index,
+            frame_count: self.frame_count(),
+            channel_count: self.channel_count(),
+            angles: decoded.slots.iter().map(|slot| slot.angles).collect(),
+        })
+    }
+
+    /// Decode the frame selected by one frame-time unit.
+    pub fn decode_time(&self, frame_time: u16) -> Result<SraFrame, String> {
+        self.decode_index(self.frame_index_for_time(frame_time)?)
+    }
+
+    /// Decode the frame selected by one canonical tick.
+    pub fn decode_tick(&self, tick: u64) -> Result<SraFrame, String> {
+        self.decode_index(self.frame_index_for_tick(tick)?)
+    }
+
+    /// The slot-pose list for `frame`, ready for the hierarchical skinner.
+    pub fn poses(&self, frame: &SraFrame) -> Vec<SlotPose> {
+        poses_from_angles(&frame.angles)
+    }
+
+    /// Decode the frame selected by one canonical tick and build its poses.
+    pub fn poses_for_tick(&self, tick: u64) -> Result<Vec<SlotPose>, String> {
+        let frame = self.decode_tick(tick)?;
+        Ok(self.poses(&frame))
+    }
+
+    fn table(&self) -> Result<PackedFrameTable<'_>, String> {
+        PackedFrameTable::parse(&self.bytes[self.table.clone()], TableForm::File)
+    }
+}
+
+/// Build the 13-float angle-form slot pose list from decoded binary angles.
+///
+/// The nine rotation floats are [`rotation_from_binary_angles`]'s
+/// `Rz(c) * Ry(b) * Rx(a)` matrix. Translation stays zero and the scale marker
+/// stays zero; the packed translation lanes are consumed by the decoder but not
+/// applied by this presentation path yet.
+pub fn poses_from_angles(angles: &[[f32; 3]]) -> Vec<SlotPose> {
+    angles
+        .iter()
+        .map(|angle| {
+            let rotation = rotation_from_binary_angles(angle[0], angle[1], angle[2]);
+            [
+                rotation[0][0],
+                rotation[0][1],
+                rotation[0][2],
+                rotation[1][0],
+                rotation[1][1],
+                rotation[1][2],
+                rotation[2][0],
+                rotation[2][1],
+                rotation[2][2],
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ]
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_animation_container(
+    masks: &[u16],
+    frame_count: u16,
+    divisor: i16,
+    values: &[f32],
+) -> Vec<u8> {
+    let slot_count = masks.len();
+    let stride_bits = ((3 * slot_count + 7) / 8) * 8;
+    let block_base = 0x20;
+    let mut record = vec![0u8; block_base + 1 + stride_bits / 8];
+    record[0] = 3;
+    record[4..6].copy_from_slice(&frame_count.to_le_bytes());
+    record[6..8].copy_from_slice(&divisor.to_le_bytes());
+    for pair in 0..2 {
+        record[8 + pair * 4..10 + pair * 4].copy_from_slice(&frame_count.to_le_bytes());
+        record[10 + pair * 4..12 + pair * 4].copy_from_slice(&divisor.to_le_bytes());
+    }
+    record[block_base] = 0x01;
+    for (slot, mask) in masks.iter().enumerate() {
+        for lane in 0..3 {
+            if mask & (1 << lane) != 0 {
+                let bit = block_base * 8 + 8 + 3 * slot + lane;
+                record[bit / 8] |= 1 << (bit % 8);
+            }
+        }
+    }
+    let stream_at = (record.len() + 3) & !3;
+    record.resize(stream_at, 0);
+    let mut next = values.iter().copied();
+    for mask in masks {
+        for lane in 0..12 {
+            if mask & (1 << lane) != 0 {
+                record.extend_from_slice(&1i32.to_le_bytes());
+                record.extend_from_slice(&next.next().unwrap_or(0.0).to_le_bytes());
+            }
+        }
+    }
+    encode_single_record_container(&record)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,5 +713,150 @@ mod tests {
         container[base..base + 4].copy_from_slice(&16u32.to_le_bytes());
         container[base + 4..base + 8].copy_from_slice(&0u32.to_le_bytes());
         assert!(parse_container(&container).is_none());
+    }
+
+    fn palette_container(
+        masks: &[u16],
+        frame_count: u16,
+        divisor: i16,
+        palettes: &[&[f32]],
+    ) -> Vec<u8> {
+        let slot_count = masks.len();
+        let stride_bits = ((3 * slot_count + 7) / 8) * 8;
+        let block_base = 0x20;
+        let mut record = vec![0u8; block_base + 1 + stride_bits / 8];
+        record[0] = 3;
+        record[4..6].copy_from_slice(&frame_count.to_le_bytes());
+        record[6..8].copy_from_slice(&divisor.to_le_bytes());
+        for pair in 0..2 {
+            record[8 + pair * 4..10 + pair * 4].copy_from_slice(&frame_count.to_le_bytes());
+            record[10 + pair * 4..12 + pair * 4].copy_from_slice(&divisor.to_le_bytes());
+        }
+        record[block_base] = 0x01;
+        for (slot, mask) in masks.iter().enumerate() {
+            for lane in 0..3 {
+                if mask & (1 << lane) != 0 {
+                    let bit = block_base * 8 + 8 + 3 * slot + lane;
+                    record[bit / 8] |= 1 << (bit % 8);
+                }
+            }
+        }
+        let stream_at = (record.len() + 3) & !3;
+        record.resize(stream_at, 0);
+        let mut next = palettes.iter();
+        for mask in masks {
+            for lane in 0..12 {
+                if mask & (1 << lane) == 0 {
+                    continue;
+                }
+                let palette = next.next().expect("one palette per set lane");
+                assert_eq!(palette.len(), usize::from(frame_count));
+                record.extend_from_slice(&0i32.to_le_bytes());
+                for value in *palette {
+                    record.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        encode_single_record_container(&record)
+    }
+
+    #[test]
+    fn a_constructed_table_decodes_known_angles_for_a_known_frame() {
+        let container = palette_container(
+            &[0x007, 0x001],
+            2,
+            100,
+            &[&[10.0, 20.0], &[30.0, 40.0], &[50.0, 60.0], &[70.0, 80.0]],
+        );
+        let animation = SraAnimation::load(container, 2).expect("synthetic table must locate");
+        assert_eq!(animation.slot_count(), 2);
+        assert_eq!(animation.frame_count(), 2);
+        assert_eq!(animation.channel_count(), 3);
+        assert_eq!(animation.divisor(), 100);
+
+        let first = animation.decode_index(0).expect("frame 0");
+        assert_eq!(first.frame_index, 0);
+        assert_eq!(first.angles, vec![[10.0, 30.0, 50.0], [70.0, 0.0, 0.0]]);
+
+        let second = animation.decode_time(100).expect("frame 1");
+        assert_eq!(second.frame_index, 1);
+        assert_eq!(second.angles, vec![[20.0, 40.0, 60.0], [80.0, 0.0, 0.0]]);
+        assert_eq!(animation.poses(&second).len(), 2);
+    }
+
+    #[test]
+    fn frame_index_advances_monotonically_with_tick_count_and_saturates() {
+        let container = synthetic_animation_container(&[0x001], 50, 100, &[0.0]);
+        let animation = SraAnimation::load(container, 1).expect("synthetic table must locate");
+        assert_eq!(animation.frame_index_for_tick(0), Ok(0));
+        assert_eq!(animation.frame_index_for_tick(99), Ok(0));
+        assert_eq!(animation.frame_index_for_tick(100), Ok(1));
+        assert_eq!(animation.frame_index_for_tick(2400), Ok(24));
+        assert_eq!(animation.frame_index_for_tick(4900), Ok(49));
+        assert_eq!(animation.frame_index_for_tick(5000), Ok(49));
+        assert_eq!(animation.frame_index_for_tick(u64::MAX), Ok(49));
+        let mut previous = 0;
+        for tick in (0..=5000u64).step_by(37) {
+            let index = animation.frame_index_for_tick(tick).expect("clock");
+            assert!(index >= previous, "index went backwards at tick {tick}");
+            assert!(index < animation.frame_count());
+            previous = index;
+        }
+        assert_eq!(
+            animation.decode_tick(2400).expect("frame 24").frame_index,
+            24
+        );
+    }
+
+    #[test]
+    fn a_decoded_pose_moves_more_than_one_bone_through_the_skinner() {
+        use crate::bone_hierarchy::BoneHierarchy;
+        use crate::object::{Bone, ObjectModel, rest_positions};
+
+        // Slot 0 rotates X, slot 1 rotates Y, slot 2 carries one angle lane only.
+        let container = synthetic_animation_container(
+            &[0x007, 0x007, 0x001],
+            1,
+            100,
+            &[1024.0, 0.0, 0.0, 0.0, 1024.0, 0.0, 0.0],
+        );
+        let animation = SraAnimation::load(container, 3).expect("synthetic table must locate");
+        let frame = animation.decode_index(0).expect("frame 0");
+        assert_eq!(frame.angles[0], [1024.0, 0.0, 0.0]);
+        assert_eq!(frame.angles[1], [0.0, 1024.0, 0.0]);
+
+        let model = ObjectModel {
+            vertices: vec![
+                ([0, 1, 0], 0),
+                ([0, 2, 0], 0),
+                ([1, 0, 0], 0),
+                ([2, 0, 0], 0),
+                ([0, 0, 1], 0),
+                ([0, 0, 2], 0),
+            ],
+            bones: vec![
+                Bone { first_vertex: 0, last_vertex: 1, local: [0, 0, 0], parent: u16::MAX },
+                Bone { first_vertex: 2, last_vertex: 3, local: [10, 0, 0], parent: u16::MAX },
+                Bone { first_vertex: 4, last_vertex: 5, local: [0, 10, 0], parent: u16::MAX },
+            ],
+            ..ObjectModel::default()
+        };
+        let hierarchy = BoneHierarchy::from_parents(vec![-1, -1, -1]);
+        let poses = animation.poses(&frame);
+        let positions =
+            crate::pose::skin_positions_hierarchical(&model, &hierarchy, &poses).expect("skin");
+        let rest = rest_positions(&model);
+        let moved_ranges = model
+            .bones
+            .iter()
+            .filter(|bone| {
+                (bone.first_vertex..=bone.last_vertex)
+                    .any(|index| positions[index as usize] != rest[index as usize])
+            })
+            .count();
+        assert!(
+            moved_ranges >= 2,
+            "the decoded pose must move more than one bone, moved {moved_ranges}"
+        );
     }
 }

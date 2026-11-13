@@ -337,6 +337,16 @@ mod tests {
                     "--facing", "--bigfile", "BIGFILE.DAT", "--entry", "66", "--direction", "0:1",
                 ],
             ),
+            (
+                &[
+                    "game", "animate", "--sra", "RAZIEL.SRA", "--bigfile", "BIGFILE.DAT",
+                    "--entry", "66", "--frame", "24",
+                ],
+                &[
+                    "--animate", "--sra", "RAZIEL.SRA", "--bigfile", "BIGFILE.DAT", "--entry",
+                    "66", "--frame", "24",
+                ],
+            ),
         ];
         for (input, expected) in cases {
             assert_dispatch(input, expected);
