@@ -37,6 +37,7 @@ use crate::engine::scene::{CameraView, PlayerFacing, SceneAssets};
 use crate::engine::spawn::{Admission, EngineNameTable};
 use crate::engine::world::{World, WorldError};
 use crate::object_texture::PageBank;
+use crate::pose;
 use crate::render::{self, FlyCamera, OrbitCamera};
 use crate::sra::{ANIMATION_FPS, PlaybackLoop};
 
@@ -71,13 +72,120 @@ impl CameraMode {
     }
 }
 
+/// One step of an `--input-script` run: hold `button` for `ticks` ticks.
+///
+/// Steps are applied sequentially from tick 0, so the first step owns ticks
+/// `0..ticks` and the next one starts where it ended. A step is a press at its
+/// first tick and a release at the tick after its last, never a wall-clock
+/// timer: the diagnostic therefore measures the same fixed ticks a headless
+/// run always uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScriptStep {
+    pub button: InputButton,
+    pub ticks: u32,
+}
+
+/// A parsed `--input-script` sequence.
+///
+/// Parsing is pure and bounded: the total tick count is capped so an untrusted
+/// spec cannot request an unbounded run. The type exposes the exact per-tick
+/// key events, which is what the diagnostics tests assert against.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputScript {
+    steps: Vec<ScriptStep>,
+}
+
+/// Largest tick count one `--input-script` step may request.
+pub const MAX_SCRIPT_STEP_TICKS: u32 = 1_000_000;
+
+/// Largest total tick count an `--input-script` may request.
+pub const MAX_SCRIPT_TOTAL_TICKS: u64 = 1_000_000;
+
+impl InputScript {
+    /// Parse `button:ticks[,button:ticks...]`.
+    ///
+    /// Buttons are `forward`, `back`, `left`, `right`, `jump` and `action`.
+    /// Every step must carry a positive tick count and the total must stay
+    /// within [`MAX_SCRIPT_TOTAL_TICKS`].
+    pub fn parse(spec: &str) -> Option<Self> {
+        let mut steps = Vec::new();
+        let mut total = 0u64;
+        for part in spec.split(',') {
+            let (raw_button, raw_ticks) = part.split_once(':')?;
+            let button = parse_script_button(raw_button.trim())?;
+            let ticks = raw_ticks.trim().parse::<u32>().ok()?;
+            if ticks == 0 || ticks > MAX_SCRIPT_STEP_TICKS {
+                return None;
+            }
+            total = total.checked_add(u64::from(ticks))?;
+            if total > MAX_SCRIPT_TOTAL_TICKS {
+                return None;
+            }
+            steps.push(ScriptStep { button, ticks });
+        }
+        (!steps.is_empty()).then_some(Self { steps })
+    }
+
+    /// Total number of ticks the whole sequence occupies.
+    pub fn total_ticks(&self) -> u64 {
+        self.steps
+            .iter()
+            .map(|step| u64::from(step.ticks))
+            .sum()
+    }
+
+    /// The key events applied at the start of `tick`, in step order.
+    ///
+    /// A step releases at the boundary tick and the following step presses at
+    /// the same boundary, so two adjacent steps of the same button are two
+    /// separate presses, not one held button.
+    pub fn events_at(&self, tick: u64) -> Vec<InputEvent> {
+        let mut events = Vec::new();
+        let mut cursor = 0u64;
+        for step in &self.steps {
+            let end = cursor + u64::from(step.ticks);
+            if tick == cursor {
+                events.push(InputEvent::press(step.button));
+            }
+            if tick == end {
+                events.push(InputEvent::release(step.button));
+            }
+            cursor = end;
+        }
+        events
+    }
+}
+
+fn parse_script_button(raw: &str) -> Option<InputButton> {
+    match raw.to_ascii_lowercase().as_str() {
+        "forward" => Some(InputButton::Forward),
+        "back" => Some(InputButton::Back),
+        "left" => Some(InputButton::Left),
+        "right" => Some(InputButton::Right),
+        "jump" => Some(InputButton::Jump),
+        "action" => Some(InputButton::Action),
+        _ => None,
+    }
+}
+
+/// Parse `X,Y,Z` into an integer world position.
+fn parse_player_pos(raw: &str) -> Option<[i32; 3]> {
+    let mut values = raw.split(',');
+    let position = [
+        values.next()?.trim().parse::<i32>().ok()?,
+        values.next()?.trim().parse::<i32>().ok()?,
+        values.next()?.trim().parse::<i32>().ok()?,
+    ];
+    values.next().is_none().then_some(position)
+}
+
 /// Parsed `--play` options.
 ///
 /// `ticks` is resolved during parsing: headless defaults to 60, while `None`
 /// in windowed mode means no frame cap. Windowed runs require `--textures`;
 /// that is a runtime check so the parser stays pure and the T1 error surface is
 /// unchanged.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlayOptions {
     pub bigfile: PathBuf,
     pub textures: Option<PathBuf>,
@@ -91,6 +199,15 @@ pub struct PlayOptions {
     pub anim_fps: u32,
     /// Whether the animation wraps (`false`) or holds the last frame (`true`).
     pub anim_once: bool,
+    /// Deterministic diagnostic input sequence (`--input-script`, headless only).
+    pub input_script: Option<InputScript>,
+    /// Explicit player position that overrides the authored record
+    /// (`--player-pos`, a test aid).
+    pub player_pos: Option<[i32; 3]>,
+    /// Third-person boom distance override in world units (`--cam-distance`).
+    pub cam_distance: Option<f32>,
+    /// Third-person eye height override in world units (`--cam-height`).
+    pub cam_height: Option<f32>,
 }
 
 impl PlayOptions {
@@ -111,6 +228,10 @@ impl PlayOptions {
             sra: None,
             anim_fps: ANIMATION_FPS,
             anim_once: false,
+            input_script: None,
+            player_pos: None,
+            cam_distance: None,
+            cam_height: None,
         };
         let mut bigfile = None;
         let mut index = 0;
@@ -152,6 +273,40 @@ impl PlayOptions {
                     index += 1;
                     continue;
                 }
+                "--input-script" => {
+                    let raw = value(args, index, "--input-script")?;
+                    options.input_script = Some(
+                        InputScript::parse(raw)
+                            .ok_or_else(|| PlayError::InvalidInputScript(raw.to_string()))?,
+                    );
+                }
+                "--player-pos" => {
+                    let raw = value(args, index, "--player-pos")?;
+                    options.player_pos = Some(
+                        parse_player_pos(raw)
+                            .ok_or_else(|| PlayError::InvalidPlayerPos(raw.to_string()))?,
+                    );
+                }
+                "--cam-distance" => {
+                    let raw = value(args, index, "--cam-distance")?;
+                    let distance = raw
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|distance| distance.is_finite())
+                        .filter(|distance| (100.0..=5000.0).contains(distance))
+                        .ok_or_else(|| PlayError::InvalidCamDistance(raw.to_string()))?;
+                    options.cam_distance = Some(distance);
+                }
+                "--cam-height" => {
+                    let raw = value(args, index, "--cam-height")?;
+                    let height = raw
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|height| height.is_finite())
+                        .filter(|height| (0.0..=5000.0).contains(height))
+                        .ok_or_else(|| PlayError::InvalidCamHeight(raw.to_string()))?;
+                    options.cam_height = Some(height);
+                }
                 "--headless" => {
                     options.headless = true;
                     index += 1;
@@ -165,12 +320,21 @@ impl PlayOptions {
             return Err(PlayError::MissingArchive);
         };
         options.bigfile = bigfile;
+        if options.input_script.is_some() && !options.headless {
+            return Err(PlayError::InputScriptRequiresHeadless);
+        }
         if options.headless {
             if options.ticks.is_none() {
                 options.ticks = Some(60);
             }
             if options.ticks == Some(0) {
                 return Err(PlayError::ZeroTicksHeadless);
+            }
+            if let Some(script) = &options.input_script {
+                // The script always runs to its own end; `--ticks` may only
+                // extend the idle tail, never truncate the sequence.
+                let script_ticks = u32::try_from(script.total_ticks()).unwrap_or(u32::MAX);
+                options.ticks = Some(options.ticks.unwrap_or(0).max(script_ticks));
             }
         }
         Ok(options)
@@ -197,6 +361,11 @@ pub enum PlayError {
     ZeroTicksHeadless,
     InvalidCamera(String),
     InvalidAnimFps(String),
+    InvalidInputScript(String),
+    InputScriptRequiresHeadless,
+    InvalidPlayerPos(String),
+    InvalidCamDistance(String),
+    InvalidCamHeight(String),
 }
 
 impl fmt::Display for PlayError {
@@ -220,6 +389,26 @@ impl fmt::Display for PlayError {
             Self::InvalidAnimFps(value) => write!(
                 f,
                 "invalid value '{value}' for --anim-fps: expected an integer in 1..=240"
+            ),
+            Self::InvalidInputScript(value) => write!(
+                f,
+                "invalid value '{value}' for --input-script: expected button:ticks pairs such as forward:60"
+            ),
+            Self::InputScriptRequiresHeadless => write!(
+                f,
+                "--input-script requires --headless: the diagnostic is a fixed-tick run"
+            ),
+            Self::InvalidPlayerPos(value) => write!(
+                f,
+                "invalid value '{value}' for --player-pos: expected X,Y,Z integers"
+            ),
+            Self::InvalidCamDistance(value) => write!(
+                f,
+                "invalid value '{value}' for --cam-distance: expected a number in 100..=5000"
+            ),
+            Self::InvalidCamHeight(value) => write!(
+                f,
+                "invalid value '{value}' for --cam-height: expected a number in 0..=5000"
             ),
         }
     }
@@ -310,7 +499,12 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
     };
     let (mut assets, bank) =
         SceneAssets::load(&options.bigfile, world.level.entry, textures).map_err(RunError::scene)?;
-    let frame = FrameState::new(world);
+    let mut frame = FrameState::new(world);
+    if let Some(position) = options.player_pos {
+        // Test aid: override the authored record before the first tick. The
+        // result is still a pure function of the same argv.
+        let _placed = frame.place_player(position);
+    }
     let animation = if options.headless {
         None
     } else {
@@ -331,19 +525,19 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
     };
 
     if options.headless {
-        return run_headless(frame, options.ticks.unwrap_or(60), &options.bigfile);
+        let ticks = options.ticks.unwrap_or(60);
+        if let Some(script) = &options.input_script {
+            return run_scripted(frame, script, ticks, &options.bigfile);
+        }
+        return run_headless(frame, ticks, &options.bigfile);
     }
 
     run_windowed(
         frame,
         assets,
         bank.expect("windowed mode requested textures"),
-        options.camera,
-        &options.unit,
-        &options.bigfile,
+        options,
         animation,
-        options.anim_fps,
-        options.anim_once,
     )
 }
 
@@ -535,19 +729,108 @@ fn run_headless(mut frame: FrameState, ticks: u32, bigfile: &Path) -> Result<(),
     Ok(())
 }
 
+/// The stable one-line `--input-script` diagnostic contract.
+///
+/// `blocked_ticks` counts ticks where the sampled movement axis was non-zero
+/// but the committed horizontal delta was zero. That single counter separates
+/// "the input never reached the simulation" (low, and the player moves) from
+/// "the sweep refused every step" (equal to the moving ticks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MovementReport {
+    pub ticks: u64,
+    pub start: [i32; 3],
+    pub end: [i32; 3],
+    pub blocked_ticks: u64,
+    pub grounded: bool,
+    pub player_bound: bool,
+}
+
+impl MovementReport {
+    /// Render the exact diagnostic line. Field order is part of the contract.
+    pub fn line(&self) -> String {
+        format!(
+            "movement ticks={} start={},{},{} end={},{},{} dx={} dy={} dz={} blocked_ticks={} grounded={} player_bound={}",
+            self.ticks,
+            self.start[0],
+            self.start[1],
+            self.start[2],
+            self.end[0],
+            self.end[1],
+            self.end[2],
+            self.end[0] - self.start[0],
+            self.end[1] - self.start[1],
+            self.end[2] - self.start[2],
+            self.blocked_ticks,
+            u8::from(self.grounded),
+            u8::from(self.player_bound),
+        )
+    }
+}
+
+/// Queue one scripted tick's key events before the tick runs.
+fn apply_script_tick(frame: &mut FrameState, script: &InputScript, tick: u64) {
+    for event in script.events_at(tick) {
+        frame.queue_input(event);
+    }
+}
+
+/// Run `ticks` fixed steps with `script` applied from tick 0 and measure the
+/// player's committed movement. Pure with respect to I/O: tests can call it on
+/// a synthetic [`FrameState`] without an archive or a window.
+pub fn run_script_ticks(
+    frame: &mut FrameState,
+    script: &InputScript,
+    ticks: u64,
+) -> Result<MovementReport, RunError> {
+    let start = frame.player_position().unwrap_or([0; 3]);
+    let mut blocked_ticks = 0u64;
+    for index in 0..ticks {
+        let before = frame.player_position();
+        apply_script_tick(frame, script, index);
+        frame
+            .run_tick(ObjectTick::step(index))
+            .map_err(RunError::engine)?;
+        let after = frame.player_position();
+        let [right, forward] = frame.current_input().move_axis();
+        if (right != 0 || forward != 0)
+            && let (Some(before), Some(after)) = (before, after)
+            && after[0] == before[0]
+            && after[1] == before[1]
+        {
+            blocked_ticks = blocked_ticks.saturating_add(1);
+        }
+    }
+    Ok(MovementReport {
+        ticks: frame.ticks(),
+        start,
+        end: frame.player_position().unwrap_or(start),
+        blocked_ticks,
+        grounded: frame.player_grounded(),
+        player_bound: frame.player().is_some(),
+    })
+}
+
+fn run_scripted(
+    mut frame: FrameState,
+    script: &InputScript,
+    ticks: u32,
+    bigfile: &Path,
+) -> Result<(), RunError> {
+    let _counts = boot_world(&mut frame, bigfile)?;
+    let report = run_script_ticks(&mut frame, script, u64::from(ticks))?;
+    outln!("{}", report.line());
+    Ok(())
+}
+
 fn run_windowed(
     frame: FrameState,
     assets: SceneAssets,
     bank: PageBank,
-    mode: CameraMode,
-    unit: &str,
-    bigfile: &Path,
+    options: &PlayOptions,
     animation: Option<crate::sra::SraAnimation>,
-    anim_fps: u32,
-    anim_once: bool,
 ) -> Result<(), RunError> {
-    boot_before_window(frame, bigfile, |frame| {
-        open_window(frame, assets, bank, mode, unit, animation, anim_fps, anim_once)
+    boot_before_window(frame, &options.bigfile, |frame| {
+        open_window(frame, assets, bank, options, animation)
     })
 }
 
@@ -572,12 +855,11 @@ fn open_window(
     frame: FrameState,
     mut assets: SceneAssets,
     bank: PageBank,
-    mode: CameraMode,
-    unit: &str,
+    options: &PlayOptions,
     animation: Option<crate::sra::SraAnimation>,
-    anim_fps: u32,
-    anim_once: bool,
 ) -> Result<(), RunError> {
+    let mode = options.camera;
+    let unit = options.unit.as_str();
     // The initial scene is the complete set of pages the first frame draws.
     // Decoding them here keeps a bad page strictly before the window.
     {
@@ -609,13 +891,17 @@ fn open_window(
         keys: CameraKeys::default(),
         mouse_last: None,
         drag: None,
+        cam_distance: options.cam_distance.unwrap_or(PLAYER_CAMERA_DISTANCE),
+        cam_height: options.cam_height.unwrap_or(PLAYER_CAMERA_HEIGHT),
+        player_orbit_yaw: 0.0,
+        player_orbit_pitch: 0.0,
         last_frame: Instant::now(),
         last_dt: 0.0,
         init_error: None,
         title: format!("soul reaver - {unit}"),
         animation,
-        anim_fps,
-        anim_policy: if anim_once {
+        anim_fps: options.anim_fps,
+        anim_policy: if options.anim_once {
             PlaybackLoop::Once
         } else {
             PlaybackLoop::Loop
@@ -689,14 +975,39 @@ fn player_button(key: &Key) -> Option<InputButton> {
     }
 }
 
-/// Third-person boom distance behind the player, in integer world units.
-const PLAYER_CAMERA_BACK: f32 = 600.0;
+/// Third-person boom distance behind the player, in world units.
+///
+/// The player model measures ~509 world units from feet to head. The view
+/// matrix uses a 45° vertical field of view (`1 / tan(PI/8)`), so a boom of 900
+/// frames roughly 745 units of height at the look plane: the whole body fits
+/// with headroom. The previous 600-unit boom framed under 500 units and, with
+/// the old 60-unit look height, aimed at the ankles, which is why the window
+/// showed only legs and hands.
+pub const PLAYER_CAMERA_DISTANCE: f32 = 900.0;
 
-/// Third-person eye height above the player's feet, in integer world units.
-const PLAYER_CAMERA_HEIGHT: f32 = 400.0;
+/// Third-person eye height above the player's feet, in world units.
+///
+/// A little above the 509-unit head, so the view is a gentle downward angle
+/// that sees the whole body instead of a top-down or ground-level shot.
+pub const PLAYER_CAMERA_HEIGHT: f32 = 520.0;
 
-/// Height of the look target above the player's feet, in integer world units.
-const PLAYER_LOOK_HEIGHT: f32 = 60.0;
+/// Height of the look target above the player's feet, in world units.
+///
+/// Mid-torso (~55% of the 509-unit body), so the frame centre is the body and
+/// the character is not cropped at the waist.
+pub const PLAYER_LOOK_HEIGHT: f32 = 280.0;
+
+/// Fallback binary yaw used before the player has moved.
+///
+/// Direct forward input moves the player along world `+Y`, so the initial boom
+/// sits behind on world `-Y`, exactly where the previous fixed boom was.
+pub const PLAYER_FALLBACK_YAW_BINARY: f32 = pose::BINARY_ANGLE_UNITS_PER_TURN / 4.0;
+
+/// Mouse orbit sensitivity for the player boom, in radians per pixel.
+pub const PLAYER_ORBIT_SENSITIVITY: f32 = 0.006;
+
+/// Pitch clamp for the player boom, in radians.
+pub const PLAYER_ORBIT_PITCH_LIMIT: f32 = 1.2;
 
 /// Build the third-person view matrix for the Z-up world.
 ///
@@ -734,14 +1045,37 @@ fn third_person_mvp(eye: [f32; 3], target: [f32; 3], aspect: f32) -> [[f32; 4]; 
 
 /// World-space eye and look target for the third-person player camera.
 ///
-/// The eye is behind the player on world `-Y` (forward is `+Y` in the Z-up
-/// world) and above it on world `+Z`. The target is a little above the feet.
-fn player_camera_world(player: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+/// The boom follows the player's produced yaw, so walking forward keeps the
+/// camera behind him. `yaw_binary` is the binary angle (`4096` units per turn)
+/// from [`FrameState::player_yaw_binary`]; `None` means the player has not
+/// moved yet and the fallback `+Y` forward is used.
+///
+/// `distance`, `height`, `yaw_offset` and `pitch` are presentation inputs: the
+/// two scalars come from `--cam-distance`/`--cam-height` (or the defaults) and
+/// the two offsets from the mouse orbit. The eye sits on the horizontal circle
+/// behind the player (`-forward`), `height` above the feet, and is raised or
+/// lowered by `distance * sin(pitch)`. The target is `PLAYER_LOOK_HEIGHT` above
+/// the feet. This never reads or writes simulation state.
+fn player_camera_world(
+    player: [f32; 3],
+    yaw_binary: Option<f32>,
+    distance: f32,
+    height: f32,
+    yaw_offset: f32,
+    pitch: f32,
+) -> ([f32; 3], [f32; 3]) {
+    let base_yaw = yaw_binary
+        .map(pose::binary_angle_to_radians)
+        .unwrap_or_else(|| pose::binary_angle_to_radians(PLAYER_FALLBACK_YAW_BINARY));
+    let yaw = base_yaw + yaw_offset;
+    let (sin_yaw, cos_yaw) = yaw.sin_cos();
+    let (sin_pitch, cos_pitch) = pitch.sin_cos();
+    let horizontal = distance * cos_pitch;
     let target = [player[0], player[1], player[2] + PLAYER_LOOK_HEIGHT];
     let eye = [
-        player[0],
-        player[1] - PLAYER_CAMERA_BACK,
-        player[2] + PLAYER_CAMERA_HEIGHT,
+        player[0] - cos_yaw * horizontal,
+        player[1] - sin_yaw * horizontal,
+        player[2] + height + distance * sin_pitch,
     ];
     (eye, target)
 }
@@ -759,6 +1093,14 @@ struct PlayApp {
     keys: CameraKeys,
     mouse_last: Option<PhysicalPosition<f64>>,
     drag: Option<MouseButton>,
+    /// Player-boom distance in world units (`--cam-distance` or the default).
+    cam_distance: f32,
+    /// Player-boom eye height in world units (`--cam-height` or the default).
+    cam_height: f32,
+    /// Mouse yaw offset around the player boom, in radians. Presentation only.
+    player_orbit_yaw: f32,
+    /// Mouse pitch offset around the player boom, in radians. Presentation only.
+    player_orbit_pitch: f32,
     last_frame: Instant,
     last_dt: f32,
     init_error: Option<String>,
@@ -818,10 +1160,10 @@ impl PlayApp {
                 }
             }
             CameraMode::Player => {
-                // Third-person follow: the camera sits behind (world -Y) and
-                // above (world +Z) the player and tracks it every frame. The
-                // world is Z-up, so "above" is +Z and the horizontal boom lies
-                // in the X/Y plane. UI-only: it never touches simulation state.
+                // Third-person follow: the boom sits behind the player along
+                // its produced yaw and above it on world +Z, and tracks both
+                // every frame. The horizontal boom lies in the X/Y plane; the
+                // mouse offsets orbit it without touching simulation state.
                 let player = self.frame.player_position().map_or(
                     [0.0; 3],
                     |position| {
@@ -832,7 +1174,14 @@ impl PlayApp {
                         ]
                     },
                 );
-                let (eye_world, target_world) = player_camera_world(player);
+                let (eye_world, target_world) = player_camera_world(
+                    player,
+                    self.frame.player_yaw_binary(),
+                    self.cam_distance,
+                    self.cam_height,
+                    self.player_orbit_yaw,
+                    self.player_orbit_pitch,
+                );
                 let transform = self.assets.transform();
                 CameraView {
                     mvp: third_person_mvp(
@@ -883,11 +1232,12 @@ impl PlayApp {
         false
     }
 
-    /// Mouse orbit/pan/zoom in orbit mode and look in fly mode.
+    /// Mouse orbit/pan/zoom in orbit mode, look in fly mode, and orbit the
+    /// third-person boom in player mode.
     fn handle_mouse(&mut self, event: &WindowEvent) -> bool {
         match event {
             WindowEvent::MouseInput { state, button, .. } => {
-                if self.mode == CameraMode::Orbit {
+                if matches!(self.mode, CameraMode::Orbit | CameraMode::Player) {
                     if *state == ElementState::Pressed {
                         self.drag = Some(*button);
                     } else if self.drag == Some(*button) {
@@ -907,7 +1257,19 @@ impl PlayApp {
                             Some(MouseButton::Right) => self.orbit.apply_pan(dx, dy),
                             _ => {}
                         },
-                        CameraMode::Player => {}
+                        CameraMode::Player => {
+                            if self.drag.is_some() {
+                                // Yaw offset and pitch are presentation-only:
+                                // they change the boom, never the player.
+                                self.player_orbit_yaw -= dx * PLAYER_ORBIT_SENSITIVITY;
+                                self.player_orbit_pitch = (self.player_orbit_pitch
+                                    + dy * PLAYER_ORBIT_SENSITIVITY)
+                                    .clamp(
+                                        -PLAYER_ORBIT_PITCH_LIMIT,
+                                        PLAYER_ORBIT_PITCH_LIMIT,
+                                    );
+                            }
+                        }
                     }
                 }
                 self.mouse_last = Some(*position);
@@ -1026,9 +1388,16 @@ impl ApplicationHandler for PlayApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        CameraMode, PLAYER_CAMERA_BACK, PLAYER_CAMERA_HEIGHT, PLAYER_LOOK_HEIGHT, PlayError,
-        PlayOptions, RunError, player_camera_world, third_person_mvp,
+        CameraMode, InputScript, PLAYER_CAMERA_DISTANCE, PLAYER_CAMERA_HEIGHT,
+        PLAYER_FALLBACK_YAW_BINARY, PLAYER_LOOK_HEIGHT, PlayError, PlayOptions, RunError,
+        apply_script_tick, player_camera_world, run_script_ticks, third_person_mvp,
     };
+    use crate::engine::clock::ObjectTick;
+    use crate::engine::collision::CollisionMesh;
+    use crate::engine::frame::FrameState;
+    use crate::engine::input::InputButton;
+    use crate::engine::world::World;
+    use crate::level::{ObjectRecord, ObjectReport};
     use std::path::PathBuf;
 
     fn argv(input: &[&str]) -> Vec<String> {
@@ -1037,6 +1406,50 @@ mod tests {
 
     fn parse(input: &[&str]) -> Result<PlayOptions, PlayError> {
         PlayOptions::parse(&argv(input))
+    }
+
+    fn report(objects: Vec<ObjectRecord>) -> ObjectReport {
+        ObjectReport {
+            room_offset: 0,
+            count: objects.len() as u32,
+            array_offset: 0,
+            objects,
+        }
+    }
+
+    fn record(name: &str, position: [i16; 3]) -> ObjectRecord {
+        ObjectRecord {
+            name: name.to_string(),
+            position,
+            object_type: 4,
+            archetype: 0,
+            instance_id: 1,
+            flags: 0,
+        }
+    }
+
+    /// A world that places the player but carries no collision mesh.
+    fn free_world() -> World {
+        World::from_report(
+            "under1".to_string(),
+            1,
+            &report(vec![record("raziel", [0, 0, 0])]),
+        )
+    }
+
+    /// A world with one constant-Y wall triangle in front of the player, so the
+    /// horizontal sweep has no room to step along +Y.
+    fn wall_world() -> World {
+        let mut world = free_world();
+        world.collision = CollisionMesh::from_room_triangles(
+            &[[-100, 2, -100], [100, 2, -100], [0, 2, 100]],
+            &[[0, 1, 2]],
+        );
+        world
+    }
+
+    fn playerless_world() -> World {
+        World::from_report("under1".to_string(), 1, &report(Vec::new()))
     }
 
     #[test]
@@ -1051,6 +1464,10 @@ mod tests {
         assert_eq!(options.sra, None);
         assert_eq!(options.anim_fps, super::ANIMATION_FPS);
         assert!(!options.anim_once);
+        assert_eq!(options.input_script, None);
+        assert_eq!(options.player_pos, None);
+        assert_eq!(options.cam_distance, None);
+        assert_eq!(options.cam_height, None);
     }
 
     #[test]
@@ -1250,21 +1667,254 @@ mod tests {
     }
 
     #[test]
-    fn the_player_camera_sits_behind_and_above_on_the_correct_axes() {
+    fn input_script_applies_presses_and_releases_for_exactly_its_ticks() {
+        let script = InputScript::parse("forward:3,right:2").expect("script must parse");
+        assert_eq!(script.total_ticks(), 5);
+
+        let mut frame = FrameState::new(free_world());
+        let mut held = Vec::new();
+        let mut edges = Vec::new();
+        for index in 0..6u64 {
+            apply_script_tick(&mut frame, &script, index);
+            frame
+                .run_tick(ObjectTick::step(index))
+                .expect("synthetic tick");
+            let input = frame.current_input();
+            held.push((
+                input.is_held(InputButton::Forward),
+                input.is_held(InputButton::Right),
+            ));
+            edges.push((
+                input.is_pressed(InputButton::Forward),
+                input.is_released(InputButton::Forward),
+                input.is_pressed(InputButton::Right),
+                input.is_released(InputButton::Right),
+            ));
+        }
+
+        assert_eq!(
+            held,
+            vec![
+                (true, false),
+                (true, false),
+                (true, false),
+                (false, true),
+                (false, true),
+                (false, false),
+            ],
+            "each step holds its button for exactly its tick count"
+        );
+        assert_eq!(
+            edges,
+            vec![
+                (true, false, false, false),
+                (false, false, false, false),
+                (false, false, false, false),
+                (false, true, true, false),
+                (false, false, false, false),
+                (false, false, false, true),
+            ],
+            "one press edge at the first tick and one release edge at the boundary"
+        );
+    }
+
+    #[test]
+    fn blocked_ticks_counts_a_sweep_that_cannot_commit_any_delta() {
+        let script = InputScript::parse("forward:30").expect("script must parse");
+        let mut frame = FrameState::new(wall_world());
+        let report = run_script_ticks(&mut frame, &script, 30).expect("scripted run");
+
+        assert_eq!(report.ticks, 30);
+        assert_eq!(report.start, [0, 0, 0]);
+        assert_eq!(report.end, [0, 0, 0], "the wall refuses every step");
+        assert_eq!(report.blocked_ticks, 30, "every moving tick was blocked");
+        assert!(report.player_bound);
+    }
+
+    #[test]
+    fn blocked_ticks_is_zero_when_the_player_moves() {
+        let script = InputScript::parse("forward:30").expect("script must parse");
+        let mut frame = FrameState::new(free_world());
+        let report = run_script_ticks(&mut frame, &script, 30).expect("scripted run");
+
+        assert_eq!(report.blocked_ticks, 0);
+        assert_eq!(report.start, [0, 0, 0]);
+        assert_eq!(
+            report.end,
+            [0, 30 * crate::engine::frame::PLAYER_SPEED_UNITS_PER_TICK, 0],
+            "an empty mesh commits the full direct translation on +Y"
+        );
+        assert!(report.end[1] > report.start[1]);
+    }
+
+    #[test]
+    fn player_bound_reflects_the_binding() {
+        let script = InputScript::parse("forward:1").expect("script must parse");
+
+        let mut bound = FrameState::new(free_world());
+        assert!(run_script_ticks(&mut bound, &script, 1)
+            .expect("scripted run")
+            .player_bound);
+
+        let mut unbound = FrameState::new(playerless_world());
+        let report = run_script_ticks(&mut unbound, &script, 1).expect("scripted run");
+        assert!(!report.player_bound, "no raziel record means no bound player");
+    }
+
+    #[test]
+    fn the_scripted_run_length_never_truncates_the_sequence() {
+        let options = parse(&[
+            "--bigfile",
+            "B",
+            "--headless",
+            "--ticks",
+            "10",
+            "--input-script",
+            "forward:30",
+        ])
+        .expect("script must parse");
+        assert_eq!(options.ticks, Some(30), "the script owns its own ticks");
+
+        let options = parse(&[
+            "--bigfile",
+            "B",
+            "--headless",
+            "--ticks",
+            "120",
+            "--input-script",
+            "forward:30",
+        ])
+        .expect("script must parse");
+        assert_eq!(options.ticks, Some(120), "--ticks may extend the idle tail");
+    }
+
+    #[test]
+    fn input_script_and_player_pos_validate() {
+        assert_eq!(
+            parse(&["--bigfile", "B", "--headless", "--input-script", "forward:0"]),
+            Err(PlayError::InvalidInputScript("forward:0".to_string()))
+        );
+        assert_eq!(
+            parse(&["--bigfile", "B", "--headless", "--input-script", "walk:4"]),
+            Err(PlayError::InvalidInputScript("walk:4".to_string()))
+        );
+        assert!(matches!(
+            parse(&["--bigfile", "B", "--input-script", "forward:4"]),
+            Err(PlayError::InputScriptRequiresHeadless)
+        ));
+
+        let options = parse(&["--bigfile", "B", "--player-pos", "-10,20,30"])
+            .expect("player position must parse");
+        assert_eq!(options.player_pos, Some([-10, 20, 30]));
+        assert_eq!(
+            parse(&["--bigfile", "B", "--player-pos", "1,2"]),
+            Err(PlayError::InvalidPlayerPos("1,2".to_string()))
+        );
+    }
+
+    #[test]
+    fn the_player_camera_puts_the_eye_behind_the_player_relative_to_its_yaw() {
         let player = [123.0, -450.0, 700.0];
-        let (eye, target) = player_camera_world(player);
-        assert_eq!(eye[0], player[0], "the boom keeps the same world X");
-        assert_eq!(eye[1], player[1] - PLAYER_CAMERA_BACK, "behind is world -Y");
-        assert_eq!(eye[2], player[2] + PLAYER_CAMERA_HEIGHT, "above is world +Z");
-        assert!(eye[2] > player[2], "the eye is above the player");
-        assert!(eye[1] < player[1], "the eye is behind the player");
-        assert_eq!(target[2], player[2] + PLAYER_LOOK_HEIGHT);
+        let (fallback, target) = player_camera_world(
+            player,
+            None,
+            PLAYER_CAMERA_DISTANCE,
+            PLAYER_CAMERA_HEIGHT,
+            0.0,
+            0.0,
+        );
+        assert!(
+            (fallback[0] - player[0]).abs() < 1e-3,
+            "the fallback boom keeps world X"
+        );
+        assert!(
+            (fallback[1] - (player[1] - PLAYER_CAMERA_DISTANCE)).abs() < 1e-3,
+            "the fallback boom is behind on world -Y"
+        );
+        assert!(
+            (fallback[2] - (player[2] + PLAYER_CAMERA_HEIGHT)).abs() < 1e-3,
+            "the eye is above the player"
+        );
+        assert!((target[2] - (player[2] + PLAYER_LOOK_HEIGHT)).abs() < 1e-3);
+
+        // Forward +X (yaw 0) rotates the boom onto world -X.
+        let (minus_x, _) = player_camera_world(
+            player,
+            Some(0.0),
+            PLAYER_CAMERA_DISTANCE,
+            PLAYER_CAMERA_HEIGHT,
+            0.0,
+            0.0,
+        );
+        assert!((minus_x[0] - (player[0] - PLAYER_CAMERA_DISTANCE)).abs() < 1e-3);
+        assert!((minus_x[1] - player[1]).abs() < 1e-3);
+
+        // A 90° yaw turn rotates the boom by 90° too: -X becomes -Y.
+        let quarter_turn = crate::pose::BINARY_ANGLE_UNITS_PER_TURN / 4.0;
+        let (minus_y, _) = player_camera_world(
+            player,
+            Some(quarter_turn),
+            PLAYER_CAMERA_DISTANCE,
+            PLAYER_CAMERA_HEIGHT,
+            0.0,
+            0.0,
+        );
+        assert!((minus_y[0] - player[0]).abs() < 1e-3);
+        assert!((minus_y[1] - (player[1] - PLAYER_CAMERA_DISTANCE)).abs() < 1e-3);
+        assert_eq!(
+            quarter_turn, PLAYER_FALLBACK_YAW_BINARY,
+            "the fallback forward is +Y, matching the first direct movement axis"
+        );
+    }
+
+    #[test]
+    fn camera_distance_and_height_overrides_move_the_eye() {
+        let player = [0.0, 0.0, 0.0];
+        let (default_eye, _) = player_camera_world(
+            player,
+            None,
+            PLAYER_CAMERA_DISTANCE,
+            PLAYER_CAMERA_HEIGHT,
+            0.0,
+            0.0,
+        );
+        let (far_eye, _) = player_camera_world(player, None, 1200.0, 800.0, 0.0, 0.0);
+        assert!((far_eye[1] + 1200.0).abs() < 1e-3, "distance controls the boom");
+        assert!((far_eye[2] - 800.0).abs() < 1e-3, "height controls the eye");
+        assert!((far_eye[1] - default_eye[1]).abs() > 1.0);
+
+        let options = parse(&["--bigfile", "B", "--cam-distance", "1200", "--cam-height", "700"])
+            .expect("overrides must parse");
+        assert_eq!(options.cam_distance, Some(1200.0));
+        assert_eq!(options.cam_height, Some(700.0));
+
+        for raw in ["99", "5001", "abc", "-1"] {
+            assert_eq!(
+                parse(&["--bigfile", "B", "--cam-distance", raw]),
+                Err(PlayError::InvalidCamDistance(raw.to_string())),
+                "distance {raw}"
+            );
+        }
+        for raw in ["5001", "abc", "-1"] {
+            assert_eq!(
+                parse(&["--bigfile", "B", "--cam-height", raw]),
+                Err(PlayError::InvalidCamHeight(raw.to_string())),
+                "height {raw}"
+            );
+        }
     }
 
     #[test]
     fn the_player_camera_keeps_the_target_in_front_and_uses_world_z_up() {
         let player = [0.0, 0.0, 0.0];
-        let (eye, target) = player_camera_world(player);
+        let (eye, target) = player_camera_world(
+            player,
+            None,
+            PLAYER_CAMERA_DISTANCE,
+            PLAYER_CAMERA_HEIGHT,
+            0.0,
+            0.0,
+        );
         let m = third_person_mvp(eye, target, 1.0);
         let point = [target[0], target[1], target[2], 1.0];
         let clip: Vec<f32> =
@@ -1280,6 +1930,38 @@ mod tests {
         assert!(
             clip_above[1] / clip_above[3] > clip[1] / clip[3],
             "world +Z points toward screen up"
+        );
+    }
+
+    #[test]
+    fn the_default_boom_frames_the_whole_body() {
+        // The player is ~509 world units tall. At the 45° vertical FOV the
+        // visible half-height at the look plane must cover head and feet.
+        let (eye, target) = player_camera_world(
+            [0.0, 0.0, 0.0],
+            None,
+            PLAYER_CAMERA_DISTANCE,
+            PLAYER_CAMERA_HEIGHT,
+            0.0,
+            0.0,
+        );
+        let distance = ((target[0] - eye[0]).powi(2)
+            + (target[1] - eye[1]).powi(2)
+            + (target[2] - eye[2]).powi(2))
+        .sqrt();
+        let half_height = distance * std::f32::consts::FRAC_PI_8.tan();
+        assert!(
+            target[2] > 200.0,
+            "the target is at mid-torso, not the ankles"
+        );
+        assert!(
+            target[2] + half_height >= 509.0,
+            "the head fits: half-height {half_height} above target {} < 509",
+            target[2]
+        );
+        assert!(
+            target[2] - half_height <= 0.0,
+            "the feet fit"
         );
     }
 }

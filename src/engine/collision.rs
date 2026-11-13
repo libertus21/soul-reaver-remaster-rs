@@ -219,12 +219,17 @@ pub struct VerticalStep {
 ///
 /// `horizontal` keeps the three projected vertices in face order; the three
 /// edges are derived on demand. `min`/`max` are the projected bounding box used
-/// by the broad phase.
+/// by the broad phase. `min_up`/`max_up` keep the source triangle's vertical
+/// extent so a wall only blocks a body whose vertical span overlaps it: a
+/// stacked room's walls must not become phantom barriers for a player on a
+/// different floor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WallTriangle {
     horizontal: [[i32; 2]; 3],
     min: [i32; 2],
     max: [i32; 2],
+    min_up: i32,
+    max_up: i32,
 }
 
 /// Room collision mesh: wall triangles plus a deterministic uniform grid, and
@@ -288,6 +293,8 @@ impl CollisionMesh {
                         horizontal,
                         min,
                         max,
+                        min_up: a[UP].min(b[UP]).min(c[UP]),
+                        max_up: a[UP].max(b[UP]).max(c[UP]),
                     });
                 }
                 FaceClass::Floor => {
@@ -426,6 +433,11 @@ impl CollisionMesh {
     /// tangent, so a diagonal push slides along the wall. At most
     /// [`MAX_SLIDE_ITERATIONS`] contacts are resolved, which bounds the tick
     /// cost and keeps the result deterministic.
+    ///
+    /// A wall only takes part when its source triangle's vertical span overlaps
+    /// the body span `[from[UP], from[UP] + PLAYER_HEIGHT_UNITS]`. The shipped
+    /// rooms stack several floors over the same `X`/`Y`, so a projection without
+    /// this test turns every upper/lower floor wall into a phantom barrier.
     pub fn sweep(&self, from: [i32; 3], delta: [i32; 3], radius: i32) -> [i32; 3] {
         let direct = add_world(from, delta);
         let from_h = horizontal_of(from);
@@ -434,6 +446,7 @@ impl CollisionMesh {
             return direct;
         }
 
+        let body = BodySpan::at(from[UP]);
         let radius = radius.max(0);
         let fixed_radius = i64::from(radius) * SUBUNITS;
         let mut current = [
@@ -447,7 +460,9 @@ impl CollisionMesh {
 
         for _ in 0..MAX_SLIDE_ITERATIONS {
             let candidate = [current[0] + remaining[0], current[1] + remaining[1]];
-            let Some(contact) = self.first_contact(current, candidate, remaining, fixed_radius) else {
+            let Some(contact) =
+                self.first_contact(current, candidate, remaining, fixed_radius, body)
+            else {
                 current = candidate;
                 break;
             };
@@ -600,12 +615,16 @@ impl CollisionMesh {
     }
 
     /// Earliest contact along one horizontal sweep, using the broad phase.
+    ///
+    /// `body` is the vertical span of the moving player; a wall whose source
+    /// triangle does not overlap it is not a barrier for this sweep.
     fn first_contact(
         &self,
         from: [i64; 2],
         to: [i64; 2],
         delta: [i64; 2],
         radius: i64,
+        body: BodySpan,
     ) -> Option<Contact> {
         let world_radius = ((radius + SUBUNITS - 1) / SUBUNITS) as i32;
         let query_from = [to_world_floor(from[0]), to_world_floor(from[1])];
@@ -614,6 +633,9 @@ impl CollisionMesh {
         let mut best: Option<Contact> = None;
         for id in ids {
             let wall = &self.walls[id as usize];
+            if !body.overlaps(wall.min_up, wall.max_up) {
+                continue;
+            }
             for edge in 0..3 {
                 let a = wall.horizontal[edge];
                 let b = wall.horizontal[(edge + 1) % 3];
@@ -625,6 +647,28 @@ impl CollisionMesh {
             }
         }
         best
+    }
+}
+
+/// Vertical span a moving body occupies during a horizontal sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BodySpan {
+    min_up: i32,
+    max_up: i32,
+}
+
+impl BodySpan {
+    /// The span from `feet` up to the player's collision height.
+    const fn at(feet: i32) -> Self {
+        Self {
+            min_up: feet,
+            max_up: feet.saturating_add(PLAYER_HEIGHT_UNITS),
+        }
+    }
+
+    /// Inclusive overlap test against a wall's vertical extent.
+    const fn overlaps(self, min_up: i32, max_up: i32) -> bool {
+        max_up >= self.min_up && min_up <= self.max_up
     }
 }
 
@@ -1144,7 +1188,7 @@ mod tests {
         ];
         for (from, delta, radius) in probes {
             let to = [from[0] + delta[0], from[1] + delta[1]];
-            let grid = mesh.first_contact(from, to, delta, radius);
+            let grid = mesh.first_contact(from, to, delta, radius, super::BodySpan::at(0));
             let mut brute: Option<super::Contact> = None;
             for wall in &mesh.walls {
                 for edge in 0..3 {
@@ -1429,6 +1473,31 @@ mod tests {
         let (land_y, _, grounded) = *arc.last().expect("the arc falls back");
         assert!(grounded, "the player must fall back to the floor");
         assert_eq!(land_y, 0);
+    }
+
+    #[test]
+    fn a_wall_on_another_floor_is_not_a_horizontal_barrier() {
+        // The same X/Y projection that blocks at floor level must not block when
+        // the source triangle sits entirely above the body (a stacked room's
+        // wall). This is the phantom-barrier case that pinned the player in
+        // `under1`.
+        let (vertices, faces) = vertical_wall(100, -500, 500, 200, 400);
+        let above = CollisionMesh::from_room_triangles(&vertices, &faces);
+        assert_eq!(
+            above.sweep([0, 0, 0], [200, 0, 0], 16),
+            [200, 0, 0],
+            "a wall above the 48-unit body span does not block"
+        );
+        assert_eq!(
+            above.sweep([0, 0, 300], [200, 0, 0], 16)[0],
+            84,
+            "the same wall blocks when the body is on its floor"
+        );
+
+        // A wall that overlaps the body span still blocks, exactly as before.
+        let (vertices, faces) = vertical_wall(100, -500, 500, -100, 100);
+        let level = CollisionMesh::from_room_triangles(&vertices, &faces);
+        assert!(level.sweep([0, 0, 0], [200, 0, 0], 16)[0] < 100);
     }
 
     #[test]
