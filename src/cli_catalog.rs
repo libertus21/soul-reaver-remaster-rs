@@ -42,7 +42,16 @@ impl Capability {
             || (self.name == "play"
                 && matches!(
                     token,
-                    "--bigfile" | "--unit" | "--ticks" | "--camera" | "--sra" | "--anim-fps"
+                    "--bigfile"
+                        | "--unit"
+                        | "--ticks"
+                        | "--camera"
+                        | "--sra"
+                        | "--anim-fps"
+                        | "--input-script"
+                        | "--player-pos"
+                        | "--cam-distance"
+                        | "--cam-height"
                 ))
             || ((self.name.ends_with("-entry")
                 || matches!(self.name, "object-info" | "object-info-actors" | "object-mesh" | "bone-hierarchy"))
@@ -93,7 +102,7 @@ pub const CAPABILITIES: [Capability; 37] = [
     Capability { group: "level", name: "links-entry", legacy: "--level-links --bigfile <DAT> --entry <INDEX>", summary: "Print one archive entry's decoded link table.", window: false },
     Capability { group: "level", name: "links-group", legacy: "--level-links --bigfile <DAT> --group <PREFIX>", summary: "Print every archive level family member's link table.", window: false },
     Capability { group: "level", name: "reach", legacy: "--level-reach --bigfile <DAT> [--start <UNIT>]", summary: "BFS the archived level graph, then group reachable, island and inbound-but-unreachable units.", window: false },
-        Capability { group: "game", name: "play", legacy: "--play --bigfile <DAT> [--textures <BIG>] [--unit <NAME>] [--ticks <N>] [--camera <MODE>] [--sra <FILE>] [--anim-fps <N>] [--anim-once]", summary: "Run the engine on an archive: a deterministic headless acceptance line with --headless, or a textured window; --sra animates the player mesh at --anim-fps.", window: true },
+        Capability { group: "game", name: "play", legacy: "--play --bigfile <DAT> [--textures <BIG>] [--unit <NAME>] [--ticks <N>] [--camera <MODE>] [--sra <FILE>] [--anim-fps <N>] [--anim-once] [--headless --input-script <SPEC> [--player-pos <X,Y,Z>]] [--cam-distance <N>] [--cam-height <N>]", summary: "Run the engine on an archive: a deterministic headless acceptance line with --headless, or a textured window; --sra animates the player mesh at --anim-fps; --input-script prints the measured movement line; --cam-distance/--cam-height shape the player boom.", window: true },
     Capability { group: "game", name: "facing", legacy: "--facing --bigfile <DAT> --entry <INDEX> --direction <DX>:<DY>", summary: "Print the yaw produced for a movement direction and the first skinned vertices.", window: false },
     Capability { group: "game", name: "animate", legacy: "--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--anim-fps <N>] [--anim-once]", summary: "Decode one .SRA frame and print the first slot angles and skinned vertices; --frame overrides the --anim-fps playback clock.", window: false },
 ];

@@ -127,6 +127,13 @@ fn error_tag(error: &PlayError) -> u8 {
         PlayError::ZeroTicksHeadless => 4,
         PlayError::InvalidCamera(_) => 5,
         PlayError::InvalidAnimFps(_) => 6,
+        // Diagnostic-only options: appended so the pre-existing tags, and the
+        // error golden that pins `InvalidCamera = 5`, cannot drift.
+        PlayError::InvalidInputScript(_) => 7,
+        PlayError::InputScriptRequiresHeadless => 8,
+        PlayError::InvalidPlayerPos(_) => 9,
+        PlayError::InvalidCamDistance(_) => 10,
+        PlayError::InvalidCamHeight(_) => 11,
     }
 }
 

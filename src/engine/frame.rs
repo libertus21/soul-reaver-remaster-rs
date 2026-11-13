@@ -406,6 +406,25 @@ impl FrameState {
             .map(|object| object.position)
     }
 
+    /// Move the bound player to an explicit position.
+    ///
+    /// This is the `--player-pos` test aid: it overrides the authored record
+    /// position before the first tick and changes nothing else. It is a pure
+    /// function of its argument, so the same position replays identically.
+    /// Returns `false` when no player is bound.
+    pub fn place_player(&mut self, position: [i32; 3]) -> bool {
+        let Some(player) = self.player else {
+            return false;
+        };
+        match self.live.get_mut(player) {
+            Ok(object) => {
+                object.position = position;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// The player's facing yaw, produced by
     /// [`pose::yaw_rotation_from_direction`] from the committed movement delta.
     ///
