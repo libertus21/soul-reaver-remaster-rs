@@ -151,6 +151,11 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
   remains undecoded. The consolidated verdict - what was searched, every carrier
   ruled out with its counts, and why the authored data simply does not exist - is
   in `docs/notes/animation-conclusion.md`.
+- **Body-angle provenance is mode-dependent.** The per-slot constructor input is
+  a per-frame staging record filled by the animation sampler from the
+  object-container animation record; the root uses the object's live aim words.
+  The staging array is not loadable at rest, and the per-slot producer split is
+  still UNKNOWN; see `docs/notes/angle-array-source.md`.
 - **No game logic.** `--play` is a deterministic skeleton: no actor AI,
   body animation, scripts, audio, streaming, particles, menus, warps or save. Room
   walls are solid, gravity lands the player on floors, ceilings block upward
