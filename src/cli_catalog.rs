@@ -17,6 +17,11 @@ pub struct Capability {
 }
 
 impl Capability {
+    /// Whether this capability emits `token` as a bare flag with no value.
+    pub fn takes_flag(&self, token: &str) -> bool {
+        matches!(self.name, "animate" | "play") && token == "--anim-once"
+    }
+
     /// Whether this capability emits `token` as a named option with a value
     /// instead of a literal token followed by its operand placeholder.
     pub fn takes_value(&self, token: &str) -> bool {
@@ -30,9 +35,15 @@ impl Capability {
             || (self.name == "facing"
                 && matches!(token, "--bigfile" | "--entry" | "--direction"))
             || (self.name == "animate"
-                && matches!(token, "--sra" | "--bigfile" | "--entry" | "--frame" | "--time"))
+                && matches!(
+                    token,
+                    "--sra" | "--bigfile" | "--entry" | "--frame" | "--time" | "--anim-fps"
+                ))
             || (self.name == "play"
-                && matches!(token, "--bigfile" | "--unit" | "--ticks" | "--camera" | "--sra"))
+                && matches!(
+                    token,
+                    "--bigfile" | "--unit" | "--ticks" | "--camera" | "--sra" | "--anim-fps"
+                ))
             || ((self.name.ends_with("-entry")
                 || matches!(self.name, "object-info" | "object-info-actors" | "object-mesh" | "bone-hierarchy"))
                 && matches!(token, "--bigfile" | "--entry"))
@@ -82,9 +93,9 @@ pub const CAPABILITIES: [Capability; 37] = [
     Capability { group: "level", name: "links-entry", legacy: "--level-links --bigfile <DAT> --entry <INDEX>", summary: "Print one archive entry's decoded link table.", window: false },
     Capability { group: "level", name: "links-group", legacy: "--level-links --bigfile <DAT> --group <PREFIX>", summary: "Print every archive level family member's link table.", window: false },
     Capability { group: "level", name: "reach", legacy: "--level-reach --bigfile <DAT> [--start <UNIT>]", summary: "BFS the archived level graph, then group reachable, island and inbound-but-unreachable units.", window: false },
-        Capability { group: "game", name: "play", legacy: "--play --bigfile <DAT> [--textures <BIG>] [--unit <NAME>] [--ticks <N>] [--camera <MODE>] [--sra <FILE>]", summary: "Run the engine on an archive: a deterministic headless acceptance line with --headless, or a textured window; --sra animates the player mesh.", window: true },
+        Capability { group: "game", name: "play", legacy: "--play --bigfile <DAT> [--textures <BIG>] [--unit <NAME>] [--ticks <N>] [--camera <MODE>] [--sra <FILE>] [--anim-fps <N>] [--anim-once]", summary: "Run the engine on an archive: a deterministic headless acceptance line with --headless, or a textured window; --sra animates the player mesh at --anim-fps.", window: true },
     Capability { group: "game", name: "facing", legacy: "--facing --bigfile <DAT> --entry <INDEX> --direction <DX>:<DY>", summary: "Print the yaw produced for a movement direction and the first skinned vertices.", window: false },
-    Capability { group: "game", name: "animate", legacy: "--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>]", summary: "Decode one .SRA frame and print the first slot angles and skinned vertices.", window: false },
+    Capability { group: "game", name: "animate", legacy: "--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--anim-fps <N>] [--anim-once]", summary: "Decode one .SRA frame and print the first slot angles and skinned vertices; --frame overrides the --anim-fps playback clock.", window: false },
 ];
 
 /// The capability table.

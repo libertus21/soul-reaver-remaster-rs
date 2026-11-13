@@ -38,6 +38,7 @@ use crate::engine::spawn::{Admission, EngineNameTable};
 use crate::engine::world::{World, WorldError};
 use crate::object_texture::PageBank;
 use crate::render::{self, FlyCamera, OrbitCamera};
+use crate::sra::{ANIMATION_FPS, PlaybackLoop};
 
 /// Camera modes accepted by `--camera`.
 ///
@@ -86,6 +87,10 @@ pub struct PlayOptions {
     pub camera: CameraMode,
     /// Presentation-only `.SRA` animation resource for the player mesh.
     pub sra: Option<PathBuf>,
+    /// Presentation playback rate, in palette frames per second.
+    pub anim_fps: u32,
+    /// Whether the animation wraps (`false`) or holds the last frame (`true`).
+    pub anim_once: bool,
 }
 
 impl PlayOptions {
@@ -104,6 +109,8 @@ impl PlayOptions {
             headless: false,
             camera: CameraMode::Fly,
             sra: None,
+            anim_fps: ANIMATION_FPS,
+            anim_once: false,
         };
         let mut bigfile = None;
         let mut index = 0;
@@ -129,6 +136,21 @@ impl PlayOptions {
                 }
                 "--sra" => {
                     options.sra = Some(PathBuf::from(value(args, index, "--sra")?));
+                }
+                "--anim-fps" => {
+                    let raw = value(args, index, "--anim-fps")?;
+                    let fps = raw
+                        .parse::<u32>()
+                        .map_err(|_| PlayError::InvalidAnimFps(raw.to_string()))?;
+                    if !(1..=240).contains(&fps) {
+                        return Err(PlayError::InvalidAnimFps(raw.to_string()));
+                    }
+                    options.anim_fps = fps;
+                }
+                "--anim-once" => {
+                    options.anim_once = true;
+                    index += 1;
+                    continue;
                 }
                 "--headless" => {
                     options.headless = true;
@@ -174,6 +196,7 @@ pub enum PlayError {
     InvalidTicks(String),
     ZeroTicksHeadless,
     InvalidCamera(String),
+    InvalidAnimFps(String),
 }
 
 impl fmt::Display for PlayError {
@@ -193,6 +216,10 @@ impl fmt::Display for PlayError {
             Self::InvalidCamera(value) => write!(
                 f,
                 "invalid value '{value}' for --camera: expected orbit, fly or player"
+            ),
+            Self::InvalidAnimFps(value) => write!(
+                f,
+                "invalid value '{value}' for --anim-fps: expected an integer in 1..=240"
             ),
         }
     }
@@ -315,6 +342,8 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
         &options.unit,
         &options.bigfile,
         animation,
+        options.anim_fps,
+        options.anim_once,
     )
 }
 
@@ -514,9 +543,11 @@ fn run_windowed(
     unit: &str,
     bigfile: &Path,
     animation: Option<crate::sra::SraAnimation>,
+    anim_fps: u32,
+    anim_once: bool,
 ) -> Result<(), RunError> {
     boot_before_window(frame, bigfile, |frame| {
-        open_window(frame, assets, bank, mode, unit, animation)
+        open_window(frame, assets, bank, mode, unit, animation, anim_fps, anim_once)
     })
 }
 
@@ -544,6 +575,8 @@ fn open_window(
     mode: CameraMode,
     unit: &str,
     animation: Option<crate::sra::SraAnimation>,
+    anim_fps: u32,
+    anim_once: bool,
 ) -> Result<(), RunError> {
     // The initial scene is the complete set of pages the first frame draws.
     // Decoding them here keeps a bad page strictly before the window.
@@ -581,6 +614,12 @@ fn open_window(
         init_error: None,
         title: format!("soul reaver - {unit}"),
         animation,
+        anim_fps,
+        anim_policy: if anim_once {
+            PlaybackLoop::Once
+        } else {
+            PlaybackLoop::Loop
+        },
     };
     event_loop
         .run_app(&mut app)
@@ -725,6 +764,8 @@ struct PlayApp {
     init_error: Option<String>,
     title: String,
     animation: Option<crate::sra::SraAnimation>,
+    anim_fps: u32,
+    anim_policy: PlaybackLoop,
 }
 
 impl PlayApp {
@@ -737,17 +778,19 @@ impl PlayApp {
 
     /// The player's produced root facing for the scene builder, if it has moved.
     ///
-    /// When `--sra` is active the animation poses are decoded from the canonical
-    /// tick count, so the presentation frame is deterministic and never reads a
-    /// wall clock. The poses are presentation-only: they are not part of
-    /// `FrameState` or the canonical digest.
+    /// When `--sra` is active the animation pose is decoded from the canonical
+    /// tick count through the explicit playback clock, so the presentation frame
+    /// is deterministic and never reads a wall clock. The poses are
+    /// presentation-only: they are not part of `FrameState` or the canonical
+    /// digest.
     fn player_facing(&self) -> Option<PlayerFacing> {
         let player = self.frame.player()?;
         let yaw = self.frame.player_yaw_binary();
-        let animation = self
-            .animation
-            .as_ref()
-            .and_then(|animation| animation.poses_for_tick(self.frame.ticks()).ok());
+        let animation = self.animation.as_ref().and_then(|animation| {
+            animation
+                .poses_for_tick(self.frame.ticks(), self.anim_fps, self.anim_policy)
+                .ok()
+        });
         if yaw.is_none() && animation.is_none() {
             return None;
         }
@@ -1006,6 +1049,8 @@ mod tests {
         assert!(!options.headless);
         assert_eq!(options.camera, CameraMode::Fly);
         assert_eq!(options.sra, None);
+        assert_eq!(options.anim_fps, super::ANIMATION_FPS);
+        assert!(!options.anim_once);
     }
 
     #[test]
@@ -1024,6 +1069,9 @@ mod tests {
             "player",
             "--sra",
             "RAZIEL.SRA",
+            "--anim-fps",
+            "20",
+            "--anim-once",
         ])
         .expect("full argv must parse");
         assert_eq!(options.bigfile, PathBuf::from("BIGFILE.DAT"));
@@ -1033,6 +1081,8 @@ mod tests {
         assert!(options.headless);
         assert_eq!(options.camera, CameraMode::Player);
         assert_eq!(options.sra, Some(PathBuf::from("RAZIEL.SRA")));
+        assert_eq!(options.anim_fps, 20);
+        assert!(options.anim_once);
     }
 
     #[test]
@@ -1062,7 +1112,14 @@ mod tests {
 
     #[test]
     fn missing_values_are_typed_errors() {
-        for option in ["--bigfile", "--textures", "--unit", "--ticks", "--camera"] {
+        for option in [
+            "--bigfile",
+            "--textures",
+            "--unit",
+            "--ticks",
+            "--camera",
+            "--anim-fps",
+        ] {
             assert_eq!(
                 parse(&[option]),
                 Err(PlayError::MissingValue(option)),
@@ -1102,6 +1159,27 @@ mod tests {
             parse(&["--bigfile", "B", "--camera", "top"]),
             Err(PlayError::InvalidCamera("top".to_string()))
         );
+    }
+
+    #[test]
+    fn anim_fps_out_of_range_is_a_typed_error() {
+        for raw in ["0", "241", "abc", "-1"] {
+            assert_eq!(
+                parse(&["--bigfile", "B", "--anim-fps", raw]),
+                Err(PlayError::InvalidAnimFps(raw.to_string())),
+                "value {raw}"
+            );
+        }
+        assert!(
+            PlayError::InvalidAnimFps("241".to_string())
+                .to_string()
+                .contains("1..=240")
+        );
+        for raw in ["1", "240"] {
+            let options = parse(&["--bigfile", "B", "--anim-fps", raw])
+                .expect("bounds are inclusive");
+            assert_eq!(options.anim_fps.to_string(), raw);
+        }
     }
 
     #[test]
