@@ -64,7 +64,8 @@ mod menu;
 mod mesh_entry;
 mod object;
 mod object_texture;
-// Pure packed-channel frame-table decoder; not wired into the viewer yet.
+// Pure packed-channel frame-table decoder; the `.SRA` loader and `--animate`
+// decode one frame through it.
 #[allow(dead_code)]
 mod packed_channel;
 // Pure one-bone pose math, wired into the `--mesh --pose` arm below.
@@ -84,8 +85,9 @@ mod tex_hd_map;
 #[allow(dead_code)]
 mod srm;
 mod srl;
-// Read-only `.SRA` key-shape detector: validated against the documented
-// `font` channel. The corpus census is negative, so it stays unwired.
+// Read-only `.SRA` container parser plus the packed animation-table locator.
+// `--animate` and `--play --sra` consume the frame decode; the older key-shape
+// detectors stay test-only for now.
 #[allow(dead_code)]
 mod sra;
 mod snd;
@@ -153,6 +155,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     }
     if args.first().is_some_and(|a| a == "--facing") {
         return run_facing(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "--animate") {
+        return run_animate(&args[1..]);
     }
     if let Some(message) = pose_mode_conflict(args) {
         eprintln!("{message}");
@@ -253,6 +258,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --textures <TEXTURES.BIG>");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --pose <FILE> [--hierarchy] [--bounds]");
         eprintln!("   or: soul-reaver-remaster-rs --facing --bigfile <BIGFILE.DAT> --entry <INDEX> --direction <DX>:<DY>");
+        eprintln!("   or: soul-reaver-remaster-rs --animate --sra <FILE.SRA> --bigfile <BIGFILE.DAT> --entry <INDEX> [--frame <N>] [--time <T>]");
         eprintln!("   or: soul-reaver-remaster-rs --srl-info <FILE.SRL>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
@@ -444,6 +450,203 @@ fn facing_report(model: &object::ObjectModel, dx: f32, dy: f32) -> Result<String
         yaw_binary * 360.0 / pose::BINARY_ANGLE_UNITS_PER_TURN,
         moved,
         first.join(";")
+    ))
+}
+
+/// Which frame `--animate` decodes: an explicit palette index, a frame-time
+/// unit, or the first frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameChoice {
+    Index(usize),
+    Time(u16),
+    Default,
+}
+
+struct AnimateInput<'a> {
+    sra: &'a str,
+    dat: &'a str,
+    entry: usize,
+    frame: Option<usize>,
+    time: Option<u16>,
+}
+
+/// `--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>]
+/// [--time <T>]`: decode one frame, skin the archived model and print a bounded
+/// acceptance line. The slot count is the model's bone count, not a file field.
+fn run_animate(args: &[String]) -> ExitCode {
+    let input = match animate_input(args) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let sra_bytes = match std::fs::read(Path::new(input.sra)) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("error: cannot read {}: {error}", file_label(Path::new(input.sra)));
+            return ExitCode::from(1);
+        }
+    };
+    let entry_bytes = match object::read_entry_bytes(Path::new(input.dat), input.entry) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let model = match object::parse_object(&entry_bytes) {
+        Ok(model) => model,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let animation = match sra::SraAnimation::load(sra_bytes, model.bones.len()) {
+        Ok(animation) => animation,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let choice = match (input.frame, input.time) {
+        (Some(index), None) => FrameChoice::Index(index),
+        (None, Some(time)) => FrameChoice::Time(time),
+        (None, None) => FrameChoice::Default,
+        (Some(_), Some(_)) => {
+            eprintln!("error: --animate accepts --frame or --time, not both");
+            return ExitCode::from(1);
+        }
+    };
+    match animate_report(
+        &model,
+        &animation,
+        &file_label(Path::new(input.sra)),
+        choice,
+    ) {
+        Ok(line) => {
+            outln!("{line}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
+    let usage = "expected --animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>]";
+    let (mut sra, mut dat, mut entry, mut frame, mut time) = (None, None, None, None, None);
+    let mut at = 0;
+    while at + 1 < args.len() {
+        let value = args[at + 1].as_str();
+        match args[at].as_str() {
+            "--sra" => sra = Some(value),
+            "--bigfile" => dat = Some(value),
+            "--entry" => {
+                entry = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
+            }
+            "--frame" => {
+                frame = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
+            }
+            "--time" => {
+                time = Some(value.parse::<u16>().map_err(|_| usage.to_string())?);
+            }
+            _ => return Err(usage.to_string()),
+        }
+        at += 2;
+    }
+    if at != args.len() {
+        return Err(usage.to_string());
+    }
+    match (sra, dat, entry) {
+        (Some(sra), Some(dat), Some(entry)) => Ok(AnimateInput {
+            sra,
+            dat,
+            entry,
+            frame,
+            time,
+        }),
+        _ => Err(usage.to_string()),
+    }
+}
+
+/// The pure core of `--animate`: one decoded frame, the slot poses it produces
+/// and the same hierarchical skin the facing path uses. No clock, no window.
+fn animate_report(
+    model: &object::ObjectModel,
+    animation: &sra::SraAnimation,
+    sra_label: &str,
+    choice: FrameChoice,
+) -> Result<String, String> {
+    let frame = match choice {
+        FrameChoice::Index(index) => {
+            if index >= animation.frame_count() {
+                return Err(format!(
+                    "--frame {index} is outside the {}-frame table",
+                    animation.frame_count()
+                ));
+            }
+            animation.decode_index(index)?
+        }
+        FrameChoice::Time(time) => animation.decode_time(time)?,
+        FrameChoice::Default => animation.decode_index(0)?,
+    };
+    let poses = animation.poses(&frame);
+    let parents: Vec<i16> = model
+        .bones
+        .iter()
+        .map(|bone| if bone.parent == u16::MAX { -1 } else { bone.parent as i16 })
+        .collect();
+    let hierarchy = bone_hierarchy::BoneHierarchy::from_parents(parents);
+    let positions = pose::skin_positions_hierarchical(model, &hierarchy, &poses)?;
+    let rest = object::rest_positions(model);
+    let moved = positions
+        .iter()
+        .zip(&rest)
+        .filter(|(posed, rest)| posed != rest)
+        .count();
+    let mut angles = Vec::new();
+    for (slot, angle) in frame.angles.iter().enumerate() {
+        if angle.iter().any(|value| *value != 0.0) {
+            angles.push(format!(
+                "{slot}:{:.3},{:.3},{:.3}",
+                angle[0], angle[1], angle[2]
+            ));
+            if angles.len() == 3 {
+                break;
+            }
+        }
+    }
+    if angles.is_empty() {
+        for (slot, angle) in frame.angles.iter().enumerate().take(3) {
+            angles.push(format!(
+                "{slot}:{:.3},{:.3},{:.3}",
+                angle[0], angle[1], angle[2]
+            ));
+        }
+    }
+    let verts: Vec<String> = positions
+        .iter()
+        .take(3)
+        .map(|position| {
+            format!(
+                "{:.3},{:.3},{:.3}",
+                position[0], position[1], position[2]
+            )
+        })
+        .collect();
+    Ok(format!(
+        "animate sra={} slots={} channels={} frame={}/{} angles={} moved={} verts={}",
+        sra_label,
+        animation.slot_count(),
+        animation.channel_count(),
+        frame.frame_index,
+        frame.frame_count,
+        angles.join(";"),
+        moved,
+        verts.join(";")
     ))
 }
 
@@ -2321,12 +2524,12 @@ fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
 mod cli_tests {
     use super::run_level_info;
     use super::{
-        bone_hierarchy_input, facing_input, facing_report, list_report, object_input,
-        parse_direction, pose_mode_conflict, resolve_texture_name, run_actor_census, run_audio,
-        run_bigfile, dispatch, run_level_links, run_level_records, run_level_structure, run_mesh,
-        run_mesh_all, run_level_geometry, run_level_objects, run_level_render, run_mesh_textured,
-        run_mesh_with, run_object_info, run_object_mesh, run_object_mesh_with, run_textures,
-        strip_launcher_noops, tshow_suffix,
+        animate_input, animate_report, bone_hierarchy_input, facing_input, facing_report,
+        list_report, object_input, parse_direction, pose_mode_conflict, resolve_texture_name,
+        run_actor_census, run_audio, run_bigfile, dispatch, run_level_links, run_level_records,
+        run_level_structure, run_mesh, run_mesh_all, run_level_geometry, run_level_objects,
+        run_level_render, run_mesh_textured, run_mesh_with, run_object_info, run_object_mesh,
+        run_object_mesh_with, run_textures, strip_launcher_noops, tshow_suffix, FrameChoice,
     };
     use std::process::ExitCode;
     use std::rc::Rc;
@@ -3156,6 +3359,62 @@ mod cli_tests {
         assert_eq!(
             object_input(&argv(&["--bigfile", "A.DAT", "--entry", "3"]), "u"),
             Ok(("A.DAT", 3, None, false, false))
+        );
+    }
+
+    #[test]
+    fn animate_reports_one_decoded_frame_and_skinned_vertices() {
+        let model = crate::object::parse_object(&crate::object::synthetic_bone_model())
+            .expect("the synthetic bone model must parse");
+        let container = crate::sra::synthetic_animation_container(
+            &[0x007, 0x007],
+            2,
+            100,
+            &[1024.0, 0.0, 0.0, 0.0, 0.0, 1024.0],
+        );
+        let animation = crate::sra::SraAnimation::load(container, model.bones.len())
+            .expect("synthetic animation must locate");
+
+        let line = animate_report(&model, &animation, "SYNTH.SRA", FrameChoice::Index(0))
+            .expect("frame 0");
+        assert!(
+            line.starts_with(
+                "animate sra=SYNTH.SRA slots=2 channels=3 frame=0/2 angles=0:1024.000,0.000,0.000;1:0.000,0.000,1024.000 moved="
+            ),
+            "{line}"
+        );
+        let verts = line.split(" verts=").nth(1).expect("verts field");
+        assert_eq!(verts.split(';').count(), 3, "three vertices: {line}");
+
+        let time = animate_report(&model, &animation, "SYNTH.SRA", FrameChoice::Time(100))
+            .expect("frame 1");
+        assert!(time.contains("frame=1/2"), "{time}");
+        assert!(
+            animate_report(&model, &animation, "SYNTH.SRA", FrameChoice::Index(2)).is_err(),
+            "a frame past the table must be loud"
+        );
+    }
+
+    #[test]
+    fn animate_input_requires_sra_archive_and_entry() {
+        let argv = |items: &[&str]| items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        let parsed_argv = argv(&[
+            "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "66", "--frame", "24",
+        ]);
+        let parsed = animate_input(&parsed_argv).expect("full argv must parse");
+        assert_eq!(
+            (parsed.sra, parsed.dat, parsed.entry, parsed.frame, parsed.time),
+            ("R.SRA", "B.DAT", 66, Some(24), None)
+        );
+        assert!(animate_input(&argv(&["--sra", "R.SRA", "--bigfile", "B.DAT"])).is_err());
+        assert!(
+            animate_input(&argv(&["--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "x"])).is_err()
+        );
+        assert!(
+            animate_input(&argv(&[
+                "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "1", "--bogus", "2",
+            ]))
+            .is_err()
         );
     }
 
