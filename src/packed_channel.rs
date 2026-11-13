@@ -323,6 +323,34 @@ impl<'a> PackedFrameTable<'a> {
     pub fn bit_planes(&self, slot_count: usize) -> Result<BitPlanes<'a>, String> {
         BitPlanes::parse(self.bytes, self.bit_plane_base(), slot_count)
     }
+
+    /// Byte offset of the file-form **inline** value stream for `slot_count`
+    /// slots.
+    ///
+    /// The validated `RAZIEL.SRA` replay stores every set lane's block in one
+    /// contiguous stream directly after the present planes, 4-byte aligned.
+    /// The table's own `+0x14` offset array points at float arrays that are not
+    /// this stream (UNKNOWN 3 in `docs/notes/packed-channel-format.md`), so
+    /// file-form callers that decode a whole record use this offset with
+    /// [`ValueStream::new`].
+    pub fn inline_value_stream_offset(&self, slot_count: usize) -> Result<usize, String> {
+        let planes = self.bit_planes(slot_count)?;
+        let present = (planes.flags() & DEFINED_FLAGS).count_ones() as usize;
+        let stride_bits = align8_bits(
+            slot_count
+                .checked_mul(3)
+                .ok_or_else(|| "packed table: 3 * slot_count overflows".to_string())?,
+        )?;
+        let plane_bytes = present
+            .checked_mul(stride_bits / 8)
+            .ok_or_else(|| "packed table: bit-plane block overflows".to_string())?;
+        let raw = self
+            .bit_plane_base()
+            .checked_add(1)
+            .and_then(|value| value.checked_add(plane_bytes))
+            .ok_or_else(|| "packed table: inline value stream overflows".to_string())?;
+        Ok((raw + 3) & !3)
+    }
 }
 
 /// The per-frame flag byte and 3-bit-per-slot plane layout.
@@ -684,6 +712,45 @@ pub fn decode_channel(
     decode_channel_range(&table, layout, frame_time, FRAME_INDEX_POLICY)
 }
 
+/// Decode the whole file-form channel at one explicit palette frame.
+///
+/// The file form concatenates every set lane's block for slots
+/// `0..slot_count` in slot order, so this is the file-resident replay entry
+/// point. `frame_index` is explicit; derive it from a clock with
+/// [`select_frame_index`] when a frame time is what the caller holds.
+pub fn decode_inline_channel(
+    table: &PackedFrameTable<'_>,
+    slot_count: usize,
+    frame_index: usize,
+) -> Result<DecodedChannel, String> {
+    if slot_count == 0 {
+        return Err("packed channel: slot count 0 has no bit-plane stride".to_string());
+    }
+    let header = table.header();
+    let frame_count = usize::from(header.frame_count);
+    if frame_index >= frame_count {
+        return Err(format!(
+            "packed channel: frame index {frame_index} is outside the {frame_count}-frame table"
+        ));
+    }
+    let planes = table.bit_planes(slot_count)?;
+    let offset = table.inline_value_stream_offset(slot_count)?;
+    let mut stream = ValueStream::new(table.bytes(), offset, frame_count, frame_index)?;
+    let mut slots = Vec::with_capacity(slot_count);
+    for slot in 0..slot_count {
+        let angles = decode_slot_angles(&planes, &mut stream, slot)?;
+        slots.push(SlotAngles {
+            angles,
+            rotation: rotation_from_binary_angles(angles[0], angles[1], angles[2]),
+        });
+    }
+    Ok(DecodedChannel {
+        frame_index,
+        flags: planes.flags(),
+        slots,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,7 +811,8 @@ mod tests {
                 present_index += 1;
             }
         }
-        let mut stream_start = bytes.len();
+        let mut stream_start = (bytes.len() + 3) & !3;
+        bytes.resize(stream_start, 0);
         for (selector, stream) in streams.iter().enumerate() {
             assert!(selector < TABLE_COUNT, "too many synthetic streams");
             let at = offsets_at + selector * width;
@@ -964,6 +1032,30 @@ mod tests {
         let table = PackedFrameTable::parse(&bytes, TableForm::File).expect("header is fine");
         assert!(table.value_offset(3).is_err());
         assert!(table.bit_planes(0).is_err());
+    }
+
+    #[test]
+    fn inline_stream_follows_the_present_planes_aligned_to_four_bytes() {
+        let masks = [0x003u16, 0x001, 0x000];
+        let stream: Vec<u8> = [
+            palette(&[10.0, 20.0]),
+            palette(&[30.0, 40.0]),
+            literal(50.0),
+        ]
+        .concat();
+        let bytes = build_table(TableForm::File, 2, 100, 0x01, 3, &masks, &[stream]);
+        let table = PackedFrameTable::parse(&bytes, TableForm::File).expect("valid table");
+        assert_eq!(
+            table.inline_value_stream_offset(3),
+            Ok(0x24),
+            "flags + one 16-bit plane (2 bytes) ends at 0x23, aligned to 0x24"
+        );
+        let decoded = decode_inline_channel(&table, 3, 1).expect("inline frame 1");
+        assert_eq!(decoded.frame_index, 1);
+        assert_eq!(decoded.slots[0].angles, [20.0, 40.0, 0.0]);
+        assert_eq!(decoded.slots[1].angles, [50.0, 0.0, 0.0]);
+        assert_eq!(decoded.slots[2].angles, [0.0, 0.0, 0.0]);
+        assert!(decode_inline_channel(&table, 3, 2).is_err());
     }
 
     #[test]
