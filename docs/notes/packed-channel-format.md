@@ -240,6 +240,9 @@ The decoder is wired into the shipped `.SRA`:
   decodes one frame and prints slot count, channel count, frame index, the first
   populated angle triples and the first three skinned vertices. Slot count is
   the model's bone count, not an `.SRA` field.
+- `--play ... --sra <FILE>` decodes one frame per canonical tick and skins the
+  player mesh through `pose::skin_positions_hierarchical`. It is presentation
+  only: no animation state enters `FrameState` and no golden digest moves.
 
 Two file-form facts are CONFIRMED by that replay: the inline stream begins at
 `align4(bit_plane_base + 1 + present * stride_bytes)` (not at the `+0x14`
