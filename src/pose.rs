@@ -369,6 +369,25 @@ pub fn pose_from_yaw(rest_slots: usize, yaw_binary: f32, translation: [f32; 3]) 
     poses
 }
 
+/// Pre-multiply a produced root yaw onto one slot pose's rotation:
+/// `pose[0..9] = Rz(yaw) * pose[0..9]`. Translation and the marker are
+/// untouched, so an animated root keeps its authored rotation while the
+/// movement direction still turns the whole body.
+pub fn compose_root_yaw(pose: &mut SlotPose, yaw_binary: f32) {
+    let yaw = rotation_from_binary_angles(0.0, 0.0, yaw_binary);
+    let local = [
+        [pose[0], pose[1], pose[2]],
+        [pose[3], pose[4], pose[5]],
+        [pose[6], pose[7], pose[8]],
+    ];
+    let rotation = mat3_mul(yaw, local);
+    for (row, values) in rotation.iter().enumerate() {
+        for (col, value) in values.iter().enumerate() {
+            pose[row * 3 + col] = *value;
+        }
+    }
+}
+
 impl PoseMatrix {
     /// The no-op pose: identity rotation, zero translation, unit scale.
     pub fn identity() -> Self {
@@ -1063,6 +1082,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn compose_root_yaw_premultiplies_the_pose_rotation_only() {
+        let mut pose = IDENTITY_SLOT;
+        pose[10] = 7.0;
+        compose_root_yaw(&mut pose, 1024.0);
+        matrix_close(
+            [[pose[0], pose[1], pose[2]], [pose[3], pose[4], pose[5]], [pose[6], pose[7], pose[8]]],
+            R_Z90,
+            1e-6,
+        );
+        assert_eq!([pose[10], pose[11], pose[12]], [7.0, 0.0, 0.0]);
     }
 
     #[test]

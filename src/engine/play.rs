@@ -84,6 +84,8 @@ pub struct PlayOptions {
     pub ticks: Option<u32>,
     pub headless: bool,
     pub camera: CameraMode,
+    /// Presentation-only `.SRA` animation resource for the player mesh.
+    pub sra: Option<PathBuf>,
 }
 
 impl PlayOptions {
@@ -101,6 +103,7 @@ impl PlayOptions {
             ticks: None,
             headless: false,
             camera: CameraMode::Fly,
+            sra: None,
         };
         let mut bigfile = None;
         let mut index = 0;
@@ -123,6 +126,9 @@ impl PlayOptions {
                     let raw = value(args, index, "--camera")?;
                     options.camera = CameraMode::parse(raw)
                         .ok_or_else(|| PlayError::InvalidCamera(raw.to_string()))?;
+                }
+                "--sra" => {
+                    options.sra = Some(PathBuf::from(value(args, index, "--sra")?));
                 }
                 "--headless" => {
                     options.headless = true;
@@ -275,9 +281,27 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
     } else {
         options.textures.as_deref()
     };
-    let (assets, bank) =
+    let (mut assets, bank) =
         SceneAssets::load(&options.bigfile, world.level.entry, textures).map_err(RunError::scene)?;
     let frame = FrameState::new(world);
+    let animation = if options.headless {
+        None
+    } else {
+        match options.sra.as_deref() {
+            Some(path) => {
+                let bytes = std::fs::read(path).map_err(|error| {
+                    RunError::Asset(format!("cannot read {}: {error}", path.display()))
+                })?;
+                let slots = assets.bone_count(PLAYER_NAME).ok_or_else(|| {
+                    RunError::Scene(format!(
+                        "cannot resolve the player model '{PLAYER_NAME}' for --sra"
+                    ))
+                })?;
+                Some(crate::sra::SraAnimation::load(bytes, slots).map_err(RunError::Scene)?)
+            }
+            None => None,
+        }
+    };
 
     if options.headless {
         return run_headless(frame, options.ticks.unwrap_or(60), &options.bigfile);
@@ -290,6 +314,7 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
         options.camera,
         &options.unit,
         &options.bigfile,
+        animation,
     )
 }
 
@@ -488,9 +513,10 @@ fn run_windowed(
     mode: CameraMode,
     unit: &str,
     bigfile: &Path,
+    animation: Option<crate::sra::SraAnimation>,
 ) -> Result<(), RunError> {
     boot_before_window(frame, bigfile, |frame| {
-        open_window(frame, assets, bank, mode, unit)
+        open_window(frame, assets, bank, mode, unit, animation)
     })
 }
 
@@ -517,6 +543,7 @@ fn open_window(
     bank: PageBank,
     mode: CameraMode,
     unit: &str,
+    animation: Option<crate::sra::SraAnimation>,
 ) -> Result<(), RunError> {
     // The initial scene is the complete set of pages the first frame draws.
     // Decoding them here keeps a bad page strictly before the window.
@@ -553,6 +580,7 @@ fn open_window(
         last_dt: 0.0,
         init_error: None,
         title: format!("soul reaver - {unit}"),
+        animation,
     };
     event_loop
         .run_app(&mut app)
@@ -696,6 +724,7 @@ struct PlayApp {
     last_dt: f32,
     init_error: Option<String>,
     title: String,
+    animation: Option<crate::sra::SraAnimation>,
 }
 
 impl PlayApp {
@@ -707,10 +736,25 @@ impl PlayApp {
     }
 
     /// The player's produced root facing for the scene builder, if it has moved.
+    ///
+    /// When `--sra` is active the animation poses are decoded from the canonical
+    /// tick count, so the presentation frame is deterministic and never reads a
+    /// wall clock. The poses are presentation-only: they are not part of
+    /// `FrameState` or the canonical digest.
     fn player_facing(&self) -> Option<PlayerFacing> {
+        let player = self.frame.player()?;
+        let yaw = self.frame.player_yaw_binary();
+        let animation = self
+            .animation
+            .as_ref()
+            .and_then(|animation| animation.poses_for_tick(self.frame.ticks()).ok());
+        if yaw.is_none() && animation.is_none() {
+            return None;
+        }
         Some(PlayerFacing {
-            player: self.frame.player()?,
-            yaw_binary: self.frame.player_yaw_binary()?,
+            player,
+            yaw_binary: yaw.unwrap_or(0.0),
+            animation,
         })
     }
 
@@ -961,6 +1005,7 @@ mod tests {
         assert_eq!(options.ticks, None);
         assert!(!options.headless);
         assert_eq!(options.camera, CameraMode::Fly);
+        assert_eq!(options.sra, None);
     }
 
     #[test]
@@ -977,6 +1022,8 @@ mod tests {
             "--headless",
             "--camera",
             "player",
+            "--sra",
+            "RAZIEL.SRA",
         ])
         .expect("full argv must parse");
         assert_eq!(options.bigfile, PathBuf::from("BIGFILE.DAT"));
@@ -985,6 +1032,7 @@ mod tests {
         assert_eq!(options.ticks, Some(120));
         assert!(options.headless);
         assert_eq!(options.camera, CameraMode::Player);
+        assert_eq!(options.sra, Some(PathBuf::from("RAZIEL.SRA")));
     }
 
     #[test]

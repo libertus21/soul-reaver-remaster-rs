@@ -249,12 +249,14 @@ impl fmt::Display for SceneError {
 impl std::error::Error for SceneError {}
 
 /// The per-frame root facing the scene builder applies to the player mesh.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlayerFacing {
     /// The live player whose mesh is re-skinned this frame.
     pub player: LiveId,
     /// The binary yaw (`4096` units per turn) the frame produced.
     pub yaw_binary: f32,
+    /// Decoded animation slot poses for this tick, when `--sra` is active.
+    pub animation: Option<Vec<crate::pose::SlotPose>>,
 }
 
 /// Static scene assets plus the memoized object-model cache.
@@ -321,6 +323,11 @@ impl SceneAssets {
         self.transform
     }
 
+    /// Bone count of `name`'s archived model, when it resolves.
+    pub fn bone_count(&mut self, name: &str) -> Option<usize> {
+        self.resolver.as_mut().and_then(|resolver| resolver.bone_count(name))
+    }
+
     /// Raw (pre-transform) first `raziel` position, when the unit places one.
     pub fn spawn(&self) -> Option<[f32; 3]> {
         self.spawn
@@ -372,8 +379,15 @@ impl SceneAssets {
                 Some(handle) => *handle,
                 None => {
                     let posed = facing
+                        .as_ref()
                         .filter(|facing| facing.player == id)
-                        .and_then(|facing| self.posed_mesh(&object.name, facing.yaw_binary))
+                        .and_then(|facing| {
+                            self.posed_mesh(
+                                &object.name,
+                                facing.yaw_binary,
+                                facing.animation.as_deref(),
+                            )
+                        })
                         .map(|mesh| remap_mesh(&mesh, &mut material_pages, &mut page_indices));
                     let data = posed.unwrap_or_else(|| match self.object_mesh(&object.name) {
                         Some(mesh) => {
@@ -404,11 +418,15 @@ impl SceneAssets {
         }
     }
 
-    fn posed_mesh(&mut self, name: &str, yaw_binary: f32) -> Option<SourceMesh> {
-        let mesh = self
-            .resolver
-            .as_mut()
-            .and_then(|resolver| resolver.posed_textured(name, yaw_binary))?;
+    fn posed_mesh(
+        &mut self,
+        name: &str,
+        yaw_binary: f32,
+        animation: Option<&[crate::pose::SlotPose]>,
+    ) -> Option<SourceMesh> {
+        let mesh = self.resolver.as_mut().and_then(|resolver| {
+            resolver.posed_textured_with_poses(name, yaw_binary, animation)
+        })?;
         Some(SourceMesh::from_textured(mesh))
     }
 
@@ -656,6 +674,7 @@ mod tests {
             Some(PlayerFacing {
                 player,
                 yaw_binary: 1024.0,
+                animation: None,
             }),
         );
         assert_eq!(
