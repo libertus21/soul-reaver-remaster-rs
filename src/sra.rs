@@ -469,24 +469,86 @@ pub struct SraFrame {
     pub angles: Vec<[f32; 3]>,
 }
 
-/// A located packed-channel table inside one `.SRA` payload record.
+/// Public descriptor of one located clip (packed frame table).
+///
+/// The index is the clip's position among the located tables, in payload-record
+/// file order. `record` is the payload-directory record it came from and
+/// `offset` is the table's byte offset relative to that record's start. The
+/// table itself carries no name or id (`docs/notes/packed-channel-format.md`,
+/// "Clip enumeration and state selection"): these fields are the only stable
+/// identifiers, and they are structural, not semantic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SraClipInfo {
+    pub index: usize,
+    pub record: usize,
+    pub offset: usize,
+    pub frame_count: usize,
+    pub divisor: i16,
+    pub channel_count: usize,
+    pub flags: u8,
+}
+
+/// A clip index outside the located set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipError {
+    OutOfRange { clip: usize, clip_count: usize },
+}
+
+impl std::fmt::Display for ClipError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfRange { clip, clip_count } => {
+                write!(f, "clip {clip} is outside the {clip_count} decoded clips")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClipError {}
+
+/// One located packed-channel table inside one `.SRA` payload record.
+#[derive(Debug, Clone)]
+struct ClipTable {
+    record: usize,
+    offset: usize,
+    table: Range<usize>,
+    header: FrameHeader,
+    flags: u8,
+}
+
+/// All packed-channel tables in one `.SRA` file, bound to a model slot count.
 ///
 /// [`SraAnimation::load`] scans the container's payload records in file order
-/// for the first structurally valid table whose whole-slot inline stream
-/// decodes for `slot_count` slots. The validated `RAZIEL.SRA` body table is the
-/// first such record. Decoding is on demand, so the animation frame is a pure
-/// function of the table and the requested index; no clock or wall time is
-/// stored here.
+/// and keeps the **first** structurally valid table in each record whose
+/// whole-slot inline stream decodes for `slot_count` slots. That "one table per
+/// record" rule is what the shipped files show: every payload record starts a
+/// table, and scanning every byte again would also match nested false positives
+/// inside a header. The validated `RAZIEL.SRA` body table is clip 0.
+///
+/// Decoding is on demand, so a frame is a pure function of a table and the
+/// requested index; no clock or wall time is stored here. The zero-argument
+/// accessors keep addressing clip 0 so existing callers are unchanged.
 #[derive(Debug, Clone)]
 pub struct SraAnimation {
     bytes: Vec<u8>,
-    table: Range<usize>,
-    header: FrameHeader,
+    clips: Vec<ClipTable>,
     slot_count: usize,
 }
 
+fn located_table(slice: &[u8], slot_count: usize) -> Option<(FrameHeader, u8)> {
+    let table = PackedFrameTable::parse(slice, TableForm::File).ok()?;
+    let planes = table.bit_planes(slot_count).ok()?;
+    if planes.flags() & 0x01 == 0 {
+        return None;
+    }
+    if packed_channel::decode_inline_channel(&table, slot_count, 0).is_err() {
+        return None;
+    }
+    Some((table.header(), planes.flags()))
+}
+
 impl SraAnimation {
-    /// Locate the table and bind it to a model's slot count.
+    /// Locate every clip and bind them to a model's slot count.
     ///
     /// The slot count is the model's bone count, not an `.SRA` field
     /// (`docs/notes/sra-slot-pose.md`). A container that does not parse, or a
@@ -498,34 +560,32 @@ impl SraAnimation {
         let container = parse_container(&bytes).ok_or_else(|| {
             "sra animation: the .SRA container directory did not parse".to_string()
         })?;
-        for record in &container.records {
-            let slice = &bytes[record.clone()];
-            for at in 0..slice.len() {
-                let Ok(table) = PackedFrameTable::parse(&slice[at..], TableForm::File) else {
-                    continue;
-                };
-                let Ok(planes) = table.bit_planes(slot_count) else {
-                    continue;
-                };
-                if planes.flags() & 0x01 == 0 {
-                    continue;
+        let mut clips = Vec::new();
+        for (record, range) in container.records.iter().enumerate() {
+            let slice = &bytes[range.clone()];
+            for offset in 0..slice.len() {
+                if let Some((header, flags)) = located_table(&slice[offset..], slot_count) {
+                    clips.push(ClipTable {
+                        record,
+                        offset,
+                        table: range.start + offset..range.end,
+                        header,
+                        flags,
+                    });
+                    break;
                 }
-                if packed_channel::decode_inline_channel(&table, slot_count, 0).is_err() {
-                    continue;
-                }
-                let header = table.header();
-                let table = record.start + at..record.end;
-                return Ok(Self {
-                    bytes,
-                    table,
-                    header,
-                    slot_count,
-                });
             }
         }
-        Err(format!(
-            "sra animation: no packed frame table decoded for {slot_count} slots"
-        ))
+        if clips.is_empty() {
+            return Err(format!(
+                "sra animation: no packed frame table decoded for {slot_count} slots"
+            ));
+        }
+        Ok(Self {
+            bytes,
+            clips,
+            slot_count,
+        })
     }
 
     /// Number of slots this animation decodes.
@@ -533,23 +593,116 @@ impl SraAnimation {
         self.slot_count
     }
 
-    /// Number of frames in the located table.
+    /// Number of clips (located tables), in file order.
+    pub fn clip_count(&self) -> usize {
+        self.clips.len()
+    }
+
+    /// Descriptors of every located clip, in file order.
+    pub fn clips(&self) -> Vec<SraClipInfo> {
+        (0..self.clips.len())
+            .filter_map(|index| self.clip_info(index).ok())
+            .collect()
+    }
+
+    /// Descriptor of one clip.
+    pub fn clip_info(&self, clip: usize) -> Result<SraClipInfo, ClipError> {
+        let located = self.clip_at(clip)?;
+        Ok(SraClipInfo {
+            index: clip,
+            record: located.record,
+            offset: located.offset,
+            frame_count: usize::from(located.header.frame_count),
+            divisor: located.header.divisor,
+            channel_count: usize::from(located.header.table_count),
+            flags: located.flags,
+        })
+    }
+
+    /// Reject a clip index that is outside the located set.
+    pub fn validate_clip(&self, clip: usize) -> Result<(), ClipError> {
+        if clip < self.clips.len() {
+            Ok(())
+        } else {
+            Err(ClipError::OutOfRange {
+                clip,
+                clip_count: self.clips.len(),
+            })
+        }
+    }
+
+    /// Number of frames in one clip.
+    pub fn frame_count_of(&self, clip: usize) -> Result<usize, ClipError> {
+        self.clip_at(clip).map(|clip| usize::from(clip.header.frame_count))
+    }
+
+    /// Frame-clock divisor of one clip.
+    pub fn divisor_of(&self, clip: usize) -> Result<i16, ClipError> {
+        self.clip_at(clip).map(|clip| clip.header.divisor)
+    }
+
+    /// Number of value streams one clip declares.
+    pub fn channel_count_of(&self, clip: usize) -> Result<usize, ClipError> {
+        self.clip_at(clip).map(|clip| usize::from(clip.header.table_count))
+    }
+
+    /// Number of frames in the default (first) clip.
     pub fn frame_count(&self) -> usize {
-        usize::from(self.header.frame_count)
+        self.clips
+            .first()
+            .map_or(0, |clip| usize::from(clip.header.frame_count))
     }
 
-    /// Number of value streams the table header declares.
+    /// Number of value streams the default clip declares.
     pub fn channel_count(&self) -> usize {
-        usize::from(self.header.table_count)
+        self.clips
+            .first()
+            .map_or(0, |clip| usize::from(clip.header.table_count))
     }
 
-    /// The table's frame-clock divisor.
+    /// The default clip's frame-clock divisor.
     pub fn divisor(&self) -> i16 {
-        self.header.divisor
+        self.clips.first().map_or(1, |clip| clip.header.divisor)
     }
 
-    /// Palette frame index for one canonical tick under an explicit playback
-    /// clock and loop policy.
+    /// Palette frame index for one canonical tick in one clip.
+    ///
+    /// See [`frame_index_for_playback`]. The source divisor comes from that
+    /// clip; the rate and wrap choice are supplied by the caller, so the
+    /// presentation clock is never a silent guess.
+    pub fn frame_index_for_clip_tick(
+        &self,
+        clip: usize,
+        tick: u64,
+        fps: u32,
+        policy: PlaybackLoop,
+    ) -> Result<usize, String> {
+        let table = self.clip_at(clip).map_err(|error| error.to_string())?;
+        frame_index_for_playback(
+            tick,
+            fps,
+            table.header.divisor,
+            usize::from(table.header.frame_count),
+            policy,
+        )
+    }
+
+    /// Palette frame index for one explicit frame-time unit in one clip.
+    pub fn frame_index_for_clip_time(
+        &self,
+        clip: usize,
+        frame_time: u16,
+    ) -> Result<usize, String> {
+        let table = self.clip_at(clip).map_err(|error| error.to_string())?;
+        packed_channel::select_frame_index(
+            frame_time,
+            table.header.divisor,
+            table.header.frame_count,
+            FRAME_INDEX_POLICY,
+        )
+    }
+
+    /// Palette frame index for one canonical tick in the default clip.
     ///
     /// See [`frame_index_for_playback`]. The source divisor comes from the
     /// located table; the rate and wrap choice are supplied by the caller, so
@@ -560,44 +713,61 @@ impl SraAnimation {
         fps: u32,
         policy: PlaybackLoop,
     ) -> Result<usize, String> {
-        frame_index_for_playback(tick, fps, self.header.divisor, self.frame_count(), policy)
+        self.frame_index_for_clip_tick(0, tick, fps, policy)
     }
 
-    /// Palette frame index for one explicit frame-time unit.
+    /// Palette frame index for one explicit frame-time unit in the default clip.
     pub fn frame_index_for_time(&self, frame_time: u16) -> Result<usize, String> {
-        packed_channel::select_frame_index(
-            frame_time,
-            self.header.divisor,
-            self.header.frame_count,
-            FRAME_INDEX_POLICY,
-        )
+        self.frame_index_for_clip_time(0, frame_time)
     }
 
-    /// Decode one palette frame.
-    pub fn decode_index(&self, frame_index: usize) -> Result<SraFrame, String> {
-        let table = self.table()?;
-        let decoded = packed_channel::decode_inline_channel(&table, self.slot_count, frame_index)?;
+    /// Decode one palette frame of one clip.
+    pub fn decode_clip_index(&self, clip: usize, frame_index: usize) -> Result<SraFrame, String> {
+        let table = self.clip_at(clip).map_err(|error| error.to_string())?;
+        let packed = self.table(clip)?;
+        let decoded = packed_channel::decode_inline_channel(&packed, self.slot_count, frame_index)?;
         Ok(SraFrame {
             frame_index: decoded.frame_index,
-            frame_count: self.frame_count(),
-            channel_count: self.channel_count(),
+            frame_count: usize::from(table.header.frame_count),
+            channel_count: usize::from(table.header.table_count),
             angles: decoded.slots.iter().map(|slot| slot.angles).collect(),
         })
     }
 
-    /// Decode the frame selected by one frame-time unit.
-    pub fn decode_time(&self, frame_time: u16) -> Result<SraFrame, String> {
-        self.decode_index(self.frame_index_for_time(frame_time)?)
+    /// Decode the frame selected by one frame-time unit in one clip.
+    pub fn decode_clip_time(&self, clip: usize, frame_time: u16) -> Result<SraFrame, String> {
+        self.decode_clip_index(clip, self.frame_index_for_clip_time(clip, frame_time)?)
     }
 
-    /// Decode the frame selected by one canonical tick under the playback clock.
+    /// Decode the frame selected by one canonical tick in one clip.
+    pub fn decode_clip_tick(
+        &self,
+        clip: usize,
+        tick: u64,
+        fps: u32,
+        policy: PlaybackLoop,
+    ) -> Result<SraFrame, String> {
+        self.decode_clip_index(clip, self.frame_index_for_clip_tick(clip, tick, fps, policy)?)
+    }
+
+    /// Decode one palette frame of the default clip.
+    pub fn decode_index(&self, frame_index: usize) -> Result<SraFrame, String> {
+        self.decode_clip_index(0, frame_index)
+    }
+
+    /// Decode the frame selected by one frame-time unit in the default clip.
+    pub fn decode_time(&self, frame_time: u16) -> Result<SraFrame, String> {
+        self.decode_clip_time(0, frame_time)
+    }
+
+    /// Decode the frame selected by one canonical tick in the default clip.
     pub fn decode_tick(
         &self,
         tick: u64,
         fps: u32,
         policy: PlaybackLoop,
     ) -> Result<SraFrame, String> {
-        self.decode_index(self.frame_index_for_tick(tick, fps, policy)?)
+        self.decode_clip_tick(0, tick, fps, policy)
     }
 
     /// The slot-pose list for `frame`, ready for the hierarchical skinner.
@@ -605,19 +775,171 @@ impl SraAnimation {
         poses_from_angles(&frame.angles)
     }
 
-    /// Decode the tick's frame under the playback clock and build its poses.
+    /// Decode the tick's frame of one clip under the playback clock and build
+    /// its poses.
+    pub fn poses_for_clip_tick(
+        &self,
+        clip: usize,
+        tick: u64,
+        fps: u32,
+        policy: PlaybackLoop,
+    ) -> Result<Vec<SlotPose>, String> {
+        let frame = self.decode_clip_tick(clip, tick, fps, policy)?;
+        Ok(self.poses(&frame))
+    }
+
+    /// Decode the default clip's tick frame and build its poses.
     pub fn poses_for_tick(
         &self,
         tick: u64,
         fps: u32,
         policy: PlaybackLoop,
     ) -> Result<Vec<SlotPose>, String> {
-        let frame = self.decode_tick(tick, fps, policy)?;
-        Ok(self.poses(&frame))
+        self.poses_for_clip_tick(0, tick, fps, policy)
     }
 
-    fn table(&self) -> Result<PackedFrameTable<'_>, String> {
-        PackedFrameTable::parse(&self.bytes[self.table.clone()], TableForm::File)
+    fn clip_at(&self, clip: usize) -> Result<&ClipTable, ClipError> {
+        self.clips.get(clip).ok_or(ClipError::OutOfRange {
+            clip,
+            clip_count: self.clips.len(),
+        })
+    }
+
+    fn table(&self, clip: usize) -> Result<PackedFrameTable<'_>, String> {
+        let located = self.clip_at(clip).map_err(|error| error.to_string())?;
+        PackedFrameTable::parse(&self.bytes[located.table.clone()], TableForm::File)
+    }
+}
+
+/// The deterministic player motion state animation selection reads.
+///
+/// Derived from existing signals only: the grounded flag and whether stage 9
+/// committed a non-zero horizontal delta this tick. It is presentation state
+/// and never enters the canonical fold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MotionState {
+    /// Grounded with no committed horizontal movement.
+    Idle,
+    /// Grounded with committed horizontal movement.
+    Moving,
+    /// Not grounded (rising or falling).
+    Airborne,
+}
+
+impl MotionState {
+    /// Map the two existing player signals to one motion state.
+    pub fn from_player_signals(grounded: bool, moving: bool) -> Self {
+        if !grounded {
+            Self::Airborne
+        } else if moving {
+            Self::Moving
+        } else {
+            Self::Idle
+        }
+    }
+}
+
+/// Explicit state-to-clip mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipMap {
+    pub idle: usize,
+    pub walk: usize,
+    pub jump: usize,
+}
+
+impl ClipMap {
+    /// Default presentation mapping for `clip_count` clips.
+    ///
+    /// The shipped tables carry no clip identity, so this is an explicit
+    /// presentation choice, not a recovered mapping: idle is the first clip,
+    /// walk the middle clip and jump the last clip. It is deterministic and
+    /// always in range; override it with `--clip-idle/--clip-walk/--clip-jump`
+    /// or freeze one clip with `--clip <N>`.
+    pub fn for_clip_count(clip_count: usize) -> Self {
+        let last = clip_count.saturating_sub(1);
+        Self {
+            idle: 0,
+            walk: last / 2,
+            jump: last,
+        }
+    }
+
+    /// The clip index for one motion state.
+    pub fn clip_for(&self, state: MotionState) -> usize {
+        match state {
+            MotionState::Idle => self.idle,
+            MotionState::Moving => self.walk,
+            MotionState::Airborne => self.jump,
+        }
+    }
+}
+
+/// A fixed clip override plus a state map, as resolved from the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipSelection {
+    pub fixed: Option<usize>,
+    pub map: ClipMap,
+}
+
+/// State-driven clip selector.
+///
+/// Rule: the clip changes only when the observed motion state changes. On a
+/// change the clip restarts at local tick 0 (`start_tick = tick`), so a state
+/// change starts the new clip at its first frame instead of inheriting a
+/// mid-clip index from the previous clip. The local tick is the tick count since
+/// that restart, and is what the playback clock consumes.
+///
+/// A fixed override (`--clip <N>`) ignores the state and uses the global tick,
+/// so it starts at frame 0 and never resets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipSelector {
+    selection: ClipSelection,
+    clip: usize,
+    start_tick: u64,
+    state: Option<MotionState>,
+}
+
+impl ClipSelector {
+    /// Build a selector. The initial clip is the fixed override or the idle
+    /// clip; the first [`ClipSelector::observe`] establishes the start tick.
+    pub fn new(selection: ClipSelection) -> Self {
+        let clip = selection.fixed.unwrap_or(selection.map.idle);
+        Self {
+            selection,
+            clip,
+            start_tick: 0,
+            state: None,
+        }
+    }
+
+    /// The active clip index.
+    pub fn clip(&self) -> usize {
+        self.clip
+    }
+
+    /// The last observed motion state, if any.
+    pub fn state(&self) -> Option<MotionState> {
+        self.state
+    }
+
+    /// Observe one tick's motion state. Returns `true` when the clip switched.
+    pub fn observe(&mut self, tick: u64, state: MotionState) -> bool {
+        if self.selection.fixed.is_some() || self.state == Some(state) {
+            return false;
+        }
+        self.state = Some(state);
+        self.clip = self.selection.map.clip_for(state);
+        self.start_tick = tick;
+        true
+    }
+
+    /// The tick the playback clock should use for this clip.
+    pub fn local_tick(&self, tick: u64) -> u64 {
+        if self.selection.fixed.is_some() {
+            tick
+        } else {
+            tick.saturating_sub(self.start_tick)
+        }
     }
 }
 
@@ -796,7 +1118,7 @@ mod tests {
         assert!(parse_container(&container).is_none());
     }
 
-    fn palette_container(
+    fn palette_record(
         masks: &[u16],
         frame_count: u16,
         divisor: i16,
@@ -838,7 +1160,38 @@ mod tests {
                 }
             }
         }
-        encode_single_record_container(&record)
+        record
+    }
+
+    fn palette_container(
+        masks: &[u16],
+        frame_count: u16,
+        divisor: i16,
+        palettes: &[&[f32]],
+    ) -> Vec<u8> {
+        encode_single_record_container(&palette_record(masks, frame_count, divisor, palettes))
+    }
+
+    /// Wrap several payload records in one valid container, in file order.
+    fn multi_record_container(records: &[Vec<u8>]) -> Vec<u8> {
+        let count = records.len() + 1;
+        let preamble_size = 8 + 4 * count;
+        let payload_base = preamble_size.div_ceil(PAYLOAD_ALIGN).max(1) * PAYLOAD_ALIGN;
+        let directory_len = 4 * (records.len() + 1);
+        let mut bytes = vec![0u8; payload_base + directory_len];
+        bytes[0..4].copy_from_slice(&(count as u32).to_le_bytes());
+        let mut offset = directory_len;
+        for (index, record) in records.iter().enumerate() {
+            let at = payload_base + index * 4;
+            bytes[at..at + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+            offset += record.len();
+        }
+        let terminator = payload_base + records.len() * 4;
+        bytes[terminator..terminator + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        for record in records {
+            bytes.extend_from_slice(record);
+        }
+        bytes
     }
 
     #[test]
@@ -1033,5 +1386,155 @@ mod tests {
             moved_ranges >= 2,
             "the decoded pose must move more than one bone, moved {moved_ranges}"
         );
+    }
+
+    #[test]
+    fn the_enumerator_finds_one_clip_per_constructed_record_in_file_order() {
+        let first = palette_record(
+            &[0x007],
+            2,
+            100,
+            &[&[10.0, 20.0], &[30.0, 40.0], &[50.0, 60.0]],
+        );
+        let second = palette_record(&[0x001], 3, 200, &[&[1.0, 2.0, 3.0]]);
+        let mut third = vec![0u8; 5];
+        third.extend(palette_record(
+            &[0x001],
+            4,
+            50,
+            &[&[7.0, 8.0, 9.0, 10.0]],
+        ));
+        let container = multi_record_container(&[first, second, third]);
+
+        let animation = SraAnimation::load(container, 1).expect("three synthetic clips");
+        assert_eq!(animation.clip_count(), 3);
+        let clips = animation.clips();
+        assert_eq!(
+            clips
+                .iter()
+                .map(|clip| (clip.index, clip.record, clip.offset))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 0), (1, 1, 0), (2, 2, 5)],
+            "clips are numbered in file order and keep their record-relative offset"
+        );
+        assert_eq!(
+            clips
+                .iter()
+                .map(|clip| (clip.frame_count, clip.divisor))
+                .collect::<Vec<_>>(),
+            vec![(2, 100), (3, 200), (4, 50)]
+        );
+        assert_eq!(
+            animation
+                .decode_clip_index(1, 0)
+                .expect("second clip frame 0")
+                .angles,
+            vec![[1.0, 0.0, 0.0]],
+            "clip 1 is the second record, not the first"
+        );
+        assert_eq!(
+            animation
+                .decode_clip_index(0, 1)
+                .expect("first clip frame 1")
+                .angles,
+            vec![[20.0, 40.0, 60.0]]
+        );
+    }
+
+    #[test]
+    fn clip_selection_maps_each_motion_state_to_the_configured_index() {
+        let map = ClipMap {
+            idle: 2,
+            walk: 5,
+            jump: 7,
+        };
+        assert_eq!(map.clip_for(MotionState::Idle), 2);
+        assert_eq!(map.clip_for(MotionState::Moving), 5);
+        assert_eq!(map.clip_for(MotionState::Airborne), 7);
+        assert_eq!(
+            MotionState::from_player_signals(true, false),
+            MotionState::Idle
+        );
+        assert_eq!(
+            MotionState::from_player_signals(true, true),
+            MotionState::Moving
+        );
+        assert_eq!(
+            MotionState::from_player_signals(false, true),
+            MotionState::Airborne,
+            "airborne wins over the committed horizontal delta"
+        );
+    }
+
+    #[test]
+    fn a_state_change_restarts_the_clip_and_only_changes_on_a_new_state() {
+        let mut selector = ClipSelector::new(ClipSelection {
+            fixed: None,
+            map: ClipMap {
+                idle: 2,
+                walk: 5,
+                jump: 7,
+            },
+        });
+
+        assert!(selector.observe(10, MotionState::Idle));
+        assert_eq!(selector.clip(), 2);
+        assert_eq!(selector.local_tick(10), 0, "the clip starts at frame 0");
+        assert_eq!(selector.local_tick(15), 5);
+        assert!(
+            !selector.observe(16, MotionState::Idle),
+            "the same state must not restart the clip"
+        );
+        assert_eq!(selector.local_tick(16), 6);
+
+        assert!(selector.observe(17, MotionState::Moving));
+        assert_eq!(selector.clip(), 5);
+        assert_eq!(
+            selector.local_tick(17),
+            0,
+            "a state change restarts the new clip"
+        );
+        assert!(!selector.observe(18, MotionState::Moving));
+        assert_eq!(selector.local_tick(18), 1);
+
+        assert!(selector.observe(20, MotionState::Airborne));
+        assert_eq!(selector.clip(), 7);
+        assert_eq!(selector.local_tick(20), 0);
+    }
+
+    #[test]
+    fn a_fixed_clip_ignores_state_and_uses_the_global_tick() {
+        let mut selector = ClipSelector::new(ClipSelection {
+            fixed: Some(3),
+            map: ClipMap {
+                idle: 0,
+                walk: 1,
+                jump: 2,
+            },
+        });
+        assert!(!selector.observe(42, MotionState::Moving));
+        assert!(!selector.observe(43, MotionState::Airborne));
+        assert_eq!(selector.clip(), 3);
+        assert_eq!(selector.local_tick(42), 42);
+        assert_eq!(selector.state(), None);
+    }
+
+    #[test]
+    fn out_of_range_clip_indices_are_typed_errors() {
+        let animation = SraAnimation::load(
+            palette_container(&[0x001], 2, 100, &[&[1.0, 2.0]]),
+            1,
+        )
+        .expect("one synthetic clip");
+        assert_eq!(animation.validate_clip(0), Ok(()));
+        assert_eq!(
+            animation.validate_clip(1),
+            Err(ClipError::OutOfRange {
+                clip: 1,
+                clip_count: 1
+            })
+        );
+        assert!(animation.frame_count_of(1).is_err());
+        assert!(animation.frame_index_for_clip_tick(1, 0, 50, PlaybackLoop::Loop).is_err());
     }
 }

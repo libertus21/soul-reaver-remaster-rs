@@ -472,15 +472,18 @@ struct AnimateInput<'a> {
     entry: usize,
     frame: Option<usize>,
     time: Option<u16>,
+    clip: Option<usize>,
+    list_clips: bool,
     anim_fps: u32,
     anim_once: bool,
 }
 
 /// `--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>]
-/// [--time <T>] [--anim-fps <N>] [--anim-once]`: decode one frame, skin the
-/// archived model and print a bounded acceptance line. The slot count is the
-/// model's bone count, not a file field. An explicit `--frame` wins over the
-/// playback clock.
+/// [--time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once] [--list-clips]`:
+/// decode one frame, skin the archived model and print a bounded acceptance
+/// line. The slot count is the model's bone count, not a file field. An explicit
+/// `--frame` wins over the playback clock. `--clip` selects the table and
+/// `--list-clips` prints the full enumeration instead of decoding.
 fn run_animate(args: &[String]) -> ExitCode {
     let input = match animate_input(args) {
         Ok(input) => input,
@@ -517,6 +520,18 @@ fn run_animate(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    if input.list_clips {
+        outln!(
+            "{}",
+            clip_listing(&animation, &file_label(Path::new(input.sra)))
+        );
+        return ExitCode::SUCCESS;
+    }
+    let clip = input.clip.unwrap_or(0);
+    if let Err(error) = animation.validate_clip(clip) {
+        eprintln!("error: {error}");
+        return ExitCode::from(1);
+    }
     let choice = match animate_choice(input.frame, input.time, input.anim_fps, input.anim_once) {
         Ok(choice) => choice,
         Err(error) => {
@@ -527,6 +542,7 @@ fn run_animate(args: &[String]) -> ExitCode {
     match animate_report(
         &model,
         &animation,
+        clip,
         &file_label(Path::new(input.sra)),
         choice,
     ) {
@@ -567,15 +583,21 @@ fn animate_choice(
 }
 
 fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
-    let usage = "expected --animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--anim-fps <N>] [--anim-once]";
-    let (mut sra, mut dat, mut entry, mut frame, mut time) = (None, None, None, None, None);
+    let usage = "expected --animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once] [--list-clips]";
+    let (mut sra, mut dat, mut entry, mut frame, mut time, mut clip) =
+        (None, None, None, None, None, None);
     let mut anim_fps = sra::ANIMATION_FPS;
     let mut anim_once = false;
+    let mut list_clips = false;
     let mut at = 0;
     while at < args.len() {
         match args[at].as_str() {
             "--anim-once" => {
                 anim_once = true;
+                at += 1;
+            }
+            "--list-clips" => {
+                list_clips = true;
                 at += 1;
             }
             token => {
@@ -593,6 +615,9 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
                     }
                     "--time" => {
                         time = Some(value.parse::<u16>().map_err(|_| usage.to_string())?);
+                    }
+                    "--clip" => {
+                        clip = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
                     }
                     "--anim-fps" => {
                         let fps = value
@@ -618,11 +643,39 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
             entry,
             frame,
             time,
+            clip,
+            list_clips,
             anim_fps,
             anim_once,
         }),
         _ => Err(usage.to_string()),
     }
+}
+
+/// The `--list-clips` enumeration: one line per located packed table.
+///
+/// The tables carry no name or id, so the structural fields (file order, payload
+/// record, record-relative offset, frame count, divisor, channel count and plane
+/// flags) are the whole identity a human can map a clip by.
+fn clip_listing(animation: &sra::SraAnimation, sra_label: &str) -> String {
+    let mut lines = vec![format!(
+        "sra clips={} slots={} ({sra_label})",
+        animation.clip_count(),
+        animation.slot_count()
+    )];
+    for clip in animation.clips() {
+        lines.push(format!(
+            "clip index={} record={} offset={} frames={} divisor={} channels={} flags=0x{:02X}",
+            clip.index,
+            clip.record,
+            clip.offset,
+            clip.frame_count,
+            clip.divisor,
+            clip.channel_count,
+            clip.flags
+        ));
+    }
+    lines.join("\n")
 }
 
 /// The pure core of `--animate`: one decoded frame, the slot poses it produces
@@ -631,22 +684,25 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
 fn animate_report(
     model: &object::ObjectModel,
     animation: &sra::SraAnimation,
+    clip: usize,
     sra_label: &str,
     choice: FrameChoice,
 ) -> Result<String, String> {
+    let frame_count = animation
+        .frame_count_of(clip)
+        .map_err(|error| error.to_string())?;
     let frame = match choice {
         FrameChoice::Index(index) => {
-            if index >= animation.frame_count() {
+            if index >= frame_count {
                 return Err(format!(
-                    "--frame {index} is outside the {}-frame table",
-                    animation.frame_count()
+                    "--frame {index} is outside the {frame_count}-frame table"
                 ));
             }
-            animation.decode_index(index)?
+            animation.decode_clip_index(clip, index)?
         }
-        FrameChoice::Time(time) => animation.decode_time(time)?,
+        FrameChoice::Time(time) => animation.decode_clip_time(clip, time)?,
         FrameChoice::Playback { tick, fps, policy } => {
-            animation.decode_tick(tick, fps, policy)?
+            animation.decode_clip_tick(clip, tick, fps, policy)?
         }
     };
     let poses = animation.poses(&frame);
@@ -694,10 +750,11 @@ fn animate_report(
         })
         .collect();
     Ok(format!(
-        "animate sra={} slots={} channels={} frame={}/{} angles={} moved={} verts={}",
+        "animate sra={} slots={} channels={} clip={} frame={}/{} angles={} moved={} verts={}",
         sra_label,
         animation.slot_count(),
-        animation.channel_count(),
+        frame.channel_count,
+        clip,
         frame.frame_index,
         frame.frame_count,
         angles.join(";"),
@@ -2580,7 +2637,8 @@ fn strip_launcher_noops(args: Vec<String>) -> Vec<String> {
 mod cli_tests {
     use super::run_level_info;
     use super::{
-        animate_choice, animate_input, animate_report, bone_hierarchy_input, facing_input,
+        animate_choice, animate_input, animate_report, bone_hierarchy_input, clip_listing,
+        facing_input,
         facing_report, list_report, object_input, parse_direction, pose_mode_conflict,
         resolve_texture_name, run_actor_census, run_audio, run_bigfile, dispatch, run_level_links,
         run_level_records, run_level_structure, run_mesh, run_mesh_all, run_level_geometry,
@@ -3432,23 +3490,41 @@ mod cli_tests {
         let animation = crate::sra::SraAnimation::load(container, model.bones.len())
             .expect("synthetic animation must locate");
 
-        let line = animate_report(&model, &animation, "SYNTH.SRA", FrameChoice::Index(0))
+        let line = animate_report(&model, &animation, 0, "SYNTH.SRA", FrameChoice::Index(0))
             .expect("frame 0");
         assert!(
             line.starts_with(
-                "animate sra=SYNTH.SRA slots=2 channels=3 frame=0/2 angles=0:1024.000,0.000,0.000;1:0.000,0.000,1024.000 moved="
+                "animate sra=SYNTH.SRA slots=2 channels=3 clip=0 frame=0/2 angles=0:1024.000,0.000,0.000;1:0.000,0.000,1024.000 moved="
             ),
             "{line}"
         );
         let verts = line.split(" verts=").nth(1).expect("verts field");
         assert_eq!(verts.split(';').count(), 3, "three vertices: {line}");
 
-        let time = animate_report(&model, &animation, "SYNTH.SRA", FrameChoice::Time(100))
+        let time = animate_report(&model, &animation, 0, "SYNTH.SRA", FrameChoice::Time(100))
             .expect("frame 1");
         assert!(time.contains("frame=1/2"), "{time}");
         assert!(
-            animate_report(&model, &animation, "SYNTH.SRA", FrameChoice::Index(2)).is_err(),
+            animate_report(&model, &animation, 0, "SYNTH.SRA", FrameChoice::Index(2)).is_err(),
             "a frame past the table must be loud"
+        );
+    }
+
+    #[test]
+    fn clip_listing_reports_the_structural_identity_of_each_table() {
+        let container = crate::sra::synthetic_animation_container(
+            &[0x001, 0x001],
+            2,
+            100,
+            &[1024.0, 0.0, 0.0, 0.0],
+        );
+        let animation = crate::sra::SraAnimation::load(container, 2).expect("synthetic table");
+        let listing = clip_listing(&animation, "SYNTH.SRA");
+        let lines: Vec<&str> = listing.lines().collect();
+        assert_eq!(lines[0], "sra clips=1 slots=2 (SYNTH.SRA)");
+        assert_eq!(
+            lines[1],
+            "clip index=0 record=0 offset=0 frames=2 divisor=100 channels=3 flags=0x01"
         );
     }
 
@@ -3464,6 +3540,14 @@ mod cli_tests {
             ("R.SRA", "B.DAT", 66, Some(24), None)
         );
         assert_eq!((parsed.anim_fps, parsed.anim_once), (crate::sra::ANIMATION_FPS, false));
+        assert_eq!((parsed.clip, parsed.list_clips), (None, false));
+
+        let clip_argv = argv(&[
+            "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "66", "--clip", "7",
+            "--list-clips",
+        ]);
+        let clip = animate_input(&clip_argv).expect("clip flags must parse");
+        assert_eq!((clip.clip, clip.list_clips), (Some(7), true));
 
         let flagged_argv = argv(&[
             "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "66", "--anim-fps", "20",
