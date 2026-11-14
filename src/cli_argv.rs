@@ -368,12 +368,22 @@ mod tests {
             ),
             (
                 &[
-                    "game", "animate", "--sra", "R.SRA", "--rank-clips", "--slots", "66",
-                    "--top", "4",
+                    "game", "animate", "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "66",
+                    "--dump-unmapped", "U.TXT", "--list-clips",
                 ],
                 &[
-                    "--animate", "--sra", "R.SRA", "--rank-clips", "--top", "4", "--slots",
-                    "66",
+                    "--animate", "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "66",
+                    "--list-clips", "--dump-unmapped", "U.TXT",
+                ],
+            ),
+            (
+                &[
+                    "game", "match-unmapped", "FPS.TXT", "--sra-dir", "OBJECT", "--slots", "66",
+                    "--out", "MATCH.TXT",
+                ],
+                &[
+                    "--match-unmapped", "FPS.TXT", "--sra-dir", "OBJECT", "--slots", "66",
+                    "--out", "MATCH.TXT",
                 ],
             ),
             (
