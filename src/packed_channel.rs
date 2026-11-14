@@ -64,6 +64,12 @@ pub const MAX_TABLE_COUNT: u8 = 16;
 pub const MAX_FRAME_COUNT: u16 = 4096;
 /// Highest slot count accepted by the bit-plane layout.
 pub const MAX_SLOT_COUNT: usize = 4096;
+/// Form-invariant header bytes hashed by [`PackedFrameTable::fingerprint`].
+pub const FINGERPRINT_HEADER_BYTES: usize = 20;
+/// FNV-1a 32-bit offset basis.
+pub const FNV_OFFSET_BASIS: u32 = 0x811C_9DC5;
+/// FNV-1a 32-bit prime.
+pub const FNV_PRIME: u32 = 0x0100_0193;
 
 const FLAG_ANGLE: u8 = 0x01;
 const FLAG_SCALE: u8 = 0x02;
@@ -181,6 +187,21 @@ fn read_i32(bytes: &[u8], at: usize) -> Result<i32, String> {
 
 fn read_f32(bytes: &[u8], at: usize) -> Result<f32, String> {
     Ok(f32::from_bits(read_u32(bytes, at)?))
+}
+
+/// FNV-1a 32-bit over `bytes`, continuing from `seed`.
+///
+/// This is the hash the runtime labelling probe uses for the content-only
+/// table fingerprint (`docs/notes/packed-channel-format.md`, "Clip
+/// enumeration and state selection"). It hashes static table content, never an
+/// address, so file and relocated memory copies agree.
+pub fn fnv1a32(bytes: &[u8], seed: u32) -> u32 {
+    let mut hash = seed;
+    for &byte in bytes {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 /// Parse the `frame_count`/`divisor` header and validate its bounds.
@@ -324,6 +345,30 @@ impl<'a> PackedFrameTable<'a> {
         BitPlanes::parse(self.bytes, self.bit_plane_base(), slot_count)
     }
 
+    /// Content-only fingerprint: FNV-1a over the 20-byte form-invariant header
+    /// and the complete bit-plane block (flags byte plus the present planes).
+    ///
+    /// This is exactly the labelling probe's canonical view. It hashes table
+    /// content, not the value-offset array, so the file form and the relocated
+    /// memory form produce the same value. `slot_count` sizes the plane stride.
+    pub fn fingerprint(&self, slot_count: usize) -> Result<u32, String> {
+        let planes = self.bit_planes(slot_count)?;
+        let header = self
+            .bytes
+            .get(..FINGERPRINT_HEADER_BYTES)
+            .ok_or_else(|| {
+                format!(
+                    "packed table: fingerprint needs {FINGERPRINT_HEADER_BYTES} header bytes, record has {}",
+                    self.bytes.len()
+                )
+            })?;
+        let block = planes
+            .bytes()
+            .get(planes.base()..planes.block_end())
+            .ok_or_else(|| "packed table: fingerprint bit-plane block is out of bounds".to_string())?;
+        Ok(fnv1a32(block, fnv1a32(header, FNV_OFFSET_BASIS)))
+    }
+
     /// Byte offset of the file-form **inline** value stream for `slot_count`
     /// slots.
     ///
@@ -414,6 +459,24 @@ impl<'a> BitPlanes<'a> {
     /// The raw flags byte.
     pub fn flags(&self) -> u8 {
         self.flags
+    }
+
+    /// The borrowed record bytes.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Byte offset of the flags byte within the borrowed record.
+    pub fn base(&self) -> usize {
+        self.base
+    }
+
+    /// First byte after the complete bit-plane block (flags + present planes).
+    ///
+    /// [`BitPlanes::parse`] already proved this is inside the record.
+    pub fn block_end(&self) -> usize {
+        let present = (self.flags & DEFINED_FLAGS).count_ones() as usize;
+        self.base + 1 + present * (self.stride_bits / 8)
     }
 
     /// Whether the plane selected by `plane` (0 angle, 1 scale, 2 translation)
@@ -723,6 +786,28 @@ pub fn decode_inline_channel(
     slot_count: usize,
     frame_index: usize,
 ) -> Result<DecodedChannel, String> {
+    decode_inline_channel_with_end(table, slot_count, frame_index).map(|(decoded, _)| decoded)
+}
+
+/// First byte after the inline value stream consumed by a whole channel.
+///
+/// This is the byte extent of the file-resident table: the inline stream
+/// starts after the present planes and one block is consumed per set lane in
+/// ascending slot/lane order. Callers that scan a payload record for further
+/// tables start here, so they never re-enter the table they just decoded.
+pub fn inline_stream_end(
+    table: &PackedFrameTable<'_>,
+    slot_count: usize,
+) -> Result<usize, String> {
+    decode_inline_channel_with_end(table, slot_count, 0).map(|(_, end)| end)
+}
+
+/// Decode a whole file-form channel and report where its value stream ends.
+fn decode_inline_channel_with_end(
+    table: &PackedFrameTable<'_>,
+    slot_count: usize,
+    frame_index: usize,
+) -> Result<(DecodedChannel, usize), String> {
     if slot_count == 0 {
         return Err("packed channel: slot count 0 has no bit-plane stride".to_string());
     }
@@ -744,11 +829,15 @@ pub fn decode_inline_channel(
             rotation: rotation_from_binary_angles(angles[0], angles[1], angles[2]),
         });
     }
-    Ok(DecodedChannel {
-        frame_index,
-        flags: planes.flags(),
-        slots,
-    })
+    let end = stream.cursor();
+    Ok((
+        DecodedChannel {
+            frame_index,
+            flags: planes.flags(),
+            slots,
+        },
+        end,
+    ))
 }
 
 #[cfg(test)]
