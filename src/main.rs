@@ -740,40 +740,28 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
             }
         }
     }
+    // `--animate` needs an `.SRA`. Offline modes (`--list-clips`, `--rank-clips`,
+    // `--dump-unmapped`) accept EITHER a model (`--bigfile` + `--entry`) OR an
+    // explicit `--slots`, never both and never a frame selector. The decode mode
+    // always needs the model.
     let Some(sra) = sra else {
         return Err(usage.to_string());
     };
-    if rank_clips {
-        if list_clips {
-            return Err("--rank-clips cannot be combined with --list-clips".to_string());
-        }
-        if dump_unmapped.is_some() {
-            return Err("--rank-clips cannot be combined with --dump-unmapped".to_string());
-        }
-        if frame.is_some() || time.is_some() || clip.is_some() {
-            return Err(
-                "--rank-clips cannot be combined with --frame, --time or --clip".to_string(),
-            );
-        }
-        let model = matches!((dat, entry), (Some(_), Some(_)));
-        if slots.is_none() && !model {
-            return Err(
-                "expected --rank-clips with --slots <N> or --bigfile <DAT> --entry <INDEX>"
-                    .to_string(),
-            );
-        }
-        if slots.is_some() && (dat.is_some() || entry.is_some()) {
-            return Err(
-                "--rank-clips accepts --slots or --bigfile/--entry, not both".to_string(),
-            );
-        }
-    } else {
-        if top.is_some() || slots.is_some() {
-            return Err("--top and --slots require --rank-clips".to_string());
-        }
-        if dat.is_none() || entry.is_none() {
+    if dat.is_some() != entry.is_some() {
+        return Err(usage.to_string());
+    }
+    let have_model = dat.is_some() && entry.is_some();
+    let have_slots = slots.is_some();
+    let offline = rank_clips || list_clips || dump_unmapped.is_some();
+    if offline {
+        if have_model == have_slots {
             return Err(usage.to_string());
         }
+        if frame.is_some() || time.is_some() {
+            return Err(usage.to_string());
+        }
+    } else if !have_model {
+        return Err(usage.to_string());
     }
     Ok(AnimateInput {
         sra,
