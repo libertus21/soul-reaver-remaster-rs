@@ -707,6 +707,12 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
                         clip = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
                     }
                     "--dump-unmapped" => dump_unmapped = Some(value),
+                    "--slots" => {
+                        slots = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
+                    }
+                    "--top" => {
+                        top = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
+                    }
                     "--anim-fps" => {
                         let fps = value
                             .parse::<u32>()
@@ -724,20 +730,28 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
             }
         }
     }
-    match (sra, dat, entry) {
-        (Some(sra), Some(dat), Some(entry)) => Ok(AnimateInput {
-            sra,
-            dat,
-            entry,
-            frame,
-            time,
-            clip,
-            list_clips,
-            dump_unmapped,
-            anim_fps,
-            anim_once,
-        }),
-        _ => Err(usage.to_string()),
+    // `--animate` needs an `.SRA`. Offline modes (`--list-clips`, `--rank-clips`,
+    // `--dump-unmapped`) accept EITHER a model (`--bigfile` + `--entry`) OR an
+    // explicit `--slots`, never both and never a frame selector. The decode mode
+    // always needs the model.
+    let Some(sra) = sra else {
+        return Err(usage.to_string());
+    };
+    if dat.is_some() != entry.is_some() {
+        return Err(usage.to_string());
+    }
+    let have_model = dat.is_some() && entry.is_some();
+    let have_slots = slots.is_some();
+    let offline = rank_clips || list_clips || dump_unmapped.is_some();
+    if offline {
+        if have_model == have_slots {
+            return Err(usage.to_string());
+        }
+        if frame.is_some() || time.is_some() {
+            return Err(usage.to_string());
+        }
+    } else if !have_model {
+        return Err(usage.to_string());
     }
     Ok(AnimateInput {
         sra,
@@ -747,6 +761,7 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
         time,
         clip,
         list_clips,
+        dump_unmapped,
         anim_fps,
         anim_once,
         rank_clips,
