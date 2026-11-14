@@ -368,6 +368,16 @@ mod tests {
             ),
             (
                 &[
+                    "game", "animate", "--sra", "R.SRA", "--rank-clips", "--slots", "66",
+                    "--top", "4",
+                ],
+                &[
+                    "--animate", "--sra", "R.SRA", "--rank-clips", "--top", "4", "--slots",
+                    "66",
+                ],
+            ),
+            (
+                &[
                     "game", "play", "--bigfile", "B.DAT", "--sra", "R.SRA", "--anim-fps", "25",
                     "--anim-once",
                 ],
