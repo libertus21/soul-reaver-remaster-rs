@@ -1,12 +1,13 @@
 # Clip labelling from runtime table selection
 
 The offline clip ranking cannot identify a real idle or walk, so the label
-source moves to the runtime: a probe observes which packed frame table the
-engine selects for the player while a human performs each state, fingerprints
-that table, and maps it to a clip index. This note records the failure of the
-heuristic, the fingerprint scheme, the segment aggregation, and the exact
-operator procedure. The probe itself stays in the session scratch directory
-because it carries module-relative anchors and engine field offsets.
+source moves to the runtime: a probe observes which frame producer the engine
+selects for the player while a human performs each state, fingerprints the
+selected table, and maps packed tables to a clip index. This note records the
+failure of the heuristic, the packed and keyed fingerprint schemes, the
+segment aggregation, the keyed-locomotion hypothesis, and the exact operator
+procedure. The probe itself stays in the session scratch directory because it
+carries module-relative anchors and engine field offsets.
 
 Nothing was launched, attached or instrumented for this slice. No production
 code changed and no golden moved.
@@ -16,8 +17,58 @@ code changed and no golden moved.
 1. Start the game and load a save where Raziel stands on solid ground.
 2. Run the probe with the three timed segments and the path to `RAZIEL.SRA`.
 3. Follow the three prompts: stand still, then walk, then jump.
-4. Read the final `LABELS` line and pass the three indices to
-   `--clip-idle`, `--clip-walk` and `--clip-jump`.
+4. Read the final `LABELS` line. A numeric index is a packed clip; `keyed`
+   and `unmapped` are producer classes, not indices. The probe prints both the
+   invariant key and the legacy digest for the dominant sample.
+
+## The keyed hypothesis (test pending)
+
+> **2026-11-14 correction.** A later capture with the fixed fingerprint shows
+> idle = clip 0 (`50:100`) and the walk samples on a packed table with pair
+> `12:209` (clip 2). The walk `unmapped` status was the legacy pointer-hash
+> defect, not a keyed producer. The keyed producer still exists (see "The keyed
+> fingerprint"), but it is not the walk explanation. See
+> `docs/notes/packed-channel-format.md`, "Clip fingerprint".
+
+Idle maps cleanly to one clip (`6` frames, divisor `580`, coverage `1.00` on
+both runs). Walk is `97-98%` `unmapped`, and jump is inconsistent (two runs
+return `34` and `0`, coverage `0.45-0.85`). The file side is exhausted:
+`RAZIEL.SRA` holds exactly one genuine table per payload record, and extending
+the enumeration to every structurally valid table added **zero** tables. The
+walk data is therefore not a second table hiding inside the record.
+
+The remaining explanation is the producer, not the file. A channel selects one
+of two writers per invocation:
+
+- the **packed** decoder, which reads the channel's packed table (the path the
+  probe has always fingerprinted), and
+- the **keyed** quaternion sampler, which runs only when the channel's keyed
+  head and its frame-array pointer are both non-null.
+
+The earlier probe fingered packed tables and **skipped keyed channels
+entirely**. If locomotion selects the keyed producer, the packed path sees
+nothing and the segment arrives as `unmapped` even though a frame array is
+playing. The hypothesis is:
+
+> Walking engages the keyed sampler (the quaternion/frame-array path). The
+> probe's silence on keyed channels is what turns walk into `unmapped`; it is
+> not a missing packed table in `RAZIEL.SRA`.
+
+The probe now fingerprints both producers and classifies every sample. The run
+is the test.
+
+### What confirms or refutes it (stated before the run)
+
+| Observation | Verdict |
+|---|---|
+| `walk` is dominated by `keyed`, with a share close to the old `unmapped` share, and `unmapped` falls to the transition residue | **Confirms** the keyed-producer hypothesis |
+| `walk` stays dominated by `unmapped` with `keyed` near zero, and `unmapped_top` prints stable packed keys | **Refutes** it: the walk producer is packed and its table is absent from the file index; the captured keys are the next evidence |
+| `keyed` is non-zero but never dominant, while `unmapped` still dominates | **Refutes the strong form**: keyed channels participate, but another producer writes most sampled slots |
+| `idle` loses its coverage or changes clip | The keyed path is not locomotion-specific; the measurement is confounded and must be repeated |
+| A keyed key is identical across idle and walk | The keyed view does not distinguish frames; it proves the path, not the selection |
+
+A keyed sample is never turned into a clip index. A keyed segment is a
+producer classification, not a `--clip-walk` value.
 
 ## Why the offline heuristic failed
 
@@ -51,15 +102,19 @@ here.
 
 ### What is read at runtime
 
-A channel record points at the packed frame table it is playing. For each
+A channel record points at the frame producer it is playing. For each
 animation invocation the probe reads:
 
-- whether the channel is on the keyed producer (keyed channels are skipped
-  because they are not the packed clip table);
-- the table's frame count and divisor from the form-invariant header;
-- the complete bit-plane block (flag byte plus the present planes).
+- the channel's producer: **keyed** when the keyed head and its frame-array
+  pointer are both non-null, **packed** otherwise;
+- for a packed channel, the table's frame count and divisor from the
+  form-invariant header, and the complete bit-plane block (flag byte plus the
+  present planes);
+- for a keyed channel, the head's frame count and the bounded content view
+  defined below.
 
-The same values are computed offline from the shipped file for every clip.
+The same packed values are computed offline from the shipped file for every
+clip.
 
 ### Why `(frame_count, divisor)` alone is insufficient
 
@@ -116,6 +171,36 @@ form-invariant, so its extra discrimination came from a pointer. The probe
 reports `ambiguous=<n>` at startup and maps an ambiguous key to the lowest
 index; it never hides the collision.
 
+## The keyed fingerprint
+
+The keyed head is a small runtime record. The observed shape is a `u16` frame
+count at `+0x00`, content bytes up to `+0x0f`, and the frame-array pointer at
+`+0x10`. The producer is keyed only when that pointer is non-null. The observed
+heads carry **no divisor field**, so the keyed key omits the divisor and the
+note says so instead of inventing one.
+
+The key is:
+
+```text
+keyed fp = k<frame_count>:<8 hex digits>
+
+FNV-1a 32-bit over:
+  the 16-byte head prefix [+0x00, +0x10)   (pointer not included)
+  the first 16 bytes at the frame-array pointer
+    (the leading floats of the first 20-float frame)
+```
+
+Both hashed regions are content, not addresses: the frame-array pointer is
+excluded, and the array sample is the leading numeric components of frame 0.
+Relocation therefore leaves the hashed bytes unchanged. The `k` prefix keeps
+keyed keys out of the packed `frame_count:divisor:hash` namespace.
+
+The 16-byte array sample is a **bounded** view, not the whole array. It is
+enough to separate keyed tables whose first frame differs. It cannot separate
+two tables that share their first four floats; they collapse to one key with a
+larger count. It also does not establish the frame stride, a divisor, or the
+interpolation, which remain UNKNOWN for the keyed producer.
+
 ## The segment design
 
 The probe hooks the per-object animation channel loop (the same hook class
@@ -138,22 +223,34 @@ threshold, the largest one is still used and the line says `low_slots=1`.
 
 ### Aggregation
 
-For the selected object the probe turns fingerprint counts into fractions,
-maps each fingerprint to a clip index, and prints the four largest buckets:
+For the selected object the probe classifies every sample as **packed**,
+**keyed**, or **unmapped**, and prints one line per segment:
 
 ```text
-CLIPLABEL segment=idle seconds=10.0 clips=6:0.94,17:0.03,2:0.03 dominant=6 coverage=0.94
-CLIPLABEL segment=walk seconds=20.0 clips=162:0.91,6:0.05 dominant=162 coverage=0.91
-CLIPLABEL segment=jump seconds=10.0 clips=212:0.72,30:0.18 dominant=212 coverage=0.72
-LABELS raziel idle=6 walk=162 jump=212 source=runtime
+CLIPLABEL segment=idle seconds=10.0 packed=1.00 keyed=0.00 unmapped=0.00 clips=55:0.96,6:0.02 dominant=55 coverage=0.96 fp=6:580:<hash> legacy=6:580:<hash>
+CLIPLABEL segment=walk seconds=20.0 packed=0.02 keyed=0.96 unmapped=0.02 clips=55:0.02 dominant=keyed coverage=0.96 fp=k300:<hash> legacy=-
+CLIPLABEL segment=jump seconds=10.0 packed=0.21 keyed=0.04 unmapped=0.75 clips=212:0.21 dominant=unmapped coverage=0.75 fp=1:100:<hash> legacy=1:100:<hash> unmapped_top=1:100:<hash>=1:100:<hash>:75,...
+LABELS raziel idle=55 walk=keyed jump=unmapped source=runtime
 ```
+
+The three fractions are disjoint and sum to 1 (rounding aside):
+
+- `packed=` is the share whose packed fingerprint maps to a clip index.
+- `keyed=` is the share produced by the keyed sampler.
+- `unmapped=` is the share on a packed table whose fingerprint is not in the
+  file index.
+
+`dominant=` is a clip index, `keyed`, or `unmapped`; `fp=` is the invariant key
+of that dominant bucket and `legacy=` the pre-fix digest for the same sample (a
+keyed sample prints `-`), so a mismatch stays diagnosable. `unmapped_top=`
+prints up to `--max-unmapped` packed keys as `<invariant>=<legacy>:<count>`;
+that list is the run summary and feeds `--match-unmapped`.
 
 Rules that keep the output honest:
 
-- `coverage` is the dominant bucket over **all** samples, including samples
-  whose fingerprint is not in the file index.
-- Unmapped samples are reported as `unmapped=<fraction>` and are never
-  silently dropped.
+- A keyed sample is never called unmapped: the file index only lists packed
+  tables.
+- Unmapped samples are never silently dropped; their raw keys are printed.
 - If unmapped samples outnumber the best mapped clip, the dominant label is
   `unmapped`, not a guessed index.
 - An empty segment prints `note=empty`; it is missing evidence, not a vote.
@@ -172,76 +269,94 @@ Rules that keep the output honest:
        --slots 66 --segments idle:10,walk:20,jump:10
    ```
 
-   Wait for `CLIPLABEL HOST attached`; the hook arms on the animation channel
-   loop.
+   Optionally add `--max-unmapped <N>` (default `5`) to change how many raw
+   unmapped keys each segment prints. Wait for `CLIPLABEL HOST attached`; the
+   hook arms on the animation channel loop.
 3. **Drive the three windows.** At the `idle` prompt, stand still: no
    movement, no attack, no camera turn. At `walk`, hold one movement
    direction without jumping. At `jump`, jump repeatedly and land between
    jumps. Each window is timed by the probe; the next prompt is the signal to
    change action.
 4. **Record the result.** Read the three `CLIPLABEL` lines and the final
-   `LABELS` line. Use the indices directly:
+   `LABELS` line. Use a numeric index directly:
 
    ```text
    --clip-idle <n> --clip-walk <n> --clip-jump <n>
    ```
 
-   If a line says `note=empty`, `dominant=unmapped`, `low_slots=1`, or has a
-   low `coverage`, repeat that segment. A state may legitimately select more
-   than one clip; the dominant bucket is the stable label for that window.
+   A `dominant=keyed` line is the keyed hypothesis holding; a
+   `dominant=unmapped` line is the hypothesis refuted and carries the packed
+   keys in `unmapped_top`. If a line says `note=empty`, `low_slots=1`, or has
+   a low `coverage`, repeat that segment. A state may legitimately select more
+   than one table; the dominant bucket is the stable label for that window.
 
 ## What it cannot establish
 
 - **One actor, one build.** The measurements are Raziel's shipped body in
   this build. Other actors, builds and animation sets are unobserved.
-- **A state may pick different clips as the state machine evolves.** The
-  label is the table the engine selected in that window, not a promise that
-  the same state always picks the same table. Context, speed, weapon, damage
+- **A state may pick different producers as the state machine evolves.** The
+  label is the table or producer the engine selected in that window, not a
+  promise that the same state always picks it. Context, speed, weapon, damage
   or progression can change the selection.
 - **The label is not a semantic name in the file.** The `.SRA` carries no
-  idle/walk/jump identifier. `idle=6` means "the engine selected clip 6 while
-  the operator stood still", not "clip 6 is named idle".
+  idle/walk/jump identifier. `idle=0` means "the engine selected packed clip
+  0 while the operator stood still", not "clip 0 is named idle".
+- **A keyed key is not a clip index.** The file index lists packed tables
+  only. A keyed key proves the producer and separates frame arrays at their
+  first frame; it does not name a clip, and `LABELS` reports it as `keyed`.
+- **The keyed frame layout is only partly observed.** The frame count and the
+  frame-array pointer are read; the stride, a divisor and the interpolation
+  are not established here.
 - **The player is inferred, not identified.** The probe uses the
   largest-coverage object. A scene with another 66-slot actor could compete
   for that role.
-- **No transitions, blends or mixed windows.** Only the dominant table per
+- **No transitions, blends or mixed windows.** Only the dominant producer per
   window is reported; the frames at a transition are part of the next or
   previous bucket.
 - **Not every frame is sampled.** A table active for a single frame may never
-  win a bucket. Absence from the top four is not proof the table is unused.
+  win a bucket. Absence from the top buckets is not proof the table is unused.
 
 ## Verification
 
 | Gate | Result |
 |---|---|
-| `--selftest` | 17 cases, 17 green (includes `fingerprint-form-invariant`) |
-| `--live-selftest` | 8 cases, 8 green in a real Frida runtime; synthetic channel records and tables with known fingerprints assert the hash, the mapping and the segment aggregation |
+| `--selftest` | 17 cases, 17 green; adds the keyed fingerprint, the keyed-dominant line, the keyed/unmapped separation, the capped unmapped list and `fingerprint-form-invariant` |
+| `--live-selftest` | 8 cases, 8 green in a real Frida runtime; adds a synthetic keyed channel (non-null keyed pointer and frame array) and a negative channel (keyed pointer with a null frame array) on top of the existing packed cases |
 | `--dry-run` | prints the plan; attaches nothing |
 | `py_compile` | clean |
 | `node --check` on `--print-agent` | clean |
-| `cargo test` | 675 green; `packed_channel` owns the invariant definition and its file/memory tests |
+| `cargo test` | 683 green on the current `main` base; `packed_channel` owns the invariant definition and its file/memory tests |
 
 The live harness spawns a throwaway system process, never the game. It
 exercises the real `NativePointer`, `Memory`, `Process`, `Interceptor`,
-`NativeCallback` and `NativeFunction` bindings. A missing Frida capability
-fails loudly before any hook is armed, rather than reporting an empty segment.
+`NativeCallback` and `NativeFunction` bindings. The keyed case asserts the
+keyed key and the keyed segment fraction; the negative case asserts that a
+keyed head with a null frame array still falls back to the packed producer. A
+missing Frida capability fails loudly before any hook is armed, rather than
+reporting an empty segment.
 
 ## Reviewer checklist
 
 - [ ] The diff contains no addresses, module-relative numbers, disassembly,
       game bytes or absolute install paths.
-- [ ] The fingerprint is described as content, not as a raw byte range at a
-      fixed position.
+- [ ] The packed fingerprint is described as content, not as a raw byte range
+      at a fixed position.
+- [ ] The keyed fingerprint names its bounded view and excludes the pointer.
+- [ ] The keyed structure is not given a divisor it was never observed to
+      have.
 - [ ] The collision policy is explicit: lowest index, `ambiguous` reported.
 - [ ] The procedure names the three actions and the three result lines.
+- [ ] The confirm/refute table appears before the run, not after it.
 - [ ] The limitations section is not softened into a promise of semantic
       clip names.
 - [ ] `cargo test` stays at its baseline.
 
 ## Next step
 
-Use the `LABELS` indices as the presentation map, then verify them in one
-rendered pass with `--play ... --clip-idle/--clip-walk/--clip-jump`. If a
-segment returns `dominant=unmapped`, the runtime table is not in the file
-index: re-run the segment before changing the heuristic, because that is an
+Run the three-window capture. A `dominant=keyed` walk settles the hypothesis
+and makes the keyed path the target of the next decoder slice. A
+`dominant=unmapped` walk refutes it and leaves the raw packed keys in
+`unmapped_top`; feed those keys to `--match-unmapped` to decide whether the
+walk table lives in another `.SRA` or is built at runtime. Do not change the
+heuristic on a single unmapped window: re-run it first, because that is an
 unobserved table, not a wrong label.

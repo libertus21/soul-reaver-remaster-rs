@@ -33,7 +33,7 @@ falsifiable shape), **PARTLY** (one side pinned, the other inferred), **UNKNOWN*
 
 | # | Question | Answer | Class | Evidence |
 |---|---|---|---|---|
-| 1 | Where does the packed data live? | The channel record at `+0x38` points to a **standalone frame-table record**, not inline data. The table is a relocatable record: the file form uses 32-bit value offsets plus a 32-bit link field at `+0x10`, while the memory form uses 64-bit pointers. Widening both shifts the payload by `0x10`. | CONFIRMED | Runtime pointer read; file bytes and captured runtime bytes agree after the shift |
+| 1 | Where does the packed data live? | The channel record at `+0x38` points to a **standalone frame-table record**, not inline data. The table is a relocatable record whose file form uses 32-bit value offsets and whose memory form uses 64-bit pointers; the pointer width shifts the payload by `0x10`. | CONFIRMED | Runtime pointer read; file bytes and runtime bytes agree after the shift |
 | 2 | Frame count, divisor, wrap | Header `+4` is a `u16` frame count, `+6` is a `s16` divisor. Frame index is `floor(frame_time / divisor)`; `frame_time` is channel `+4` (current) and `+6` (previous). The observed table is 50 frames at divisor 100. The `index+1 >= count` wrap branch was reached in code but not exercised by the validated frame. | CONFIRMED for count/divisor/index; PARTLY for the wrap | Live capture `time=2400`, index `24/50`; code path |
 | 3 | Per-frame payload layout | A flag byte selects which of three planes are present: bit 0 angle, bit 1 scale, bit 2 translation. Present planes are concatenated at `align8(3 * slot_count)` bits (200 bits for 66 slots). Each plane stores **3 bits per slot**; the 3 bits are a component mask (bit 0 X, bit 1 Y, bit 2 Z). The 12-bit mask maps bit 0-2 to angles, 4-6 to scale, 8-10 to translation. | CONFIRMED for the angle plane and the mask; PARTLY for the scale plane | 66-slot live capture; file replay |
 | 4 | Value encoding | The value stream is a sequence of blocks: `i32 0` + `frame_count` `f32` palette, or `i32 1` + one `f32` literal. One block is consumed per set bit, in ascending lane order. The floats are signed and already in **binary-angle units** (4096 per turn); the palette index is the frame index. | CONFIRMED | Decoded values equal the staged values exactly |
@@ -228,8 +228,6 @@ wired into canonical frame state):
   `Wrap` but is never implicit.
 - `PackedFrameTable::parse` / `BitPlanes::parse` / `BitPlanes::slot_mask` parse
   the offset array, the flags byte and the per-slot 3-bit plane groups.
-- `PackedFrameTable::fingerprint` returns the form-invariant
-  `TableFingerprint` (mapping key) and the legacy diagnostic digest.
 - `ValueStream::next_value` walks the palette/literal blocks in ascending lane
   order.
 - `decode_slot_angles` returns one slot's angle triple;
@@ -298,18 +296,33 @@ never enters `FrameState` and no determinism golden moves.
 
 ## Clip enumeration and state selection
 
-A `.SRA` payload is a record container, and in the measured files **every
-payload record starts one structurally valid packed frame table**. Enumerating
-"the first valid table in each record, in file order" is therefore the clip
-list; scanning every byte again would also match nested false positives inside a
-record (for example the duplicate header word at `+0x08` parses as a
-one-stream table). Measured read-only, with the model bone count as the slot
-count:
+A `.SRA` payload is a record container. The **base** enumeration keeps the first
+structurally valid packed frame table in each payload record, in file order, so
+indices `0..base` are stable. A record may in principle hold more than one
+table, so the loader continues past the base table's inline value stream and
+appends every further structurally valid table after the base indices (record
+order, then order within the record). Additional tables are deduplicated by the
+form-invariant content fingerprint the labelling probe uses: frame count,
+divisor, and FNV-1a 32-bit over `+0x00..+0x10` plus the complete bit-plane
+block. That view is literal content, so a relocated memory copy agrees with the
+file form; the definition and its evidence are in "Clip fingerprint" below.
 
-| File | Payload records | Located clips | Frame counts (range) | Streams per table |
-|---|---:|---:|---|---|
-| `RAZIEL.SRA` | 230 | **230** | 1..50 (`50` appears 4x, `48` 3x, `1` 33x) | 3 |
-| `SLUAGH.SRA` | 23 | **23** | 5..15 | 2 |
+The `+0x04`/`+0x08` duplicate header word `(divisor << 16) | frame_count` parses
+as a one-stream table with the same frame count and divisor. A candidate nested
+in the base table's 20-byte header is therefore rejected and reported, never
+indexed. A candidate past a table's extent that parses as a header but fails the
+whole-slot inline decode is counted as structurally rejected.
+
+Measured read-only at the player's 66-slot stride:
+
+| File | Payload records | Base clips | Additional distinct | Duplicates | Header aliases rejected |
+|---|---:|---:|---:|---:|---:|
+| `RAZIEL.SRA` | 230 | **230** | **0** | 0 | 380 |
+
+The same scan over all 227 `OBJECT/*.SRA` found **0 genuine additional tables**:
+every extra structural match at a non-base offset was a `+0x04`/`+0x08` header
+alias, not a second table. A record therefore holds one table in the measured
+corpus, and the original one-table-per-record enumeration was already complete.
 
 `RAZIEL.SRA` clip 0 is the validated 50-frame body table: divisor 100, flags
 `0x05` (angle + translation), 3 streams. No table carries a name, id, state
@@ -323,35 +336,6 @@ byte or clip index:
 - The runtime samples a table through the channel pointer at `+0x38`; it never
   reads a table id. Which channel set is active is an engine state question,
   not a field in the file.
-
-**UNKNOWN, not a failure**: the shipped tables do not identify idle, walk or
-jump. The presentation default maps states to distinct clips by position
-(`idle = 0`, `walk = clip_count / 2`, `jump = clip_count - 1`) and is
-overridable. Measured candidates a human can map with `--list-clips`:
-low-motion, loop-like 48-50 frame tables (clips 0, 50, 98 for the player) are
-plausible idle/locomotion, while high-motion one-shot tables (clip 16) are
-plausible jump/attack. These are motion metrics, not identities.
-
-Selection reads only existing deterministic signals: `player_grounded()` and
-whether stage 9 committed a non-zero horizontal delta (`player_moving()`).
-The rule is: evaluate once per rendered frame, switch only on a state change,
-and restart the switched clip at local tick 0. A fixed `--clip <N>` ignores the
-state and uses the global tick. Playback stays presentation-only; no animation
-state enters `FrameState` and no determinism golden moves.
-
-CLI:
-
-```text
---animate ... --list-clips            print one line per located clip, with
-                                       fp=<invariant> legacy=<old digest>
---animate ... --clip <N>              decode clip N (default 0)
---play ... --sra <FILE> \
-    [--clip <N>]                      freeze one clip
-    [--clip-idle <N>] [--clip-walk <N>] [--clip-jump <N>]
-```
-
-Every explicit index is validated against the decoded clip count and rejected
-with a typed `ClipError::OutOfRange`; non-integers are a typed `PlayError`.
 
 ## Clip fingerprint: form-invariant content digest (2026-11-14)
 
@@ -426,6 +410,12 @@ collision, and the four extra collisions are the price of dropping the
 form-dependent word. The mapping policy is unchanged: the index keeps the
 lowest clip and reports `ambiguous`.
 
+The extended scan still finds **0 genuine additional tables** in the measured
+corpus: every extra structural match at a non-base offset is a `+0x04`/`+0x08`
+header alias. So the earlier conclusion that walk could not be in a second table
+of `RAZIEL.SRA` stands; the reason walk was unmapped was the fingerprint, not a
+missing table.
+
 ### The short jump clips (`2:700`, `2:400`, `4:433`)
 
 These are not misparsed keyed or nested structures. Each pair is a real located
@@ -444,6 +434,43 @@ are short (2-4 frame), slow-divisor tables; their semantic state is UNKNOWN.
 The pair alone cannot separate 37 from 47 or 25 from 32; the invariant digest
 can. Their previous `unmapped` status was the same pointer-hash defect, not a
 missing clip.
+
+`--match-unmapped <FILE> --sra-dir <DIR> [--slots <N>]` still searches every
+`.SRA` for a probe key and reports the file, record and index. It now compares
+invariant keys; an old probe key that contains the pointer half is expected to
+be `absent`.
+
+**UNKNOWN, not a failure**: the shipped tables do not identify idle, walk or
+jump. The presentation default maps states to distinct clips by position
+(`idle = 0`, `walk = clip_count / 2`, `jump = clip_count - 1`) and is
+overridable. Measured candidates a human can map with `--list-clips`:
+low-motion, loop-like 48-50 frame tables (clips 0, 50, 98 for the player) are
+plausible idle/locomotion, while high-motion one-shot tables (clip 16) are
+plausible jump/attack. These are motion metrics, not identities.
+
+Selection reads only existing deterministic signals: `player_grounded()` and
+whether stage 9 committed a non-zero horizontal delta (`player_moving()`).
+The rule is: evaluate once per rendered frame, switch only on a state change,
+and restart the switched clip at local tick 0. A fixed `--clip <N>` ignores the
+state and uses the global tick. Playback stays presentation-only; no animation
+state enters `FrameState` and no determinism golden moves.
+
+CLI:
+
+```text
+--animate ... --list-clips            one line per located clip + scan stats,
+                                       including fp=<invariant> legacy=<old>
+--animate ... --clip <N>              decode clip N (default 0)
+--animate ... --dump-unmapped <FILE>  write appended and rejected table keys
+--match-unmapped <FILE> --sra-dir <DIR> [--slots <N>]
+                                      search every .SRA for probe fingerprints
+--play ... --sra <FILE> \
+    [--clip <N>]                      freeze one clip
+    [--clip-idle <N>] [--clip-walk <N>] [--clip-jump <N>]
+```
+
+Every explicit index is validated against the decoded clip count and rejected
+with a typed `ClipError::OutOfRange`; non-integers are a typed `PlayError`.
 
 ## Offline clip ranking (`--animate --rank-clips`)
 
@@ -554,6 +581,22 @@ python sr1_packed_frame_probe.py --live-selftest  PASS cases=4
 python sr1_packed_frame_probe.py --dry-run        prints the plan
 ```
 
+### Extended enumeration
+
+Read-only against the shipped player body at its 66-slot stride:
+
+```text
+sra clips=230 slots=66 base=230 additional=0 duplicates=0 distinct=229
+    rejected_aliases=380 rejected_invalid=0 (RAZIEL.SRA)
+clip index=55 record=55 offset=0 frames=6 divisor=580 channels=3 flags=0x05
+```
+
+The base indices `0..=229` are unchanged: clipping at index 55 is still the
+same six-frame, divisor-580 table. The 380 rejected candidates are the
+`+0x04`/`+0x08` duplicate header word in each record, not extra tables. A
+directory-wide scan at the same stride found no genuine additional table in any
+of the 227 `OBJECT/*.SRA` files.
+
 ### The older atomic capture
 
 `angle_atomic.log` was recorded in a different process session and a different
@@ -626,7 +669,7 @@ transition is the missing observation.
    pointer for one channel.
 6. **Coverage**: one shipped build, one actor, one animation state, one
    non-wrapping frame. Other actors, clips and wrap frames are unobserved.
-7. **The widened `+0x10` field's meaning.** It is an offset in the file and a
+7. **The widened +0x10 field meaning.** It is an offset in the file and a
    pointer in memory, but what it points at, and whether it is null for every
    unloaded clip, is not established. Its non-null-ness is why the legacy
    fingerprint could never be form-invariant.

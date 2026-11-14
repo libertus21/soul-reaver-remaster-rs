@@ -64,20 +64,20 @@ pub const MAX_TABLE_COUNT: u8 = 16;
 pub const MAX_FRAME_COUNT: u16 = 4096;
 /// Highest slot count accepted by the bit-plane layout.
 pub const MAX_SLOT_COUNT: usize = 4096;
-/// Header bytes that are identical in the file and memory forms.
+/// Header bytes hashed by [`PackedFrameTable::fingerprint`].
 ///
-/// `+0x00..+0x0F` holds the table/stream count, the three per-channel bytes,
+/// `+0x00..+0x10` holds the table/stream count, the three per-channel bytes,
 /// the `u16` frame count, the `s16` divisor and the two duplicated
-/// `(divisor << 16) | frame_count` words. Every one of those is literal table
-/// content, so relocation copies it unchanged.
-pub const INVARIANT_HEADER_BYTES: usize = 0x10;
-/// Header bytes hashed by the pre-fix fingerprint (kept for diagnostics).
+/// `(divisor << 16) | frame_count` words. All of it is literal content, so
+/// relocation copies it unchanged.
+pub const FINGERPRINT_HEADER_BYTES: usize = 0x10;
+/// Header bytes hashed by [`PackedFrameTable::legacy_fingerprint`].
 ///
 /// `+0x10..+0x13` is the low half of a field that is 4 bytes wide in the file
 /// form and 8 bytes wide in the memory form: an offset in the file, a
 /// relocated absolute pointer in memory. Hashing it is form- and
-/// session-dependent, so it must never identify a clip.
-pub const LEGACY_HEADER_BYTES: usize = 0x14;
+/// session-dependent, so the legacy digest is diagnostic only.
+pub const LEGACY_FINGERPRINT_HEADER_BYTES: usize = 0x14;
 /// FNV-1a 32-bit offset basis.
 pub const FNV_OFFSET_BASIS: u32 = 0x811C_9DC5;
 /// FNV-1a 32-bit prime.
@@ -203,8 +203,10 @@ fn read_f32(bytes: &[u8], at: usize) -> Result<f32, String> {
 
 /// FNV-1a 32-bit over `bytes`, continuing from `seed`.
 ///
-/// This is the hash both forms of a packed frame table share. It only ever
-/// runs over content bytes, never over an offset or a pointer.
+/// This is the hash the runtime labelling probe uses for the content-only
+/// table fingerprint (`docs/notes/packed-channel-format.md`, "Clip
+/// enumeration and state selection"). It hashes static table content, never an
+/// address, so file and relocated memory copies agree.
 pub fn fnv1a32(bytes: &[u8], seed: u32) -> u32 {
     let mut hash = seed;
     for &byte in bytes {
@@ -212,36 +214,6 @@ pub fn fnv1a32(bytes: &[u8], seed: u32) -> u32 {
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     hash
-}
-
-/// Both fingerprint views of one packed frame table.
-///
-/// [`Self::invariant`] is the identity key: it is equal for the file form and
-/// the relocated memory form. [`Self::legacy`] reproduces the pre-fix key,
-/// which hashed the form-dependent `+0x10..+0x13` field as well; it is emitted
-/// only so a diagnostic can show why an old runtime key failed to map.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TableFingerprint {
-    /// Table frame count (`+0x04`).
-    pub frame_count: u16,
-    /// Table clock divisor (`+0x06`).
-    pub divisor: i16,
-    /// Form-invariant content digest over `+0x00..+0x10` and the bit planes.
-    pub invariant: u32,
-    /// Legacy digest over `+0x00..+0x14` and the bit planes.
-    pub legacy: u32,
-}
-
-impl TableFingerprint {
-    /// The mapping key: `<frame_count>:<divisor>:<invariant hex>`.
-    pub fn key(&self) -> String {
-        format!("{}:{}:{:08x}", self.frame_count, self.divisor, self.invariant)
-    }
-
-    /// The diagnostic-only legacy key.
-    pub fn legacy_key(&self) -> String {
-        format!("{}:{}:{:08x}", self.frame_count, self.divisor, self.legacy)
-    }
 }
 
 /// Parse the `frame_count`/`divisor` header and validate its bounds.
@@ -385,63 +357,53 @@ impl<'a> PackedFrameTable<'a> {
         BitPlanes::parse(self.bytes, self.bit_plane_base(), slot_count)
     }
 
-    /// Both content fingerprints of this table.
+    /// Form-invariant content fingerprint: FNV-1a over the 16-byte header
+    /// (`+0x00..+0x10`) and the complete bit-plane block (flags byte plus the
+    /// present planes).
     ///
-    /// The invariant digest hashes exactly:
+    /// The two regions are literal table content, so the file form and the
+    /// relocated memory form agree. Explicitly excluded:
     ///
-    /// - bytes `+0x00..+0x10` (16): table/stream count, the three
-    ///   per-channel bytes, the `u16` frame count, the `s16` divisor and the
-    ///   two duplicated `(divisor << 16) | frame_count` words;
-    /// - the complete bit-plane block: the flags byte followed by the
-    ///   present planes, each `align8(3 * slot_count)` bits.
-    ///
-    /// Both regions are literal table content, so relocation copies them
-    /// byte-for-byte and the file form and the memory form agree.
-    ///
-    /// Explicitly **excluded**:
-    ///
-    /// - `+0x10..+0x13`: the low half of a field that is 4 bytes wide in the
-    ///   file form and 8 bytes wide in the memory form. In the file it is an
-    ///   offset; in memory it is a relocated absolute pointer. Hashing it is
-    ///   form-dependent *and* session-dependent (ASLR). This is the exact bug
-    ///   the legacy view preserves: a clip whose widened field is null still
-    ///   matches, every other clip does not.
-    /// - the value-offset/pointer array: `+0x14 + i*4` in the file versus
-    ///   `+0x18 + i*8` in memory.
+    /// - `+0x10..+0x13`: the low half of a field that is a 4-byte file offset
+    ///   and an 8-byte memory pointer. Hashing it made the old key
+    ///   form-dependent and session-dependent (ASLR).
+    /// - the value-offset/pointer array (`+0x14 + i*4` vs `+0x18 + i*8`).
     /// - the value streams: the file's `+0x14` offsets do not point at the
-    ///   inline palette the replay decodes (UNKNOWN 3 in
-    ///   `docs/notes/packed-channel-format.md`), so a canonical stream
+    ///   inline palette the replay decodes (UNKNOWN 3), so a canonical stream
     ///   location shared by both forms is not established.
     ///
-    /// The legacy digest is computed the same way over
-    /// [`LEGACY_HEADER_BYTES`]; callers must not map on it.
-    pub fn fingerprint(&self, slot_count: usize) -> Result<TableFingerprint, String> {
+    /// `slot_count` sizes the plane stride. This is the only key callers may
+    /// map on; [`Self::legacy_fingerprint`] is for diagnostics.
+    pub fn fingerprint(&self, slot_count: usize) -> Result<u32, String> {
+        self.hash_header_and_block(slot_count, FINGERPRINT_HEADER_BYTES)
+    }
+
+    /// The pre-fix digest, which hashed the 20-byte header (`+0x00..+0x14`).
+    ///
+    /// It includes the form-dependent widened field at `+0x10`, so it is
+    /// neither form- nor session-invariant. Emitted only so a stale runtime key
+    /// can be compared directly; never map on it.
+    pub fn legacy_fingerprint(&self, slot_count: usize) -> Result<u32, String> {
+        self.hash_header_and_block(slot_count, LEGACY_FINGERPRINT_HEADER_BYTES)
+    }
+
+    fn hash_header_and_block(
+        &self,
+        slot_count: usize,
+        header_bytes: usize,
+    ) -> Result<u32, String> {
         let planes = self.bit_planes(slot_count)?;
-        let block = planes
-            .bytes()
-            .get(planes.base()..planes.block_end())
-            .ok_or_else(|| "packed table: fingerprint block is out of bounds".to_string())?;
-        let invariant_header = self
-            .bytes
-            .get(..INVARIANT_HEADER_BYTES)
-            .ok_or_else(|| {
-                format!(
-                    "packed table: fingerprint needs {INVARIANT_HEADER_BYTES} header bytes, record has {}",
-                    self.bytes.len()
-                )
-            })?;
-        let legacy_header = self.bytes.get(..LEGACY_HEADER_BYTES).ok_or_else(|| {
+        let header = self.bytes.get(..header_bytes).ok_or_else(|| {
             format!(
-                "packed table: legacy fingerprint needs {LEGACY_HEADER_BYTES} header bytes, record has {}",
+                "packed table: fingerprint needs {header_bytes} header bytes, record has {}",
                 self.bytes.len()
             )
         })?;
-        Ok(TableFingerprint {
-            frame_count: self.header.frame_count,
-            divisor: self.header.divisor,
-            invariant: fnv1a32(block, fnv1a32(invariant_header, FNV_OFFSET_BASIS)),
-            legacy: fnv1a32(block, fnv1a32(legacy_header, FNV_OFFSET_BASIS)),
-        })
+        let block = planes
+            .bytes()
+            .get(planes.base()..planes.block_end())
+            .ok_or_else(|| "packed table: fingerprint bit-plane block is out of bounds".to_string())?;
+        Ok(fnv1a32(block, fnv1a32(header, FNV_OFFSET_BASIS)))
     }
 
     /// Byte offset of the file-form **inline** value stream for `slot_count`
@@ -546,8 +508,7 @@ impl<'a> BitPlanes<'a> {
         self.base
     }
 
-    /// First byte after the complete bit-plane block (flags byte plus the
-    /// present planes).
+    /// First byte after the complete bit-plane block (flags + present planes).
     ///
     /// [`BitPlanes::parse`] already proved this is inside the record.
     pub fn block_end(&self) -> usize {
@@ -862,6 +823,28 @@ pub fn decode_inline_channel(
     slot_count: usize,
     frame_index: usize,
 ) -> Result<DecodedChannel, String> {
+    decode_inline_channel_with_end(table, slot_count, frame_index).map(|(decoded, _)| decoded)
+}
+
+/// First byte after the inline value stream consumed by a whole channel.
+///
+/// This is the byte extent of the file-resident table: the inline stream
+/// starts after the present planes and one block is consumed per set lane in
+/// ascending slot/lane order. Callers that scan a payload record for further
+/// tables start here, so they never re-enter the table they just decoded.
+pub fn inline_stream_end(
+    table: &PackedFrameTable<'_>,
+    slot_count: usize,
+) -> Result<usize, String> {
+    decode_inline_channel_with_end(table, slot_count, 0).map(|(_, end)| end)
+}
+
+/// Decode a whole file-form channel and report where its value stream ends.
+fn decode_inline_channel_with_end(
+    table: &PackedFrameTable<'_>,
+    slot_count: usize,
+    frame_index: usize,
+) -> Result<(DecodedChannel, usize), String> {
     if slot_count == 0 {
         return Err("packed channel: slot count 0 has no bit-plane stride".to_string());
     }
@@ -883,11 +866,15 @@ pub fn decode_inline_channel(
             rotation: rotation_from_binary_angles(angles[0], angles[1], angles[2]),
         });
     }
-    Ok(DecodedChannel {
-        frame_index,
-        flags: planes.flags(),
-        slots,
-    })
+    let end = stream.cursor();
+    Ok((
+        DecodedChannel {
+            frame_index,
+            flags: planes.flags(),
+            slots,
+        },
+        end,
+    ))
 }
 
 #[cfg(test)]
@@ -1221,9 +1208,6 @@ mod tests {
         assert_eq!(decoded.slots[0].angles, [2048.0, 0.0, 0.0]);
     }
 
-    /// The invariant fingerprint must be identical for the file and memory
-    /// forms of one table, even though the widened `+0x10` field holds an
-    /// offset in the file and an absolute pointer in memory.
     #[test]
     fn file_and_memory_forms_share_the_invariant_fingerprint() {
         let masks = [0x007u16, 0x700, 0x005];
@@ -1239,24 +1223,24 @@ mod tests {
             PackedFrameTable::parse(&file, TableForm::File).expect("valid file table");
         let memory_table =
             PackedFrameTable::parse(&memory, TableForm::Memory).expect("valid memory table");
-        let file_fp = file_table.fingerprint(3).expect("file fingerprint");
-        let memory_fp = memory_table.fingerprint(3).expect("memory fingerprint");
+        let file_invariant = file_table.fingerprint(3).expect("file fingerprint");
+        let memory_invariant = memory_table.fingerprint(3).expect("memory fingerprint");
+        let file_legacy = file_table.legacy_fingerprint(3).expect("file legacy");
+        let memory_legacy = memory_table.legacy_fingerprint(3).expect("memory legacy");
 
         assert_eq!(
-            file_table.bytes()[..INVARIANT_HEADER_BYTES],
-            memory_table.bytes()[..INVARIANT_HEADER_BYTES],
+            file_table.bytes()[..FINGERPRINT_HEADER_BYTES],
+            memory_table.bytes()[..FINGERPRINT_HEADER_BYTES],
             "the first 16 header bytes are literal content in both forms"
         );
         assert_eq!(
-            file_fp.invariant, memory_fp.invariant,
+            file_invariant, memory_invariant,
             "the invariant digest must not depend on the form"
         );
         assert_ne!(
-            file_fp.legacy, memory_fp.legacy,
+            file_legacy, memory_legacy,
             "the legacy digest hashes +0x10..+0x13, which differs by form"
         );
-        assert_eq!(file_fp.frame_count, 12);
-        assert_eq!(file_fp.divisor, 209);
     }
 
     #[test]
@@ -1265,16 +1249,23 @@ mod tests {
         let streams = [literal(1.0), literal(2.0)];
         let bytes = build_table(TableForm::Memory, 4, 100, 0x01, 2, &masks, &streams);
         let table = PackedFrameTable::parse(&bytes, TableForm::Memory).expect("valid table");
-        let before = table.fingerprint(2).expect("fingerprint");
+        let before = (
+            table.fingerprint(2).expect("fingerprint"),
+            table.legacy_fingerprint(2).expect("legacy"),
+        );
 
         let mut relocated = bytes.clone();
         for selector in 0..TABLE_COUNT {
             let at = MEMORY_VALUE_OFFSETS_AT + selector * 8;
-            relocated[at..at + 8].copy_from_slice(&(0x1000_0000_0000u64 + selector as u64 * 0x80).to_le_bytes());
+            let pointer = 0x1111_0000_0000_0000u64 + selector as u64 * 0x80;
+            relocated[at..at + 8].copy_from_slice(&pointer.to_le_bytes());
         }
         let relocated = PackedFrameTable::parse(&relocated, TableForm::Memory)
             .expect("valid relocated table");
-        let after = relocated.fingerprint(2).expect("fingerprint");
+        let after = (
+            relocated.fingerprint(2).expect("fingerprint"),
+            relocated.legacy_fingerprint(2).expect("legacy"),
+        );
 
         assert_eq!(before, after, "the offset/pointer array is not hashed");
     }
@@ -1283,19 +1274,25 @@ mod tests {
     fn moving_the_widened_link_field_changes_only_the_legacy_digest() {
         let bytes = build_table(TableForm::File, 8, 150, 0x01, 2, &[0x001, 0x001], &[]);
         let table = PackedFrameTable::parse(&bytes, TableForm::File).expect("valid table");
-        let before = table.fingerprint(2).expect("fingerprint");
+        let before = (
+            table.fingerprint(2).expect("fingerprint"),
+            table.legacy_fingerprint(2).expect("legacy"),
+        );
 
         let mut moved = bytes.clone();
         moved[0x10..0x14].copy_from_slice(&0x0000_ABCDu32.to_le_bytes());
         let moved = PackedFrameTable::parse(&moved, TableForm::File).expect("valid table");
-        let after = moved.fingerprint(2).expect("fingerprint");
+        let after = (
+            moved.fingerprint(2).expect("fingerprint"),
+            moved.legacy_fingerprint(2).expect("legacy"),
+        );
 
         assert_eq!(
-            before.invariant, after.invariant,
+            before.0, after.0,
             "a moved link offset must not split the invariant identity"
         );
         assert_ne!(
-            before.legacy, after.legacy,
+            before.1, after.1,
             "the legacy view still hashes the moved field"
         );
     }
@@ -1314,14 +1311,8 @@ mod tests {
         let after = changed.fingerprint(2).expect("fingerprint");
 
         assert_ne!(
-            before.invariant, after.invariant,
+            before, after,
             "the per-slot masks are part of the identity"
-        );
-        assert_eq!(before.key(), format!("4:100:{:08x}", before.invariant));
-        assert_eq!(
-            before.legacy_key(),
-            format!("4:100:{:08x}", before.legacy),
-            "both keys stay human-readable"
         );
     }
 

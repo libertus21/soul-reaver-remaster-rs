@@ -18,6 +18,7 @@
 //! `docs/notes/sra-animation.md`: a padded preamble, then a `0xFFFFFFFF`-closed
 //! `u32` payload directory whose offsets are relative to the payload boundary.
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use crate::packed_channel::{
@@ -524,18 +525,19 @@ pub struct SraClipInfo {
     pub divisor: i16,
     pub channel_count: usize,
     pub flags: u8,
-    /// Form-invariant content digest of the table (`+0x00..+0x10` plus the
-    /// complete bit-plane block). This is the key a runtime observation maps
-    /// on; see [`SraClipInfo::fingerprint_text`].
+    /// Content-only table fingerprint (`frame_count:divisor:hash` hash part).
+    /// This is the form-invariant digest a runtime observation maps on.
     pub fingerprint: u32,
-    /// Legacy digest that also hashed `+0x10..+0x13`. Diagnostic only: in
-    /// memory that field is a relocated pointer, so this digest is neither
-    /// form-invariant nor session-invariant.
+    /// Legacy 20-byte-header digest. Diagnostic only: in memory the extra
+    /// field is a relocated pointer, so this digest is neither form- nor
+    /// session-invariant.
     pub legacy_fingerprint: u32,
+    /// Whether this table was found after the first table in its record.
+    pub additional: bool,
 }
 
 impl SraClipInfo {
-    /// `<frame_count>:<divisor>:<invariant hex>`, the mapping key.
+    /// The labelling probe's human-readable fingerprint key.
     pub fn fingerprint_text(&self) -> String {
         format!(
             "{}:{}:{:08x}",
@@ -543,13 +545,42 @@ impl SraClipInfo {
         )
     }
 
-    /// `<frame_count>:<divisor>:<legacy hex>`, for diagnostics only.
+    /// The diagnostic-only legacy key.
     pub fn legacy_fingerprint_text(&self) -> String {
         format!(
             "{}:{}:{:08x}",
             self.frame_count, self.divisor, self.legacy_fingerprint
         )
     }
+}
+
+/// One candidate table rejected during the extended scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RejectedTable {
+    /// Payload record index.
+    pub record: usize,
+    /// Byte offset relative to the record start.
+    pub offset: usize,
+    pub frame_count: u16,
+    pub divisor: i16,
+    pub channel_count: u8,
+}
+
+/// How the extended enumeration classified a file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClipScanStats {
+    /// First structurally valid table per payload record (indices `0..base`).
+    pub base_count: usize,
+    /// Additional non-duplicate tables appended after `base_count`.
+    pub additional_distinct: usize,
+    /// Valid additional tables dropped because their fingerprint was indexed.
+    pub additional_duplicates: usize,
+    /// Distinct fingerprints across base plus additional tables.
+    pub distinct_fingerprints: usize,
+    /// `+0x04`/`+0x08` header-word aliases: rejected, never indexed.
+    pub rejected_aliases: Vec<RejectedTable>,
+    /// Header-shaped candidates past a table's extent that failed full validity.
+    pub rejected_invalid: usize,
 }
 
 /// A clip index outside the located set.
@@ -580,16 +611,25 @@ struct ClipTable {
     flags: u8,
     fingerprint: u32,
     legacy_fingerprint: u32,
+    additional: bool,
 }
 
 /// All packed-channel tables in one `.SRA` file, bound to a model slot count.
 ///
-/// [`SraAnimation::load`] scans the container's payload records in file order
-/// and keeps the **first** structurally valid table in each record whose
-/// whole-slot inline stream decodes for `slot_count` slots. That "one table per
-/// record" rule is what the shipped files show: every payload record starts a
-/// table, and scanning every byte again would also match nested false positives
-/// inside a header. The validated `RAZIEL.SRA` body table is clip 0.
+/// [`SraAnimation::load`] scans the container's payload records in file order.
+/// It keeps the **first** structurally valid table in each record as the base
+/// clip (`0..base_count`), exactly as the shipped enumeration always did, then
+/// continues past that table's inline value stream to append any further
+/// structurally valid, non-duplicate tables after the base indices.
+///
+/// The `+0x04`/`+0x08` duplicate header word parses as a bogus one-stream table
+/// (`docs/notes/packed-channel-format.md`, "Clip enumeration and state
+/// selection"). A candidate nested in the base table's 20-byte header with the
+/// base frame count and divisor is therefore rejected and reported, never
+/// indexed.
+///
+/// The slot count is the model's bone count, not an `.SRA` field
+/// (`docs/notes/sra-slot-pose.md`).
 ///
 /// Decoding is on demand, so a frame is a pure function of a table and the
 /// requested index; no clock or wall time is stored here. The zero-argument
@@ -599,30 +639,131 @@ pub struct SraAnimation {
     bytes: Vec<u8>,
     clips: Vec<ClipTable>,
     slot_count: usize,
+    stats: ClipScanStats,
 }
 
-fn located_table(
-    slice: &[u8],
-    slot_count: usize,
-) -> Option<(FrameHeader, u8, packed_channel::TableFingerprint)> {
+/// One table located by the structural scan, with its byte extent and hash.
+#[derive(Debug, Clone, Copy)]
+struct LocatedTable {
+    header: FrameHeader,
+    flags: u8,
+    /// First byte after the inline value stream, relative to the table start.
+    end: usize,
+    fingerprint: u32,
+    legacy_fingerprint: u32,
+}
+
+/// Structural validity the loader has always used: parse the header and value
+/// offsets, validate the bit planes, require the angle plane, and decode the
+/// whole inline stream for `slot_count` slots.
+fn located_table(slice: &[u8], slot_count: usize) -> Option<LocatedTable> {
     let table = PackedFrameTable::parse(slice, TableForm::File).ok()?;
     let planes = table.bit_planes(slot_count).ok()?;
     if planes.flags() & 0x01 == 0 {
         return None;
     }
-    if packed_channel::decode_inline_channel(&table, slot_count, 0).is_err() {
-        return None;
-    }
+    let end = packed_channel::inline_stream_end(&table, slot_count).ok()?;
     let fingerprint = table.fingerprint(slot_count).ok()?;
-    Some((table.header(), planes.flags(), fingerprint))
+    let legacy_fingerprint = table.legacy_fingerprint(slot_count).ok()?;
+    Some(LocatedTable {
+        header: table.header(),
+        flags: planes.flags(),
+        end,
+        fingerprint,
+        legacy_fingerprint,
+    })
+}
+
+/// The first structurally valid table in one payload record and its offset.
+fn first_table(slice: &[u8], slot_count: usize) -> Option<(usize, LocatedTable)> {
+    (0..slice.len()).find_map(|offset| {
+        located_table(&slice[offset..], slot_count).map(|table| (offset, table))
+    })
+}
+
+/// The `+0x04`/`+0x08` duplicate header word aliases inside the base header.
+///
+/// The header stores `(divisor << 16) | frame_count` at `+0x08` and `+0x0C`.
+/// Read one word earlier those bytes look like a one-stream table with the same
+/// frame count and divisor, so a byte scan would index the same clip twice.
+/// These candidates are rejected and reported, never appended.
+fn header_aliases(
+    slice: &[u8],
+    record: usize,
+    base_offset: usize,
+    base: &FrameHeader,
+) -> Vec<RejectedTable> {
+    let end = base_offset
+        .saturating_add(packed_channel::FINGERPRINT_HEADER_BYTES)
+        .min(slice.len());
+    let mut rejected = Vec::new();
+    for candidate in (base_offset + 1)..end {
+        let Ok(header) = packed_channel::parse_header(&slice[candidate..]) else {
+            continue;
+        };
+        if header.frame_count == base.frame_count && header.divisor == base.divisor {
+            rejected.push(RejectedTable {
+                record,
+                offset: candidate,
+                frame_count: header.frame_count,
+                divisor: header.divisor,
+                channel_count: header.table_count,
+            });
+        }
+    }
+    rejected
+}
+
+/// Continue the byte scan after a table's inline stream and append any further
+/// structurally valid, non-duplicate tables.
+///
+/// `start` is the first byte after the table just accepted. A structural match
+/// advances past its own stream so nested matches inside it are never counted.
+fn scan_additional(
+    slice: &[u8],
+    record: usize,
+    range: &Range<usize>,
+    start: usize,
+    slot_count: usize,
+    fingerprints: &mut HashSet<u32>,
+    clips: &mut Vec<ClipTable>,
+    stats: &mut ClipScanStats,
+) {
+    let mut cursor = start.min(slice.len());
+    while cursor < slice.len() {
+        if let Some(located) = located_table(&slice[cursor..], slot_count) {
+            if fingerprints.insert(located.fingerprint) {
+                clips.push(ClipTable {
+                    record,
+                    offset: cursor,
+                    table: range.start + cursor..range.end,
+                    header: located.header,
+                    flags: located.flags,
+                    fingerprint: located.fingerprint,
+                    legacy_fingerprint: located.legacy_fingerprint,
+                    additional: true,
+                });
+                stats.additional_distinct += 1;
+            } else {
+                stats.additional_duplicates += 1;
+            }
+            cursor = cursor.saturating_add(located.end.max(1));
+        } else {
+            if packed_channel::parse_header(&slice[cursor..]).is_ok() {
+                stats.rejected_invalid += 1;
+            }
+            cursor += 1;
+        }
+    }
 }
 
 impl SraAnimation {
     /// Locate every clip and bind them to a model's slot count.
     ///
-    /// The slot count is the model's bone count, not an `.SRA` field
-    /// (`docs/notes/sra-slot-pose.md`). A container that does not parse, or a
-    /// payload with no table that decodes for that many slots, is a loud error.
+    /// A container that does not parse, or a payload with no table that decodes
+    /// for that many slots, is a loud error. Base indices are stable: they are
+    /// the first valid table of each record in file order, so a new table in a
+    /// record never shifts an earlier index.
     pub fn load(bytes: Vec<u8>, slot_count: usize) -> Result<Self, String> {
         if slot_count == 0 {
             return Err("sra animation: slot count 0 cannot size the bit planes".to_string());
@@ -631,35 +772,64 @@ impl SraAnimation {
             "sra animation: the .SRA container directory did not parse".to_string()
         })?;
         let mut clips = Vec::new();
+        let mut fingerprints = HashSet::new();
+        let mut stats = ClipScanStats::default();
         for (record, range) in container.records.iter().enumerate() {
             let slice = &bytes[range.clone()];
-            for offset in 0..slice.len() {
-                if let Some((header, flags, fingerprint)) =
-                    located_table(&slice[offset..], slot_count)
-                {
-                    clips.push(ClipTable {
-                        record,
-                        offset,
-                        table: range.start + offset..range.end,
-                        header,
-                        flags,
-                        fingerprint: fingerprint.invariant,
-                        legacy_fingerprint: fingerprint.legacy,
-                    });
-                    break;
-                }
-            }
+            let Some((offset, base)) = first_table(slice, slot_count) else {
+                continue;
+            };
+            clips.push(ClipTable {
+                record,
+                offset,
+                table: range.start + offset..range.end,
+                header: base.header,
+                flags: base.flags,
+                fingerprint: base.fingerprint,
+                legacy_fingerprint: base.legacy_fingerprint,
+                additional: false,
+            });
+            fingerprints.insert(base.fingerprint);
+            stats.base_count += 1;
+            stats.rejected_aliases.extend(header_aliases(
+                slice,
+                record,
+                offset,
+                &base.header,
+            ));
+            scan_additional(
+                slice,
+                record,
+                range,
+                offset + base.end,
+                slot_count,
+                &mut fingerprints,
+                &mut clips,
+                &mut stats,
+            );
         }
         if clips.is_empty() {
             return Err(format!(
                 "sra animation: no packed frame table decoded for {slot_count} slots"
             ));
         }
+        stats.distinct_fingerprints = fingerprints.len();
         Ok(Self {
             bytes,
             clips,
             slot_count,
+            stats,
         })
+    }
+
+    /// How the extended enumeration classified this file.
+    pub fn scan_stats(&self) -> &ClipScanStats {
+        &self.stats
+    }
+
+    /// Number of base clips (one per payload record, the stable `0..` prefix).
+    pub fn base_clip_count(&self) -> usize {
+        self.stats.base_count
     }
 
     /// Number of slots this animation decodes.
@@ -667,7 +837,7 @@ impl SraAnimation {
         self.slot_count
     }
 
-    /// Number of clips (located tables), in file order.
+    /// Number of clips (base plus appended additional tables), in file order.
     pub fn clip_count(&self) -> usize {
         self.clips.len()
     }
@@ -692,6 +862,7 @@ impl SraAnimation {
             flags: located.flags,
             fingerprint: located.fingerprint,
             legacy_fingerprint: located.legacy_fingerprint,
+            additional: located.additional,
         })
     }
 
@@ -1660,27 +1831,6 @@ mod tests {
     }
 
     #[test]
-    fn clip_descriptors_expose_the_invariant_and_legacy_fingerprints() {
-        let container = palette_container(&[0x001], 2, 100, &[&[10.0, 20.0]]);
-        let animation = SraAnimation::load(container, 1).expect("one synthetic clip");
-        let clip = animation.clip_info(0).expect("clip 0");
-        assert_eq!(
-            clip.fingerprint_text(),
-            format!("2:100:{:08x}", clip.fingerprint),
-            "the mapping key keeps the pair readable"
-        );
-        assert_eq!(
-            clip.legacy_fingerprint_text(),
-            format!("2:100:{:08x}", clip.legacy_fingerprint)
-        );
-        assert_ne!(
-            clip.fingerprint, clip.legacy_fingerprint,
-            "the 16-byte and 20-byte views are different hash inputs"
-        );
-        assert_ne!(clip.fingerprint, 0, "a real table has a non-zero digest");
-    }
-
-    #[test]
     fn clip_selection_maps_each_motion_state_to_the_configured_index() {
         let map = ClipMap {
             idle: 2,
@@ -1777,5 +1927,148 @@ mod tests {
         assert!(animation
             .frame_index_for_clip_tick(1, 0, ANIMATION_UNITS_PER_SECOND, PlaybackLoop::Loop)
             .is_err());
+    }
+
+    #[test]
+    fn a_record_with_two_tables_appends_the_second_after_the_base_index() {
+        let first = palette_record(&[0x001], 2, 100, &[&[10.0, 20.0]]);
+        let second = palette_record(&[0x001], 3, 200, &[&[1.0, 2.0, 3.0]]);
+        let mut record = first.clone();
+        record.extend_from_slice(&second);
+        let animation = SraAnimation::load(encode_single_record_container(&record), 1)
+            .expect("two tables in one record");
+
+        assert_eq!(animation.base_clip_count(), 1);
+        assert_eq!(animation.clip_count(), 2);
+        assert_eq!(animation.scan_stats().additional_distinct, 1);
+        assert_eq!(animation.scan_stats().additional_duplicates, 0);
+
+        let clips = animation.clips();
+        assert!(!clips[0].additional, "the first table keeps the base index");
+        assert!(clips[1].additional, "the second table is marked additional");
+        assert_eq!(
+            (clips[1].index, clips[1].record, clips[1].offset),
+            (1, 0, first.len()),
+            "the second table is appended after the base index at its real offset"
+        );
+        assert_eq!((clips[1].frame_count, clips[1].divisor), (3, 200));
+        assert_eq!(
+            animation
+                .decode_clip_index(1, 0)
+                .expect("second table frame 0")
+                .angles,
+            vec![[1.0, 0.0, 0.0]],
+            "the appended index addresses the second table, not the first"
+        );
+    }
+
+    #[test]
+    fn the_plus_0x08_duplicate_header_word_is_rejected_as_a_bogus_table() {
+        let container = palette_container(
+            &[0x001, 0x001],
+            2,
+            100,
+            &[&[1024.0, 0.0], &[0.0, 0.0]],
+        );
+        let animation = SraAnimation::load(container, 2).expect("one real table");
+        assert_eq!(animation.clip_count(), 1, "the alias is never indexed");
+        let stats = animation.scan_stats();
+        assert!(
+            stats
+                .rejected_aliases
+                .iter()
+                .any(|rejected| rejected.offset == 8
+                    && rejected.frame_count == 2
+                    && rejected.divisor == 100),
+            "the +0x08 header word must be reported: {:?}",
+            stats.rejected_aliases
+        );
+        assert!(stats.rejected_aliases.iter().all(|rejected| rejected.record == 0));
+    }
+
+    #[test]
+    fn duplicate_additional_tables_are_deduplicated_by_fingerprint() {
+        let a = palette_record(&[0x001], 1, 100, &[&[5.0]]);
+        let b = palette_record(&[0x001], 2, 200, &[&[7.0, 8.0]]);
+        let c = palette_record(&[0x001], 3, 300, &[&[9.0, 10.0, 11.0]]);
+
+        // Record 0: A. Record 1: B + A (A repeats record 0). Record 2: C + B
+        // (B repeats an earlier record's base). Both repeats are dropped.
+        let mut record_one = b.clone();
+        record_one.extend_from_slice(&a);
+        let mut record_two = c.clone();
+        record_two.extend_from_slice(&b);
+        let container = multi_record_container(&[a, record_one, record_two]);
+
+        let animation = SraAnimation::load(container, 1).expect("three base tables");
+        assert_eq!(animation.base_clip_count(), 3);
+        assert_eq!(animation.clip_count(), 3, "no duplicate is appended");
+        assert_eq!(animation.scan_stats().additional_distinct, 0);
+        assert_eq!(animation.scan_stats().additional_duplicates, 2);
+    }
+
+    #[test]
+    fn base_indices_do_not_move_when_a_record_gains_a_second_table() {
+        let first = palette_record(&[0x001], 2, 100, &[&[10.0, 20.0]]);
+        let second = palette_record(&[0x001], 3, 200, &[&[1.0, 2.0, 3.0]]);
+        let single = SraAnimation::load(encode_single_record_container(&first), 1)
+            .expect("single table");
+        let mut paired_record = first.clone();
+        paired_record.extend_from_slice(&second);
+        let paired = SraAnimation::load(encode_single_record_container(&paired_record), 1)
+            .expect("paired record");
+
+        assert_eq!(paired.clip_count(), 2);
+        assert_eq!(
+            single.clips()[0],
+            paired.clips()[0],
+            "index 0 is unchanged by the appended table"
+        );
+        assert_eq!((paired.clips()[0].index, paired.clips()[0].offset), (0, 0));
+        assert_eq!(
+            (paired.clips()[1].index, paired.clips()[1].offset),
+            (1, first.len())
+        );
+    }
+
+    #[test]
+    fn identical_tables_share_a_fingerprint_while_different_tables_do_not() {
+        let a = palette_record(&[0x001], 2, 100, &[&[10.0, 20.0]]);
+        let a_twin = a.clone();
+        let b = palette_record(&[0x001], 3, 200, &[&[1.0, 2.0, 3.0]]);
+        let one = SraAnimation::load(encode_single_record_container(&a), 1).expect("A");
+        let twin = SraAnimation::load(encode_single_record_container(&a_twin), 1).expect("A'");
+        let other = SraAnimation::load(encode_single_record_container(&b), 1).expect("B");
+        assert_eq!(one.clips()[0].fingerprint, twin.clips()[0].fingerprint);
+        assert_ne!(one.clips()[0].fingerprint, other.clips()[0].fingerprint);
+        assert_eq!(
+            one.clips()[0].fingerprint_text(),
+            format!(
+                "2:100:{:08x}",
+                one.clips()[0].fingerprint
+            )
+        );
+    }
+
+    #[test]
+    fn clip_descriptors_expose_the_invariant_and_legacy_fingerprints() {
+        let record = palette_record(&[0x001], 2, 100, &[&[10.0, 20.0]]);
+        let animation =
+            SraAnimation::load(encode_single_record_container(&record), 1).expect("one clip");
+        let clip = animation.clip_info(0).expect("clip 0");
+        assert_eq!(
+            clip.fingerprint_text(),
+            format!("2:100:{:08x}", clip.fingerprint),
+            "the mapping key keeps the pair readable"
+        );
+        assert_eq!(
+            clip.legacy_fingerprint_text(),
+            format!("2:100:{:08x}", clip.legacy_fingerprint)
+        );
+        assert_ne!(
+            clip.fingerprint, clip.legacy_fingerprint,
+            "the 16-byte and 20-byte views are different hash inputs"
+        );
+        assert_ne!(clip.fingerprint, 0, "a real table has a non-zero digest");
     }
 }
