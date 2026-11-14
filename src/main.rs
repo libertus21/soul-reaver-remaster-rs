@@ -53,6 +53,9 @@ mod bone_hierarchy;
 mod cli_argv;
 mod cli_catalog;
 mod cli_out;
+// Offline heuristic ranking for identifier-less `.SRA` clips; read by
+// `--animate --rank-clips` only.
+mod clip_rank;
 // Launcher CLI arg parser (pure). Viewer only strips three no-op flags.
 #[allow(dead_code)]
 mod launcher_cli;
@@ -159,6 +162,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--animate") {
         return run_animate(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--match-unmapped") {
+        return run_match_unmapped(&args[1..]);
+    }
     if let Some(message) = pose_mode_conflict(args) {
         eprintln!("{message}");
         return ExitCode::from(1);
@@ -259,6 +265,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --pose <FILE> [--hierarchy] [--bounds]");
         eprintln!("   or: soul-reaver-remaster-rs --facing --bigfile <BIGFILE.DAT> --entry <INDEX> --direction <DX>:<DY>");
         eprintln!("   or: soul-reaver-remaster-rs --animate --sra <FILE.SRA> --bigfile <BIGFILE.DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--anim-fps <N>] [--anim-once]");
+        eprintln!("   or: soul-reaver-remaster-rs --animate --sra <FILE.SRA> --rank-clips --slots <N> [--top <N>]");
         eprintln!("   or: soul-reaver-remaster-rs --srl-info <FILE.SRL>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
@@ -469,23 +476,30 @@ enum FrameChoice {
 
 struct AnimateInput<'a> {
     sra: &'a str,
-    dat: &'a str,
-    entry: usize,
+    dat: Option<&'a str>,
+    entry: Option<usize>,
     frame: Option<usize>,
     time: Option<u16>,
     clip: Option<usize>,
     list_clips: bool,
+    dump_unmapped: Option<&'a str>,
     anim_fps: u32,
     anim_once: bool,
+    rank_clips: bool,
+    top: usize,
+    slots: Option<usize>,
 }
 
-/// `--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>]
-/// [--time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once] [--list-clips]`:
-/// decode one frame, skin the archived model and print a bounded acceptance
-/// line. The slot count is the model's bone count, not a file field. An explicit
-/// `--frame` wins over the divisor-aware playback clock; `--anim-fps` counts
-/// frames per second for a divisor-100 clip. `--clip` selects the table and
-/// `--list-clips` prints the full enumeration instead of decoding.
+/// `--animate --sra <FILE> (--bigfile <DAT> --entry <INDEX> | --slots <N>)
+/// [--frame <N> | --time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once]
+/// [--list-clips] [--rank-clips [--top <N>]]`: decode one frame, skin the
+/// archived model and print a bounded acceptance line, or rank every clip.
+/// The slot count is the model's bone count, not a file field; `--slots` states
+/// it directly for offline ranking without a model. An explicit `--frame` wins
+/// over the divisor-aware playback clock; `--anim-fps` counts frames per second
+/// for a divisor-100 clip. `--clip` selects the table, `--list-clips` prints the
+/// full enumeration, and `--rank-clips` prints the heuristic shortlist instead
+/// of decoding one frame.
 fn run_animate(args: &[String]) -> ExitCode {
     let input = match animate_input(args) {
         Ok(input) => input,
@@ -501,7 +515,17 @@ fn run_animate(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let entry_bytes = match object::read_entry_bytes(Path::new(input.dat), input.entry) {
+    if input.rank_clips {
+        return run_rank_clips(&input, sra_bytes);
+    }
+    let (dat, entry) = match (input.dat, input.entry) {
+        (Some(dat), Some(entry)) => (dat, entry),
+        _ => {
+            eprintln!("error: --animate needs --bigfile <DAT> --entry <INDEX>");
+            return ExitCode::from(1);
+        }
+    };
+    let entry_bytes = match object::read_entry_bytes(Path::new(dat), entry) {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!("error: {error}");
@@ -522,11 +546,15 @@ fn run_animate(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let sra_label = file_label(Path::new(input.sra));
+    if let Some(path) = input.dump_unmapped {
+        if let Err(error) = write_unmapped_report(Path::new(path), &animation, &sra_label) {
+            eprintln!("error: cannot write {}: {error}", file_label(Path::new(path)));
+            return ExitCode::from(1);
+        }
+    }
     if input.list_clips {
-        outln!(
-            "{}",
-            clip_listing(&animation, &file_label(Path::new(input.sra)))
-        );
+        outln!("{}", clip_listing(&animation, &sra_label));
         return ExitCode::SUCCESS;
     }
     let clip = input.clip.unwrap_or(0);
@@ -545,7 +573,7 @@ fn run_animate(args: &[String]) -> ExitCode {
         &model,
         &animation,
         clip,
-        &file_label(Path::new(input.sra)),
+        &sra_label,
         choice,
     ) {
         Ok(line) => {
@@ -557,6 +585,56 @@ fn run_animate(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// `--rank-clips`: decode every located clip and print a bounded heuristic
+/// shortlist. The slot count comes from `--slots` or from the archived model's
+/// bone count; it is not an `.SRA` field.
+fn run_rank_clips(input: &AnimateInput<'_>, sra_bytes: Vec<u8>) -> ExitCode {
+    let slot_count = match input.slots {
+        Some(slots) => slots,
+        None => {
+            let (Some(dat), Some(entry)) = (input.dat, input.entry) else {
+                eprintln!("error: --rank-clips needs --slots or --bigfile/--entry");
+                return ExitCode::from(1);
+            };
+            let entry_bytes = match object::read_entry_bytes(Path::new(dat), entry) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(error.exit_code());
+                }
+            };
+            match object::parse_object(&entry_bytes) {
+                Ok(model) => model.bones.len(),
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(error.exit_code());
+                }
+            }
+        }
+    };
+    let animation = match sra::SraAnimation::load(sra_bytes, slot_count) {
+        Ok(animation) => animation,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let report = match clip_rank::rank_animation(&animation) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let text = clip_rank::report_text(
+        &file_label(Path::new(input.sra)),
+        &report,
+        input.top,
+    );
+    outln!("{text}");
+    ExitCode::SUCCESS
 }
 
 /// Resolve the frame `--animate` prints. An explicit `--frame` wins, then an
@@ -585,12 +663,15 @@ fn animate_choice(
 }
 
 fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
-    let usage = "expected --animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once] [--list-clips]";
-    let (mut sra, mut dat, mut entry, mut frame, mut time, mut clip) =
-        (None, None, None, None, None, None);
+    let usage = "expected --animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once] [--list-clips] [--dump-unmapped <FILE>]";
+    let (mut sra, mut dat, mut entry, mut frame, mut time, mut clip, mut dump_unmapped) =
+        (None, None, None, None, None, None, None);
     let mut anim_fps = sra::ANIMATION_FPS;
     let mut anim_once = false;
     let mut list_clips = false;
+    let mut rank_clips = false;
+    let mut top = None;
+    let mut slots = None;
     let mut at = 0;
     while at < args.len() {
         match args[at].as_str() {
@@ -600,6 +681,10 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
             }
             "--list-clips" => {
                 list_clips = true;
+                at += 1;
+            }
+            "--rank-clips" => {
+                rank_clips = true;
                 at += 1;
             }
             token => {
@@ -621,6 +706,7 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
                     "--clip" => {
                         clip = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
                     }
+                    "--dump-unmapped" => dump_unmapped = Some(value),
                     "--anim-fps" => {
                         let fps = value
                             .parse::<u32>()
@@ -647,37 +733,366 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
             time,
             clip,
             list_clips,
+            dump_unmapped,
             anim_fps,
             anim_once,
         }),
         _ => Err(usage.to_string()),
     }
+    Ok(AnimateInput {
+        sra,
+        dat,
+        entry,
+        frame,
+        time,
+        clip,
+        list_clips,
+        anim_fps,
+        anim_once,
+        rank_clips,
+        top: top.unwrap_or(clip_rank::DEFAULT_TOP),
+        slots,
+    })
 }
 
 /// The `--list-clips` enumeration: one line per located packed table.
 ///
 /// The tables carry no name or id, so the structural fields (file order, payload
-/// record, record-relative offset, frame count, divisor, channel count and plane
-/// flags) are the whole identity a human can map a clip by.
+/// record, record-relative offset, frame count, divisor, channel count, plane
+/// flags and content fingerprint) are the whole identity a human can map a clip
+/// by. The `sra` line also reports how the extended scan classified the file:
+/// base tables, appended additional tables, dropped duplicates and rejected
+/// header aliases.
 fn clip_listing(animation: &sra::SraAnimation, sra_label: &str) -> String {
+    let stats = animation.scan_stats();
     let mut lines = vec![format!(
-        "sra clips={} slots={} ({sra_label})",
+        "sra clips={} slots={} base={} additional={} duplicates={} distinct={} rejected_aliases={} rejected_invalid={} ({sra_label})",
         animation.clip_count(),
-        animation.slot_count()
+        animation.slot_count(),
+        stats.base_count,
+        stats.additional_distinct,
+        stats.additional_duplicates,
+        stats.distinct_fingerprints,
+        stats.rejected_aliases.len(),
+        stats.rejected_invalid
     )];
     for clip in animation.clips() {
+        let additional = if clip.additional { " additional=1" } else { "" };
         lines.push(format!(
-            "clip index={} record={} offset={} frames={} divisor={} channels={} flags=0x{:02X}",
+            "clip index={} record={} offset={} frames={} divisor={} channels={} flags=0x{:02X} fp={}{}",
             clip.index,
             clip.record,
             clip.offset,
             clip.frame_count,
             clip.divisor,
             clip.channel_count,
-            clip.flags
+            clip.flags,
+            clip.fingerprint_text(),
+            additional
         ));
     }
     lines.join("\n")
+}
+
+/// The `--dump-unmapped` report: appended tables, dropped duplicates and the
+/// rejected header aliases. Every line carries the frame count, divisor, stream
+/// count and the 8-hex fingerprint hash, so a runtime probe can diff tables.
+fn unmapped_report(animation: &sra::SraAnimation, sra_label: &str) -> String {
+    let stats = animation.scan_stats();
+    let mut lines = vec![format!(
+        "unmapped sra={sra_label} clips={} base={} additional={} duplicates={} distinct={} rejected_aliases={} rejected_invalid={}",
+        animation.clip_count(),
+        stats.base_count,
+        stats.additional_distinct,
+        stats.additional_duplicates,
+        stats.distinct_fingerprints,
+        stats.rejected_aliases.len(),
+        stats.rejected_invalid
+    )];
+    for clip in animation.clips().into_iter().filter(|clip| clip.additional) {
+        lines.push(format!(
+            "unmapped index={} record={} offset={} frames={} divisor={} channels={} fp={}",
+            clip.index,
+            clip.record,
+            clip.offset,
+            clip.frame_count,
+            clip.divisor,
+            clip.channel_count,
+            clip.fingerprint_text()
+        ));
+    }
+    for rejected in &stats.rejected_aliases {
+        lines.push(format!(
+            "rejected kind=header-alias record={} offset={} frames={} divisor={} channels={}",
+            rejected.record,
+            rejected.offset,
+            rejected.frame_count,
+            rejected.divisor,
+            rejected.channel_count
+        ));
+    }
+    lines.join("\n")
+}
+
+fn write_unmapped_report(path: &Path, animation: &sra::SraAnimation, label: &str) -> std::io::Result<()> {
+    std::fs::write(path, format!("{}\n", unmapped_report(animation, label)))
+}
+
+/// One located table that matched a probe fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FingerprintHit {
+    key: String,
+    file: String,
+    index: usize,
+    record: usize,
+    offset: usize,
+    frames: usize,
+    divisor: i16,
+    channels: usize,
+}
+
+/// Result of enumerating one directory of `.SRA` files.
+#[derive(Debug, Default)]
+struct MatchScan {
+    hits: Vec<FingerprintHit>,
+    files_scanned: usize,
+    files_skipped: usize,
+}
+
+/// Parse the labelling probe's `frame_count:divisor:hash` key.
+///
+/// Accepts an optional `fp=` prefix and a `u`/`i` decimal pair plus an 8-hex
+/// hash. Any other token is not a fingerprint.
+fn parse_fingerprint_key(token: &str) -> Option<String> {
+    let token = token.strip_prefix("fp=").unwrap_or(token);
+    let mut parts = token.split(':');
+    let frames = parts.next()?.parse::<u16>().ok()?;
+    let divisor = parts.next()?.parse::<i16>().ok()?;
+    let hash = u32::from_str_radix(parts.next()?, 16).ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(format!("{frames}:{divisor}:{hash:08x}"))
+}
+
+/// Every distinct fingerprint key in a probe dump, preserving input order.
+///
+/// Blank lines and `#` comments are ignored; the first fingerprint-shaped
+/// token on each line wins.
+fn fingerprint_keys(text: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut keys = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(key) = line.split_whitespace().find_map(parse_fingerprint_key) {
+            if seen.insert(key.clone()) {
+                keys.push(key);
+            }
+        }
+    }
+    keys
+}
+
+/// Enumerate every `.SRA` in `dir` and index every located table's fingerprint.
+fn scan_sra_directory(dir: &Path, slots: usize) -> Result<MatchScan, String> {
+    let read = std::fs::read_dir(dir)
+        .map_err(|error| format!("cannot read {}: {error}", file_label(dir)))?;
+    let mut paths: Vec<PathBuf> = read
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("sra"))
+        })
+        .collect();
+    paths.sort();
+    let mut scan = MatchScan::default();
+    for path in paths {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                scan.files_skipped += 1;
+                continue;
+            }
+        };
+        let animation = match sra::SraAnimation::load(bytes, slots) {
+            Ok(animation) => animation,
+            Err(_) => {
+                scan.files_skipped += 1;
+                continue;
+            }
+        };
+        scan.files_scanned += 1;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for clip in animation.clips() {
+            scan.hits.push(FingerprintHit {
+                key: clip.fingerprint_text(),
+                file: name.clone(),
+                index: clip.index,
+                record: clip.record,
+                offset: clip.offset,
+                frames: clip.frame_count,
+                divisor: clip.divisor,
+                channels: clip.channel_count,
+            });
+        }
+    }
+    Ok(scan)
+}
+
+/// Build the matcher report. Returns the text plus located/absent key counts.
+fn match_report(keys: &[String], scan: &MatchScan) -> (String, usize, usize) {
+    const PER_KEY_LIMIT: usize = 8;
+    let mut lines = Vec::new();
+    let mut located = 0usize;
+    let mut absent = 0usize;
+    for key in keys {
+        let matches: Vec<&FingerprintHit> = scan.hits.iter().filter(|hit| &hit.key == key).collect();
+        if matches.is_empty() {
+            absent += 1;
+            lines.push(format!("match fp={key} absent"));
+            continue;
+        }
+        located += 1;
+        lines.push(format!("match fp={key} found={}", matches.len()));
+        for hit in matches.iter().take(PER_KEY_LIMIT) {
+            lines.push(format!(
+                "  file={} record={} index={} offset={} frames={} divisor={} channels={}",
+                hit.file, hit.record, hit.index, hit.offset, hit.frames, hit.divisor, hit.channels
+            ));
+        }
+        if matches.len() > PER_KEY_LIMIT {
+            lines.push(format!("  more={}", matches.len() - PER_KEY_LIMIT));
+        }
+    }
+    lines.push(format!(
+        "match summary files={} skipped={} fingerprints={} located={} absent={}",
+        scan.files_scanned,
+        scan.files_skipped,
+        keys.len(),
+        located,
+        absent
+    ));
+    (lines.join("\n"), located, absent)
+}
+
+struct MatchInput<'a> {
+    file: &'a str,
+    dir: &'a str,
+    out: Option<&'a str>,
+    slots: usize,
+}
+
+fn match_input(args: &[String]) -> Result<MatchInput<'_>, String> {
+    let usage = "expected --match-unmapped <FILE> --sra-dir <DIR> [--slots <N>] [--out <FILE>]";
+    let (mut file, mut dir, mut out) = (None, None, None);
+    let mut slots = 66usize;
+    let mut at = 0;
+    while at < args.len() {
+        match args[at].as_str() {
+            "--sra-dir" => {
+                let Some(value) = args.get(at + 1).map(String::as_str) else {
+                    return Err(usage.to_string());
+                };
+                dir = Some(value);
+                at += 2;
+            }
+            "--slots" => {
+                let Some(value) = args.get(at + 1).map(String::as_str) else {
+                    return Err(usage.to_string());
+                };
+                slots = value.parse::<usize>().map_err(|_| usage.to_string())?;
+                if !(1..=packed_channel::MAX_SLOT_COUNT).contains(&slots) {
+                    return Err(format!(
+                        "invalid value '{value}' for --slots: expected 1..={}",
+                        packed_channel::MAX_SLOT_COUNT
+                    ));
+                }
+                at += 2;
+            }
+            "--out" => {
+                let Some(value) = args.get(at + 1).map(String::as_str) else {
+                    return Err(usage.to_string());
+                };
+                out = Some(value);
+                at += 2;
+            }
+            token if token.starts_with("--") => return Err(usage.to_string()),
+            token => {
+                if file.is_some() {
+                    return Err(usage.to_string());
+                }
+                file = Some(token);
+                at += 1;
+            }
+        }
+    }
+    match (file, dir) {
+        (Some(file), Some(dir)) if slots > 0 => Ok(MatchInput {
+            file,
+            dir,
+            out,
+            slots,
+        }),
+        _ => Err(usage.to_string()),
+    }
+}
+
+/// `--match-unmapped <FILE> --sra-dir <DIR> [--slots <N>]`: search every
+/// `.SRA` in `DIR` for the probe fingerprints in `FILE`.
+///
+/// An absent fingerprint is a documented result (exit 0), not a failure: it
+/// says the runtime table is not a static table in any scanned file.
+fn run_match_unmapped(args: &[String]) -> ExitCode {
+    let input = match match_input(args) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let text = match std::fs::read_to_string(input.file) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!(
+                "error: cannot read {}: {error}",
+                file_label(Path::new(input.file))
+            );
+            return ExitCode::from(1);
+        }
+    };
+    let keys = fingerprint_keys(&text);
+    if keys.is_empty() {
+        eprintln!(
+            "error: no frame_count:divisor:hash fingerprints in {}",
+            file_label(Path::new(input.file))
+        );
+        return ExitCode::from(1);
+    }
+    let scan = match scan_sra_directory(Path::new(input.dir), input.slots) {
+        Ok(scan) => scan,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let (report, _, _) = match_report(&keys, &scan);
+    if let Some(path) = input.out {
+        if let Err(error) = std::fs::write(path, format!("{report}\n")) {
+            eprintln!("error: cannot write {}: {error}", file_label(Path::new(path)));
+            return ExitCode::from(1);
+        }
+    }
+    outln!("{report}");
+    ExitCode::SUCCESS
 }
 
 /// The pure core of `--animate`: one decoded frame, the slot poses it produces
@@ -2641,12 +3056,13 @@ mod cli_tests {
     use super::{
         animate_choice, animate_input, animate_report, bone_hierarchy_input, clip_listing,
         facing_input,
-        facing_report, list_report, object_input, parse_direction, pose_mode_conflict,
+        facing_report, fingerprint_keys, list_report, match_report, object_input,
+        parse_direction, parse_fingerprint_key, pose_mode_conflict,
         resolve_texture_name, run_actor_census, run_audio, run_bigfile, dispatch, run_level_links,
         run_level_records, run_level_structure, run_mesh, run_mesh_all, run_level_geometry,
         run_level_objects, run_level_render, run_mesh_textured, run_mesh_with, run_object_info,
-        run_object_mesh, run_object_mesh_with, run_textures, strip_launcher_noops, tshow_suffix,
-        FrameChoice,
+        run_object_mesh, run_object_mesh_with, run_textures, scan_sra_directory,
+        strip_launcher_noops, tshow_suffix, FrameChoice, MatchScan,
     };
     use std::process::ExitCode;
     use std::rc::Rc;
@@ -3523,10 +3939,69 @@ mod cli_tests {
         let animation = crate::sra::SraAnimation::load(container, 2).expect("synthetic table");
         let listing = clip_listing(&animation, "SYNTH.SRA");
         let lines: Vec<&str> = listing.lines().collect();
-        assert_eq!(lines[0], "sra clips=1 slots=2 (SYNTH.SRA)");
         assert_eq!(
-            lines[1],
-            "clip index=0 record=0 offset=0 frames=2 divisor=100 channels=3 flags=0x01"
+            lines[0],
+            "sra clips=1 slots=2 base=1 additional=0 duplicates=0 distinct=1 rejected_aliases=2 rejected_invalid=0 (SYNTH.SRA)"
+        );
+        assert!(
+            lines[1].starts_with(
+                "clip index=0 record=0 offset=0 frames=2 divisor=100 channels=3 flags=0x01 fp=2:100:"
+            ),
+            "{}",
+            lines[1]
+        );
+    }
+
+    #[test]
+    fn fingerprint_keys_parse_the_probe_format_and_ignore_noise() {
+        let keys = fingerprint_keys(
+            "# comment\nfp=6:580:deadbeef extra\n6:580:DEADBEEF\nnot a key\n",
+        );
+        assert_eq!(keys, vec!["6:580:deadbeef".to_string()]);
+        assert_eq!(
+            parse_fingerprint_key("1:100:00abcdef"),
+            Some("1:100:00abcdef".to_string())
+        );
+        assert_eq!(parse_fingerprint_key("1:100"), None);
+        assert_eq!(parse_fingerprint_key("x:100:zz"), None);
+        assert_eq!(parse_fingerprint_key("1:100:00abcdef:9"), None);
+    }
+
+    #[test]
+    fn match_report_reports_absent_as_a_result_not_an_error() {
+        let scan = MatchScan::default();
+        let (report, located, absent) = match_report(&["1:100:deadbeef".to_string()], &scan);
+        assert_eq!((located, absent), (0, 1));
+        assert!(report.contains("match fp=1:100:deadbeef absent"), "{report}");
+        assert!(
+            report.contains("match summary files=0 skipped=0 fingerprints=1 located=0 absent=1"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn scan_sra_directory_indexes_every_located_table_by_file_and_record() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let container = crate::sra::synthetic_animation_container(&[0x001], 2, 100, &[10.0, 20.0]);
+        std::fs::write(tmp.path().join("A.SRA"), &container).expect("write A.SRA");
+        std::fs::write(tmp.path().join("BAD.SRA"), b"not a container").expect("write BAD.SRA");
+        std::fs::write(tmp.path().join("IGNORE.SRM"), b"x").expect("write IGNORE.SRM");
+
+        let scan = scan_sra_directory(tmp.path(), 1).expect("scan must succeed");
+        assert_eq!(scan.files_scanned, 1);
+        assert_eq!(scan.files_skipped, 1, "a non-container .SRA is skipped, not fatal");
+        assert_eq!(scan.hits.len(), 1);
+        let hit = &scan.hits[0];
+        assert_eq!(hit.file, "A.SRA");
+        assert_eq!((hit.record, hit.index, hit.offset), (0, 0, 0));
+        assert_eq!((hit.frames, hit.divisor, hit.channels), (2, 100, 3));
+
+        let (report, located, absent) = match_report(&[hit.key.clone()], &scan);
+        assert_eq!((located, absent), (1, 0));
+        assert!(report.contains("file=A.SRA record=0 index=0"), "{report}");
+        assert!(
+            report.contains("match summary files=1 skipped=1 fingerprints=1 located=1 absent=0"),
+            "{report}"
         );
     }
 
@@ -3539,10 +4014,14 @@ mod cli_tests {
         let parsed = animate_input(&parsed_argv).expect("full argv must parse");
         assert_eq!(
             (parsed.sra, parsed.dat, parsed.entry, parsed.frame, parsed.time),
-            ("R.SRA", "B.DAT", 66, Some(24), None)
+            ("R.SRA", Some("B.DAT"), Some(66), Some(24), None)
         );
         assert_eq!((parsed.anim_fps, parsed.anim_once), (crate::sra::ANIMATION_FPS, false));
-        assert_eq!((parsed.clip, parsed.list_clips), (None, false));
+        assert_eq!(
+            (parsed.clip, parsed.list_clips, parsed.rank_clips),
+            (None, false, false)
+        );
+        assert_eq!((parsed.top, parsed.slots), (crate::clip_rank::DEFAULT_TOP, None));
 
         let clip_argv = argv(&[
             "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "66", "--clip", "7",
@@ -3550,6 +4029,13 @@ mod cli_tests {
         ]);
         let clip = animate_input(&clip_argv).expect("clip flags must parse");
         assert_eq!((clip.clip, clip.list_clips), (Some(7), true));
+
+        let dump_argv = argv(&[
+            "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "66",
+            "--dump-unmapped", "UNMAPPED.TXT",
+        ]);
+        let dump = animate_input(&dump_argv).expect("dump flag must parse");
+        assert_eq!(dump.dump_unmapped, Some("UNMAPPED.TXT"));
 
         let flagged_argv = argv(&[
             "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "66", "--anim-fps", "20",
@@ -3571,6 +4057,39 @@ mod cli_tests {
         assert!(
             animate_input(&argv(&[
                 "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "1", "--bogus", "2",
+            ]))
+            .is_err()
+        );
+
+        let rank_argv = argv(&[
+            "--sra", "R.SRA", "--rank-clips", "--slots", "66", "--top", "4",
+        ]);
+        let rank = animate_input(&rank_argv).expect("rank mode accepts an explicit slot count");
+        assert_eq!((rank.rank_clips, rank.slots, rank.top), (true, Some(66), 4));
+        assert_eq!((rank.dat, rank.entry), (None, None));
+
+        let ranked_model_argv = argv(&[
+            "--sra", "R.SRA", "--rank-clips", "--bigfile", "B.DAT", "--entry", "66",
+        ]);
+        let ranked_model =
+            animate_input(&ranked_model_argv).expect("rank mode derives slots from a model");
+        assert_eq!(
+            (ranked_model.slots, ranked_model.dat, ranked_model.entry),
+            (None, Some("B.DAT"), Some(66))
+        );
+
+        assert!(animate_input(&argv(&["--sra", "R.SRA", "--rank-clips"])).is_err());
+        assert!(
+            animate_input(&argv(&[
+                "--sra", "R.SRA", "--rank-clips", "--slots", "66", "--frame", "1",
+            ]))
+            .is_err()
+        );
+        assert!(animate_input(&argv(&["--sra", "R.SRA", "--top", "4"])).is_err());
+        assert!(
+            animate_input(&argv(&[
+                "--sra", "R.SRA", "--rank-clips", "--slots", "66", "--bigfile", "B.DAT",
+                "--entry", "66",
             ]))
             .is_err()
         );

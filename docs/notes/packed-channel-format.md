@@ -293,18 +293,33 @@ never enters `FrameState` and no determinism golden moves.
 
 ## Clip enumeration and state selection
 
-A `.SRA` payload is a record container, and in the measured files **every
-payload record starts one structurally valid packed frame table**. Enumerating
-"the first valid table in each record, in file order" is therefore the clip
-list; scanning every byte again would also match nested false positives inside a
-record (for example the duplicate header word at `+0x08` parses as a
-one-stream table). Measured read-only, with the model bone count as the slot
-count:
+A `.SRA` payload is a record container. The **base** enumeration keeps the first
+structurally valid packed frame table in each payload record, in file order, so
+indices `0..base` are stable. A record may in principle hold more than one
+table, so the loader continues past the base table's inline value stream and
+appends every further structurally valid table after the base indices (record
+order, then order within the record). Additional tables are deduplicated by the
+same content fingerprint the labelling probe uses: frame count, divisor, and
+FNV-1a 32-bit over the 20-byte form-invariant header plus the complete bit-plane
+block. That fingerprint hashes table content, not value offsets, so a relocated
+memory copy agrees with the file form.
 
-| File | Payload records | Located clips | Frame counts (range) | Streams per table |
-|---|---:|---:|---|---|
-| `RAZIEL.SRA` | 230 | **230** | 1..50 (`50` appears 4x, `48` 3x, `1` 33x) | 3 |
-| `SLUAGH.SRA` | 23 | **23** | 5..15 | 2 |
+The `+0x04`/`+0x08` duplicate header word `(divisor << 16) | frame_count` parses
+as a one-stream table with the same frame count and divisor. A candidate nested
+in the base table's 20-byte header is therefore rejected and reported, never
+indexed. A candidate past a table's extent that parses as a header but fails the
+whole-slot inline decode is counted as structurally rejected.
+
+Measured read-only at the player's 66-slot stride:
+
+| File | Payload records | Base clips | Additional distinct | Duplicates | Header aliases rejected |
+|---|---:|---:|---:|---:|---:|
+| `RAZIEL.SRA` | 230 | **230** | **0** | 0 | 380 |
+
+The same scan over all 227 `OBJECT/*.SRA` found **0 genuine additional tables**:
+every extra structural match at a non-base offset was a `+0x04`/`+0x08` header
+alias, not a second table. A record therefore holds one table in the measured
+corpus, and the original one-table-per-record enumeration was already complete.
 
 `RAZIEL.SRA` clip 0 is the validated 50-frame body table: divisor 100, flags
 `0x05` (angle + translation), 3 streams. No table carries a name, id, state
@@ -318,6 +333,26 @@ byte or clip index:
 - The runtime samples a table through the channel pointer at `+0x38`; it never
   reads a table id. Which channel set is active is an engine state question,
   not a field in the file.
+
+## The unmapped walk table
+
+The runtime labelling probe fingerprints the active table. Idle maps to clip 55
+(`6:580:...`), so the scheme is sound. Walk is 97-98% unmapped, with 2-3% of
+samples still on clip 55 during transitions. Extending the enumeration does not
+add a walk table to `RAZIEL.SRA`: the file has exactly one table per record and
+the only extra matches are the header aliases above. Answer (a), "an additional
+table inside a `RAZIEL.SRA` record", is therefore **refuted**.
+
+The probe aggregates unmapped samples as a fraction and does not print the raw
+unmapped fingerprints, so the walk key was not captured in the offline evidence.
+Whether the walk table is (b) a table in a different `.SRA` or (c) built at
+runtime is a **documented UNKNOWN**, not a guess. `--match-unmapped <FILE>
+--sra-dir <DIR> [--slots <N>]` searches every `.SRA` in a directory for a probe
+fingerprint and reports the file, record and index that contains it; an absent
+key is printed as `absent` and exits 0. Feeding it the unmapped key from a probe
+run settles (b) versus (c) in one command. A scan of all 227 files at 66 slots
+found 103 distinct fingerprint keys outside `RAZIEL.SRA`, so a static cross-file
+match is possible in principle and (c) is not asserted without the key.
 
 **UNKNOWN, not a failure**: the shipped tables do not identify idle, walk or
 jump. The presentation default maps states to distinct clips by position
@@ -337,8 +372,11 @@ state enters `FrameState` and no determinism golden moves.
 CLI:
 
 ```text
---animate ... --list-clips            print one line per located clip
+--animate ... --list-clips            print one line per located clip + scan stats
 --animate ... --clip <N>              decode clip N (default 0)
+--animate ... --dump-unmapped <FILE>  write appended and rejected table keys
+--match-unmapped <FILE> --sra-dir <DIR> [--slots <N>]
+                                      search every .SRA for probe fingerprints
 --play ... --sra <FILE> \
     [--clip <N>]                      freeze one clip
     [--clip-idle <N>] [--clip-walk <N>] [--clip-jump <N>]
@@ -346,6 +384,63 @@ CLI:
 
 Every explicit index is validated against the decoded clip count and rejected
 with a typed `ClipError::OutOfRange`; non-integers are a typed `PlayError`.
+
+## Offline clip ranking (`--animate --rank-clips`)
+
+The tables have no name, id or state byte, so a human mapping idle / walk / jump
+has to try clips one by one. `--animate --sra <FILE> --rank-clips` decodes
+**every** located clip and prints a bounded, parseable shortlist plus a
+`suggest --clip-idle/--clip-walk/--clip-jump` line ready for `--play`.
+
+The slot count is not an `.SRA` field (it is the model bone count), so ranking
+takes it from `--slots <N>` or from `--bigfile <DAT> --entry <INDEX>`:
+
+```text
+--animate --sra <FILE> --rank-clips --slots <N> [--top <N>]
+```
+
+Default `--top` is 8, capped at 64. Output is bounded to
+`10 + 4 * top` lines: one summary, one threshold line, four bucket headers, at
+most `top` rows per bucket, one suggestion and three justification lines.
+
+All per-axis differences are **shortest-arc** binary-angle differences wrapped
+into `[-2048, +2048]` units. Stored angles are not normalized, so a raw
+subtraction across the 0/4096 turn boundary would turn a small rotation into a
+full-turn spike. Reported degrees still use `value * 360 / 4096`.
+
+| Metric | Definition |
+|---|---|
+| `duration_ms` | `frames * divisor * 1000 / 5000` (integer math) |
+| `mean_delta_deg` | mean absolute per-axis consecutive-frame change over all frames/slots |
+| `max_delta_deg` | largest single consecutive-frame change |
+| `loop_closure_deg` | mean `|frame[0] - frame[last]|` per axis; near 0 loops cleanly |
+| `moving_slots` | slots whose largest consecutive-frame change exceeds `0.50deg` |
+| `period` | `p` in `1..frames/2` minimising mean `|frame[k] - frame[k+p]|`, or `none`; residual reported in degrees |
+
+Heuristic thresholds (also printed verbatim by the command):
+
+| Rule | Threshold |
+|---|---|
+| `STILL` | `mean_delta_deg <= 0.50` |
+| `IMPACT` | `max_delta_deg >= 5.00`, `max/mean >= 4.00`, no real periodicity |
+| `LOCOMOTION` | `0.50 < mean_delta_deg <= 8.00`, real period `p >= 2`, residual `<= 1.00deg` |
+| `OTHER` | everything else |
+
+A period of `1` is the trivial adjacent-frame shift: for a smooth trajectory it
+always wins the residual search and says nothing about repetition. It is
+reported as `period=1`, but it is **not** periodicity evidence for `LOCOMOTION`
+or `IMPACT`. Bucket rows are sorted by the bucket's own key (`STILL` ascending
+motion, `LOCOMOTION` ascending residual, `IMPACT` descending spike ratio,
+`OTHER` descending maximum change).
+
+**UNKNOWN, not a failure**: this is a heuristic shortlist, never ground truth.
+Measured read-only on the shipped player body, the thresholds put the still
+clips in `STILL` and every remaining clip in `IMPACT`; no clip passed the real
+periodicity rule, so `LOCOMOTION` is empty. The walk suggestion then falls back
+to the lowest non-still motion and says so in its justification line. A bucket
+can be empty, and an empty bucket is printed with `note=empty` instead of being
+silently guessed. The trio is a starting point for a human, not a recovered
+identity mapping.
 
 ## Validation
 
@@ -398,6 +493,22 @@ python sr1_packed_frame_probe.py --selftest       PASS cases=8
 python sr1_packed_frame_probe.py --live-selftest  PASS cases=4
 python sr1_packed_frame_probe.py --dry-run        prints the plan
 ```
+
+### Extended enumeration
+
+Read-only against the shipped player body at its 66-slot stride:
+
+```text
+sra clips=230 slots=66 base=230 additional=0 duplicates=0 distinct=229
+    rejected_aliases=380 rejected_invalid=0 (RAZIEL.SRA)
+clip index=55 record=55 offset=0 frames=6 divisor=580 channels=3 flags=0x05
+```
+
+The base indices `0..=229` are unchanged: clipping at index 55 is still the
+same six-frame, divisor-580 table. The 380 rejected candidates are the
+`+0x04`/`+0x08` duplicate header word in each record, not extra tables. A
+directory-wide scan at the same stride found no genuine additional table in any
+of the 227 `OBJECT/*.SRA` files.
 
 ### The older atomic capture
 
