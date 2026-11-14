@@ -33,7 +33,7 @@ falsifiable shape), **PARTLY** (one side pinned, the other inferred), **UNKNOWN*
 
 | # | Question | Answer | Class | Evidence |
 |---|---|---|---|---|
-| 1 | Where does the packed data live? | The channel record at `+0x38` points to a **standalone frame-table record**, not inline data. The table is a relocatable record whose file form uses 32-bit value offsets and whose memory form uses 64-bit pointers; the pointer width shifts the payload by `0x10`. | CONFIRMED | Runtime pointer read; file bytes and runtime bytes agree after the shift |
+| 1 | Where does the packed data live? | The channel record at `+0x38` points to a **standalone frame-table record**, not inline data. The table is a relocatable record: the file form uses 32-bit value offsets plus a 32-bit link field at `+0x10`, while the memory form uses 64-bit pointers. Widening both shifts the payload by `0x10`. | CONFIRMED | Runtime pointer read; file bytes and captured runtime bytes agree after the shift |
 | 2 | Frame count, divisor, wrap | Header `+4` is a `u16` frame count, `+6` is a `s16` divisor. Frame index is `floor(frame_time / divisor)`; `frame_time` is channel `+4` (current) and `+6` (previous). The observed table is 50 frames at divisor 100. The `index+1 >= count` wrap branch was reached in code but not exercised by the validated frame. | CONFIRMED for count/divisor/index; PARTLY for the wrap | Live capture `time=2400`, index `24/50`; code path |
 | 3 | Per-frame payload layout | A flag byte selects which of three planes are present: bit 0 angle, bit 1 scale, bit 2 translation. Present planes are concatenated at `align8(3 * slot_count)` bits (200 bits for 66 slots). Each plane stores **3 bits per slot**; the 3 bits are a component mask (bit 0 X, bit 1 Y, bit 2 Z). The 12-bit mask maps bit 0-2 to angles, 4-6 to scale, 8-10 to translation. | CONFIRMED for the angle plane and the mask; PARTLY for the scale plane | 66-slot live capture; file replay |
 | 4 | Value encoding | The value stream is a sequence of blocks: `i32 0` + `frame_count` `f32` palette, or `i32 1` + one `f32` literal. One block is consumed per set bit, in ascending lane order. The floats are signed and already in **binary-angle units** (4096 per turn); the palette index is the frame index. | CONFIRMED | Decoded values equal the staged values exactly |
@@ -79,13 +79,16 @@ The table is a standalone record. Its two forms differ only by pointer width:
 | frame count (`u16`) | `+0x04` | `+0x04` |
 | divisor (`s16`) | `+0x06` | `+0x06` |
 | four header words | `+0x08..+0x0F` | `+0x08..+0x0F` |
-| reserved | `+0x10..+0x13` | `+0x10..+0x17` |
+| widened link field (file offset vs memory pointer) | `+0x10..+0x13` (4 bytes) | `+0x10..+0x17` (8 bytes) |
 | value-block offsets/pointers | `+0x14 + i*4` | `+0x18 + i*8` |
 | bit-plane block | `+0x14 + 4*count` | `+0x18 + 8*count` |
 
 `count` is the byte at `+0x00` (3 in the observed table). The file form stores
-three 32-bit offsets; the memory form stores three 64-bit pointers. That is the
-whole `0x10` shift: the file block starts at `+0x20`, the memory block at `+0x30`.
+three 32-bit offsets; the memory form stores three 64-bit pointers. The field
+at `+0x10` is widened the same way: one 32-bit offset in the file, one 64-bit
+pointer in memory. The `0x10` block shift is therefore the sum of two
+changes, `+4` for that field and `+4*count` for the offset array. In the file
+the block starts at `+0x20`, in memory at `+0x30`.
 
 The observed header is frame count 50, divisor 100, and four words
 `50, 100, 50, 100`. The frame clock is:
@@ -225,6 +228,8 @@ wired into canonical frame state):
   `Wrap` but is never implicit.
 - `PackedFrameTable::parse` / `BitPlanes::parse` / `BitPlanes::slot_mask` parse
   the offset array, the flags byte and the per-slot 3-bit plane groups.
+- `PackedFrameTable::fingerprint` returns the form-invariant
+  `TableFingerprint` (mapping key) and the legacy diagnostic digest.
 - `ValueStream::next_value` walks the palette/literal blocks in ascending lane
   order.
 - `decode_slot_angles` returns one slot's angle triple;
@@ -337,7 +342,8 @@ state enters `FrameState` and no determinism golden moves.
 CLI:
 
 ```text
---animate ... --list-clips            print one line per located clip
+--animate ... --list-clips            print one line per located clip, with
+                                       fp=<invariant> legacy=<old digest>
 --animate ... --clip <N>              decode clip N (default 0)
 --play ... --sra <FILE> \
     [--clip <N>]                      freeze one clip
@@ -346,6 +352,98 @@ CLI:
 
 Every explicit index is validated against the decoded clip count and rejected
 with a typed `ClipError::OutOfRange`; non-integers are a typed `PlayError`.
+
+## Clip fingerprint: form-invariant content digest (2026-11-14)
+
+A runtime observation names the packed table the engine selected; the file
+enumeration names the same table in a payload record. Mapping one to the other
+needs a key that survives relocation, so the fingerprint is defined only over
+bytes that are identical in the file and memory forms.
+
+### Definition
+
+```text
+invariant_fp = FNV-1a 32-bit over, in this order:
+  1. table bytes +0x00..+0x10   (16 bytes)
+  2. the complete bit-plane block: flags byte then the present planes,
+     each align8(3 * slot_count) bits
+
+key = "<frame_count>:<divisor>:<invariant_fp as 8 lowercase hex digits>"
+```
+
+Included, and why each is form-invariant:
+
+- `+0x00` table/stream count, `+0x01..+0x03` the three per-channel bytes,
+  `+0x04` `u16` frame count, `+0x06` `s16` divisor, `+0x08..+0x0F` the two
+  duplicated `(divisor << 16) | frame_count` words. These are literal content;
+  relocation copies them unchanged.
+- the flags byte and the per-slot 3-bit component masks. These are static
+  animation content, also copied unchanged.
+
+Excluded, with the reason:
+
+- `+0x10..+0x13`. The field is 4 bytes wide in the file and 8 bytes wide in
+  memory: a file offset versus an absolute pointer. Hashing its low half makes
+  the key form-dependent and session-dependent (ASLR). This is the defect that
+  produced `unmapped` walk keys.
+- the value-offset/pointer array (`+0x14 + i*4` vs `+0x18 + i*8`).
+- the value streams. The file's `+0x14` offsets do not point at the inline
+  palette the replay decodes (UNKNOWN 3), so a stream location shared by both
+  forms is not established. The header and the masks already identify the
+  table.
+
+The pre-fix digest, which hashed `+0x00..+0x14` instead of `+0x00..+0x10`, is
+still emitted as `legacy=`. It is a diagnostic only and must never be used for
+mapping.
+
+### Evidence
+
+A captured memory-form table and the shipped file table were compared for two
+clips. In both clips `+0x00..+0x10` and the whole bit-plane block are
+byte-identical; only the widened field and the pointer array differ.
+
+| Clip | Pair | File legacy | Runtime legacy | Invariant (both forms) |
+|---|---:|---:|---:|---:|
+| 0 (idle) | `50:100` | `b1db0234` | `b1db0234` | `a1f48a74` |
+| 2 | `12:209` | `b71d0a05` | `59559fbd` | `3acaf951` |
+
+- Clip 0's widened field is null in both forms, so the legacy digest coincides
+  by accident. That is the observed idle key, which is why idle mapped before
+  the fix.
+- Clip 2's widened field is a non-null file offset and a relocated pointer. Its
+  legacy digest therefore has three different values: file form, captured
+  session and observed session. Its invariant digest is one value.
+- The observed walk key `12:209:59559fbd` is a legacy key. It cannot be
+  reproduced offline: its 4 bytes at `+0x10..+0x13` are a pointer that exists
+  only in that process. The pair `12:209` plus the byte-identical header and
+  block identify clip 2; under the invariant digest the walk observation emits
+  `12:209:3acaf951`. This is **PARTLY** (fingerprint-implied), pending one
+  runtime run with the fixed probe.
+
+Uniqueness over the 230 `RAZIEL.SRA` clips at 66 slots: the invariant view gives
+**225 distinct keys**. Five pairs collide; the previous 20-byte view had one
+collision, and the four extra collisions are the price of dropping the
+form-dependent word. The mapping policy is unchanged: the index keeps the
+lowest clip and reports `ambiguous`.
+
+### The short jump clips (`2:700`, `2:400`, `4:433`)
+
+These are not misparsed keyed or nested structures. Each pair is a real located
+clip:
+
+| Pair | Clips |
+|---|---:|
+| `2:700` | 35 |
+| `2:400` | 37, 47 |
+| `4:433` | 25, 32 |
+
+The captured runtime arena contains memory-form tables whose `+0x00..+0x10`
+and bit-plane block are byte-identical to those file clips, so the engine
+really selected packed tables with those shapes during the jump window. They
+are short (2-4 frame), slow-divisor tables; their semantic state is UNKNOWN.
+The pair alone cannot separate 37 from 47 or 25 from 32; the invariant digest
+can. Their previous `unmapped` status was the same pointer-hash defect, not a
+missing clip.
 
 ## Offline clip ranking (`--animate --rank-clips`)
 
@@ -528,6 +626,10 @@ transition is the missing observation.
    pointer for one channel.
 6. **Coverage**: one shipped build, one actor, one animation state, one
    non-wrapping frame. Other actors, clips and wrap frames are unobserved.
+7. **The widened `+0x10` field's meaning.** It is an offset in the file and a
+   pointer in memory, but what it points at, and whether it is null for every
+   unloaded clip, is not established. Its non-null-ness is why the legacy
+   fingerprint could never be form-invariant.
 
 ## Falsification ledger
 

@@ -783,7 +783,9 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
 ///
 /// The tables carry no name or id, so the structural fields (file order, payload
 /// record, record-relative offset, frame count, divisor, channel count and plane
-/// flags) are the whole identity a human can map a clip by.
+/// flags) plus the form-invariant content fingerprint are the whole identity a
+/// human can map a clip by. `legacy=` is the pre-fix digest, kept visible so a
+/// stale runtime key can be compared directly.
 fn clip_listing(animation: &sra::SraAnimation, sra_label: &str) -> String {
     let mut lines = vec![format!(
         "sra clips={} slots={} ({sra_label})",
@@ -792,14 +794,16 @@ fn clip_listing(animation: &sra::SraAnimation, sra_label: &str) -> String {
     )];
     for clip in animation.clips() {
         lines.push(format!(
-            "clip index={} record={} offset={} frames={} divisor={} channels={} flags=0x{:02X}",
+            "clip index={} record={} offset={} frames={} divisor={} channels={} flags=0x{:02X} fp={} legacy={}",
             clip.index,
             clip.record,
             clip.offset,
             clip.frame_count,
             clip.divisor,
             clip.channel_count,
-            clip.flags
+            clip.flags,
+            clip.fingerprint_text(),
+            clip.legacy_fingerprint_text()
         ));
     }
     lines.join("\n")
@@ -3646,12 +3650,22 @@ mod cli_tests {
             &[1024.0, 0.0, 0.0, 0.0],
         );
         let animation = crate::sra::SraAnimation::load(container, 2).expect("synthetic table");
+        let clip = animation.clips()[0];
         let listing = clip_listing(&animation, "SYNTH.SRA");
         let lines: Vec<&str> = listing.lines().collect();
         assert_eq!(lines[0], "sra clips=1 slots=2 (SYNTH.SRA)");
         assert_eq!(
             lines[1],
-            "clip index=0 record=0 offset=0 frames=2 divisor=100 channels=3 flags=0x01"
+            format!(
+                "clip index=0 record=0 offset=0 frames=2 divisor=100 channels=3 flags=0x01 fp={} legacy={}",
+                clip.fingerprint_text(),
+                clip.legacy_fingerprint_text()
+            )
+        );
+        assert!(
+            clip.fingerprint_text().starts_with("2:100:"),
+            "the invariant key keeps the pair readable: {}",
+            clip.fingerprint_text()
         );
     }
 

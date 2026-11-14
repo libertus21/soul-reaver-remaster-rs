@@ -82,7 +82,7 @@ The probe hashes a **content-only canonical view**:
 
 ```text
 FNV-1a 32-bit over:
-  the 20-byte form-invariant header
+  the 16-byte form-invariant header (+0x00..+0x10)
   the complete bit-plane block (flags byte + present planes)
 ```
 
@@ -94,6 +94,15 @@ they are cheap to read and make the key human-readable:
 fp = <frame_count>:<divisor>:<8 hex digits>
 ```
 
+The first version of this scheme hashed 20 header bytes. That included
+`+0x10..+0x13`, the low half of a field that is a 4-byte offset in the file and
+an 8-byte absolute pointer in memory. Every clip whose field was non-null
+therefore failed to map (idle was the exception because its field is null). The
+scheme now hashes only `+0x00..+0x10`; `docs/notes/packed-channel-format.md`,
+"Clip fingerprint", records the definition, the measured file/memory pairs and
+the collision count. The probe still emits the old digest as `legacy=` so a
+stale key is diagnosable, but it maps on the invariant key only.
+
 The host enumerates the shipped file with the engine's rule (one packed table
 per payload record, in file order) and fingerprints every clip. This slice
 checked that enumeration against `--animate --list-clips`: **230 of 230 clips
@@ -101,12 +110,11 @@ match in order, record, frame count and divisor**.
 
 ### Uniqueness
 
-The canonical view yields **229 distinct fingerprints for 230 clips**. The one
-collision is a pair of byte-identical tables: they differ only in where their
-value streams live, and their header, bit planes and stream content are the
-same. Choosing the lower index is therefore semantically safe for that pair.
-The probe reports `ambiguous=1` at startup and maps the fingerprint to the
-lowest index; it never hides the collision.
+The canonical view yields **225 distinct fingerprints for 230 clips**: five
+pairs collide. The earlier 20-byte view had one collision, but it was not
+form-invariant, so its extra discrimination came from a pointer. The probe
+reports `ambiguous=<n>` at startup and maps an ambiguous key to the lowest
+index; it never hides the collision.
 
 ## The segment design
 
@@ -206,12 +214,12 @@ Rules that keep the output honest:
 
 | Gate | Result |
 |---|---|
-| `--selftest` | 13 cases, 13 green |
-| `--live-selftest` | 6 cases, 6 green in a real Frida runtime; synthetic channel records and tables with known fingerprints assert the hash, the mapping and the segment aggregation |
+| `--selftest` | 17 cases, 17 green (includes `fingerprint-form-invariant`) |
+| `--live-selftest` | 8 cases, 8 green in a real Frida runtime; synthetic channel records and tables with known fingerprints assert the hash, the mapping and the segment aggregation |
 | `--dry-run` | prints the plan; attaches nothing |
 | `py_compile` | clean |
 | `node --check` on `--print-agent` | clean |
-| `cargo test` | 669 green; docs-only change |
+| `cargo test` | 675 green; `packed_channel` owns the invariant definition and its file/memory tests |
 
 The live harness spawns a throwaway system process, never the game. It
 exercises the real `NativePointer`, `Memory`, `Process`, `Interceptor`,

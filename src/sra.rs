@@ -524,6 +524,32 @@ pub struct SraClipInfo {
     pub divisor: i16,
     pub channel_count: usize,
     pub flags: u8,
+    /// Form-invariant content digest of the table (`+0x00..+0x10` plus the
+    /// complete bit-plane block). This is the key a runtime observation maps
+    /// on; see [`SraClipInfo::fingerprint_text`].
+    pub fingerprint: u32,
+    /// Legacy digest that also hashed `+0x10..+0x13`. Diagnostic only: in
+    /// memory that field is a relocated pointer, so this digest is neither
+    /// form-invariant nor session-invariant.
+    pub legacy_fingerprint: u32,
+}
+
+impl SraClipInfo {
+    /// `<frame_count>:<divisor>:<invariant hex>`, the mapping key.
+    pub fn fingerprint_text(&self) -> String {
+        format!(
+            "{}:{}:{:08x}",
+            self.frame_count, self.divisor, self.fingerprint
+        )
+    }
+
+    /// `<frame_count>:<divisor>:<legacy hex>`, for diagnostics only.
+    pub fn legacy_fingerprint_text(&self) -> String {
+        format!(
+            "{}:{}:{:08x}",
+            self.frame_count, self.divisor, self.legacy_fingerprint
+        )
+    }
 }
 
 /// A clip index outside the located set.
@@ -552,6 +578,8 @@ struct ClipTable {
     table: Range<usize>,
     header: FrameHeader,
     flags: u8,
+    fingerprint: u32,
+    legacy_fingerprint: u32,
 }
 
 /// All packed-channel tables in one `.SRA` file, bound to a model slot count.
@@ -573,7 +601,10 @@ pub struct SraAnimation {
     slot_count: usize,
 }
 
-fn located_table(slice: &[u8], slot_count: usize) -> Option<(FrameHeader, u8)> {
+fn located_table(
+    slice: &[u8],
+    slot_count: usize,
+) -> Option<(FrameHeader, u8, packed_channel::TableFingerprint)> {
     let table = PackedFrameTable::parse(slice, TableForm::File).ok()?;
     let planes = table.bit_planes(slot_count).ok()?;
     if planes.flags() & 0x01 == 0 {
@@ -582,7 +613,8 @@ fn located_table(slice: &[u8], slot_count: usize) -> Option<(FrameHeader, u8)> {
     if packed_channel::decode_inline_channel(&table, slot_count, 0).is_err() {
         return None;
     }
-    Some((table.header(), planes.flags()))
+    let fingerprint = table.fingerprint(slot_count).ok()?;
+    Some((table.header(), planes.flags(), fingerprint))
 }
 
 impl SraAnimation {
@@ -602,13 +634,17 @@ impl SraAnimation {
         for (record, range) in container.records.iter().enumerate() {
             let slice = &bytes[range.clone()];
             for offset in 0..slice.len() {
-                if let Some((header, flags)) = located_table(&slice[offset..], slot_count) {
+                if let Some((header, flags, fingerprint)) =
+                    located_table(&slice[offset..], slot_count)
+                {
                     clips.push(ClipTable {
                         record,
                         offset,
                         table: range.start + offset..range.end,
                         header,
                         flags,
+                        fingerprint: fingerprint.invariant,
+                        legacy_fingerprint: fingerprint.legacy,
                     });
                     break;
                 }
@@ -654,6 +690,8 @@ impl SraAnimation {
             divisor: located.header.divisor,
             channel_count: usize::from(located.header.table_count),
             flags: located.flags,
+            fingerprint: located.fingerprint,
+            legacy_fingerprint: located.legacy_fingerprint,
         })
     }
 
@@ -1619,6 +1657,27 @@ mod tests {
                 .angles,
             vec![[20.0, 40.0, 60.0]]
         );
+    }
+
+    #[test]
+    fn clip_descriptors_expose_the_invariant_and_legacy_fingerprints() {
+        let container = palette_container(&[0x001], 2, 100, &[&[10.0, 20.0]]);
+        let animation = SraAnimation::load(container, 1).expect("one synthetic clip");
+        let clip = animation.clip_info(0).expect("clip 0");
+        assert_eq!(
+            clip.fingerprint_text(),
+            format!("2:100:{:08x}", clip.fingerprint),
+            "the mapping key keeps the pair readable"
+        );
+        assert_eq!(
+            clip.legacy_fingerprint_text(),
+            format!("2:100:{:08x}", clip.legacy_fingerprint)
+        );
+        assert_ne!(
+            clip.fingerprint, clip.legacy_fingerprint,
+            "the 16-byte and 20-byte views are different hash inputs"
+        );
+        assert_ne!(clip.fingerprint, 0, "a real table has a non-zero digest");
     }
 
     #[test]
