@@ -134,6 +134,7 @@ fn error_tag(error: &PlayError) -> u8 {
         PlayError::InvalidPlayerPos(_) => 9,
         PlayError::InvalidCamDistance(_) => 10,
         PlayError::InvalidCamHeight(_) => 11,
+        PlayError::InvalidClip(_) => 12,
     }
 }
 

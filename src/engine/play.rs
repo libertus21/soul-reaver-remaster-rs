@@ -39,7 +39,10 @@ use crate::engine::world::{World, WorldError};
 use crate::object_texture::PageBank;
 use crate::pose;
 use crate::render::{self, FlyCamera, OrbitCamera};
-use crate::sra::{ANIMATION_FPS, PlaybackLoop};
+use crate::sra::{
+    ANIMATION_FPS, ClipError, ClipMap, ClipSelection, ClipSelector, MotionState, PlaybackLoop,
+    units_per_second_for_fps,
+};
 
 /// Camera modes accepted by `--camera`.
 ///
@@ -195,10 +198,18 @@ pub struct PlayOptions {
     pub camera: CameraMode,
     /// Presentation-only `.SRA` animation resource for the player mesh.
     pub sra: Option<PathBuf>,
-    /// Presentation playback rate, in palette frames per second.
+    /// Presentation playback rate, in frames per second for a divisor-100 clip.
     pub anim_fps: u32,
     /// Whether the animation wraps (`false`) or holds the last frame (`true`).
     pub anim_once: bool,
+    /// Frozen clip override (`--clip <N>`); state selection is ignored.
+    pub clip: Option<usize>,
+    /// Explicit grounded/idle clip (`--clip-idle <N>`).
+    pub clip_idle: Option<usize>,
+    /// Explicit grounded/moving clip (`--clip-walk <N>`).
+    pub clip_walk: Option<usize>,
+    /// Explicit airborne clip (`--clip-jump <N>`).
+    pub clip_jump: Option<usize>,
     /// Deterministic diagnostic input sequence (`--input-script`, headless only).
     pub input_script: Option<InputScript>,
     /// Explicit player position that overrides the authored record
@@ -212,6 +223,36 @@ pub struct PlayOptions {
 
 impl PlayOptions {
     pub const DEFAULT_UNIT: &'static str = "under1";
+
+    /// Resolve the state-to-clip mapping against the loaded clip count.
+    ///
+    /// Explicit indices are strict: an index outside `0..clip_count` is a typed
+    /// [`ClipError`]. The default map comes from
+    /// [`ClipMap::for_clip_count`], which is always in range.
+    pub fn clip_selection(&self, clip_count: usize) -> Result<ClipSelection, ClipError> {
+        let default = ClipMap::for_clip_count(clip_count);
+        let map = ClipMap {
+            idle: self.clip_idle.unwrap_or(default.idle),
+            walk: self.clip_walk.unwrap_or(default.walk),
+            jump: self.clip_jump.unwrap_or(default.jump),
+        };
+        let out_of_range = |clip: usize| ClipError::OutOfRange { clip, clip_count };
+        if let Some(fixed) = self.clip {
+            if fixed >= clip_count {
+                return Err(out_of_range(fixed));
+            }
+            return Ok(ClipSelection {
+                fixed: Some(fixed),
+                map,
+            });
+        }
+        for clip in [map.idle, map.walk, map.jump] {
+            if clip >= clip_count {
+                return Err(out_of_range(clip));
+            }
+        }
+        Ok(ClipSelection { fixed: None, map })
+    }
 
     /// Parse the argv that follows `--play`.
     ///
@@ -228,6 +269,10 @@ impl PlayOptions {
             sra: None,
             anim_fps: ANIMATION_FPS,
             anim_once: false,
+            clip: None,
+            clip_idle: None,
+            clip_walk: None,
+            clip_jump: None,
             input_script: None,
             player_pos: None,
             cam_distance: None,
@@ -272,6 +317,16 @@ impl PlayOptions {
                     options.anim_once = true;
                     index += 1;
                     continue;
+                }
+                "--clip" => options.clip = Some(clip_value(args, index, "--clip")?),
+                "--clip-idle" => {
+                    options.clip_idle = Some(clip_value(args, index, "--clip-idle")?)
+                }
+                "--clip-walk" => {
+                    options.clip_walk = Some(clip_value(args, index, "--clip-walk")?)
+                }
+                "--clip-jump" => {
+                    options.clip_jump = Some(clip_value(args, index, "--clip-jump")?)
                 }
                 "--input-script" => {
                     let raw = value(args, index, "--input-script")?;
@@ -351,6 +406,16 @@ fn value<'a>(
         .ok_or(PlayError::MissingValue(option))
 }
 
+fn clip_value(
+    args: &[String],
+    index: usize,
+    option: &'static str,
+) -> Result<usize, PlayError> {
+    let raw = value(args, index, option)?;
+    raw.parse::<usize>()
+        .map_err(|_| PlayError::InvalidClip(raw.to_string()))
+}
+
 /// Typed `--play` failures. `main` prints each one and exits 1.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlayError {
@@ -361,6 +426,7 @@ pub enum PlayError {
     ZeroTicksHeadless,
     InvalidCamera(String),
     InvalidAnimFps(String),
+    InvalidClip(String),
     InvalidInputScript(String),
     InputScriptRequiresHeadless,
     InvalidPlayerPos(String),
@@ -389,6 +455,10 @@ impl fmt::Display for PlayError {
             Self::InvalidAnimFps(value) => write!(
                 f,
                 "invalid value '{value}' for --anim-fps: expected an integer in 1..=240"
+            ),
+            Self::InvalidClip(value) => write!(
+                f,
+                "invalid value '{value}' for a clip option: expected a non-negative integer"
             ),
             Self::InvalidInputScript(value) => write!(
                 f,
@@ -423,6 +493,8 @@ pub enum RunError {
     /// A world load or parse failure: fail with exit code 2.
     World(WorldError),
     Scene(String),
+    /// A clip index outside the decoded set: a typed option error.
+    Clip(crate::sra::ClipError),
     /// A missing or undecodable texture page: fail fast with exit code 2.
     Texture(String),
     /// An unreadable asset archive during headless boot: fail with exit code 2.
@@ -470,6 +542,7 @@ impl fmt::Display for RunError {
             ),
             Self::World(error) => write!(f, "{error}"),
             Self::Scene(detail) => write!(f, "cannot build the render scene: {detail}"),
+            Self::Clip(error) => write!(f, "{error}"),
             Self::Texture(detail) => write!(f, "cannot decode texture page: {detail}"),
             Self::Asset(detail) => write!(f, "cannot read the asset archive: {detail}"),
             Self::Window(detail) => write!(f, "cannot open the play window: {detail}"),
@@ -523,6 +596,15 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
             None => None,
         }
     };
+    let clip_selector = match &animation {
+        Some(animation) => {
+            let selection = options
+                .clip_selection(animation.clip_count())
+                .map_err(RunError::Clip)?;
+            Some(ClipSelector::new(selection))
+        }
+        None => None,
+    };
 
     if options.headless {
         let ticks = options.ticks.unwrap_or(60);
@@ -538,6 +620,7 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
         bank.expect("windowed mode requested textures"),
         options,
         animation,
+        clip_selector,
     )
 }
 
@@ -828,9 +911,10 @@ fn run_windowed(
     bank: PageBank,
     options: &PlayOptions,
     animation: Option<crate::sra::SraAnimation>,
+    clip_selector: Option<ClipSelector>,
 ) -> Result<(), RunError> {
     boot_before_window(frame, &options.bigfile, |frame| {
-        open_window(frame, assets, bank, options, animation)
+        open_window(frame, assets, bank, options, animation, clip_selector)
     })
 }
 
@@ -857,6 +941,7 @@ fn open_window(
     bank: PageBank,
     options: &PlayOptions,
     animation: Option<crate::sra::SraAnimation>,
+    clip_selector: Option<ClipSelector>,
 ) -> Result<(), RunError> {
     let mode = options.camera;
     let unit = options.unit.as_str();
@@ -900,6 +985,7 @@ fn open_window(
         init_error: None,
         title: format!("soul reaver - {unit}"),
         animation,
+        clip_selector,
         anim_fps: options.anim_fps,
         anim_policy: if options.anim_once {
             PlaybackLoop::Once
@@ -1106,6 +1192,8 @@ struct PlayApp {
     init_error: Option<String>,
     title: String,
     animation: Option<crate::sra::SraAnimation>,
+    /// State-driven clip selector; `None` when `--sra` is inactive.
+    clip_selector: Option<ClipSelector>,
     anim_fps: u32,
     anim_policy: PlaybackLoop,
 }
@@ -1120,19 +1208,33 @@ impl PlayApp {
 
     /// The player's produced root facing for the scene builder, if it has moved.
     ///
-    /// When `--sra` is active the animation pose is decoded from the canonical
-    /// tick count through the explicit playback clock, so the presentation frame
-    /// is deterministic and never reads a wall clock. The poses are
-    /// presentation-only: they are not part of `FrameState` or the canonical
-    /// digest.
-    fn player_facing(&self) -> Option<PlayerFacing> {
+    /// When `--sra` is active the selector observes the deterministic grounded /
+    /// moving signals once per rendered frame and maps them to a clip. The
+    /// playback clock consumes the clip's local tick, so a state change restarts
+    /// the new clip at frame 0. Everything here is presentation-only: it is not
+    /// part of `FrameState` and never enters the canonical digest.
+    fn player_facing(&mut self) -> Option<PlayerFacing> {
         let player = self.frame.player()?;
         let yaw = self.frame.player_yaw_binary();
-        let animation = self.animation.as_ref().and_then(|animation| {
-            animation
-                .poses_for_tick(self.frame.ticks(), self.anim_fps, self.anim_policy)
-                .ok()
-        });
+        let tick = self.frame.ticks();
+        let state = MotionState::from_player_signals(
+            self.frame.player_grounded(),
+            self.frame.player_moving(),
+        );
+        if let Some(selector) = self.clip_selector.as_mut() {
+            selector.observe(tick, state);
+        }
+        let animation = match (&self.animation, &self.clip_selector) {
+            (Some(animation), Some(selector)) => animation
+                .poses_for_clip_tick(
+                    selector.clip(),
+                    selector.local_tick(tick),
+                    units_per_second_for_fps(self.anim_fps),
+                    self.anim_policy,
+                )
+                .ok(),
+            _ => None,
+        };
         if yaw.is_none() && animation.is_none() {
             return None;
         }
@@ -1398,6 +1500,7 @@ mod tests {
     use crate::engine::input::InputButton;
     use crate::engine::world::World;
     use crate::level::{ObjectRecord, ObjectReport};
+    use crate::sra::{ClipError, ClipMap};
     use std::path::PathBuf;
 
     fn argv(input: &[&str]) -> Vec<String> {
@@ -1464,6 +1567,15 @@ mod tests {
         assert_eq!(options.sra, None);
         assert_eq!(options.anim_fps, super::ANIMATION_FPS);
         assert!(!options.anim_once);
+        assert_eq!(
+            (
+                options.clip,
+                options.clip_idle,
+                options.clip_walk,
+                options.clip_jump
+            ),
+            (None, None, None, None)
+        );
         assert_eq!(options.input_script, None);
         assert_eq!(options.player_pos, None);
         assert_eq!(options.cam_distance, None);
@@ -1500,6 +1612,68 @@ mod tests {
         assert_eq!(options.sra, Some(PathBuf::from("RAZIEL.SRA")));
         assert_eq!(options.anim_fps, 20);
         assert!(options.anim_once);
+    }
+
+    #[test]
+    fn clip_options_parse_and_resolve_against_the_clip_count() {
+        let options = parse(&[
+            "--bigfile",
+            "B",
+            "--sra",
+            "R.SRA",
+            "--clip-idle",
+            "2",
+            "--clip-walk",
+            "4",
+            "--clip-jump",
+            "6",
+        ])
+        .expect("clip map must parse");
+        let selection = options.clip_selection(10).expect("indices are in range");
+        assert_eq!(
+            selection.map,
+            ClipMap {
+                idle: 2,
+                walk: 4,
+                jump: 6
+            }
+        );
+        assert_eq!(selection.fixed, None);
+
+        let fixed = parse(&["--bigfile", "B", "--clip", "7"]).expect("fixed clip parses");
+        assert_eq!(fixed.clip_selection(10).expect("in range").fixed, Some(7));
+
+        let defaults = parse(&["--bigfile", "B"]).expect("defaults parse");
+        assert_eq!(
+            defaults.clip_selection(10).expect("in range").map,
+            ClipMap {
+                idle: 0,
+                walk: 4,
+                jump: 9
+            },
+            "the default map is deterministic and always in range"
+        );
+
+        let bad_map = parse(&["--bigfile", "B", "--clip-walk", "10"]).expect("parses");
+        assert_eq!(
+            bad_map.clip_selection(10),
+            Err(ClipError::OutOfRange {
+                clip: 10,
+                clip_count: 10
+            })
+        );
+        let bad_fixed = parse(&["--bigfile", "B", "--clip", "11"]).expect("parses");
+        assert_eq!(
+            bad_fixed.clip_selection(10),
+            Err(ClipError::OutOfRange {
+                clip: 11,
+                clip_count: 10
+            })
+        );
+        assert_eq!(
+            parse(&["--bigfile", "B", "--clip", "x"]),
+            Err(PlayError::InvalidClip("x".to_string()))
+        );
     }
 
     #[test]

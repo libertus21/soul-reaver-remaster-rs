@@ -235,11 +235,12 @@ wired into canonical frame state):
 
 The decoder is wired into the shipped `.SRA`:
 
-- `--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>]
-  [--time <T>]` locates the first structurally valid table in a payload record,
-  decodes one frame and prints slot count, channel count, frame index, the first
-  populated angle triples and the first three skinned vertices. Slot count is
-  the model's bone count, not an `.SRA` field.
+- `--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--clip <N>]
+  [--frame <N>] [--time <T>] [--list-clips]` locates every structurally valid
+  table, decodes one frame of the selected clip and prints slot count, channel
+  count, clip index, frame index, the first populated angle triples and the first
+  three skinned vertices. `--list-clips` prints the enumeration instead. Slot
+  count is the model's bone count, not an `.SRA` field.
 - `--play ... --sra <FILE>` decodes one frame per canonical tick and skins the
   player mesh through `pose::skin_positions_hierarchical`. It is presentation
   only: no animation state enters `FrameState` and no golden digest moves.
@@ -254,27 +255,97 @@ slot in slot order. At frame 24, slot 6 decodes to exactly
 
 The capture above fixes the **source-side** frame unit (`divisor` and
 `frame_index = floor(frame_time / divisor)`), but it does **not** establish how
-many palette frames the game draws per second. The authored wall-clock rate is
-therefore **UNKNOWN**. The renderer treats the presentation rate as an explicit
-choice in `src/sra.rs`:
+many source time units the game advances per second. The authored wall-clock
+rate is therefore **UNKNOWN**. The renderer models the presentation clock as a
+constant rate in animation time units per second and lets each clip's `divisor`
+convert that rate into a palette frame index in `src/sra.rs`:
 
 ```text
-frames_elapsed = tick * fps / 60
-index          = frames_elapsed % frame_count      (PlaybackLoop::Loop)
-index          = min(frames_elapsed, frame_count-1) (PlaybackLoop::Once)
+units_elapsed = tick * units_per_second / 60
+frame_index   = units_elapsed / divisor
+index         = frame_index % frame_count           (PlaybackLoop::Loop)
+index         = min(frame_index, frame_count - 1)   (PlaybackLoop::Once)
 ```
+
+The divisor is therefore load-bearing. At the same clock rate, a clip with
+divisor `544` advances `100 / 544` as fast as the validated divisor-100
+reference. The measured `RAZIEL.SRA` clips include divisors `100`, `177`, `209`,
+`233` and `544`, so they keep their relative authored speeds instead of all
+playing at one rate.
 
 The arithmetic is integer-only (`u64`, no float, no wall clock) and narrows only
 at the end, so a large tick count cannot hit the old `u16` frame-time ceiling
-that froze playback. `ANIMATION_FPS` defaults to **50**: the validated table has
-50 frames, so one full palette pass lasts one second of simulation, and one
-palette frame lasts about 1.2 ticks at the fixed 60 Hz rate. This is a
-presentation default, not a measured engine constant.
+that froze playback. `ANIMATION_UNITS_PER_SECOND` defaults to **5000**. That
+value is derived from the validated reference clip: it has divisor `100` and 50
+frames, and the earlier presentation choice played it at 50 palette frames per
+second, so `50 frames/s * 100 units/frame = 5000 units/s`. One full 50-frame
+pass therefore still lasts one second of simulation, and one reference frame
+lasts about 1.2 ticks at the fixed 60 Hz rate. This is a presentation default,
+not a measured engine constant.
 
-Change it with `--anim-fps <N>` (accepted range `1..=240`); add `--anim-once`
-for a single pass that holds the last frame instead of wrapping. In `--animate`,
-an explicit `--frame <N>` overrides the playback clock. The clock is
-presentation-only: it never enters `FrameState` and no determinism golden moves.
+`--anim-fps <N>` (accepted range `1..=240`) keeps its shipped name but is
+defined as frames per second for a divisor-100 clip; it converts internally to
+`N * 100` time units per second. A clip with another divisor plays at
+`N * 100 / divisor` frames per second. Add `--anim-once` for a single pass that
+holds the last frame instead of wrapping. In `--animate`, an explicit
+`--frame <N>` overrides the playback clock. The clock is presentation-only: it
+never enters `FrameState` and no determinism golden moves.
+
+## Clip enumeration and state selection
+
+A `.SRA` payload is a record container, and in the measured files **every
+payload record starts one structurally valid packed frame table**. Enumerating
+"the first valid table in each record, in file order" is therefore the clip
+list; scanning every byte again would also match nested false positives inside a
+record (for example the duplicate header word at `+0x08` parses as a
+one-stream table). Measured read-only, with the model bone count as the slot
+count:
+
+| File | Payload records | Located clips | Frame counts (range) | Streams per table |
+|---|---:|---:|---|---|
+| `RAZIEL.SRA` | 230 | **230** | 1..50 (`50` appears 4x, `48` 3x, `1` 33x) | 3 |
+| `SLUAGH.SRA` | 23 | **23** | 5..15 | 2 |
+
+`RAZIEL.SRA` clip 0 is the validated 50-frame body table: divisor 100, flags
+`0x05` (angle + translation), 3 streams. No table carries a name, id, state
+byte or clip index:
+
+- `+0x00` table/stream count, `+0x04` frame count, `+0x06` divisor.
+- `+0x08` and `+0x0C` are the same packed word, `(divisor << 16) | frame_count`.
+- `+0x14` starts the value-offset array; there is no id word before it.
+- The three bytes at `+0x01..+0x03` are equal within a table (`100` in most,
+  `150` in a few) and do not track record order, so they are not an index.
+- The runtime samples a table through the channel pointer at `+0x38`; it never
+  reads a table id. Which channel set is active is an engine state question,
+  not a field in the file.
+
+**UNKNOWN, not a failure**: the shipped tables do not identify idle, walk or
+jump. The presentation default maps states to distinct clips by position
+(`idle = 0`, `walk = clip_count / 2`, `jump = clip_count - 1`) and is
+overridable. Measured candidates a human can map with `--list-clips`:
+low-motion, loop-like 48-50 frame tables (clips 0, 50, 98 for the player) are
+plausible idle/locomotion, while high-motion one-shot tables (clip 16) are
+plausible jump/attack. These are motion metrics, not identities.
+
+Selection reads only existing deterministic signals: `player_grounded()` and
+whether stage 9 committed a non-zero horizontal delta (`player_moving()`).
+The rule is: evaluate once per rendered frame, switch only on a state change,
+and restart the switched clip at local tick 0. A fixed `--clip <N>` ignores the
+state and uses the global tick. Playback stays presentation-only; no animation
+state enters `FrameState` and no determinism golden moves.
+
+CLI:
+
+```text
+--animate ... --list-clips            print one line per located clip
+--animate ... --clip <N>              decode clip N (default 0)
+--play ... --sra <FILE> \
+    [--clip <N>]                      freeze one clip
+    [--clip-idle <N>] [--clip-walk <N>] [--clip-jump <N>]
+```
+
+Every explicit index is validated against the decoded clip count and rejected
+with a typed `ClipError::OutOfRange`; non-integers are a typed `PlayError`.
 
 ## Validation
 

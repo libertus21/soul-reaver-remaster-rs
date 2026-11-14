@@ -304,6 +304,9 @@ pub struct FrameState {
     player_vertical_velocity: i64,
     /// Whether the player ended the last tick resting on a walkable floor.
     player_grounded: bool,
+    /// Whether stage 9 committed a non-zero horizontal delta this tick.
+    /// Presentation/diagnostic state only: it never enters the canonical fold.
+    player_moving: bool,
     /// The facing yaw last produced from a non-zero horizontal movement delta.
     /// `None` until the player first moves; a zero delta keeps the previous
     /// value. Presentation state only: it never enters the canonical fold.
@@ -340,6 +343,7 @@ impl FrameState {
             player: None,
             player_vertical_velocity: 0,
             player_grounded: false,
+            player_moving: false,
             player_yaw: None,
             player_yaw_binary: None,
             view: CullView::default(),
@@ -448,6 +452,14 @@ impl FrameState {
     /// floor geometry always reports `false` because `Y` is not resolved there.
     pub fn player_grounded(&self) -> bool {
         self.player_grounded
+    }
+
+    /// Whether stage 9 committed a non-zero horizontal delta on the last tick.
+    ///
+    /// Diagnostic presentation state, not part of the canonical digest. A tick
+    /// with no input, or one where the sweep was fully blocked, reports `false`.
+    pub fn player_moving(&self) -> bool {
+        self.player_moving
     }
 
     /// The player's signed vertical velocity in fixed-point subunits per tick.
@@ -787,6 +799,7 @@ impl FrameState {
                 ]);
             }
         }
+        self.player_moving = matches!(horizontal_delta, Some([dx, dy]) if dx != 0 || dy != 0);
         if let Some([dx, dy]) = horizontal_delta
             && let Some(rotation) = pose::yaw_rotation_from_direction(dx as f32, dy as f32)
         {
@@ -1978,6 +1991,36 @@ mod tests {
         let right = frame.player_yaw().expect("right movement sets the facing");
         assert_facing_x(right, [1.0, 0.0, 0.0]);
         assert_ne!(right, forward, "a different direction produces a different rotation");
+    }
+
+    #[test]
+    fn player_moving_tracks_the_committed_horizontal_delta() {
+        let mut frame = frame();
+        tick(&mut frame, 0);
+        assert!(!frame.player_moving(), "no input means no movement");
+
+        frame.queue_input(InputEvent::press(InputButton::Forward));
+        tick(&mut frame, 1);
+        assert!(frame.player_moving(), "a committed delta reports movement");
+
+        frame.queue_input(InputEvent::release(InputButton::Forward));
+        tick(&mut frame, 2);
+        assert!(
+            !frame.player_moving(),
+            "releasing the button clears the movement signal"
+        );
+
+        let mut blocked = FrameState::new(world_with_wall());
+        assert!(
+            blocked.place_player([100 - super::PLAYER_RADIUS_UNITS, 0, 0]),
+            "the player is bound"
+        );
+        blocked.queue_input(InputEvent::press(InputButton::Right));
+        tick(&mut blocked, 3);
+        assert!(
+            !blocked.player_moving(),
+            "a fully blocked sweep commits no delta"
+        );
     }
 
     #[test]
