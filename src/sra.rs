@@ -38,19 +38,45 @@ pub const TANGENT_MAX: i64 = 1_000_000;
 const PAYLOAD_ALIGN: usize = 2048;
 const MAX_COUNT: usize = 1 << 20;
 
-/// Presentation playback rate, in palette frames per second of simulation.
+/// Constant presentation clock rate, in animation time units per second.
 ///
 /// The authored wall-clock rate is **UNKNOWN**. The live capture fixes only the
 /// source-side unit: `frame_index = floor(frame_time / divisor)`, with
 /// `frame_time = 2400` and divisor `100` selecting frame `24`. It says nothing
-/// about how many frames the game draws per second. This value is therefore an
-/// explicit presentation choice, not a measured engine constant.
+/// about how many time units the game advances per second. This value is
+/// therefore an explicit presentation choice, not a measured engine constant.
 ///
-/// `50` is chosen because the validated table has 50 frames, so one full
-/// palette pass lasts one second of simulation, and it is close to the fixed
-/// 60 Hz tick (one palette frame every ~1.2 ticks). Change it with
-/// `--anim-fps <N>`; the clock itself stays integer-only and deterministic.
-pub const ANIMATION_FPS: u32 = 50;
+/// The clock advances this many time units per simulated second, and each clip's
+/// `divisor` turns those units into palette frames. That makes the divisor
+/// load-bearing: a clip with a larger divisor plays proportionally slower.
+///
+/// `5000` is derived from the validated reference clip. It has divisor `100` and
+/// 50 frames, and the previous presentation choice played it at `50` palette
+/// frames per second. `50 frames/s * 100 units/frame = 5000 units/s`, so the
+/// reference clip still makes one full 50-frame pass in one simulated second.
+/// Change the reference speed with `--anim-fps <N>`; the clock itself stays
+/// integer-only and deterministic.
+pub const ANIMATION_UNITS_PER_SECOND: u64 = 5_000;
+
+/// Divisor of the validated reference clip used to interpret `--anim-fps`.
+pub const REFERENCE_DIVISOR: u64 = 100;
+
+/// Presentation playback rate of the reference clip, in palette frames/second.
+///
+/// This is the `--anim-fps` unit: frames per second for a divisor-100 clip. It
+/// is derived from [`ANIMATION_UNITS_PER_SECOND`] so the two cannot drift. A clip
+/// with another divisor plays at `ANIMATION_UNITS_PER_SECOND / divisor` frames
+/// per second.
+pub const ANIMATION_FPS: u32 = (ANIMATION_UNITS_PER_SECOND / REFERENCE_DIVISOR) as u32;
+
+/// Convert the `--anim-fps` reference speed to the clock's time units per second.
+///
+/// `fps` counts frames per second for a divisor-[`REFERENCE_DIVISOR`] clip, so
+/// the equivalent constant rate is `fps * REFERENCE_DIVISOR` time units per
+/// second.
+pub fn units_per_second_for_fps(fps: u32) -> u64 {
+    u64::from(fps) * REFERENCE_DIVISOR
+}
 
 /// How a playback clock handles a frame index past the last palette frame.
 ///
@@ -67,40 +93,52 @@ pub enum PlaybackLoop {
 
 /// Map one canonical 60 Hz tick to a palette frame index for presentation.
 ///
-/// The mapping is integer-only and deterministic: `frames_elapsed = tick * fps
-/// / 60`, then `frames_elapsed % frame_count` ([`PlaybackLoop::Loop`]) or a
-/// clamp to `frame_count - 1` ([`PlaybackLoop::Once`]). No float and no wall
-/// clock is involved.
+/// The mapping is integer-only and deterministic:
 ///
-/// `divisor` is the table's source-side frame unit. It is validated here for
-/// consistency with the decoder, but it does **not** set the presentation rate:
-/// the authored rate is UNKNOWN (see [`ANIMATION_FPS`]). The arithmetic is
-/// `u64` throughout, so large tick counts cannot hit the `u16` frame-time
-/// ceiling that used to freeze playback.
+/// ```text
+/// units_elapsed = tick * units_per_second / 60
+/// frame_index   = units_elapsed / divisor
+/// index         = frame_index % frame_count           (PlaybackLoop::Loop)
+/// index         = min(frame_index, frame_count - 1)   (PlaybackLoop::Once)
+/// ```
+///
+/// `divisor` is the table's source-side frame duration, so it sets the clip's
+/// relative speed: at the same constant rate, a clip with divisor `544` advances
+/// `100 / 544` as fast as the validated divisor-`100` reference. The absolute
+/// wall-clock rate stays UNKNOWN (see [`ANIMATION_UNITS_PER_SECOND`]).
+///
+/// The arithmetic is `u64` throughout, so large tick counts cannot hit the
+/// `u16` frame-time ceiling that used to freeze playback.
 pub fn frame_index_for_playback(
     tick: u64,
-    fps: u32,
+    units_per_second: u64,
     divisor: i16,
     frame_count: usize,
     policy: PlaybackLoop,
 ) -> Result<usize, String> {
-    if fps == 0 {
-        return Err("sra playback: fps 0 cannot advance the animation".to_string());
+    if units_per_second == 0 {
+        return Err(
+            "sra playback: rate 0 units per second cannot advance the animation".to_string(),
+        );
     }
-    if divisor <= 0 {
-        return Err(format!(
-            "sra playback: divisor {divisor} must be positive to select a frame"
-        ));
-    }
+    let divisor = match u64::try_from(divisor) {
+        Ok(value) if value > 0 => value,
+        _ => {
+            return Err(format!(
+                "sra playback: divisor {divisor} must be positive to select a frame"
+            ));
+        }
+    };
     if frame_count == 0 {
         return Err("sra playback: frame count 0 cannot select a frame".to_string());
     }
     let frame_count = u64::try_from(frame_count)
         .map_err(|_| format!("sra playback: frame count {frame_count} does not fit u64"))?;
-    let frames_elapsed = tick.saturating_mul(u64::from(fps)) / 60;
+    let units_elapsed = tick.saturating_mul(units_per_second) / 60;
+    let frame_index = units_elapsed / divisor;
     let index = match policy {
-        PlaybackLoop::Loop => frames_elapsed % frame_count,
-        PlaybackLoop::Once => frames_elapsed.min(frame_count - 1),
+        PlaybackLoop::Loop => frame_index % frame_count,
+        PlaybackLoop::Once => frame_index.min(frame_count - 1),
     };
     usize::try_from(index)
         .map_err(|_| format!("sra playback: frame index {index} does not fit this platform"))
@@ -674,13 +712,13 @@ impl SraAnimation {
         &self,
         clip: usize,
         tick: u64,
-        fps: u32,
+        units_per_second: u64,
         policy: PlaybackLoop,
     ) -> Result<usize, String> {
         let table = self.clip_at(clip).map_err(|error| error.to_string())?;
         frame_index_for_playback(
             tick,
-            fps,
+            units_per_second,
             table.header.divisor,
             usize::from(table.header.frame_count),
             policy,
@@ -710,10 +748,10 @@ impl SraAnimation {
     pub fn frame_index_for_tick(
         &self,
         tick: u64,
-        fps: u32,
+        units_per_second: u64,
         policy: PlaybackLoop,
     ) -> Result<usize, String> {
-        self.frame_index_for_clip_tick(0, tick, fps, policy)
+        self.frame_index_for_clip_tick(0, tick, units_per_second, policy)
     }
 
     /// Palette frame index for one explicit frame-time unit in the default clip.
@@ -744,10 +782,13 @@ impl SraAnimation {
         &self,
         clip: usize,
         tick: u64,
-        fps: u32,
+        units_per_second: u64,
         policy: PlaybackLoop,
     ) -> Result<SraFrame, String> {
-        self.decode_clip_index(clip, self.frame_index_for_clip_tick(clip, tick, fps, policy)?)
+        self.decode_clip_index(
+            clip,
+            self.frame_index_for_clip_tick(clip, tick, units_per_second, policy)?,
+        )
     }
 
     /// Decode one palette frame of the default clip.
@@ -764,10 +805,10 @@ impl SraAnimation {
     pub fn decode_tick(
         &self,
         tick: u64,
-        fps: u32,
+        units_per_second: u64,
         policy: PlaybackLoop,
     ) -> Result<SraFrame, String> {
-        self.decode_clip_tick(0, tick, fps, policy)
+        self.decode_clip_tick(0, tick, units_per_second, policy)
     }
 
     /// The slot-pose list for `frame`, ready for the hierarchical skinner.
@@ -781,10 +822,10 @@ impl SraAnimation {
         &self,
         clip: usize,
         tick: u64,
-        fps: u32,
+        units_per_second: u64,
         policy: PlaybackLoop,
     ) -> Result<Vec<SlotPose>, String> {
-        let frame = self.decode_clip_tick(clip, tick, fps, policy)?;
+        let frame = self.decode_clip_tick(clip, tick, units_per_second, policy)?;
         Ok(self.poses(&frame))
     }
 
@@ -792,10 +833,10 @@ impl SraAnimation {
     pub fn poses_for_tick(
         &self,
         tick: u64,
-        fps: u32,
+        units_per_second: u64,
         policy: PlaybackLoop,
     ) -> Result<Vec<SlotPose>, String> {
-        self.poses_for_clip_tick(0, tick, fps, policy)
+        self.poses_for_clip_tick(0, tick, units_per_second, policy)
     }
 
     fn clip_at(&self, clip: usize) -> Result<&ClipTable, ClipError> {
@@ -1219,25 +1260,36 @@ mod tests {
     }
 
     #[test]
-    fn playback_clock_advances_about_fifty_times_per_second_at_fifty_fps() {
+    fn playback_clock_advances_about_fifty_times_per_second_at_the_default_rate() {
         let mut previous = 0;
         for tick in 0..=120u64 {
-            let index =
-                frame_index_for_playback(tick, ANIMATION_FPS, 100, 1000, PlaybackLoop::Loop)
-                    .expect("clock");
+            let index = frame_index_for_playback(
+                tick,
+                ANIMATION_UNITS_PER_SECOND,
+                100,
+                1000,
+                PlaybackLoop::Loop,
+            )
+            .expect("clock");
             assert!(index >= previous, "index went backwards at tick {tick}");
             previous = index;
         }
         assert_eq!(
-            frame_index_for_playback(60, ANIMATION_FPS, 100, 1000, PlaybackLoop::Loop),
+            frame_index_for_playback(
+                60,
+                ANIMATION_UNITS_PER_SECOND,
+                100,
+                1000,
+                PlaybackLoop::Loop
+            ),
             Ok(50),
-            "60 ticks at 50 fps is 50 palette frames"
+            "60 ticks at the default rate is 50 divisor-100 palette frames"
         );
         let advances = (1..=60u64)
             .filter(|&tick| {
                 let now = frame_index_for_playback(
                     tick,
-                    ANIMATION_FPS,
+                    ANIMATION_UNITS_PER_SECOND,
                     100,
                     1000,
                     PlaybackLoop::Loop,
@@ -1245,7 +1297,7 @@ mod tests {
                 .expect("clock");
                 let before = frame_index_for_playback(
                     tick - 1,
-                    ANIMATION_FPS,
+                    ANIMATION_UNITS_PER_SECOND,
                     100,
                     1000,
                     PlaybackLoop::Loop,
@@ -1261,29 +1313,89 @@ mod tests {
     fn playback_clock_with_divisor_100_and_50_frames_matches_first_transitions() {
         let indices: Vec<usize> = (0..=8u64)
             .map(|tick| {
-                frame_index_for_playback(tick, 50, 100, 50, PlaybackLoop::Loop).expect("clock")
+                frame_index_for_playback(
+                    tick,
+                    ANIMATION_UNITS_PER_SECOND,
+                    100,
+                    50,
+                    PlaybackLoop::Loop,
+                )
+                .expect("clock")
             })
             .collect();
         assert_eq!(indices, vec![0, 0, 1, 2, 3, 4, 5, 5, 6]);
         assert_eq!(
-            frame_index_for_playback(60, 50, 100, 50, PlaybackLoop::Loop),
+            frame_index_for_playback(
+                60,
+                ANIMATION_UNITS_PER_SECOND,
+                100,
+                50,
+                PlaybackLoop::Loop
+            ),
             Ok(0),
             "the 50th advance wraps back to frame 0"
         );
     }
 
     #[test]
+    fn the_divisor_sets_each_clips_relative_playback_rate() {
+        let slider = |tick: u64, divisor: i16| {
+            frame_index_for_playback(
+                tick,
+                ANIMATION_UNITS_PER_SECOND,
+                divisor,
+                1000,
+                PlaybackLoop::Loop,
+            )
+            .expect("clock")
+        };
+        assert_eq!(
+            (slider(0, 100), slider(0, 544)),
+            (0, 0),
+            "both clips start at frame 0"
+        );
+        assert_eq!(
+            (slider(6, 100), slider(6, 544)),
+            (5, 0),
+            "the reference clip advances while the slower clip is still on frame 0"
+        );
+        assert_eq!(
+            (slider(7, 100), slider(7, 544)),
+            (5, 1),
+            "the divisor-544 clip advances one tick later"
+        );
+        assert_eq!(
+            (slider(60, 100), slider(60, 544)),
+            (50, 9),
+            "one second advances 50 reference frames and 9 divisor-544 frames"
+        );
+        assert_eq!(
+            (slider(120, 100), slider(120, 544)),
+            (100, 18),
+            "two seconds preserve the same relative rate"
+        );
+        let reference = slider(490, 100);
+        let slow = slider(490, 544);
+        assert_eq!((reference, slow), (408, 75));
+        assert_eq!(
+            reference * REFERENCE_DIVISOR as usize,
+            slow * 544,
+            "the frame counts are exactly in the ratio 544:100"
+        );
+    }
+
+    #[test]
     fn playback_loop_wraps_at_frame_count_and_does_not_saturate() {
         assert_eq!(
-            frame_index_for_playback(600, 50, 100, 50, PlaybackLoop::Loop),
+            frame_index_for_playback(600, ANIMATION_UNITS_PER_SECOND, 100, 50, PlaybackLoop::Loop),
             Ok(0)
         );
         assert_eq!(
-            frame_index_for_playback(601, 50, 100, 50, PlaybackLoop::Loop),
+            frame_index_for_playback(601, ANIMATION_UNITS_PER_SECOND, 100, 50, PlaybackLoop::Loop),
             Ok(0)
         );
         assert_eq!(
-            frame_index_for_playback(602, 50, 100, 50, PlaybackLoop::Loop),
+            frame_index_for_playback(602, ANIMATION_UNITS_PER_SECOND, 100, 50, PlaybackLoop::Loop),
             Ok(1)
         );
     }
@@ -1291,35 +1403,89 @@ mod tests {
     #[test]
     fn playback_once_saturates_at_the_last_frame() {
         assert_eq!(
-            frame_index_for_playback(59, 50, 100, 50, PlaybackLoop::Once),
+            frame_index_for_playback(59, ANIMATION_UNITS_PER_SECOND, 100, 50, PlaybackLoop::Once),
             Ok(49)
         );
         assert_eq!(
-            frame_index_for_playback(60, 50, 100, 50, PlaybackLoop::Once),
+            frame_index_for_playback(60, ANIMATION_UNITS_PER_SECOND, 100, 50, PlaybackLoop::Once),
             Ok(49)
         );
         assert_eq!(
-            frame_index_for_playback(10_000_000, 50, 100, 50, PlaybackLoop::Once),
+            frame_index_for_playback(
+                10_000_000,
+                ANIMATION_UNITS_PER_SECOND,
+                100,
+                50,
+                PlaybackLoop::Once
+            ),
             Ok(49)
         );
     }
 
     #[test]
+    fn loop_and_once_honor_a_divisor_other_than_100() {
+        let at = |tick: u64, policy: PlaybackLoop| {
+            frame_index_for_playback(tick, ANIMATION_UNITS_PER_SECOND, 544, 10, policy)
+                .expect("clock")
+        };
+        assert_eq!(at(65, PlaybackLoop::Loop), 9);
+        assert_eq!(at(66, PlaybackLoop::Loop), 0, "frame 10 wraps to 0");
+        assert_eq!(at(71, PlaybackLoop::Loop), 0);
+        assert_eq!(at(72, PlaybackLoop::Loop), 1);
+        assert_eq!(at(65, PlaybackLoop::Once), 9);
+        assert_eq!(at(66, PlaybackLoop::Once), 9, "Once holds the last frame");
+        assert_eq!(
+            at(10_000_000, PlaybackLoop::Once),
+            9,
+            "a huge tick still saturates at the divisor-544 last frame"
+        );
+        assert_eq!(
+            at(10_000_000, PlaybackLoop::Loop),
+            2,
+            "a huge tick wraps instead of saturating"
+        );
+    }
+
+    #[test]
     fn large_tick_counts_keep_advancing_past_the_u16_ceiling() {
-        let huge =
-            frame_index_for_playback(10_000_000, 50, 100, 50, PlaybackLoop::Loop).expect("clock");
-        let next = frame_index_for_playback(10_000_001, 50, 100, 50, PlaybackLoop::Loop)
-            .expect("clock");
+        let huge = frame_index_for_playback(
+            10_000_000,
+            ANIMATION_UNITS_PER_SECOND,
+            100,
+            50,
+            PlaybackLoop::Loop,
+        )
+        .expect("clock");
+        let next = frame_index_for_playback(
+            10_000_001,
+            ANIMATION_UNITS_PER_SECOND,
+            100,
+            50,
+            PlaybackLoop::Loop,
+        )
+        .expect("clock");
         assert_eq!((huge, next), (33, 34));
         assert_ne!(huge, 49, "a large tick must not freeze on the last frame");
         assert_ne!(
-            frame_index_for_playback(65_535, 50, 100, 50, PlaybackLoop::Loop),
-            frame_index_for_playback(10_000_000, 50, 100, 50, PlaybackLoop::Loop),
+            frame_index_for_playback(
+                65_535,
+                ANIMATION_UNITS_PER_SECOND,
+                100,
+                50,
+                PlaybackLoop::Loop
+            ),
+            frame_index_for_playback(
+                10_000_000,
+                ANIMATION_UNITS_PER_SECOND,
+                100,
+                50,
+                PlaybackLoop::Loop
+            ),
             "the clock does not saturate at the u16 frame-time ceiling"
         );
         assert!(frame_index_for_playback(0, 0, 100, 50, PlaybackLoop::Loop)
             .unwrap_err()
-            .contains("fps"));
+            .contains("rate 0"));
     }
 
     #[test]
@@ -1327,12 +1493,26 @@ mod tests {
         let container = synthetic_animation_container(&[0x001], 50, 100, &[0.0]);
         let animation = SraAnimation::load(container, 1).expect("synthetic table must locate");
         let frame = animation
-            .decode_tick(10_000_000, ANIMATION_FPS, PlaybackLoop::Loop)
+            .decode_tick(
+                10_000_000,
+                ANIMATION_UNITS_PER_SECOND,
+                PlaybackLoop::Loop
+            )
             .expect("a large tick still decodes");
         assert_eq!(frame.frame_index, 33);
         assert_eq!(
-            animation.frame_index_for_tick(10_000_000, ANIMATION_FPS, PlaybackLoop::Loop),
-            frame_index_for_playback(10_000_000, ANIMATION_FPS, 100, 50, PlaybackLoop::Loop)
+            animation.frame_index_for_tick(
+                10_000_000,
+                ANIMATION_UNITS_PER_SECOND,
+                PlaybackLoop::Loop
+            ),
+            frame_index_for_playback(
+                10_000_000,
+                ANIMATION_UNITS_PER_SECOND,
+                100,
+                50,
+                PlaybackLoop::Loop
+            )
         );
     }
 
@@ -1535,6 +1715,8 @@ mod tests {
             })
         );
         assert!(animation.frame_count_of(1).is_err());
-        assert!(animation.frame_index_for_clip_tick(1, 0, 50, PlaybackLoop::Loop).is_err());
+        assert!(animation
+            .frame_index_for_clip_tick(1, 0, ANIMATION_UNITS_PER_SECOND, PlaybackLoop::Loop)
+            .is_err());
     }
 }

@@ -41,6 +41,7 @@ use crate::pose;
 use crate::render::{self, FlyCamera, OrbitCamera};
 use crate::sra::{
     ANIMATION_FPS, ClipError, ClipMap, ClipSelection, ClipSelector, MotionState, PlaybackLoop,
+    units_per_second_for_fps,
 };
 
 /// Camera modes accepted by `--camera`.
@@ -197,7 +198,7 @@ pub struct PlayOptions {
     pub camera: CameraMode,
     /// Presentation-only `.SRA` animation resource for the player mesh.
     pub sra: Option<PathBuf>,
-    /// Presentation playback rate, in palette frames per second.
+    /// Presentation playback rate, in frames per second for a divisor-100 clip.
     pub anim_fps: u32,
     /// Whether the animation wraps (`false`) or holds the last frame (`true`).
     pub anim_once: bool,
@@ -1228,7 +1229,7 @@ impl PlayApp {
                 .poses_for_clip_tick(
                     selector.clip(),
                     selector.local_tick(tick),
-                    self.anim_fps,
+                    units_per_second_for_fps(self.anim_fps),
                     self.anim_policy,
                 )
                 .ok(),

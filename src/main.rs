@@ -454,7 +454,8 @@ fn facing_report(model: &object::ObjectModel, dx: f32, dy: f32) -> Result<String
 }
 
 /// Which frame `--animate` decodes: an explicit palette index, a frame-time
-/// unit, or the playback clock (which `--anim-fps`/`--anim-once` shape).
+/// unit, or the divisor-aware playback clock (which `--anim-fps`/`--anim-once`
+/// shape; `--anim-fps` counts frames per second for a divisor-100 clip).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FrameChoice {
     Index(usize),
@@ -482,7 +483,8 @@ struct AnimateInput<'a> {
 /// [--time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once] [--list-clips]`:
 /// decode one frame, skin the archived model and print a bounded acceptance
 /// line. The slot count is the model's bone count, not a file field. An explicit
-/// `--frame` wins over the playback clock. `--clip` selects the table and
+/// `--frame` wins over the divisor-aware playback clock; `--anim-fps` counts
+/// frames per second for a divisor-100 clip. `--clip` selects the table and
 /// `--list-clips` prints the full enumeration instead of decoding.
 fn run_animate(args: &[String]) -> ExitCode {
     let input = match animate_input(args) {
@@ -702,7 +704,7 @@ fn animate_report(
         }
         FrameChoice::Time(time) => animation.decode_clip_time(clip, time)?,
         FrameChoice::Playback { tick, fps, policy } => {
-            animation.decode_clip_tick(clip, tick, fps, policy)?
+            animation.decode_clip_tick(clip, tick, sra::units_per_second_for_fps(fps), policy)?
         }
     };
     let poses = animation.poses(&frame);

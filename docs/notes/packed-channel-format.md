@@ -255,27 +255,41 @@ slot in slot order. At frame 24, slot 6 decodes to exactly
 
 The capture above fixes the **source-side** frame unit (`divisor` and
 `frame_index = floor(frame_time / divisor)`), but it does **not** establish how
-many palette frames the game draws per second. The authored wall-clock rate is
-therefore **UNKNOWN**. The renderer treats the presentation rate as an explicit
-choice in `src/sra.rs`:
+many source time units the game advances per second. The authored wall-clock
+rate is therefore **UNKNOWN**. The renderer models the presentation clock as a
+constant rate in animation time units per second and lets each clip's `divisor`
+convert that rate into a palette frame index in `src/sra.rs`:
 
 ```text
-frames_elapsed = tick * fps / 60
-index          = frames_elapsed % frame_count      (PlaybackLoop::Loop)
-index          = min(frames_elapsed, frame_count-1) (PlaybackLoop::Once)
+units_elapsed = tick * units_per_second / 60
+frame_index   = units_elapsed / divisor
+index         = frame_index % frame_count           (PlaybackLoop::Loop)
+index         = min(frame_index, frame_count - 1)   (PlaybackLoop::Once)
 ```
+
+The divisor is therefore load-bearing. At the same clock rate, a clip with
+divisor `544` advances `100 / 544` as fast as the validated divisor-100
+reference. The measured `RAZIEL.SRA` clips include divisors `100`, `177`, `209`,
+`233` and `544`, so they keep their relative authored speeds instead of all
+playing at one rate.
 
 The arithmetic is integer-only (`u64`, no float, no wall clock) and narrows only
 at the end, so a large tick count cannot hit the old `u16` frame-time ceiling
-that froze playback. `ANIMATION_FPS` defaults to **50**: the validated table has
-50 frames, so one full palette pass lasts one second of simulation, and one
-palette frame lasts about 1.2 ticks at the fixed 60 Hz rate. This is a
-presentation default, not a measured engine constant.
+that froze playback. `ANIMATION_UNITS_PER_SECOND` defaults to **5000**. That
+value is derived from the validated reference clip: it has divisor `100` and 50
+frames, and the earlier presentation choice played it at 50 palette frames per
+second, so `50 frames/s * 100 units/frame = 5000 units/s`. One full 50-frame
+pass therefore still lasts one second of simulation, and one reference frame
+lasts about 1.2 ticks at the fixed 60 Hz rate. This is a presentation default,
+not a measured engine constant.
 
-Change it with `--anim-fps <N>` (accepted range `1..=240`); add `--anim-once`
-for a single pass that holds the last frame instead of wrapping. In `--animate`,
-an explicit `--frame <N>` overrides the playback clock. The clock is
-presentation-only: it never enters `FrameState` and no determinism golden moves.
+`--anim-fps <N>` (accepted range `1..=240`) keeps its shipped name but is
+defined as frames per second for a divisor-100 clip; it converts internally to
+`N * 100` time units per second. A clip with another divisor plays at
+`N * 100 / divisor` frames per second. Add `--anim-once` for a single pass that
+holds the last frame instead of wrapping. In `--animate`, an explicit
+`--frame <N>` overrides the playback clock. The clock is presentation-only: it
+never enters `FrameState` and no determinism golden moves.
 
 ## Clip enumeration and state selection
 
