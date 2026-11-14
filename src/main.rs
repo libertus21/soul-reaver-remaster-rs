@@ -53,6 +53,9 @@ mod bone_hierarchy;
 mod cli_argv;
 mod cli_catalog;
 mod cli_out;
+// Offline heuristic ranking for identifier-less `.SRA` clips; read by
+// `--animate --rank-clips` only.
+mod clip_rank;
 // Launcher CLI arg parser (pure). Viewer only strips three no-op flags.
 #[allow(dead_code)]
 mod launcher_cli;
@@ -262,6 +265,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX> --pose <FILE> [--hierarchy] [--bounds]");
         eprintln!("   or: soul-reaver-remaster-rs --facing --bigfile <BIGFILE.DAT> --entry <INDEX> --direction <DX>:<DY>");
         eprintln!("   or: soul-reaver-remaster-rs --animate --sra <FILE.SRA> --bigfile <BIGFILE.DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--anim-fps <N>] [--anim-once]");
+        eprintln!("   or: soul-reaver-remaster-rs --animate --sra <FILE.SRA> --rank-clips --slots <N> [--top <N>]");
         eprintln!("   or: soul-reaver-remaster-rs --srl-info <FILE.SRL>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
@@ -472,8 +476,8 @@ enum FrameChoice {
 
 struct AnimateInput<'a> {
     sra: &'a str,
-    dat: &'a str,
-    entry: usize,
+    dat: Option<&'a str>,
+    entry: Option<usize>,
     frame: Option<usize>,
     time: Option<u16>,
     clip: Option<usize>,
@@ -481,15 +485,21 @@ struct AnimateInput<'a> {
     dump_unmapped: Option<&'a str>,
     anim_fps: u32,
     anim_once: bool,
+    rank_clips: bool,
+    top: usize,
+    slots: Option<usize>,
 }
 
-/// `--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>]
-/// [--time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once] [--list-clips]`:
-/// decode one frame, skin the archived model and print a bounded acceptance
-/// line. The slot count is the model's bone count, not a file field. An explicit
-/// `--frame` wins over the divisor-aware playback clock; `--anim-fps` counts
-/// frames per second for a divisor-100 clip. `--clip` selects the table and
-/// `--list-clips` prints the full enumeration instead of decoding.
+/// `--animate --sra <FILE> (--bigfile <DAT> --entry <INDEX> | --slots <N>)
+/// [--frame <N> | --time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once]
+/// [--list-clips] [--rank-clips [--top <N>]]`: decode one frame, skin the
+/// archived model and print a bounded acceptance line, or rank every clip.
+/// The slot count is the model's bone count, not a file field; `--slots` states
+/// it directly for offline ranking without a model. An explicit `--frame` wins
+/// over the divisor-aware playback clock; `--anim-fps` counts frames per second
+/// for a divisor-100 clip. `--clip` selects the table, `--list-clips` prints the
+/// full enumeration, and `--rank-clips` prints the heuristic shortlist instead
+/// of decoding one frame.
 fn run_animate(args: &[String]) -> ExitCode {
     let input = match animate_input(args) {
         Ok(input) => input,
@@ -505,7 +515,17 @@ fn run_animate(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let entry_bytes = match object::read_entry_bytes(Path::new(input.dat), input.entry) {
+    if input.rank_clips {
+        return run_rank_clips(&input, sra_bytes);
+    }
+    let (dat, entry) = match (input.dat, input.entry) {
+        (Some(dat), Some(entry)) => (dat, entry),
+        _ => {
+            eprintln!("error: --animate needs --bigfile <DAT> --entry <INDEX>");
+            return ExitCode::from(1);
+        }
+    };
+    let entry_bytes = match object::read_entry_bytes(Path::new(dat), entry) {
         Ok(bytes) => bytes,
         Err(error) => {
             eprintln!("error: {error}");
@@ -567,6 +587,56 @@ fn run_animate(args: &[String]) -> ExitCode {
     }
 }
 
+/// `--rank-clips`: decode every located clip and print a bounded heuristic
+/// shortlist. The slot count comes from `--slots` or from the archived model's
+/// bone count; it is not an `.SRA` field.
+fn run_rank_clips(input: &AnimateInput<'_>, sra_bytes: Vec<u8>) -> ExitCode {
+    let slot_count = match input.slots {
+        Some(slots) => slots,
+        None => {
+            let (Some(dat), Some(entry)) = (input.dat, input.entry) else {
+                eprintln!("error: --rank-clips needs --slots or --bigfile/--entry");
+                return ExitCode::from(1);
+            };
+            let entry_bytes = match object::read_entry_bytes(Path::new(dat), entry) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(error.exit_code());
+                }
+            };
+            match object::parse_object(&entry_bytes) {
+                Ok(model) => model.bones.len(),
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(error.exit_code());
+                }
+            }
+        }
+    };
+    let animation = match sra::SraAnimation::load(sra_bytes, slot_count) {
+        Ok(animation) => animation,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let report = match clip_rank::rank_animation(&animation) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let text = clip_rank::report_text(
+        &file_label(Path::new(input.sra)),
+        &report,
+        input.top,
+    );
+    outln!("{text}");
+    ExitCode::SUCCESS
+}
+
 /// Resolve the frame `--animate` prints. An explicit `--frame` wins, then an
 /// explicit `--time`; only when neither is present does the playback clock
 /// apply (at tick 0, so the default frame is still the first palette frame).
@@ -599,6 +669,9 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
     let mut anim_fps = sra::ANIMATION_FPS;
     let mut anim_once = false;
     let mut list_clips = false;
+    let mut rank_clips = false;
+    let mut top = None;
+    let mut slots = None;
     let mut at = 0;
     while at < args.len() {
         match args[at].as_str() {
@@ -608,6 +681,10 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
             }
             "--list-clips" => {
                 list_clips = true;
+                at += 1;
+            }
+            "--rank-clips" => {
+                rank_clips = true;
                 at += 1;
             }
             token => {
@@ -662,6 +739,20 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
         }),
         _ => Err(usage.to_string()),
     }
+    Ok(AnimateInput {
+        sra,
+        dat,
+        entry,
+        frame,
+        time,
+        clip,
+        list_clips,
+        anim_fps,
+        anim_once,
+        rank_clips,
+        top: top.unwrap_or(clip_rank::DEFAULT_TOP),
+        slots,
+    })
 }
 
 /// The `--list-clips` enumeration: one line per located packed table.
@@ -3923,10 +4014,14 @@ mod cli_tests {
         let parsed = animate_input(&parsed_argv).expect("full argv must parse");
         assert_eq!(
             (parsed.sra, parsed.dat, parsed.entry, parsed.frame, parsed.time),
-            ("R.SRA", "B.DAT", 66, Some(24), None)
+            ("R.SRA", Some("B.DAT"), Some(66), Some(24), None)
         );
         assert_eq!((parsed.anim_fps, parsed.anim_once), (crate::sra::ANIMATION_FPS, false));
-        assert_eq!((parsed.clip, parsed.list_clips), (None, false));
+        assert_eq!(
+            (parsed.clip, parsed.list_clips, parsed.rank_clips),
+            (None, false, false)
+        );
+        assert_eq!((parsed.top, parsed.slots), (crate::clip_rank::DEFAULT_TOP, None));
 
         let clip_argv = argv(&[
             "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "66", "--clip", "7",
@@ -3962,6 +4057,39 @@ mod cli_tests {
         assert!(
             animate_input(&argv(&[
                 "--sra", "R.SRA", "--bigfile", "B.DAT", "--entry", "1", "--bogus", "2",
+            ]))
+            .is_err()
+        );
+
+        let rank_argv = argv(&[
+            "--sra", "R.SRA", "--rank-clips", "--slots", "66", "--top", "4",
+        ]);
+        let rank = animate_input(&rank_argv).expect("rank mode accepts an explicit slot count");
+        assert_eq!((rank.rank_clips, rank.slots, rank.top), (true, Some(66), 4));
+        assert_eq!((rank.dat, rank.entry), (None, None));
+
+        let ranked_model_argv = argv(&[
+            "--sra", "R.SRA", "--rank-clips", "--bigfile", "B.DAT", "--entry", "66",
+        ]);
+        let ranked_model =
+            animate_input(&ranked_model_argv).expect("rank mode derives slots from a model");
+        assert_eq!(
+            (ranked_model.slots, ranked_model.dat, ranked_model.entry),
+            (None, Some("B.DAT"), Some(66))
+        );
+
+        assert!(animate_input(&argv(&["--sra", "R.SRA", "--rank-clips"])).is_err());
+        assert!(
+            animate_input(&argv(&[
+                "--sra", "R.SRA", "--rank-clips", "--slots", "66", "--frame", "1",
+            ]))
+            .is_err()
+        );
+        assert!(animate_input(&argv(&["--sra", "R.SRA", "--top", "4"])).is_err());
+        assert!(
+            animate_input(&argv(&[
+                "--sra", "R.SRA", "--rank-clips", "--slots", "66", "--bigfile", "B.DAT",
+                "--entry", "66",
             ]))
             .is_err()
         );

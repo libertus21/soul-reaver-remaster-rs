@@ -385,6 +385,63 @@ CLI:
 Every explicit index is validated against the decoded clip count and rejected
 with a typed `ClipError::OutOfRange`; non-integers are a typed `PlayError`.
 
+## Offline clip ranking (`--animate --rank-clips`)
+
+The tables have no name, id or state byte, so a human mapping idle / walk / jump
+has to try clips one by one. `--animate --sra <FILE> --rank-clips` decodes
+**every** located clip and prints a bounded, parseable shortlist plus a
+`suggest --clip-idle/--clip-walk/--clip-jump` line ready for `--play`.
+
+The slot count is not an `.SRA` field (it is the model bone count), so ranking
+takes it from `--slots <N>` or from `--bigfile <DAT> --entry <INDEX>`:
+
+```text
+--animate --sra <FILE> --rank-clips --slots <N> [--top <N>]
+```
+
+Default `--top` is 8, capped at 64. Output is bounded to
+`10 + 4 * top` lines: one summary, one threshold line, four bucket headers, at
+most `top` rows per bucket, one suggestion and three justification lines.
+
+All per-axis differences are **shortest-arc** binary-angle differences wrapped
+into `[-2048, +2048]` units. Stored angles are not normalized, so a raw
+subtraction across the 0/4096 turn boundary would turn a small rotation into a
+full-turn spike. Reported degrees still use `value * 360 / 4096`.
+
+| Metric | Definition |
+|---|---|
+| `duration_ms` | `frames * divisor * 1000 / 5000` (integer math) |
+| `mean_delta_deg` | mean absolute per-axis consecutive-frame change over all frames/slots |
+| `max_delta_deg` | largest single consecutive-frame change |
+| `loop_closure_deg` | mean `|frame[0] - frame[last]|` per axis; near 0 loops cleanly |
+| `moving_slots` | slots whose largest consecutive-frame change exceeds `0.50deg` |
+| `period` | `p` in `1..frames/2` minimising mean `|frame[k] - frame[k+p]|`, or `none`; residual reported in degrees |
+
+Heuristic thresholds (also printed verbatim by the command):
+
+| Rule | Threshold |
+|---|---|
+| `STILL` | `mean_delta_deg <= 0.50` |
+| `IMPACT` | `max_delta_deg >= 5.00`, `max/mean >= 4.00`, no real periodicity |
+| `LOCOMOTION` | `0.50 < mean_delta_deg <= 8.00`, real period `p >= 2`, residual `<= 1.00deg` |
+| `OTHER` | everything else |
+
+A period of `1` is the trivial adjacent-frame shift: for a smooth trajectory it
+always wins the residual search and says nothing about repetition. It is
+reported as `period=1`, but it is **not** periodicity evidence for `LOCOMOTION`
+or `IMPACT`. Bucket rows are sorted by the bucket's own key (`STILL` ascending
+motion, `LOCOMOTION` ascending residual, `IMPACT` descending spike ratio,
+`OTHER` descending maximum change).
+
+**UNKNOWN, not a failure**: this is a heuristic shortlist, never ground truth.
+Measured read-only on the shipped player body, the thresholds put the still
+clips in `STILL` and every remaining clip in `IMPACT`; no clip passed the real
+periodicity rule, so `LOCOMOTION` is empty. The walk suggestion then falls back
+to the lowest non-still motion and says so in its justification line. A bucket
+can be empty, and an empty bucket is printed with `note=empty` instead of being
+silently guessed. The trio is a starting point for a human, not a recovered
+identity mapping.
+
 ## Validation
 
 ### Live capture
