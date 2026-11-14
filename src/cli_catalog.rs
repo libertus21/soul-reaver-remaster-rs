@@ -19,7 +19,12 @@ pub struct Capability {
 impl Capability {
     /// Whether this capability emits `token` as a bare flag with no value.
     pub fn takes_flag(&self, token: &str) -> bool {
-        matches!(self.name, "animate" | "play") && token == "--anim-once"
+        matches!(
+            (self.name, token),
+            ("animate" | "play", "--anim-once")
+                | ("animate", "--list-clips")
+                | ("animate", "--rank-clips")
+        )
     }
 
     /// Whether this capability emits `token` as a named option with a value
@@ -37,7 +42,15 @@ impl Capability {
             || (self.name == "animate"
                 && matches!(
                     token,
-                    "--sra" | "--bigfile" | "--entry" | "--frame" | "--time" | "--anim-fps"
+                    "--sra"
+                        | "--bigfile"
+                        | "--entry"
+                        | "--frame"
+                        | "--time"
+                        | "--clip"
+                        | "--anim-fps"
+                        | "--top"
+                        | "--slots"
                 ))
             || (self.name == "play"
                 && matches!(
@@ -104,7 +117,7 @@ pub const CAPABILITIES: [Capability; 37] = [
     Capability { group: "level", name: "reach", legacy: "--level-reach --bigfile <DAT> [--start <UNIT>]", summary: "BFS the archived level graph, then group reachable, island and inbound-but-unreachable units.", window: false },
         Capability { group: "game", name: "play", legacy: "--play --bigfile <DAT> [--textures <BIG>] [--unit <NAME>] [--ticks <N>] [--camera <MODE>] [--sra <FILE>] [--anim-fps <N>] [--anim-once] [--headless --input-script <SPEC> [--player-pos <X,Y,Z>]] [--cam-distance <N>] [--cam-height <N>]", summary: "Run the engine on an archive: a deterministic headless acceptance line with --headless, or a textured window; --sra animates the player mesh from a constant time-unit clock whose clips honor their divisors, and --anim-fps sets frames per second for a divisor-100 clip; --input-script prints the measured movement line; --cam-distance/--cam-height shape the player boom.", window: true },
     Capability { group: "game", name: "facing", legacy: "--facing --bigfile <DAT> --entry <INDEX> --direction <DX>:<DY>", summary: "Print the yaw produced for a movement direction and the first skinned vertices.", window: false },
-    Capability { group: "game", name: "animate", legacy: "--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--anim-fps <N>] [--anim-once]", summary: "Decode one .SRA frame and print the first slot angles and skinned vertices; --frame overrides the divisor-aware playback clock, and --anim-fps sets frames per second for a divisor-100 clip.", window: false },
+    Capability { group: "game", name: "animate", legacy: "--animate --sra <FILE> [--bigfile <DAT>] [--entry <INDEX>] [--frame <N>] [--time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once] [--list-clips] [--rank-clips] [--top <N>] [--slots <N>]", summary: "Decode one .SRA frame and print the first slot angles and skinned vertices; --frame overrides the divisor-aware playback clock, --anim-fps sets frames per second for a divisor-100 clip, and --rank-clips prints a bounded heuristic shortlist of every clip (--slots or --bigfile/--entry supply the slot count).", window: false },
 ];
 
 /// The capability table.
