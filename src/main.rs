@@ -663,7 +663,7 @@ fn animate_choice(
 }
 
 fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
-    let usage = "expected --animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once] [--list-clips] [--dump-unmapped <FILE>]";
+    let usage = "expected --animate --sra <FILE> (--bigfile <DAT> --entry <INDEX> | --slots <N>) [--frame <N> | --time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once] [--list-clips] [--dump-unmapped <FILE>] [--rank-clips [--top <N>]]";
     let (mut sra, mut dat, mut entry, mut frame, mut time, mut clip, mut dump_unmapped) =
         (None, None, None, None, None, None, None);
     let mut anim_fps = sra::ANIMATION_FPS;
@@ -707,11 +707,21 @@ fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
                         clip = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
                     }
                     "--dump-unmapped" => dump_unmapped = Some(value),
-                    "--slots" => {
-                        slots = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
-                    }
                     "--top" => {
-                        top = Some(value.parse::<usize>().map_err(|_| usage.to_string())?);
+                        let count = value.parse::<usize>().map_err(|_| usage.to_string())?;
+                        if !(1..=64).contains(&count) {
+                            return Err(format!(
+                                "invalid value '{value}' for --top: expected an integer in 1..=64"
+                            ));
+                        }
+                        top = Some(count);
+                    }
+                    "--slots" => {
+                        let count = value.parse::<usize>().map_err(|_| usage.to_string())?;
+                        if count == 0 {
+                            return Err("--slots must be at least 1".to_string());
+                        }
+                        slots = Some(count);
                     }
                     "--anim-fps" => {
                         let fps = value
@@ -794,7 +804,7 @@ fn clip_listing(animation: &sra::SraAnimation, sra_label: &str) -> String {
     for clip in animation.clips() {
         let additional = if clip.additional { " additional=1" } else { "" };
         lines.push(format!(
-            "clip index={} record={} offset={} frames={} divisor={} channels={} flags=0x{:02X} fp={}{}",
+            "clip index={} record={} offset={} frames={} divisor={} channels={} flags=0x{:02X} fp={} legacy={}{}",
             clip.index,
             clip.record,
             clip.offset,
@@ -803,6 +813,7 @@ fn clip_listing(animation: &sra::SraAnimation, sra_label: &str) -> String {
             clip.channel_count,
             clip.flags,
             clip.fingerprint_text(),
+            clip.legacy_fingerprint_text(),
             additional
         ));
     }
@@ -826,14 +837,15 @@ fn unmapped_report(animation: &sra::SraAnimation, sra_label: &str) -> String {
     )];
     for clip in animation.clips().into_iter().filter(|clip| clip.additional) {
         lines.push(format!(
-            "unmapped index={} record={} offset={} frames={} divisor={} channels={} fp={}",
+            "unmapped index={} record={} offset={} frames={} divisor={} channels={} fp={} legacy={}",
             clip.index,
             clip.record,
             clip.offset,
             clip.frame_count,
             clip.divisor,
             clip.channel_count,
-            clip.fingerprint_text()
+            clip.fingerprint_text(),
+            clip.legacy_fingerprint_text()
         ));
     }
     for rejected in &stats.rejected_aliases {

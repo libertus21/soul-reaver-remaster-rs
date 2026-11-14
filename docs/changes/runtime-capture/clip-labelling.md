@@ -17,11 +17,18 @@ code changed and no golden moved.
 1. Start the game and load a save where Raziel stands on solid ground.
 2. Run the probe with the three timed segments and the path to `RAZIEL.SRA`.
 3. Follow the three prompts: stand still, then walk, then jump.
-4. Read the final `LABELS` line. A numeric index is a packed clip; `keyed` and
-   `unmapped` are producer classes, not indices, until the hypothesis below is
-   settled.
+4. Read the final `LABELS` line. A numeric index is a packed clip; `keyed`
+   and `unmapped` are producer classes, not indices. The probe prints both the
+   invariant key and the legacy digest for the dominant sample.
 
 ## The keyed hypothesis (test pending)
+
+> **2026-11-14 correction.** A later capture with the fixed fingerprint shows
+> idle = clip 0 (`50:100`) and the walk samples on a packed table with pair
+> `12:209` (clip 2). The walk `unmapped` status was the legacy pointer-hash
+> defect, not a keyed producer. The keyed producer still exists (see "The keyed
+> fingerprint"), but it is not the walk explanation. See
+> `docs/notes/packed-channel-format.md`, "Clip fingerprint".
 
 Idle maps cleanly to one clip (`6` frames, divisor `580`, coverage `1.00` on
 both runs). Walk is `97-98%` `unmapped`, and jump is inconsistent (two runs
@@ -130,7 +137,7 @@ The probe hashes a **content-only canonical view**:
 
 ```text
 FNV-1a 32-bit over:
-  the 20-byte form-invariant header
+  the 16-byte form-invariant header (+0x00..+0x10)
   the complete bit-plane block (flags byte + present planes)
 ```
 
@@ -142,6 +149,15 @@ they are cheap to read and make the key human-readable:
 fp = <frame_count>:<divisor>:<8 hex digits>
 ```
 
+The first version of this scheme hashed 20 header bytes. That included
+`+0x10..+0x13`, the low half of a field that is a 4-byte offset in the file and
+an 8-byte absolute pointer in memory. Every clip whose field was non-null
+therefore failed to map (idle was the exception because its field is null). The
+scheme now hashes only `+0x00..+0x10`; `docs/notes/packed-channel-format.md`,
+"Clip fingerprint", records the definition, the measured file/memory pairs and
+the collision count. The probe still emits the old digest as `legacy=` so a
+stale key is diagnosable, but it maps on the invariant key only.
+
 The host enumerates the shipped file with the engine's rule (one packed table
 per payload record, in file order) and fingerprints every clip. This slice
 checked that enumeration against `--animate --list-clips`: **230 of 230 clips
@@ -149,12 +165,11 @@ match in order, record, frame count and divisor**.
 
 ### Uniqueness
 
-The canonical view yields **229 distinct fingerprints for 230 clips**. The one
-collision is a pair of byte-identical tables: they differ only in where their
-value streams live, and their header, bit planes and stream content are the
-same. Choosing the lower index is therefore semantically safe for that pair.
-The probe reports `ambiguous=1` at startup and maps the fingerprint to the
-lowest index; it never hides the collision.
+The canonical view yields **225 distinct fingerprints for 230 clips**: five
+pairs collide. The earlier 20-byte view had one collision, but it was not
+form-invariant, so its extra discrimination came from a pointer. The probe
+reports `ambiguous=<n>` at startup and maps an ambiguous key to the lowest
+index; it never hides the collision.
 
 ## The keyed fingerprint
 
@@ -212,9 +227,9 @@ For the selected object the probe classifies every sample as **packed**,
 **keyed**, or **unmapped**, and prints one line per segment:
 
 ```text
-CLIPLABEL segment=idle seconds=10.0 packed=1.00 keyed=0.00 unmapped=0.00 clips=55:0.96,6:0.02 dominant=55 coverage=0.96 fp=6:580:<hash>
-CLIPLABEL segment=walk seconds=20.0 packed=0.02 keyed=0.96 unmapped=0.02 clips=55:0.02 dominant=keyed coverage=0.96 fp=k300:<hash>
-CLIPLABEL segment=jump seconds=10.0 packed=0.21 keyed=0.04 unmapped=0.75 clips=212:0.21 dominant=unmapped coverage=0.75 fp=1:100:<hash> unmapped_top=1:100:<hash>:75,...
+CLIPLABEL segment=idle seconds=10.0 packed=1.00 keyed=0.00 unmapped=0.00 clips=55:0.96,6:0.02 dominant=55 coverage=0.96 fp=6:580:<hash> legacy=6:580:<hash>
+CLIPLABEL segment=walk seconds=20.0 packed=0.02 keyed=0.96 unmapped=0.02 clips=55:0.02 dominant=keyed coverage=0.96 fp=k300:<hash> legacy=-
+CLIPLABEL segment=jump seconds=10.0 packed=0.21 keyed=0.04 unmapped=0.75 clips=212:0.21 dominant=unmapped coverage=0.75 fp=1:100:<hash> legacy=1:100:<hash> unmapped_top=1:100:<hash>=1:100:<hash>:75,...
 LABELS raziel idle=55 walk=keyed jump=unmapped source=runtime
 ```
 
@@ -225,11 +240,11 @@ The three fractions are disjoint and sum to 1 (rounding aside):
 - `unmapped=` is the share on a packed table whose fingerprint is not in the
   file index.
 
-`dominant=` is a clip index, `keyed`, or `unmapped`; `fp=` is the raw
-fingerprint of that dominant bucket, so a keyed or unmapped result is still
-copyable. `unmapped_top=` prints up to `--max-unmapped` raw packed keys
-verbatim with their counts; that list is the run summary and feeds
-`--match-unmapped`.
+`dominant=` is a clip index, `keyed`, or `unmapped`; `fp=` is the invariant key
+of that dominant bucket and `legacy=` the pre-fix digest for the same sample (a
+keyed sample prints `-`), so a mismatch stays diagnosable. `unmapped_top=`
+prints up to `--max-unmapped` packed keys as `<invariant>=<legacy>:<count>`;
+that list is the run summary and feeds `--match-unmapped`.
 
 Rules that keep the output honest:
 
@@ -284,8 +299,8 @@ Rules that keep the output honest:
   promise that the same state always picks it. Context, speed, weapon, damage
   or progression can change the selection.
 - **The label is not a semantic name in the file.** The `.SRA` carries no
-  idle/walk/jump identifier. `idle=55` means "the engine selected packed clip
-  55 while the operator stood still", not "clip 55 is named idle".
+  idle/walk/jump identifier. `idle=0` means "the engine selected packed clip
+  0 while the operator stood still", not "clip 0 is named idle".
 - **A keyed key is not a clip index.** The file index lists packed tables
   only. A keyed key proves the producer and separates frame arrays at their
   first frame; it does not name a clip, and `LABELS` reports it as `keyed`.
@@ -305,12 +320,12 @@ Rules that keep the output honest:
 
 | Gate | Result |
 |---|---|
-| `--selftest` | 16 cases, 16 green; adds the keyed fingerprint, the keyed-dominant line, the keyed/unmapped separation and the capped unmapped list |
+| `--selftest` | 17 cases, 17 green; adds the keyed fingerprint, the keyed-dominant line, the keyed/unmapped separation, the capped unmapped list and `fingerprint-form-invariant` |
 | `--live-selftest` | 8 cases, 8 green in a real Frida runtime; adds a synthetic keyed channel (non-null keyed pointer and frame array) and a negative channel (keyed pointer with a null frame array) on top of the existing packed cases |
 | `--dry-run` | prints the plan; attaches nothing |
 | `py_compile` | clean |
 | `node --check` on `--print-agent` | clean |
-| `cargo test` | green and unchanged by this docs-only change: 661 on the `main` base, 669 once the pending all-tables slice is included |
+| `cargo test` | 683 green on the current `main` base; `packed_channel` owns the invariant definition and its file/memory tests |
 
 The live harness spawns a throwaway system process, never the game. It
 exercises the real `NativePointer`, `Memory`, `Process`, `Interceptor`,

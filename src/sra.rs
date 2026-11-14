@@ -526,7 +526,12 @@ pub struct SraClipInfo {
     pub channel_count: usize,
     pub flags: u8,
     /// Content-only table fingerprint (`frame_count:divisor:hash` hash part).
+    /// This is the form-invariant digest a runtime observation maps on.
     pub fingerprint: u32,
+    /// Legacy 20-byte-header digest. Diagnostic only: in memory the extra
+    /// field is a relocated pointer, so this digest is neither form- nor
+    /// session-invariant.
+    pub legacy_fingerprint: u32,
     /// Whether this table was found after the first table in its record.
     pub additional: bool,
 }
@@ -537,6 +542,14 @@ impl SraClipInfo {
         format!(
             "{}:{}:{:08x}",
             self.frame_count, self.divisor, self.fingerprint
+        )
+    }
+
+    /// The diagnostic-only legacy key.
+    pub fn legacy_fingerprint_text(&self) -> String {
+        format!(
+            "{}:{}:{:08x}",
+            self.frame_count, self.divisor, self.legacy_fingerprint
         )
     }
 }
@@ -597,6 +610,7 @@ struct ClipTable {
     header: FrameHeader,
     flags: u8,
     fingerprint: u32,
+    legacy_fingerprint: u32,
     additional: bool,
 }
 
@@ -636,6 +650,7 @@ struct LocatedTable {
     /// First byte after the inline value stream, relative to the table start.
     end: usize,
     fingerprint: u32,
+    legacy_fingerprint: u32,
 }
 
 /// Structural validity the loader has always used: parse the header and value
@@ -649,11 +664,13 @@ fn located_table(slice: &[u8], slot_count: usize) -> Option<LocatedTable> {
     }
     let end = packed_channel::inline_stream_end(&table, slot_count).ok()?;
     let fingerprint = table.fingerprint(slot_count).ok()?;
+    let legacy_fingerprint = table.legacy_fingerprint(slot_count).ok()?;
     Some(LocatedTable {
         header: table.header(),
         flags: planes.flags(),
         end,
         fingerprint,
+        legacy_fingerprint,
     })
 }
 
@@ -723,6 +740,7 @@ fn scan_additional(
                     header: located.header,
                     flags: located.flags,
                     fingerprint: located.fingerprint,
+                    legacy_fingerprint: located.legacy_fingerprint,
                     additional: true,
                 });
                 stats.additional_distinct += 1;
@@ -768,6 +786,7 @@ impl SraAnimation {
                 header: base.header,
                 flags: base.flags,
                 fingerprint: base.fingerprint,
+                legacy_fingerprint: base.legacy_fingerprint,
                 additional: false,
             });
             fingerprints.insert(base.fingerprint);
@@ -842,6 +861,7 @@ impl SraAnimation {
             channel_count: usize::from(located.header.table_count),
             flags: located.flags,
             fingerprint: located.fingerprint,
+            legacy_fingerprint: located.legacy_fingerprint,
             additional: located.additional,
         })
     }
@@ -2028,5 +2048,27 @@ mod tests {
                 one.clips()[0].fingerprint
             )
         );
+    }
+
+    #[test]
+    fn clip_descriptors_expose_the_invariant_and_legacy_fingerprints() {
+        let record = palette_record(&[0x001], 2, 100, &[&[10.0, 20.0]]);
+        let animation =
+            SraAnimation::load(encode_single_record_container(&record), 1).expect("one clip");
+        let clip = animation.clip_info(0).expect("clip 0");
+        assert_eq!(
+            clip.fingerprint_text(),
+            format!("2:100:{:08x}", clip.fingerprint),
+            "the mapping key keeps the pair readable"
+        );
+        assert_eq!(
+            clip.legacy_fingerprint_text(),
+            format!("2:100:{:08x}", clip.legacy_fingerprint)
+        );
+        assert_ne!(
+            clip.fingerprint, clip.legacy_fingerprint,
+            "the 16-byte and 20-byte views are different hash inputs"
+        );
+        assert_ne!(clip.fingerprint, 0, "a real table has a non-zero digest");
     }
 }
