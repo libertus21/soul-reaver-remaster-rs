@@ -11,6 +11,7 @@ and engine field offsets, which the repository rules forbid.
 |---|---|---|---|
 | Capture plan | `docs/changes/runtime-capture/capture-plan.md` | yes | Roles, mechanism choice, session procedure, outcome table. No numbers |
 | Live self-test note | `docs/changes/runtime-capture/live-selftest.md` | yes | Why a mocked self-test misses API-shape bugs, and the live-runtime gate every probe must pass |
+| Clip-labelling note | `docs/changes/runtime-capture/clip-labelling.md` | yes | Why offline ranking cannot label idle/walk/jump, the packed and keyed fingerprints, the keyed-locomotion hypothesis, the segment procedure and the limits |
 | This note | `docs/changes/runtime-capture/README.md` | yes | Explains the boundary so the next reader does not go looking for a missing script |
 | Probe script | scratch directory, outside the repo | **no** | Carries module-relative offsets, engine field offsets and host paths |
 | Capture logs | wherever the operator saves them | **no** | Runtime data from a shipped binary; never repo material |
