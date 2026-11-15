@@ -23,6 +23,10 @@ default state map in `sra::ClipMap::for_clip_count`. No golden digest moved.
    and `unmapped` are producer classes, not indices. The probe prints both the
    invariant key and the legacy digest for the dominant sample.
 
+For a repeating action such as jumping, three windows cannot separate its
+phases. Use the time-series path in "The jump profile: a time series, not a
+longer window".
+
 ## Runtime result (2026-11-14)
 
 The three-window capture was run against our own build and produced these
@@ -292,6 +296,81 @@ Rules that keep the output honest:
 - Only one line per segment and one `LABELS` line are printed. There is no
   per-call text, and the host enforces a hard line cap.
 
+## The jump profile: a time series, not a longer window
+
+A single jump window blends three different animations: ascent, fall and
+landing. The measured jump window proves it — four clips shared it (`27:0.16`,
+`16:0.15`, `2:0.12`, `37:0.07`, keyed `0.21`) and no clip passed `0.16`
+coverage. Lengthening that window does not clean the blend; it averages more
+phases into the same histogram. A single window asks "which clip is jump?",
+and the honest answer is "none of them, separately".
+
+A time series asks a different question: "which clip is playing right now?"
+Jumping repeats, so a short window per step lands in one phase of the cycle at
+a time. The dominant clip of each window tracks that phase, and the repeating
+tail of the sequence is the cycle. The phase is inferred from **ordering**, not
+from content: the probe never reads vertical velocity. That is enough to
+separate ascent from fall when the cadence is steady, and it is the reason the
+output is a sequence rather than a longer label.
+
+### New flags
+
+| Flag | Meaning |
+|---|---|
+| `--auto-windows <SECONDS>` | Emit a numbered window every `SECONDS`; names are generated (`w1`, `w2`, ...). Default off. Replaces named `--segments`. |
+| `--total <SECONDS>` | Stop after this much wall time. Optional; without it the run continues until Ctrl+C or the line cap. |
+| `--segments` | Unchanged: named, operator-paced windows. Supplying it together with `--auto-windows` is a typed error, never a silent override. |
+
+### Output shapes
+
+One line per window, carrying the same buckets as a named segment plus the
+window index and its scheduled span:
+
+```text
+CLIPLABEL window=3 t=2.0-3.0 packed=0.80 keyed=0.20 unmapped=0.00 clips=27:0.78,16:0.22 dominant=27 coverage=0.78 fp=6:240:81ba1565 slots=66
+```
+
+The run ends with one sequence line, one token per window:
+
+```text
+SEQUENCE windows=12 step=1.0 dominant=27,27,16,16,2,2,55,55,27,27,16,16
+```
+
+Each token is the window's dominant clip index, or `keyed` / `unmapped` when a
+producer class won, or `-` when the window received no sample. An empty window
+is missing evidence, not a vote; it stays visible in the sequence instead of
+silently disappearing.
+
+### The three-step jump profile
+
+1. **Hold the rhythm.** Start from standing still, then jump repeatedly at a
+   steady rhythm for the whole run. Do not stop between jumps longer than the
+   cycle you want to observe.
+2. **Run the series.** From the scratch directory:
+
+   ```text
+   python sr1_clip_label_probe.py --attach SRX.exe --sra <RAZIEL.SRA> \
+       --slots 66 --auto-windows 1.0 --total 15
+   ```
+
+   The hook arms on the animation channel loop and the probe emits fifteen
+   one-second windows.
+3. **Read the cycle.** Take the repeating tail of `SEQUENCE` and tag the first
+   distinct group as **ascent**, the next as **fall**, and the group that
+   returns to the idle clip as **landing / recovery**. The tail repeats because
+   the action repeats; the first full cycle is the profile.
+
+### How to read the sequence
+
+| Pattern | Reading |
+|---|---|
+| Two windows of one clip, two of the next, then the idle clip, repeating | Ascent, fall, landing/recovery. The cycle is the profile. |
+| The same clip in every window | No phase separation. The window is as long as the phase, or the jump cadence is irregular; shorten `step` and steady the rhythm. |
+| One clip for many windows, then a sudden switch | The window straddled a phase edge. One window is one blend; move to a shorter step to locate the boundary. |
+| `keyed` or `unmapped` runs | That phase selected a producer the file index cannot name. Report the class, not an invented index. |
+| No repeating tail at all | The cadence is irregular; the sequence smears and only the largest bucket per window is trustworthy. |
+| `-` anywhere | An empty window: no sample arrived. Repeat the run; do not read it as a phase. |
+
 ## The exact four-step procedure
 
 1. **Set up.** Start `SRX.exe`, load a save where Raziel stands on solid
@@ -345,9 +424,18 @@ Rules that keep the output honest:
 - **The player is inferred, not identified.** The probe uses the
   largest-coverage object. A scene with another 66-slot actor could compete
   for that role.
+- **The probe never reads vertical velocity.** The jump phase is inferred from
+  the ordering in `SEQUENCE`, not from motion. An irregular jump cadence, or a
+  step comparable in length to ascent or fall, smears the sequence; ascent and
+  fall cannot be told apart by the content of one window.
+- **A sequence token is not a semantic name.** `SEQUENCE ... 27,27,16,16`
+  means "the engine selected clip 27 in two consecutive windows while the
+  operator was ascending", not "clip 27 is named ascent". The tag comes from
+  where the group sits in the cycle, and a different cadence can shift it.
 - **No transitions, blends or mixed windows.** Only the dominant producer per
   window is reported; the frames at a transition are part of the next or
-  previous bucket.
+  previous bucket. In the jump profile that means the boundary window is a
+  blend and only the repeating interior of a group is clean.
 - **Not every frame is sampled.** A table active for a single frame may never
   win a bucket. Absence from the top buckets is not proof the table is unused.
 
@@ -355,9 +443,9 @@ Rules that keep the output honest:
 
 | Gate | Result |
 |---|---|
-| `--selftest` | 17 cases, 17 green; adds the keyed fingerprint, the keyed-dominant line, the keyed/unmapped separation, the capped unmapped list and `fingerprint-form-invariant` |
-| `--live-selftest` | 8 cases, 8 green in a real Frida runtime; adds a synthetic keyed channel (non-null keyed pointer and frame array) and a negative channel (keyed pointer with a null frame array) on top of the existing packed cases |
-| `--dry-run` | prints the plan; attaches nothing |
+| `--selftest` | 21 cases, 21 green; adds `auto-window-lines`, `auto-window-empty`, `auto-window-sequence` and `auto-window-conflict` to the keyed, keyed/unmapped, capped-list and form-invariance cases |
+| `--live-selftest` | 9 cases, 9 green in a real Frida runtime; adds `auto-window-sequence`, which drives four synthetic windows (one empty) through the real agent segment lifecycle and asserts the token order on top of the packed, keyed and negative cases |
+| `--dry-run` | prints the plan; attaches nothing. `--auto-windows 1.0 --total 15` reports `planned=15`; `--auto-windows` plus `--segments` exits with the typed conflict |
 | `py_compile` | clean |
 | `node --check` on `--print-agent` | clean |
 | `cargo test` | 688 green after wiring the labelled defaults; `packed_channel` owns the invariant definition and its file/memory tests |
@@ -388,10 +476,12 @@ reporting an empty segment.
 
 ## Next step
 
-Idle and walk are labelled; jump is not. A jump slice would need the operator to
-hold jump-up, fall and land as three separate windows (or the probe to segment
-by vertical velocity) so each clip is measured on its own, then repeat the idle
-window on a different section to characterise the clip-0 variant. Until then,
-`27` stays a documented PARTIAL and must not be reported as a confirmed jump
-clip. Do not change the heuristic on a single unmapped window: re-run it first,
-because that is an unobserved table, not a wrong label.
+Idle and walk are labelled; jump is still PARTIAL. The time-series probe is the
+instrument for the jump profile: run the three-step procedure above, then
+repeat it twice at the same cadence. A clip is confirmed for a phase only when
+the same group occupies the same position in the repeating tail across runs.
+Until then, `27` stays the documented best-effort default and must not be
+reported as a confirmed jump clip. A second idle run on a different section
+would characterise the clip-0 variant. Do not change the heuristic on a single
+unmapped window: re-run it first, because that is an unobserved table, not a
+wrong label.
