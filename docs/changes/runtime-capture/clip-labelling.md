@@ -5,7 +5,8 @@ source moves to the runtime: a probe observes which frame producer the engine
 selects for the player while a human performs each state, fingerprints the
 selected table, and maps packed tables to a clip index. This note records the
 failure of the heuristic, the packed and keyed fingerprint schemes, the
-segment aggregation, the keyed-locomotion hypothesis, and the exact operator
+segment aggregation, the keyed-locomotion hypothesis, the vertical-motion
+segmentation that replaced time windows for the jump, and the exact operator
 procedure. The probe itself stays in the session scratch directory because it
 carries module-relative anchors and engine field offsets.
 
@@ -14,18 +15,23 @@ launched and no production code changed. The capture has since been run (see
 "Runtime result" below), and the measured idle and walk indices are now the
 default state map in `sra::ClipMap::for_clip_count`. No golden digest moved.
 
+Jump labelling no longer asks a human to keep a rhythm. The probe classifies
+each observed frame by the player's own vertical velocity and aggregates per
+phase, so the measurement does not depend on the operator's cadence.
+
 ## Quick path
 
 1. Start the game and load a save where Raziel stands on solid ground.
-2. Run the probe with the three timed segments and the path to `RAZIEL.SRA`.
-3. Follow the three prompts: stand still, then walk, then jump.
-4. Read the final `LABELS` line. A numeric index is a packed clip; `keyed`
-   and `unmapped` are producer classes, not indices. The probe prints both the
-   invariant key and the legacy digest for the dominant sample.
+2. Run the probe in its default mode with the path to `RAZIEL.SRA`:
+   `--attach SRX.exe --sra <RAZIEL.SRA> --slots 66 --motion-seconds 15`.
+3. Stand still for a moment, then jump normally and land. No steady rhythm is
+   required; the probe reads vertical motion, not your timing.
+4. Read `ZCALIB`, the four `PHASE` lines and the final `LABELS` line. A
+   numeric index is a packed clip; `unknown` means the phase was too thin or
+   the signal failed calibration.
 
-For a repeating action such as jumping, three windows cannot separate its
-phases. Use the time-series path in "The jump profile: a time series, not a
-longer window".
+`--segments` (three timed prompts) and `--auto-windows` (a diagnostic time
+series) still work, but they are no longer the way to label the jump.
 
 ## Runtime result (2026-11-14)
 
@@ -49,10 +55,10 @@ Two caveats belong to the result, not to a footnote:
   coverage `1.00` instead of clip `55`. Both runs are clean, so idle appears to
   select more than one table, likely per section or variant. `55` is the most
   frequent observation and is the default.
-- **Jump is not confirmed.** A single timed window contains jump-up, fall and
-  land, so a spread across four clips is expected; the probe cannot separate
-  them. `27` is the largest share and is kept as a documented best-effort
-  default only.
+- **Jump is not confirmed by a timed window.** A single timed window contains
+  jump-up, fall and land, so a spread across four clips is expected. `27` is
+  the largest share and is kept as a documented best-effort `jump_up` default
+  only until the vertical-phase run below reproduces it.
 
 These values are wired into `sra::ClipMap::for_clip_count` with a per-index
 provenance doc comment, clamped to the decoded clip count so a short animation
@@ -296,82 +302,177 @@ Rules that keep the output honest:
 - Only one line per segment and one `LABELS` line are printed. There is no
   per-call text, and the host enforces a hard line cap.
 
-## The jump profile: a time series, not a longer window
+## Why time windows were replaced
 
-A single jump window blends three different animations: ascent, fall and
-landing. The measured jump window proves it — four clips shared it (`27:0.16`,
-`16:0.15`, `2:0.12`, `37:0.07`, keyed `0.21`) and no clip passed `0.16`
-coverage. Lengthening that window does not clean the blend; it averages more
-phases into the same histogram. A single window asks "which clip is jump?",
-and the honest answer is "none of them, separately".
+The time-window profile never reproduced. Two identical 15-second jump runs,
+same save, same operator, one-second windows:
 
-A time series asks a different question: "which clip is playing right now?"
-Jumping repeats, so a short window per step lands in one phase of the cycle at
-a time. The dominant clip of each window tracks that phase, and the repeating
-tail of the sequence is the cycle. The phase is inferred from **ordering**, not
-from content: the probe never reads vertical velocity. That is enough to
-separate ascent from fall when the cadence is steady, and it is the reason the
-output is a sequence rather than a longer label.
+```text
+run 1  SEQUENCE dominant=55,36,16,2,27,36,35,35,27,27,0,27,27,35,0
+run 2  SEQUENCE dominant=0,36,36,36,0,36,39,35,27,0,36,16,2,27,27
+```
 
-### New flags
+The two sequences are incompatible, and the numbers say why:
+
+| Measurement | Value |
+|---|---|
+| Per-window coverage | `0.21` to `0.52` |
+| Clips mixed into one window | 4 to 6 |
+| Dominant entries that are 1-2 frame poses | several (`55`, `36`, `0`) |
+| `unmapped` across all 30 windows | `0.00` |
+
+One second is longer than a phase and close to the whole jump cycle, so each
+window averages ascent, fall and landing instead of separating them. The
+dominant clip of a window is then whichever pose happened to win a blend, and
+several of those poses last one or two frames: they cannot be an animation.
+Asking a human to hold a rhythm only helps if that rhythm matches the engine's
+cycle, which is a coincidence, not a measurement.
+
+The fingerprint side is not at fault: `unmapped = 0.00` in every window. Only
+the labelling window was wrong, so the window is what this slice replaces.
+
+## The vertical signal
+
+Three candidates were evaluated in order:
+
+| Candidate | Verdict |
+|---|---|
+| Root pose slot's world translation Z | **Chosen.** The runtime slot layout is documented and measured: 13 floats per slot, translation at float indices 10..12, and the walking series moves `x`/`y` while `z` stays constant in a Z-up world. Reachable from the same channel loop hook. |
+| The player object's world position field | Rejected. The runtime object's field layout is not pinned by any note; using an unverified offset would move the uncertainty from the measurement to the address. |
+| Any other vertical already in the channel loop | Rejected. The channel record carries frame-producer data, not motion. |
+
+Reading it does not assume an object layout. At the channel loop the object
+base is recovered when the return address is one of the three known
+per-object sites. The offset of the object field that points at the pose array
+is then discovered **once per object** by a bounded scan of aligned pointer
+fields, scored by pose shape: a near-orthonormal 3x3 rotation block per sampled
+slot and a finite translation. The offset is cached; the pointer is re-read
+every frame because the pose array lives in a per-frame arena. Each sample is
+`float 12` (Z) of slot 0.
+
+The probe does not trust the signal. It prints one bounded calibration line:
+
+```text
+ZCALIB signal=root-slot-z samples=812 zmin=-4831.5 zmax=-4632.0 dzmin=-37.2 dzmax=39.8 sign_changes=41 flat=0.12 calibrated=yes
+```
+
+Calibration requires at least 24 samples, at least 95% finite values and
+`|z| <= 1e6` world units. The line also shows the observed range, the `dz`
+range, how often `dz` changes sign and the flat fraction, so a wrong signal is
+visible immediately: standing should be flat with about zero sign changes, and
+a jump must change sign. If calibration fails, the run prints
+`calibrated=no reason=<insufficient|nonfinite|range|no-player>` and **no phase
+is labelled**; an uncalibrated run is missing evidence, not a result.
+
+## Phases and hysteresis
+
+`dz` is the difference in Z between consecutive samples of the same object, so
+one sample is one animation invocation, not one wall-clock tick. Three named
+constants govern the machine, in world units per frame:
+
+| Constant | Value | Role |
+|---|---:|---|
+| `DZ_ENTER` | `4.0` | Larger threshold: used to start ascent or fall |
+| `DZ_LEAVE` | `1.5` | Smaller threshold: used to return to a grounded phase |
+| `DZ_HOLD` | `3` | Consecutive frames required before a change commits |
+
+| Condition | Phase |
+|---|---|
+| `dz > DZ_ENTER` | `ASCENT` |
+| `dz < -DZ_ENTER` | `FALL` |
+| `abs(dz) <= DZ_LEAVE` after having been airborne | `LANDED` |
+| `abs(dz) <= DZ_LEAVE` and never airborne in this run | `GROUND` |
+| `DZ_LEAVE < abs(dz) <= DZ_ENTER` | dead band: hold the current phase |
+
+The dead band is the hysteresis. A phase is entered only above `DZ_ENTER`, but
+it is left only once a different phase has satisfied its own entry condition
+for `DZ_HOLD` consecutive frames. An apex that hovers near zero therefore holds
+`ASCENT` instead of flapping, and a jittery standing signal stays `GROUND`.
+`GROUND` is only reachable while the object has never been airborne; after the
+first ascent or fall the grounded phase is `LANDED`, which is what makes a
+landing distinguishable from the initial stance.
+
+## Aggregation per phase
+
+There are no windows. Every sampled frame contributes to exactly one phase, and
+each phase is aggregated over the whole run: frame count, mapped clip
+distribution, keyed share, dominant clip and coverage.
+
+```text
+PHASE name=ascent frames=41 clips=27:0.88,16:0.07 dominant=27 coverage=0.88
+PHASE name=fall frames=38 clips=2:0.71,29:0.18 dominant=2 coverage=0.71
+PHASE name=land frames=17 clips=55:0.94 dominant=55 coverage=0.94
+PHASE name=ground frames=120 clips=55:0.96 dominant=55 coverage=0.96
+```
+
+`clips=` lists the top mapped indices with their share of that phase, so a
+mixed phase is visible rather than hidden behind one number. A phase whose
+dominant clip is `keyed` or `unmapped` keeps that class; it never becomes a
+clip index.
+
+The run ends with one line that is directly usable:
+
+```text
+LABELS raziel idle=55 walk=2 jump_up=27 fall=2 land=55 source=runtime-vertical
+```
+
+`jump_up`, `fall` and `land` are this run's measurement (`ASCENT`, `FALL`,
+`LANDED`). `idle` and `walk` are **carried**: a jump run does not observe
+either state, so their values are the confirmed three-segment labels and can
+be overridden with `--idle-clip` / `--walk-clip`.
+
+A phase is printed as `unknown` when its frame count is below `6` or its
+dominant coverage is below `0.40`, and every field is `unknown` when the run is
+uncalibrated. A thin or blended phase is not worth a guess.
+
+### Modes and flags
 
 | Flag | Meaning |
 |---|---|
-| `--auto-windows <SECONDS>` | Emit a numbered window every `SECONDS`; names are generated (`w1`, `w2`, ...). Default off. Replaces named `--segments`. |
-| `--total <SECONDS>` | Stop after this much wall time. Optional; without it the run continues until Ctrl+C or the line cap. |
-| `--segments` | Unchanged: named, operator-paced windows. Supplying it together with `--auto-windows` is a typed error, never a silent override. |
+| `--by-motion` | Default mode: one run, frames classified by vertical motion, aggregated per phase. |
+| `--motion-seconds <SECONDS>` | Length of that single run (default `15`). `--total` overrides it. |
+| `--dz-enter`, `--dz-leave`, `--dz-hold` | Override the hysteresis constants; `leave` must stay below `enter`. |
+| `--idle-clip`, `--walk-clip` | Carried labels for the final line (defaults `55` and `2`). |
+| `--segments` | Named, operator-paced segments (the three-prompt capture). Still supported. |
+| `--auto-windows <SECONDS>` | Diagnostic time series, one numbered window per step. Still supported, no longer used for labelling. |
+| `--total <SECONDS>` | Stop after this much wall time. |
 
-### Output shapes
+Supplying `--by-motion` together with `--segments`, `--segment` or
+`--auto-windows` is a typed error, never a silent override.
 
-One line per window, carrying the same buckets as a named segment plus the
-window index and its scheduled span:
+### The three-step jump procedure
 
-```text
-CLIPLABEL window=3 t=2.0-3.0 packed=0.80 keyed=0.20 unmapped=0.00 clips=27:0.78,16:0.22 dominant=27 coverage=0.78 fp=6:240:81ba1565 slots=66
-```
-
-The run ends with one sequence line, one token per window:
-
-```text
-SEQUENCE windows=12 step=1.0 dominant=27,27,16,16,2,2,55,55,27,27,16,16
-```
-
-Each token is the window's dominant clip index, or `keyed` / `unmapped` when a
-producer class won, or `-` when the window received no sample. An empty window
-is missing evidence, not a vote; it stays visible in the sequence instead of
-silently disappearing.
-
-### The three-step jump profile
-
-1. **Hold the rhythm.** Start from standing still, then jump repeatedly at a
-   steady rhythm for the whole run. Do not stop between jumps longer than the
-   cycle you want to observe.
-2. **Run the series.** From the scratch directory:
+1. **Stand.** Load a save where Raziel stands on solid ground in a quiet room,
+   focus the game window and leave the game unpaused.
+2. **Run.** From the scratch directory:
 
    ```text
    python sr1_clip_label_probe.py --attach SRX.exe --sra <RAZIEL.SRA> \
-       --slots 66 --auto-windows 1.0 --total 15
+       --slots 66 --motion-seconds 15
    ```
 
-   The hook arms on the animation channel loop and the probe emits fifteen
-   one-second windows.
-3. **Read the cycle.** Take the repeating tail of `SEQUENCE` and tag the first
-   distinct group as **ascent**, the next as **fall**, and the group that
-   returns to the idle clip as **landing / recovery**. The tail repeats because
-   the action repeats; the first full cycle is the profile.
+   Wait for `CLIPLABEL HOST attached`, then for the `SEGMENT name=motion`
+   prompt. Stand still for a second, then jump normally and land, as many times
+   as fits in the run. No rhythm is required.
+3. **Read.** Check `ZCALIB` first: `calibrated=yes` and a `dz` range that
+   changes sign. Then read the `PHASE` lines and the `LABELS` line. A phase
+   printed `unknown` is missing evidence, not a negative.
 
-### How to read the sequence
+### How to read the result
 
 | Pattern | Reading |
 |---|---|
-| Two windows of one clip, two of the next, then the idle clip, repeating | Ascent, fall, landing/recovery. The cycle is the profile. |
-| The same clip in every window | No phase separation. The window is as long as the phase, or the jump cadence is irregular; shorten `step` and steady the rhythm. |
-| One clip for many windows, then a sudden switch | The window straddled a phase edge. One window is one blend; move to a shorter step to locate the boundary. |
-| `keyed` or `unmapped` runs | That phase selected a producer the file index cannot name. Report the class, not an invented index. |
-| No repeating tail at all | The cadence is irregular; the sequence smears and only the largest bucket per window is trustworthy. |
-| `-` anywhere | An empty window: no sample arrived. Repeat the run; do not read it as a phase. |
+| `calibrated=no` | The vertical signal failed. Do not read the phases; re-run and check `ZCALIB`. |
+| One clip dominates `ascent` and a different one dominates `fall` | The two phases are distinct animations. That is the jump profile. |
+| The same clip dominates `ascent` and `fall` | One animation covers the airborne body; the phase split is real but the clip is shared. |
+| `land` dominated by the `ground` clip | Landing returns to the stance animation; the phase boundary is real but the clip is shared. |
+| Coverage below `0.40` in a phase | The phase is a blend. Report the class, not the guessed index. |
+| `keyed` or `unmapped` dominant | That phase selected a producer the file index cannot name. |
 
-## The exact four-step procedure
+## The exact four-step segment procedure (optional)
+
+The three-prompt capture is still the way to label idle and walk. It is not
+used for the jump.
 
 1. **Set up.** Start `SRX.exe`, load a save where Raziel stands on solid
    ground in a quiet room, focus the game window, and leave the game
@@ -424,31 +525,39 @@ silently disappearing.
 - **The player is inferred, not identified.** The probe uses the
   largest-coverage object. A scene with another 66-slot actor could compete
   for that role.
-- **The probe never reads vertical velocity.** The jump phase is inferred from
-  the ordering in `SEQUENCE`, not from motion. An irregular jump cadence, or a
-  step comparable in length to ascent or fall, smears the sequence; ascent and
-  fall cannot be told apart by the content of one window.
-- **A sequence token is not a semantic name.** `SEQUENCE ... 27,27,16,16`
-  means "the engine selected clip 27 in two consecutive windows while the
-  operator was ascending", not "clip 27 is named ascent". The tag comes from
-  where the group sits in the cycle, and a different cadence can shift it.
-- **No transitions, blends or mixed windows.** Only the dominant producer per
-  window is reported; the frames at a transition are part of the next or
-  previous bucket. In the jump profile that means the boundary window is a
-  blend and only the repeating interior of a group is clean.
+- **The vertical signal is measured; the phase-to-clip mapping is still an
+  inference.** `ASCENT` means "the root pose slot's Z was rising for at least
+  `DZ_HOLD` frames". It does not prove the engine's state machine considered
+  the actor to be jumping, and a clip may span two phases.
+- **A clip can span two phases.** If one animation covers the whole airborne
+  arc, `ascent` and `fall` legitimately report the same index. That is a
+  property of the animation, not a failed measurement.
+- **The pose array is the builder's output.** The sampled slot may be the
+  previous frame's build. At animation rate that is a one-frame lag in the
+  phase boundary, not a wrong sign.
+- **A phase label is not a semantic name.** `jump_up=27` means "the engine
+  selected packed clip 27 while the root slot was rising", not "clip 27 is
+  named jump-up".
+- **`idle` and `walk` are carried, not re-measured.** A jump run never observes
+  either state; their values come from the confirmed three-segment capture and
+  are printed as such.
+- **No transitions or blends are modelled.** A phase boundary is committed
+  after `DZ_HOLD` frames, so the first frames after a boundary may still carry
+  the previous phase. Dense transitions are not resolved.
 - **Not every frame is sampled.** A table active for a single frame may never
-  win a bucket. Absence from the top buckets is not proof the table is unused.
+  win a phase bucket. Absence from the top buckets is not proof the table is
+  unused.
 
 ## Verification
 
 | Gate | Result |
 |---|---|
-| `--selftest` | 21 cases, 21 green; adds `auto-window-lines`, `auto-window-empty`, `auto-window-sequence` and `auto-window-conflict` to the keyed, keyed/unmapped, capped-list and form-invariance cases |
-| `--live-selftest` | 9 cases, 9 green in a real Frida runtime; adds `auto-window-sequence`, which drives four synthetic windows (one empty) through the real agent segment lifecycle and asserts the token order on top of the packed, keyed and negative cases |
-| `--dry-run` | prints the plan; attaches nothing. `--auto-windows 1.0 --total 15` reports `planned=15`; `--auto-windows` plus `--segments` exits with the typed conflict |
+| `--selftest` | 31 cases, 31 green; the four mandatory vertical series are `motion-clean-arc`, `motion-jitter-holds`, `motion-ground-only` and `motion-uncalibrated`, plus the `ZCALIB`, `PHASE`, `LABELS`, `unknown` and mode-conflict cases |
+| `--live-selftest` | 14 cases, 14 green in a real Frida runtime; the vertical machine runs in the real agent and matches the host for the clean arc, the jittery series, the grounded series and the uncalibrated one; `motion-scan-read-path` allocates a synthetic object and proves the bounded pose-field discovery plus the root-slot Z read in the real runtime |
+| `--dry-run` | prints the plan; attaches nothing. Default mode reports the signal, the hysteresis constants and the per-phase aggregation; `--by-motion` plus `--segments` exits with the typed conflict; `--auto-windows 1.0 --total 3` still reports `planned=3` |
 | `py_compile` | clean |
 | `node --check` on `--print-agent` | clean |
-| `cargo test` | 688 green after wiring the labelled defaults; `packed_channel` owns the invariant definition and its file/memory tests |
+| `cargo test` | 688 green, unchanged by this docs-only slice |
 
 The live harness spawns a throwaway system process, never the game. It
 exercises the real `NativePointer`, `Memory`, `Process`, `Interceptor`,
@@ -462,26 +571,29 @@ reporting an empty segment.
 
 - [ ] The diff contains no addresses, module-relative numbers, disassembly,
       game bytes or absolute install paths.
+- [ ] The two-run incompatibility and the low coverage are the stated reason
+      for replacing time windows, not a preference.
+- [ ] The vertical signal is named, its validation is described, and the
+      hysteresis constants are explicit.
+- [ ] The phase definitions include `GROUND` versus `LANDED`.
+- [ ] A failed calibration yields `uncalibrated`, never a phase.
 - [ ] The packed fingerprint is described as content, not as a raw byte range
       at a fixed position.
 - [ ] The keyed fingerprint names its bounded view and excludes the pointer.
-- [ ] The keyed structure is not given a divisor it was never observed to
-      have.
 - [ ] The collision policy is explicit: lowest index, `ambiguous` reported.
-- [ ] The procedure names the three actions and the three result lines.
-- [ ] The confirm/refute table appears before the run, not after it.
-- [ ] The limitations section is not softened into a promise of semantic
-      clip names.
+- [ ] The procedure requires no rhythm and names the result lines.
+- [ ] The limitations say the phase-to-clip mapping is an inference and a clip
+      may span two phases.
 - [ ] `cargo test` stays at its baseline.
 
 ## Next step
 
-Idle and walk are labelled; jump is still PARTIAL. The time-series probe is the
-instrument for the jump profile: run the three-step procedure above, then
-repeat it twice at the same cadence. A clip is confirmed for a phase only when
-the same group occupies the same position in the repeating tail across runs.
-Until then, `27` stays the documented best-effort default and must not be
-reported as a confirmed jump clip. A second idle run on a different section
-would characterise the clip-0 variant. Do not change the heuristic on a single
-unmapped window: re-run it first, because that is an unobserved table, not a
-wrong label.
+Idle and walk are labelled; the jump is now measured per phase instead of
+guessed from a window. Run the three-step motion procedure twice on the same
+save. A phase label is confirmed only when the same dominant clip reproduces
+in the same phase across runs. Until then `27` stays the documented
+best-effort `jump_up` default and must not be reported as confirmed. A second
+idle run on a different section would characterise the clip-0 variant. Do not
+change the hysteresis constants on a single blended phase: re-run first,
+because a low-coverage phase is a blend, not a wrong threshold.
+
