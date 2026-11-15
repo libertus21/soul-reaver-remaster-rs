@@ -5,9 +5,10 @@ source moves to the runtime: a probe observes which frame producer the engine
 selects for the player while a human performs each state, fingerprints the
 selected table, and maps packed tables to a clip index. This note records the
 failure of the heuristic, the packed and keyed fingerprint schemes, the
-segment aggregation, the keyed-locomotion hypothesis, and the exact operator
-procedure. The probe itself stays in the session scratch directory because it
-carries module-relative anchors and engine field offsets.
+segment aggregation, the keyed-locomotion hypothesis, the per-jump aligned
+template that now carries the jump result, and the exact operator procedure.
+The probe itself stays in the session scratch directory because it carries
+module-relative anchors and engine field offsets.
 
 The first revision of this note described a docs-only slice: nothing was
 launched and no production code changed. The capture has since been run (see
@@ -24,8 +25,8 @@ default state map in `sra::ClipMap::for_clip_count`. No golden digest moved.
    invariant key and the legacy digest for the dominant sample.
 
 For a repeating action such as jumping, three windows cannot separate its
-phases. Use the time-series path in "The jump profile: a time series, not a
-longer window".
+phases. Use the per-jump aligned template in "Per-jump alignment: the primary
+jump result". The older time-series path is kept as a secondary view.
 
 ## Runtime result (2026-11-14)
 
@@ -298,6 +299,10 @@ Rules that keep the output honest:
 
 ## The jump profile: a time series, not a longer window
 
+> **Secondary view.** The per-jump aligned template in the next section is the
+> primary jump result. Keep this time-series path for a quick cadence check; it
+> cannot align jumps of different lengths, which is why it diluted each phase.
+
 A single jump window blends three different animations: ascent, fall and
 landing. The measured jump window proves it — four clips shared it (`27:0.16`,
 `16:0.15`, `2:0.12`, `37:0.07`, keyed `0.21`) and no clip passed `0.16`
@@ -371,6 +376,164 @@ silently disappearing.
 | No repeating tail at all | The cadence is irregular; the sequence smears and only the largest bucket per window is trustworthy. |
 | `-` anywhere | An empty window: no sample arrived. Repeat the run; do not read it as a phase. |
 
+## Per-jump alignment: the primary jump result
+
+### Why phase aggregation failed
+
+The first vertical run reported the failure directly:
+
+```text
+ZCALIB samples=451 z=-299..756 dz=-459..463 sign_changes=103 flat=0.34 calibrated=yes
+ascent  131 samples dominant=35 coverage=0.35 (36:0.31)
+fall    164 samples dominant=36 coverage=0.29 (37:0.29, 35:0.12, 34:0.12)
+land    136 samples dominant=34 coverage=0.35 (35:0.22, 0:0.11)
+ground   20 samples dominant=0  coverage=0.60
+LABELS jump_up=unknown fall=unknown land=unknown
+```
+
+Three facts explain it, and none is a threshold to tune:
+
+- **The signal is coarse for the arc.** 451 samples over 15 s is about 30 Hz,
+  while the vertical delta peaks near 460 units per sample and the whole Z
+  span is about 1055. A jump crosses in a handful of samples.
+- **A phase aggregate pools different relative positions.** Roughly fifteen
+  jumps share each phase bucket, and inside one jump the clip changes
+  (takeoff, rise, apex, fall, impact, recovery). Pooling those positions
+  dilutes every phase to about 0.3 coverage, because the same bucket holds a
+  takeoff pose in one jump and a recovery pose in another.
+- **The dominant clips are held poses, not cycles.** The winners are one- and
+  two-frame tables, consistent with short held poses rather than a loop.
+
+Phase aggregation answers "which clip is jump?" over the whole run, and the
+honest answer is "several, because a jump is a sequence." Alignment asks the
+useful question instead: "what is the clip at the same relative point of every
+jump?"
+
+### The jump detection rule
+
+The probe reads the root pose slot's world Z on every hook invocation and tags
+each sample with the selected clip. Two consecutive samples give the vertical
+delta `dz`. A jump:
+
+- **starts** at the sample just before `dz` crosses above `+DZ_ENTER` (default
+  `4.0` world units per sample), so the takeoff ground pose anchors the
+  template;
+- **ends** once the arc has turned downward (`dz` below `-DZ_ENTER`) and the
+  dead band `|dz| <= DZ_LEAVE` (default `1.5`) has held for `DZ_HOLD` (default
+  `3`) consecutive samples.
+
+The downward requirement and the quiet hold are the same hysteresis the phase
+machine uses; together they stop a long apex hover from closing the jump early.
+A gap in the signal closes the jump at the previous sample, and an arc still
+airborne at the end of the run is not counted. At most `--max-jumps` (default
+`6`) complete jumps are kept, and each prints one bounded line:
+
+```text
+JUMP n=1 samples=9 dur=0.30 z=0..1055 seq=35,35,35,36,36,36,36,34,34
+```
+
+`samples` and `dur` describe the arc, `z` is the measured minimum and maximum,
+and `seq` is the ordered clip per sample. A `keyed` or `unmapped` producer
+prints its class, never an invented index.
+
+### The resampler
+
+Every jump has a different length, so the sequences are compared on relative
+time. For a jump of `N` samples the probe assigns each of the `--jump-buckets`
+(default `10`) buckets to the sample nearest the bucket's center:
+
+```text
+bucket b center   = (b + 0.5) / buckets
+sample i position = i / (N - 1)
+nearest center, ties to the lower sample index
+```
+
+Nearest-center always yields exactly one sample per bucket, so a short jump
+cannot leave a hole and every jump contributes to every bucket. The mapping is
+exact for a known length: `N = 10` with `10` buckets is the identity, and
+`N = 5` maps to `0,1,1,1,2,2,3,3,3,4`.
+
+### The agreement metric and the template
+
+For each bucket the probe takes the modal clip across all jumps and reports its
+agreement, the modal share:
+
+```text
+TEMPLATE buckets=10 jumps=6 b0=35:1.00 b1=35:1.00 b2=36:0.83 b3=36:1.00 b4=36:1.00 b5=37:0.67 b6=34:0.83 b7=34:1.00 b8=0:0.83 b9=0:1.00
+```
+
+Agreement is not semantic truth. It says the same clip occupied the same
+relative position in that fraction of the detected jumps. A bucket at `1.00`
+is stable across the run; a low bucket is a transition the jumps did not share.
+
+### The label rule
+
+The template is split into thirds plus a landing anchor:
+
+| Label | Buckets | Rule |
+|---|---|---|
+| `jump_up` | first third | modal clip in buckets `[0, buckets/3)` |
+| `fall` | middle third | modal clip in buckets `[buckets/3, 2*buckets/3)` |
+| `land` | after the last airborne bucket | modal clip in the buckets after the last bucket whose median Z is above the template baseline by more than the leave threshold |
+
+The line is:
+
+```text
+LABELS raziel idle=<carried> walk=<carried> jump_up=<clip> fall=<clip> land=<clip> source=runtime-jump-template agreement=<min>
+```
+
+Two constants gate it, and `--dry-run` prints both:
+
+- `--min-jumps` (default `3`): fewer complete jumps and every jump label is
+  `unknown`, never a guess.
+- `--jump-agreement` (default `0.60`): the weakest bucket used for a label
+  must reach this share; below it the label is `unknown`.
+
+`agreement=` is the minimum share over every bucket the three labels used.
+`keyed`, `unmapped` and empty buckets can never become a clip label. `idle`
+and `walk` stay carried from the confirmed three-segment run, because a jump
+capture does not observe those states.
+
+`--by-motion` still prints the phase aggregate as secondary output (`ZCALIB`
+plus one `PHASE` line per phase); the template is the primary result.
+
+### The three-step jump capture
+
+1. **Stand.** Load a save where Raziel stands on solid ground in a quiet room
+   and leave the game unpaused.
+2. **Jump normally several times.** Start the run and jump at a natural
+   cadence, landing fully between jumps. Do not try to hold a rhythm and do not
+   walk or turn between jumps. The run needs about fifteen seconds and at least
+   `--min-jumps` complete arcs.
+
+   ```text
+   python sr1_clip_label_probe.py --attach SRX.exe --sra <RAZIEL.SRA> \
+       --slots 66 --motion-seconds 15
+   ```
+
+3. **Read the template, then the labels.** The `JUMP` lines are the raw arcs,
+   `TEMPLATE` is the aligned profile, and the final `LABELS` line is the derived
+   result. A label at `unknown` means the run did not contain enough consistent
+   jumps; repeat it rather than forcing a value.
+
+### What the template cannot establish
+
+- **A jump shorter than the sample period.** If the whole arc falls between two
+  samples, no complete jump is detected and the line stays silent rather than
+  inventing one. At the engine's animation rate a very short hop is the case
+  this method cannot see.
+- **Different heights or different jump styles.** The template assumes the
+  jumps are comparable. A high jump and a short hop align badly and the bucket
+  agreement drops; that is the signal to capture one style at a time.
+- **Agreement is not semantic truth.** A bucket at `1.00` means the same clip
+  held the same relative position across the detected jumps. It does not name
+  the pose, and it does not prove the clip is the only one that could play
+  there.
+- **A coarse rate is only partly fixed.** Sampling every hook invocation and
+  printing the measured rate makes the limit visible, but the engine's
+  animation rate still bounds resolution. Alignment compares relative
+  positions; it does not recover frames that were never sampled.
+
 ## The exact four-step procedure
 
 1. **Set up.** Start `SRX.exe`, load a save where Raziel stands on solid
@@ -443,9 +606,9 @@ silently disappearing.
 
 | Gate | Result |
 |---|---|
-| `--selftest` | 21 cases, 21 green; adds `auto-window-lines`, `auto-window-empty`, `auto-window-sequence` and `auto-window-conflict` to the keyed, keyed/unmapped, capped-list and form-invariance cases |
-| `--live-selftest` | 9 cases, 9 green in a real Frida runtime; adds `auto-window-sequence`, which drives four synthetic windows (one empty) through the real agent segment lifecycle and asserts the token order on top of the packed, keyed and negative cases |
-| `--dry-run` | prints the plan; attaches nothing. `--auto-windows 1.0 --total 15` reports `planned=15`; `--auto-windows` plus `--segments` exits with the typed conflict |
+| `--selftest` | 40 cases, 40 green; adds `motion-zcalib-rate` and `jump-identical-detected`, `jump-identical-agreement`, `jump-outlier-localized`, `jump-too-few-unknown`, `jump-ground-zero`, `jump-resample-exact`, `jump-line-shape` and `jump-labels-identical` on top of the fingerprint, segment, keyed and phase cases |
+| `--live-selftest` | 19 cases, 19 green in a real Frida runtime; the agent's own detector feeds the host template, adding `jump-identical-template`, `jump-outlier-localized`, `jump-too-few-unknown`, `jump-ground-zero` and `jump-resample-exact` |
+| `--dry-run` | prints the plan; attaches nothing. It names the per-jump detector, the nearest-center resampler, the template, and both label constants (`--min-jumps 3`, `--jump-agreement 0.60`) |
 | `py_compile` | clean |
 | `node --check` on `--print-agent` | clean |
 | `cargo test` | 688 green after wiring the labelled defaults; `packed_channel` owns the invariant definition and its file/memory tests |
@@ -454,9 +617,13 @@ The live harness spawns a throwaway system process, never the game. It
 exercises the real `NativePointer`, `Memory`, `Process`, `Interceptor`,
 `NativeCallback` and `NativeFunction` bindings. The keyed case asserts the
 keyed key and the keyed segment fraction; the negative case asserts that a
-keyed head with a null frame array still falls back to the packed producer. A
-missing Frida capability fails loudly before any hook is armed, rather than
-reporting an empty segment.
+keyed head with a null frame array still falls back to the packed producer. The
+jump cases drive the agent's `detectJumps` with synthetic arcs, then assert the
+template on the returned records: three identical arcs reach `1.00` per bucket,
+one outlier lowers only its own bucket, fewer than the minimum arcs and a
+grounded series both produce `unknown`, and the resampler is exact for a known
+length. A missing Frida capability fails loudly before any hook is armed,
+rather than reporting an empty segment.
 
 ## Reviewer checklist
 
@@ -468,6 +635,9 @@ reporting an empty segment.
 - [ ] The keyed structure is not given a divisor it was never observed to
       have.
 - [ ] The collision policy is explicit: lowest index, `ambiguous` reported.
+- [ ] The jump section states the detection rule, the resampler, the agreement
+      metric and the label gate with both constants.
+- [ ] Per-jump output is bounded by `--max-jumps`; there is no per-call text.
 - [ ] The procedure names the three actions and the three result lines.
 - [ ] The confirm/refute table appears before the run, not after it.
 - [ ] The limitations section is not softened into a promise of semantic
@@ -476,12 +646,13 @@ reporting an empty segment.
 
 ## Next step
 
-Idle and walk are labelled; jump is still PARTIAL. The time-series probe is the
-instrument for the jump profile: run the three-step procedure above, then
-repeat it twice at the same cadence. A clip is confirmed for a phase only when
-the same group occupies the same position in the repeating tail across runs.
-Until then, `27` stays the documented best-effort default and must not be
-reported as a confirmed jump clip. A second idle run on a different section
-would characterise the clip-0 variant. Do not change the heuristic on a single
-unmapped window: re-run it first, because that is an unobserved table, not a
-wrong label.
+Idle and walk are labelled; jump is measured per jump, not yet confirmed. Run
+the three-step jump capture above, then repeat it twice with the same jump
+style. A jump label is a candidate only when the template is stable across runs
+and the bucket agreement clears the threshold; a single run with `unknown`
+labels means the arcs were too few or too different, so repeat it rather than
+forcing a value. Until then, `27` stays the documented best-effort default and
+must not be reported as a confirmed jump clip. A second idle run on a different
+section would characterise the clip-0 variant. Do not change the heuristic on a
+single unmapped window: re-run it first, because that is an unobserved table,
+not a wrong label.
