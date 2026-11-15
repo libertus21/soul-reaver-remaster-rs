@@ -762,13 +762,14 @@ rather than reporting an empty segment.
 
 ## Next step
 
-Idle and walk are labelled; jump is measured per jump, not yet confirmed. Run
-the three-step jump capture above, then repeat it twice with the same jump
-style. A jump label is a candidate only when the template is stable across runs
-and the bucket agreement clears the threshold; a single run with `unknown`
-labels means the arcs were too few or too different, so repeat it rather than
-forcing a value. Until then, `27` stays the documented best-effort default and
-must not be reported as a confirmed jump clip. A second idle run on a different
-section would characterise the clip-0 variant. Do not change the heuristic on a
-single unmapped window: re-run it first, because that is an unobserved table,
-not a wrong label.
+> **2026-11-15 resolution.** The aligned per-jump template was run twice. Every
+> jump played `35 -> (keyed transition) -> 36 -> (keyed transition) -> 37` (24
+> samples over about `0.76 s`) and all six jumps produced the same order, so
+> jump-up, fall and land are `35`, `36` and `37` at agreement `0.83 -> 1.00`.
+> The keyed buckets are transitions, not clips. See
+> `docs/notes/packed-channel-format.md`, "State defaults". The paragraph below
+> is the pre-run state, kept for the record.
+
+Idle and walk are labelled; jump was still PARTIAL then. A clip is confirmed
+for a phase only when the same group occupies the same position in the
+repeating tail across runs.

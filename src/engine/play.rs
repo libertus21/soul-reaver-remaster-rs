@@ -40,7 +40,7 @@ use crate::object_texture::PageBank;
 use crate::pose;
 use crate::render::{self, FlyCamera, OrbitCamera};
 use crate::sra::{
-    ANIMATION_FPS, ClipError, ClipMap, ClipSelection, ClipSelector, MotionState, PlaybackLoop,
+    ANIMATION_FPS, ClipError, ClipMap, ClipSelection, ClipSelector, PlaybackLoop,
     units_per_second_for_fps,
 };
 
@@ -208,8 +208,15 @@ pub struct PlayOptions {
     pub clip_idle: Option<usize>,
     /// Explicit grounded/moving clip (`--clip-walk <N>`).
     pub clip_walk: Option<usize>,
-    /// Explicit airborne clip (`--clip-jump <N>`).
+    /// Airborne shortcut (`--clip-jump <N>`): sets ascending, falling and
+    /// landing together. Testing aid, not a per-state override.
     pub clip_jump: Option<usize>,
+    /// Explicit ascending clip (`--clip-jump-up <N>`).
+    pub clip_jump_up: Option<usize>,
+    /// Explicit falling clip (`--clip-fall <N>`).
+    pub clip_fall: Option<usize>,
+    /// Explicit landing clip (`--clip-land <N>`).
+    pub clip_land: Option<usize>,
     /// Deterministic diagnostic input sequence (`--input-script`, headless only).
     pub input_script: Option<InputScript>,
     /// Explicit player position that overrides the authored record
@@ -228,13 +235,18 @@ impl PlayOptions {
     ///
     /// Explicit indices are strict: an index outside `0..clip_count` is a typed
     /// [`ClipError`]. The default map comes from
-    /// [`ClipMap::for_clip_count`], which is always in range.
+    /// [`ClipMap::for_clip_count`], which is always in range. `--clip-jump <N>`
+    /// is a shortcut that sets all three airborne states; the per-state flags
+    /// (`--clip-jump-up`, `--clip-fall`, `--clip-land`) override it
+    /// individually because they are applied afterwards.
     pub fn clip_selection(&self, clip_count: usize) -> Result<ClipSelection, ClipError> {
         let default = ClipMap::for_clip_count(clip_count);
         let map = ClipMap {
             idle: self.clip_idle.unwrap_or(default.idle),
             walk: self.clip_walk.unwrap_or(default.walk),
-            jump: self.clip_jump.unwrap_or(default.jump),
+            jump_up: self.clip_jump_up.or(self.clip_jump).unwrap_or(default.jump_up),
+            fall: self.clip_fall.or(self.clip_jump).unwrap_or(default.fall),
+            land: self.clip_land.or(self.clip_jump).unwrap_or(default.land),
         };
         let out_of_range = |clip: usize| ClipError::OutOfRange { clip, clip_count };
         if let Some(fixed) = self.clip {
@@ -246,7 +258,7 @@ impl PlayOptions {
                 map,
             });
         }
-        for clip in [map.idle, map.walk, map.jump] {
+        for clip in [map.idle, map.walk, map.jump_up, map.fall, map.land] {
             if clip >= clip_count {
                 return Err(out_of_range(clip));
             }
@@ -273,6 +285,9 @@ impl PlayOptions {
             clip_idle: None,
             clip_walk: None,
             clip_jump: None,
+            clip_jump_up: None,
+            clip_fall: None,
+            clip_land: None,
             input_script: None,
             player_pos: None,
             cam_distance: None,
@@ -327,6 +342,15 @@ impl PlayOptions {
                 }
                 "--clip-jump" => {
                     options.clip_jump = Some(clip_value(args, index, "--clip-jump")?)
+                }
+                "--clip-jump-up" => {
+                    options.clip_jump_up = Some(clip_value(args, index, "--clip-jump-up")?)
+                }
+                "--clip-fall" => {
+                    options.clip_fall = Some(clip_value(args, index, "--clip-fall")?)
+                }
+                "--clip-land" => {
+                    options.clip_land = Some(clip_value(args, index, "--clip-land")?)
                 }
                 "--input-script" => {
                     let raw = value(args, index, "--input-script")?;
@@ -601,7 +625,8 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
             let selection = options
                 .clip_selection(animation.clip_count())
                 .map_err(RunError::Clip)?;
-            Some(ClipSelector::new(selection))
+            let landing_ticks = selection.map.landing_window(animation);
+            Some(ClipSelector::new(selection, landing_ticks))
         }
         None => None,
     };
@@ -1208,21 +1233,21 @@ impl PlayApp {
 
     /// The player's produced root facing for the scene builder, if it has moved.
     ///
-    /// When `--sra` is active the selector observes the deterministic grounded /
-    /// moving signals once per rendered frame and maps them to a clip. The
-    /// playback clock consumes the clip's local tick, so a state change restarts
-    /// the new clip at frame 0. Everything here is presentation-only: it is not
-    /// part of `FrameState` and never enters the canonical digest.
+    /// When `--sra` is active the selector observes the deterministic grounded,
+    /// moving and signed-vertical-velocity signals once per rendered frame and
+    /// maps them to one of the five motion states. The playback clock consumes
+    /// the clip's local tick, so a state change restarts the new clip at frame
+    /// 0. Everything here is presentation-only: it is not part of `FrameState`
+    /// and never enters the canonical digest.
     fn player_facing(&mut self) -> Option<PlayerFacing> {
         let player = self.frame.player()?;
         let yaw = self.frame.player_yaw_binary();
         let tick = self.frame.ticks();
-        let state = MotionState::from_player_signals(
-            self.frame.player_grounded(),
-            self.frame.player_moving(),
-        );
+        let grounded = self.frame.player_grounded();
+        let moving = self.frame.player_moving();
+        let vertical_velocity = self.frame.player_vertical_velocity();
         if let Some(selector) = self.clip_selector.as_mut() {
-            selector.observe(tick, state);
+            selector.observe_signals(tick, grounded, moving, vertical_velocity);
         }
         let animation = match (&self.animation, &self.clip_selector) {
             (Some(animation), Some(selector)) => animation
@@ -1572,9 +1597,12 @@ mod tests {
                 options.clip,
                 options.clip_idle,
                 options.clip_walk,
-                options.clip_jump
+                options.clip_jump,
+                options.clip_jump_up,
+                options.clip_fall,
+                options.clip_land
             ),
-            (None, None, None, None)
+            (None, None, None, None, None, None, None)
         );
         assert_eq!(options.input_script, None);
         assert_eq!(options.player_pos, None);
@@ -1635,8 +1663,11 @@ mod tests {
             ClipMap {
                 idle: 2,
                 walk: 4,
-                jump: 6
-            }
+                jump_up: 6,
+                fall: 6,
+                land: 6,
+            },
+            "--clip-jump is the all-three shortcut"
         );
         assert_eq!(selection.fixed, None);
 
@@ -1649,7 +1680,9 @@ mod tests {
             ClipMap {
                 idle: 9,
                 walk: 2,
-                jump: 9
+                jump_up: 9,
+                fall: 9,
+                land: 9,
             },
             "the measured defaults clamp to the last decoded clip"
         );
@@ -1658,9 +1691,11 @@ mod tests {
             ClipMap {
                 idle: 55,
                 walk: 2,
-                jump: 27
+                jump_up: 35,
+                fall: 36,
+                land: 37,
             },
-            "the shipped player resolves the measured indices"
+            "the shipped player resolves the five measured indices"
         );
 
         let bad_map = parse(&["--bigfile", "B", "--clip-walk", "10"]).expect("parses");
@@ -1693,7 +1728,9 @@ mod tests {
             ClipMap {
                 idle: 55,
                 walk: 2,
-                jump: 27
+                jump_up: 35,
+                fall: 36,
+                land: 37,
             },
             "the documented default map"
         );
@@ -1708,7 +1745,9 @@ mod tests {
             ClipMap {
                 idle: 64,
                 walk: 2,
-                jump: 27
+                jump_up: 35,
+                fall: 36,
+                land: 37,
             }
         );
 
@@ -1722,7 +1761,9 @@ mod tests {
             ClipMap {
                 idle: 55,
                 walk: 8,
-                jump: 27
+                jump_up: 35,
+                fall: 36,
+                land: 37,
             }
         );
 
@@ -1736,9 +1777,61 @@ mod tests {
             ClipMap {
                 idle: 55,
                 walk: 2,
-                jump: 30
-            }
+                jump_up: 30,
+                fall: 30,
+                land: 30,
+            },
+            "--clip-jump sets ascending, falling and landing together"
         );
+    }
+
+    #[test]
+    fn per_state_airborne_flags_override_the_jump_shortcut_individually() {
+        let resolve = |argv: &[&str]| {
+            parse(argv)
+                .expect("parses")
+                .clip_selection(230)
+                .expect("in range")
+                .map
+        };
+
+        let fall_only = resolve(&["--bigfile", "B", "--clip-jump", "30", "--clip-fall", "12"]);
+        assert_eq!(
+            (fall_only.jump_up, fall_only.fall, fall_only.land),
+            (30, 12, 30)
+        );
+
+        let mixed = resolve(&[
+            "--bigfile",
+            "B",
+            "--clip-jump",
+            "30",
+            "--clip-jump-up",
+            "21",
+            "--clip-land",
+            "20",
+        ]);
+        assert_eq!((mixed.jump_up, mixed.fall, mixed.land), (21, 30, 20));
+
+        let land_only = resolve(&["--bigfile", "B", "--clip-land", "40"]);
+        assert_eq!(
+            (land_only.jump_up, land_only.fall, land_only.land),
+            (35, 36, 40),
+            "a per-state flag alone leaves the other defaults intact"
+        );
+
+        for flag in ["--clip-jump-up", "--clip-fall", "--clip-land"] {
+            assert_eq!(
+                parse(&["--bigfile", "B", flag, "10"])
+                    .expect("parses")
+                    .clip_selection(10),
+                Err(ClipError::OutOfRange {
+                    clip: 10,
+                    clip_count: 10
+                }),
+                "{flag} is validated strictly"
+            );
+        }
     }
 
     #[test]
@@ -1761,7 +1854,9 @@ mod tests {
             ClipMap {
                 idle: 0,
                 walk: 0,
-                jump: 0
+                jump_up: 0,
+                fall: 0,
+                land: 0,
             },
             "every default falls back to the only decoded clip"
         );

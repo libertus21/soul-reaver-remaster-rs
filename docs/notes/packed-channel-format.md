@@ -430,58 +430,88 @@ clip:
 The captured runtime arena contains memory-form tables whose `+0x00..+0x10`
 and bit-plane block are byte-identical to those file clips, so the engine
 really selected packed tables with those shapes during the jump window. They
-are short (2-4 frame), slow-divisor tables; their semantic state is UNKNOWN.
-The pair alone cannot separate 37 from 47 or 25 from 32; the invariant digest
-can. Their previous `unmapped` status was the same pointer-hash defect, not a
-missing clip.
+are short (2-4 frame), slow-divisor tables. The five-state aligned capture now
+labels `35` (`2:700`) as jump-up and `37` (`2:400:876bcf9b`) as land; `25`,
+`32` and `47` remain unlabelled. The pair alone cannot separate 37 from 47 or
+25 from 32, but the invariant digest can: 37 and 47 share `2:400` yet hash
+differently (`876bcf9b` vs `42223778`), so the runtime sample resolves to 37.
 
 `--match-unmapped <FILE> --sra-dir <DIR> [--slots <N>]` still searches every
 `.SRA` for a probe key and reports the file, record and index. It now compares
 invariant keys; an old probe key that contains the pointer half is expected to
 be `absent`.
 
-### State defaults: runtime-labelled clips (2026-11-14)
+### State defaults: runtime-labelled clips (2026-11-14, five-state map 2026-11-15)
 
 The shipped tables still carry no state identity, so the default map is a
-runtime observation of the table the engine selected, not a decoded field. The
-clip-labelling probe watched the player's packed table while the operator held
-one state, mapped the invariant fingerprint back to the file index, and
-reported the coverage of the dominant bucket
+runtime observation of the table the engine selected, not a decoded field
 (`docs/changes/runtime-capture/clip-labelling.md`).
 
 | Index | State | Evidence class | How it was measured |
 |---:|---|---|---|
 | 55 | idle | **CONFIRMED** | Clip `55` (`6:580`) held coverage `1.00` in 3 of 4 runs of the still window. |
 | 2 | walk | **CONFIRMED** | The moving window selected clip `2` (`12:209:3acaf951`) with coverage `0.91`; the fingerprint was predicted from this file before the run, then matched. |
-| 27 | jump | **PARTIAL / UNKNOWN** | The jump window was split: `27:0.16`, `16:0.15`, `2:0.12`, `37:0.07`, keyed `0.21`. Not a single clip. |
+| 35 | jump_up | **CONFIRMED** | Two runs of the aligned per-jump template made clip `35` (`2:700`) the first phase; template agreement `0.83 -> 1.00`. |
+| 36 | fall | **CONFIRMED** | The middle phase of the same two-run sequence was clip `36` (`1:100`); agreement `0.83 -> 1.00`. |
+| 37 | land | **CONFIRMED** | The last phase was clip `37` (`2:400`); agreement `0.83 -> 1.00`. |
 
-`unmapped` was `0.00` in all three segments after the invariant-fingerprint
-fix, so every sampled table now maps to a file index.
+**The jump is an ordered sequence, not one clip.** The aligned capture recorded
+a jump as `35 -> (keyed) -> 36 -> (keyed) -> 37`, 24 samples over about
+`0.76 s`; all six jumps produced this order. The `keyed` buckets are transitions,
+not clips, so they never become an index. This is why the earlier single jump
+window split across four clips (`27:0.16`, `16:0.15`, `2:0.12`, `37:0.07`,
+keyed `0.21`): it averaged three phases plus their transitions.
 
-Two caveats are part of the record:
+Two caveats are part of the record. **Idle has a variant**: one earlier run
+observed clip `0` (`50:100`) at coverage `1.00` instead of `55`, so idle likely
+selects per section or variant; `55` is the most frequent and is the default.
+**The map is a phase model, not five semantic names**: each label means "the
+engine selected this table in this phase", the `.SRA` still has no state byte,
+and a different cadence or section can select another table.
 
-- **Idle has a variant.** One earlier run observed clip `0` (`50:100`) at
-  coverage `1.00` instead of clip `55`. Both observations are clean, so idle
-  most likely selects different tables per section or variant; `55` is the most
-  frequent and is the default.
-- **Jump is not confirmed.** A spread of four clips plus keyed samples is
-  consistent with jump-up, fall and land being distinct clips, which one
-  timed window cannot separate. `27` has the largest share and is kept as a
-  documented best-effort default only.
+#### The landing window is derived from the `land` clip duration
 
-The default map lives in `sra::ClipMap::for_clip_count`: each index is clamped
-to the last decoded clip, so an animation with fewer clips than a measured
-index falls back to its last clip instead of returning
-`ClipError::OutOfRange`. `--clip-idle`, `--clip-walk` and `--clip-jump` still
-override individual entries with strict validation, and `--clip <N>` still
-freezes one clip.
+`Landing` is the only state with a duration, so its window is not hand-picked.
+It is one pass of the configured `land` clip at the presentation clock:
 
-Selection reads only existing deterministic signals: `player_grounded()` and
-whether stage 9 committed a non-zero horizontal delta (`player_moving()`).
-The rule is: evaluate once per rendered frame, switch only on a state change,
-and restart the switched clip at local tick 0. A fixed `--clip <N>` ignores the
-state and uses the global tick. Playback stays presentation-only; no animation
-state enters `FrameState` and no determinism golden moves.
+```text
+seconds = frames * divisor / ANIMATION_UNITS_PER_SECOND
+ticks   = floor(seconds * 60)            (the fixed 60 Hz frame clock)
+```
+
+The result is clamped to **4..=30 ticks** (`66.7 ms ..= 0.5 s`). The floor keeps
+a one-frame, low-divisor clip visible instead of a zero- or one-tick flicker;
+the ceiling stops a pathologically long `land` clip from holding the state for
+seconds. The shipped `land` clip is `37` (`2:400`), so the default window is
+`floor(2 * 400 * 60 / 5000) = 9` ticks (`0.15 s`). The derivation reads the
+`land` clip actually in the resolved map, so a `--clip-land` override moves the
+window with it. `ClipMap::for_clip_count` still clamps every index to the last
+decoded clip, so a short animation falls back instead of erroring.
+
+Selection reads only existing deterministic signals: `player_grounded()`,
+whether stage 9 committed a non-zero horizontal delta (`player_moving()`), and
+the signed `player_vertical_velocity()`:
+
+| State | Rule |
+|---|---|
+| `Ascending` | not grounded and velocity `> 0` |
+| `Falling` | not grounded and velocity `<= 0` (exactly zero counts as falling) |
+| `Landing` | grounded inside the window that opens on the touchdown tick |
+| `Moving` | grounded, outside the window, non-zero committed delta |
+| `Idle` | grounded, outside the window, zero committed delta |
+
+A touchdown is `grounded` now with a previous observation of `false`; a
+first observation has no previous sample, so a player that spawns resting on
+the floor does not play a landing. The window is `[touchdown, touchdown +
+ticks)`: the touchdown tick is `Landing`, and the exclusive bound releases to
+`Idle`/`Moving`. Because `Landing` holds for the whole window regardless of the
+committed delta, a touchdown cannot oscillate `Landing -> Idle -> Landing`.
+
+The switching rule is unchanged: evaluate once per rendered frame, switch only
+on a state change, and restart the switched clip at local tick 0. A fixed
+`--clip <N>` ignores the state and uses the global tick. Playback stays
+presentation-only; no animation state enters `FrameState` and no determinism
+golden moves.
 
 CLI:
 
@@ -494,11 +524,14 @@ CLI:
                                       search every .SRA for probe fingerprints
 --play ... --sra <FILE> \
     [--clip <N>]                      freeze one clip
-    [--clip-idle <N>] [--clip-walk <N>] [--clip-jump <N>]
+    [--clip-idle <N>] [--clip-walk <N>]
+    [--clip-jump <N>]                 shortcut: sets jump-up, fall and land
+    [--clip-jump-up <N>] [--clip-fall <N>] [--clip-land <N>]
 ```
 
-Every explicit index is validated against the decoded clip count and rejected
-with a typed `ClipError::OutOfRange`; non-integers are a typed `PlayError`.
+`--clip-jump <N>` sets all three airborne states together as a testing
+shortcut; an explicit per-state flag wins for that state. Every index is
+validated strictly against the decoded clip count (`ClipError::OutOfRange`).
 
 ## Offline clip ranking (`--animate --rank-clips`)
 

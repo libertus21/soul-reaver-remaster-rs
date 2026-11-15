@@ -1063,40 +1063,139 @@ impl SraAnimation {
 
 /// The deterministic player motion state animation selection reads.
 ///
-/// Derived from existing signals only: the grounded flag and whether stage 9
-/// committed a non-zero horizontal delta this tick. It is presentation state
-/// and never enters the canonical fold.
+/// Derived from the grounded flag, the committed horizontal delta and the
+/// signed vertical velocity; `Landing` also uses the touchdown edge and window
+/// owned by [`MotionTracker`]. Presentation state only: never in the canonical
+/// fold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MotionState {
     /// Grounded with no committed horizontal movement.
     Idle,
     /// Grounded with committed horizontal movement.
     Moving,
-    /// Not grounded (rising or falling).
-    Airborne,
+    /// Not grounded with a positive (rising) vertical velocity.
+    Ascending,
+    /// Not grounded with a zero or negative (falling) vertical velocity.
+    Falling,
+    /// Grounded inside the landing window that opened on the touchdown tick.
+    Landing,
 }
 
 impl MotionState {
-    /// Map the two existing player signals to one motion state.
-    pub fn from_player_signals(grounded: bool, moving: bool) -> Self {
-        if !grounded {
-            Self::Airborne
-        } else if moving {
-            Self::Moving
+    /// Classify one sample from the existing player signals.
+    ///
+    /// This pure half never sees the landing window. `vertical_velocity` is the
+    /// signed fixed-point velocity of
+    /// [`FrameState::player_vertical_velocity`](crate::engine::frame::FrameState::player_vertical_velocity);
+    /// exactly zero counts as `Falling`: a non-grounded player with no upward
+    /// motion is on its way down (or at the apex).
+    pub fn from_player_signals(grounded: bool, moving: bool, vertical_velocity: i64) -> Self {
+        if grounded {
+            if moving {
+                Self::Moving
+            } else {
+                Self::Idle
+            }
+        } else if vertical_velocity > 0 {
+            Self::Ascending
         } else {
-            Self::Idle
+            Self::Falling
         }
+    }
+}
+
+/// Shortest landing window, in 60 Hz ticks.
+///
+/// Four ticks (`66.7 ms`) is the shortest hold visible as a distinct pose; a
+/// one-frame, low-divisor land clip would otherwise derive a zero- or one-tick
+/// window and never present its own first frame.
+pub const LANDING_WINDOW_MIN_TICKS: u64 = 4;
+
+/// Longest landing window, in 60 Hz ticks.
+///
+/// Landing is a recovery phase, not a loop: `30` ticks (`0.5 s`) covers a slow
+/// two-frame land clip with room, and stops a very long clip from holding the
+/// state for seconds.
+pub const LANDING_WINDOW_MAX_TICKS: u64 = 30;
+
+/// Derive the landing window from the `land` clip's own duration.
+///
+/// One pass takes `frames * divisor / units_per_second` seconds at
+/// [`ANIMATION_UNITS_PER_SECOND`], so at the fixed 60 Hz clock the hold is
+/// `floor(frames * divisor * 60 / units_per_second)` ticks, clamped to
+/// [`LANDING_WINDOW_MIN_TICKS`]..=[`LANDING_WINDOW_MAX_TICKS`]. A zero frame
+/// count, non-positive divisor or zero rate falls back to the minimum instead
+/// of dividing by zero. The shipped land clip (2 frames, divisor 400) gives
+/// `floor(2 * 400 * 60 / 5000) = 9` ticks (`0.15 s`).
+pub fn landing_window_ticks(frame_count: usize, divisor: i16, units_per_second: u64) -> u64 {
+    let (Ok(frames), Ok(divisor)) = (u64::try_from(frame_count), u64::try_from(divisor)) else {
+        return LANDING_WINDOW_MIN_TICKS;
+    };
+    if frames == 0 || divisor == 0 || units_per_second == 0 {
+        return LANDING_WINDOW_MIN_TICKS;
+    }
+    let units = frames.saturating_mul(divisor).saturating_mul(60);
+    (units / units_per_second).clamp(LANDING_WINDOW_MIN_TICKS, LANDING_WINDOW_MAX_TICKS)
+}
+
+/// Stateful half of the motion machine: the touchdown edge and its window.
+///
+/// [`MotionState::from_player_signals`] is memoryless, so it cannot express
+/// `Landing`. This tracker keeps only the previous grounded sample and the
+/// exclusive tick at which the open window closes. A touchdown is `grounded`
+/// now with a previous observation of `false`; a first observation has no
+/// previous sample, so a spawn already resting on the floor does not play a
+/// landing. The window is `[touchdown, touchdown + landing_ticks)`: the
+/// touchdown tick is `Landing` and the exclusive bound releases to
+/// `Idle`/`Moving`. Leaving the ground clears the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MotionTracker {
+    landing_ticks: u64,
+    landing_until: Option<u64>,
+    last_grounded: Option<bool>,
+}
+
+impl MotionTracker {
+    /// Build a tracker with an explicit landing window in ticks.
+    pub fn new(landing_ticks: u64) -> Self {
+        Self {
+            landing_ticks,
+            landing_until: None,
+            last_grounded: None,
+        }
+    }
+
+    /// Observe one rendered frame's player signals and return its motion state.
+    pub fn observe(
+        &mut self,
+        tick: u64,
+        grounded: bool,
+        moving: bool,
+        vertical_velocity: i64,
+    ) -> MotionState {
+        let touchdown = grounded && self.last_grounded == Some(false);
+        self.last_grounded = Some(grounded);
+        if !grounded {
+            self.landing_until = None;
+            return MotionState::from_player_signals(grounded, moving, vertical_velocity);
+        }
+        if touchdown {
+            self.landing_until = Some(tick.saturating_add(self.landing_ticks));
+        }
+        if self.landing_until.is_some_and(|until| tick < until) {
+            return MotionState::Landing;
+        }
+        self.landing_until = None;
+        MotionState::from_player_signals(grounded, moving, vertical_velocity)
     }
 }
 
 /// Default idle clip: **CONFIRMED** by runtime observation.
 ///
-/// The clip-labelling probe watched the player's selected packed table while
-/// the operator stood still: clip `55` (`6:580`) held coverage `1.00` in three
-/// of four runs. One earlier run observed clip `0` (`50:100`) at the same
-/// coverage, so idle appears to have more than one variant, likely section- or
-/// variant-dependent; `55` is the most frequent observation and is the default.
-/// See `docs/changes/runtime-capture/clip-labelling.md`.
+/// Clip `55` (`6:580`) held coverage `1.00` in three of four still-window runs;
+/// one earlier run saw clip `0` (`50:100`) at the same coverage, so idle has a
+/// variant. `55` is the most frequent observation and is the default. See
+/// `docs/changes/runtime-capture/clip-labelling.md`.
 pub const DEFAULT_IDLE_CLIP: usize = 55;
 
 /// Default moving clip: **CONFIRMED** by runtime observation.
@@ -1107,44 +1206,59 @@ pub const DEFAULT_IDLE_CLIP: usize = 55;
 /// agree.
 pub const DEFAULT_WALK_CLIP: usize = 2;
 
-/// Default airborne clip: **PARTIAL / UNKNOWN**, not confirmed.
+/// Default ascending clip: **CONFIRMED** by runtime observation.
 ///
-/// The jump window was not dominated by a single clip: clip `27` held `0.16`,
-/// clip `16` `0.15`, clip `2` `0.12` and clip `37` `0.07`, with `0.21` keyed.
-/// That spread is consistent with jump-up, fall and land being distinct clips,
-/// which the probe cannot separate inside one window. `27` has the largest
-/// share and is kept only as a documented best-effort default.
-pub const DEFAULT_JUMP_CLIP: usize = 27;
+/// The aligned per-jump template placed clip `35` first in the ordered
+/// `35 -> 36 -> 37` sequence. Two independent runs agreed on the phase at
+/// `0.83`, rising to `1.00` once the templates were aligned, and the shipped
+/// `RAZIEL.SRA` holds a `2:700` two-frame table at that index. See
+/// `docs/notes/packed-channel-format.md`, "State defaults".
+pub const DEFAULT_JUMP_UP_CLIP: usize = 35;
+
+/// Default falling clip: **CONFIRMED** by runtime observation.
+///
+/// The middle phase of the same aligned sequence was clip `36` (template
+/// agreement `0.83 -> 1.00` across two runs).
+pub const DEFAULT_FALL_CLIP: usize = 36;
+
+/// Default landing clip: **CONFIRMED** by runtime observation, and the source
+/// of the landing-window length.
+///
+/// The last phase of the aligned sequence was clip `37` (agreement
+/// `0.83 -> 1.00`). Its shipped table is `2:400`, so [`landing_window_ticks`]
+/// derives `floor(2 * 400 * 60 / 5000) = 9` ticks for the `Landing` hold.
+pub const DEFAULT_LAND_CLIP: usize = 37;
 
 /// Explicit state-to-clip mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClipMap {
     pub idle: usize,
     pub walk: usize,
-    pub jump: usize,
+    pub jump_up: usize,
+    pub fall: usize,
+    pub land: usize,
 }
 
 impl ClipMap {
     /// Default presentation mapping for `clip_count` clips.
     ///
-    /// The shipped tables carry no clip identity, so these indices are a
-    /// runtime observation of the table the engine selected per state, not a
-    /// field recovered from the file: [`DEFAULT_IDLE_CLIP`] and
-    /// [`DEFAULT_WALK_CLIP`] are confirmed, [`DEFAULT_JUMP_CLIP`] is a
-    /// best-effort partial.
+    /// The tables carry no clip identity, so every index is a runtime
+    /// observation of the table the engine selected, not a decoded field. All
+    /// five are **CONFIRMED** by two independent runtime runs of our build.
     ///
-    /// Each default is clamped to the last decoded clip, so an animation with
-    /// fewer clips than a measured index falls back to its last clip instead of
-    /// returning an out-of-range error or panicking. A zero-clip animation maps
-    /// every state to `0`, exactly like the previous saturating behaviour.
-    /// Override the map with `--clip-idle/--clip-walk/--clip-jump` or freeze one
-    /// clip with `--clip <N>`.
+    /// Each default is clamped to the last decoded clip, so a short animation
+    /// falls back to its last clip instead of erroring; a zero-clip animation
+    /// maps every state to `0`. Override with `--clip-idle`, `--clip-walk`,
+    /// `--clip-jump-up`, `--clip-fall`, `--clip-land` or the `--clip-jump`
+    /// all-three shortcut, or freeze one clip with `--clip <N>`.
     pub fn for_clip_count(clip_count: usize) -> Self {
         let last = clip_count.saturating_sub(1);
         Self {
             idle: DEFAULT_IDLE_CLIP.min(last),
             walk: DEFAULT_WALK_CLIP.min(last),
-            jump: DEFAULT_JUMP_CLIP.min(last),
+            jump_up: DEFAULT_JUMP_UP_CLIP.min(last),
+            fall: DEFAULT_FALL_CLIP.min(last),
+            land: DEFAULT_LAND_CLIP.min(last),
         }
     }
 
@@ -1153,8 +1267,21 @@ impl ClipMap {
         match state {
             MotionState::Idle => self.idle,
             MotionState::Moving => self.walk,
-            MotionState::Airborne => self.jump,
+            MotionState::Ascending => self.jump_up,
+            MotionState::Falling => self.fall,
+            MotionState::Landing => self.land,
         }
+    }
+
+    /// Derive this map's landing window from the configured `land` clip.
+    ///
+    /// See [`landing_window_ticks`]. A resolved map is always in range against
+    /// its animation, so a missing clip falls back to the minimum window: the
+    /// window is presentation timing, not a decode.
+    pub fn landing_window(&self, animation: &SraAnimation) -> u64 {
+        let frames = animation.frame_count_of(self.land).unwrap_or(0);
+        let divisor = animation.divisor_of(self.land).unwrap_or(0);
+        landing_window_ticks(frames, divisor, ANIMATION_UNITS_PER_SECOND)
     }
 }
 
@@ -1173,23 +1300,29 @@ pub struct ClipSelection {
 /// mid-clip index from the previous clip. The local tick is the tick count since
 /// that restart, and is what the playback clock consumes.
 ///
+/// The selector owns the [`MotionTracker`], so one call per rendered frame
+/// classifies the signals and applies the switching rule atomically. Because
+/// `Landing` is held for the whole derived window, a touchdown cannot alternate
+/// `Landing -> Idle -> Landing`: the state only changes when the window closes.
+///
 /// A fixed override (`--clip <N>`) ignores the state and uses the global tick,
 /// so it starts at frame 0 and never resets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClipSelector {
     selection: ClipSelection,
+    tracker: MotionTracker,
     clip: usize,
     start_tick: u64,
     state: Option<MotionState>,
 }
 
 impl ClipSelector {
-    /// Build a selector. The initial clip is the fixed override or the idle
-    /// clip; the first [`ClipSelector::observe`] establishes the start tick.
-    pub fn new(selection: ClipSelection) -> Self {
+    /// Build a selector with an explicit landing window in ticks.
+    pub fn new(selection: ClipSelection, landing_ticks: u64) -> Self {
         let clip = selection.fixed.unwrap_or(selection.map.idle);
         Self {
             selection,
+            tracker: MotionTracker::new(landing_ticks),
             clip,
             start_tick: 0,
             state: None,
@@ -1204,6 +1337,23 @@ impl ClipSelector {
     /// The last observed motion state, if any.
     pub fn state(&self) -> Option<MotionState> {
         self.state
+    }
+
+    /// Observe one rendered frame's raw player signals and switch if needed.
+    ///
+    /// Classifies the sample through the [`MotionTracker`] first, then applies
+    /// [`ClipSelector::observe`] to the resulting state.
+    pub fn observe_signals(
+        &mut self,
+        tick: u64,
+        grounded: bool,
+        moving: bool,
+        vertical_velocity: i64,
+    ) -> bool {
+        let state = self
+            .tracker
+            .observe(tick, grounded, moving, vertical_velocity);
+        self.observe(tick, state)
     }
 
     /// Observe one tick's motion state. Returns `true` when the clip switched.
@@ -1869,61 +2019,239 @@ mod tests {
         let map = ClipMap {
             idle: 2,
             walk: 5,
-            jump: 7,
+            jump_up: 7,
+            fall: 8,
+            land: 9,
         };
         assert_eq!(map.clip_for(MotionState::Idle), 2);
         assert_eq!(map.clip_for(MotionState::Moving), 5);
-        assert_eq!(map.clip_for(MotionState::Airborne), 7);
+        assert_eq!(map.clip_for(MotionState::Ascending), 7);
+        assert_eq!(map.clip_for(MotionState::Falling), 8);
+        assert_eq!(map.clip_for(MotionState::Landing), 9);
+    }
+
+    #[test]
+    fn vertical_velocity_sign_separates_ascending_from_falling() {
         assert_eq!(
-            MotionState::from_player_signals(true, false),
-            MotionState::Idle
+            MotionState::from_player_signals(false, false, 1),
+            MotionState::Ascending,
+            "a positive signed velocity is a rise"
         );
         assert_eq!(
-            MotionState::from_player_signals(true, true),
+            MotionState::from_player_signals(false, false, 0),
+            MotionState::Falling,
+            "exactly zero is not a rise, so it falls"
+        );
+        assert_eq!(
+            MotionState::from_player_signals(false, true, -1),
+            MotionState::Falling,
+            "a negative velocity falls even while moving horizontally"
+        );
+        assert_eq!(
+            MotionState::from_player_signals(true, false, 1234),
+            MotionState::Idle,
+            "grounded wins over a stale velocity"
+        );
+        assert_eq!(
+            MotionState::from_player_signals(true, true, -99),
             MotionState::Moving
-        );
-        assert_eq!(
-            MotionState::from_player_signals(false, true),
-            MotionState::Airborne,
-            "airborne wins over the committed horizontal delta"
         );
     }
 
     #[test]
-    fn default_map_uses_the_runtime_labelled_indices() {
+    fn landing_window_is_derived_from_the_land_clip_duration() {
+        // frames * divisor / units_per_second seconds, then * 60 ticks.
+        assert_eq!(landing_window_ticks(2, 400, ANIMATION_UNITS_PER_SECOND), 9);
+        assert_eq!(landing_window_ticks(6, 240, ANIMATION_UNITS_PER_SECOND), 17);
+        assert_eq!(
+            landing_window_ticks(1, 100, ANIMATION_UNITS_PER_SECOND),
+            LANDING_WINDOW_MIN_TICKS,
+            "a sub-frame duration clamps up to the visible minimum"
+        );
+        assert_eq!(
+            landing_window_ticks(50, 100, ANIMATION_UNITS_PER_SECOND),
+            LANDING_WINDOW_MAX_TICKS,
+            "a one-second clip clamps down to the recovery maximum"
+        );
+        for (frames, divisor, rate) in [(0usize, 400i16, 5_000u64), (2, 0, 5_000), (2, 400, 0)] {
+            assert_eq!(
+                landing_window_ticks(frames, divisor, rate),
+                LANDING_WINDOW_MIN_TICKS,
+                "an undefined duration falls back to the minimum"
+            );
+        }
+    }
+
+    #[test]
+    fn the_landing_window_reads_the_land_clips_own_frames_and_divisor() {
+        let first = palette_record(&[0x001], 3, 100, &[&[1.0, 2.0, 3.0]]);
+        let land = palette_record(&[0x001], 2, 400, &[&[4.0, 5.0]]);
+        let animation = SraAnimation::load(multi_record_container(&[first, land]), 1)
+            .expect("two records, two clips");
+        let mut map = ClipMap::for_clip_count(10);
+        map.land = 1;
+        assert_eq!(map.landing_window(&animation), 9);
+    }
+
+    #[test]
+    fn landing_holds_for_the_window_then_releases_to_the_grounded_state() {
+        let mut tracker = MotionTracker::new(9);
+        assert_eq!(
+            tracker.observe(0, true, false, 0),
+            MotionState::Idle,
+            "a spawn sample with no previous observation is not a touchdown"
+        );
+        assert_eq!(tracker.observe(1, false, false, 800), MotionState::Ascending);
+        assert_eq!(tracker.observe(2, false, false, -100), MotionState::Falling);
+        for tick in 3..12 {
+            assert_eq!(
+                tracker.observe(tick, true, false, 0),
+                MotionState::Landing,
+                "tick {tick} is inside the 9-tick window that opened at 3"
+            );
+        }
+        assert_eq!(
+            tracker.observe(12, true, false, 0),
+            MotionState::Idle,
+            "the exclusive end of the window releases to idle"
+        );
+        assert_eq!(
+            tracker.observe(13, true, true, 0),
+            MotionState::Moving,
+            "the grounded state then follows the horizontal delta"
+        );
+    }
+
+    #[test]
+    fn touchdown_does_not_flap_on_the_landing_boundary() {
+        let selection = ClipSelection {
+            fixed: None,
+            map: ClipMap {
+                idle: 55,
+                walk: 2,
+                jump_up: 35,
+                fall: 36,
+                land: 37,
+            },
+        };
+        let mut selector = ClipSelector::new(selection, 6);
+        let mut switches = 0;
+        let mut switches_after_touchdown = 0;
+        // Ground, rise, fall, then land while the committed horizontal delta
+        // alternates every tick. A flapping machine would toggle Landing/Idle
+        // or Landing/Moving inside the window.
+        let samples = [
+            (0u64, true, false, 0i64),
+            (1, false, false, 500),
+            (2, false, false, -50),
+            (3, true, true, 0),
+            (4, true, false, 0),
+            (5, true, true, 0),
+            (6, true, false, 0),
+            (7, true, true, 0),
+            (8, true, false, 0),
+            (9, true, true, 0),
+            (10, true, false, 0),
+        ];
+        for (tick, grounded, moving, velocity) in samples {
+            let switched = selector.observe_signals(tick, grounded, moving, velocity);
+            if switched {
+                switches += 1;
+                if tick >= 3 {
+                    switches_after_touchdown += 1;
+                }
+            }
+            let state = selector.state().expect("observed");
+            if (3..9).contains(&tick) {
+                assert_eq!(
+                    state,
+                    MotionState::Landing,
+                    "tick {tick} must hold Landing across the alternating delta"
+                );
+                assert_eq!(selector.clip(), 37);
+            }
+        }
+        assert_eq!(
+            switches, 6,
+            "Idle, Ascending, Falling, Landing, Moving and Idle; nothing repeats"
+        );
+        assert_eq!(
+            switches_after_touchdown, 3,
+            "after touchdown only entering Landing, leaving it to Moving and \
+             then following the delta to Idle may switch"
+        );
+        assert_eq!(
+            selector.state(),
+            Some(MotionState::Idle),
+            "the window closes at tick 9; the committed delta then decides"
+        );
+        assert_eq!(selector.clip(), 55);
+    }
+
+    #[test]
+    fn default_map_uses_the_five_confirmed_indices() {
         let map = ClipMap::for_clip_count(230);
         assert_eq!(map.idle, DEFAULT_IDLE_CLIP);
         assert_eq!(map.walk, DEFAULT_WALK_CLIP);
-        assert_eq!(map.jump, DEFAULT_JUMP_CLIP);
+        assert_eq!(map.jump_up, DEFAULT_JUMP_UP_CLIP);
+        assert_eq!(map.fall, DEFAULT_FALL_CLIP);
+        assert_eq!(map.land, DEFAULT_LAND_CLIP);
         assert_eq!(
-            (map.idle, map.walk, map.jump),
-            (55, 2, 27),
-            "the defaults are the measured indices, not positional guesses"
+            (map.idle, map.walk, map.jump_up, map.fall, map.land),
+            (55, 2, 35, 36, 37),
+            "the defaults are the measured five-state sequence"
         );
     }
 
     #[test]
     fn default_map_clamps_indices_past_the_clip_count() {
         let single = ClipMap::for_clip_count(1);
-        assert_eq!((single.idle, single.walk, single.jump), (0, 0, 0));
+        assert_eq!(
+            (
+                single.idle,
+                single.walk,
+                single.jump_up,
+                single.fall,
+                single.land
+            ),
+            (0, 0, 0, 0, 0)
+        );
 
         let short = ClipMap::for_clip_count(10);
         assert_eq!(
-            (short.idle, short.walk, short.jump),
-            (9, 2, 9),
+            (
+                short.idle,
+                short.walk,
+                short.jump_up,
+                short.fall,
+                short.land
+            ),
+            (9, 2, 9, 9, 9),
             "each default past the last clip falls back to the last clip"
         );
 
         let empty = ClipMap::for_clip_count(0);
-        assert_eq!((empty.idle, empty.walk, empty.jump), (0, 0, 0));
+        assert_eq!(
+            (
+                empty.idle,
+                empty.walk,
+                empty.jump_up,
+                empty.fall,
+                empty.land
+            ),
+            (0, 0, 0, 0, 0)
+        );
     }
 
     #[test]
     fn default_map_selection_switches_on_state_change_and_restarts_at_local_zero() {
-        let mut selector = ClipSelector::new(ClipSelection {
-            fixed: None,
-            map: ClipMap::for_clip_count(230),
-        });
+        let mut selector = ClipSelector::new(
+            ClipSelection {
+                fixed: None,
+                map: ClipMap::for_clip_count(230),
+            },
+            9,
+        );
         assert_eq!(selector.clip(), DEFAULT_IDLE_CLIP);
 
         assert!(selector.observe(5, MotionState::Idle));
@@ -1941,21 +2269,34 @@ mod tests {
             "the walk clip restarts at local tick 0"
         );
 
-        assert!(selector.observe(12, MotionState::Airborne));
-        assert_eq!(selector.clip(), DEFAULT_JUMP_CLIP);
+        assert!(selector.observe(12, MotionState::Ascending));
+        assert_eq!(selector.clip(), DEFAULT_JUMP_UP_CLIP);
         assert_eq!(selector.local_tick(12), 0);
+
+        assert!(selector.observe(13, MotionState::Falling));
+        assert_eq!(selector.clip(), DEFAULT_FALL_CLIP);
+        assert_eq!(selector.local_tick(13), 0);
+
+        assert!(selector.observe(14, MotionState::Landing));
+        assert_eq!(selector.clip(), DEFAULT_LAND_CLIP);
+        assert_eq!(selector.local_tick(14), 0);
     }
 
     #[test]
     fn a_state_change_restarts_the_clip_and_only_changes_on_a_new_state() {
-        let mut selector = ClipSelector::new(ClipSelection {
-            fixed: None,
-            map: ClipMap {
-                idle: 2,
-                walk: 5,
-                jump: 7,
+        let mut selector = ClipSelector::new(
+            ClipSelection {
+                fixed: None,
+                map: ClipMap {
+                    idle: 2,
+                    walk: 5,
+                    jump_up: 7,
+                    fall: 8,
+                    land: 9,
+                },
             },
-        });
+            9,
+        );
 
         assert!(selector.observe(10, MotionState::Idle));
         assert_eq!(selector.clip(), 2);
@@ -1977,23 +2318,38 @@ mod tests {
         assert!(!selector.observe(18, MotionState::Moving));
         assert_eq!(selector.local_tick(18), 1);
 
-        assert!(selector.observe(20, MotionState::Airborne));
+        assert!(selector.observe(20, MotionState::Ascending));
         assert_eq!(selector.clip(), 7);
         assert_eq!(selector.local_tick(20), 0);
+
+        assert!(selector.observe(21, MotionState::Falling));
+        assert_eq!(selector.clip(), 8);
+        assert_eq!(selector.local_tick(21), 0);
+
+        assert!(selector.observe(22, MotionState::Landing));
+        assert_eq!(selector.clip(), 9);
+        assert_eq!(selector.local_tick(22), 0);
     }
 
     #[test]
     fn a_fixed_clip_ignores_state_and_uses_the_global_tick() {
-        let mut selector = ClipSelector::new(ClipSelection {
-            fixed: Some(3),
-            map: ClipMap {
-                idle: 0,
-                walk: 1,
-                jump: 2,
+        let mut selector = ClipSelector::new(
+            ClipSelection {
+                fixed: Some(3),
+                map: ClipMap {
+                    idle: 0,
+                    walk: 1,
+                    jump_up: 2,
+                    fall: 4,
+                    land: 5,
+                },
             },
-        });
+            9,
+        );
         assert!(!selector.observe(42, MotionState::Moving));
-        assert!(!selector.observe(43, MotionState::Airborne));
+        assert!(!selector.observe(43, MotionState::Ascending));
+        assert!(!selector.observe(44, MotionState::Falling));
+        assert!(!selector.observe(45, MotionState::Landing));
         assert_eq!(selector.clip(), 3);
         assert_eq!(selector.local_tick(42), 42);
         assert_eq!(selector.state(), None);
