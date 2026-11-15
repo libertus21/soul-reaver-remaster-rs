@@ -6,7 +6,8 @@ selects for the player while a human performs each state, fingerprints the
 selected table, and maps packed tables to a clip index. This note records the
 failure of the heuristic, the packed and keyed fingerprint schemes, the
 segment aggregation, the keyed-locomotion hypothesis, the per-jump aligned
-template that now carries the jump result, and the exact operator procedure.
+template that now carries the jump result, the whole-directory index that
+attributes each actor to its source file, and the exact operator procedure.
 The probe itself stays in the session scratch directory because it carries
 module-relative anchors and engine field offsets.
 
@@ -29,19 +30,33 @@ measured reason; nothing is carried across actors. This multi-actor revision is
 a scratch-probe change only: the committed artifact is this note, no engine code
 changed, and no golden digest moved.
 
+A single `.SRA` cannot label a whole scene either. A live actor's frames can only
+be named if the table they point at is in the index, and every actor file is a
+different table set: `RAZIEL.SRA` holds 230 clips at 66 slots, `SLUAGH.SRA` 23
+clips at 24 slots. The probe therefore indexes a **whole directory**. Each
+fingerprint maps to `(source file, per-file clip index)`, and every actor is
+attributed to the one file its own frames came from. A fingerprint that appears
+in two files keeps both candidates and is marked `ambiguous`; an actor whose
+observed slot count contradicts its file is reported as `slot-mismatch` and is
+not labelled.
+
 ## Quick path
 
 1. Start the game and load a save where the actors you care about are visible,
    on solid ground, with at least one of them free to walk.
-2. Run the probe in its default mode with the path to the `.SRA` file whose
-   clip indices you want (for example `RAZIEL.SRA` for the player):
-   `--attach SRX.exe --sra <RAZIEL.SRA> --motion-seconds 20`.
+2. Run the probe in its default mode against the whole animation directory, so
+   every actor's own file is in the index:
+   `--attach SRX.exe --sra-dir <OBJECT> --motion-seconds 20`.
+   A single-file run (`--sra <FILE>`) still works, but actors whose clips live in
+   another file will come back `unmapped`.
 3. Let each actor stand still, then walk a little, then jump normally once or
    twice. No steady rhythm is required; the probe reads each object's own
    vertical and horizontal motion, not your timing.
-4. Read the `IDENTITY` verdict first, then one `ACTOR` / `PHASE` / `LABELS`
-   block per object. A numeric index is a packed clip; `unknown` means that
-   field was not measured well enough to name a clip.
+4. Read the `CLIPMAP` line, then the `IDENTITY` verdict, then one
+   `ACTOR` / `PHASE` / `LABELS` block per object. `ACTOR ... file=<name>` names
+   the file its clips came from; `file=ambiguous` and `reason=slot-mismatch` are
+   refusals, not labels. A numeric index is a per-file packed clip; `unknown`
+   means that field was not measured well enough to name a clip.
 
 For a repeating action such as jumping, three windows cannot separate its
 phases. Use the per-jump aligned template in "Per-jump alignment: the primary
@@ -454,20 +469,24 @@ absence of evidence.
 1. **Prepare.** Load a save with the actors you want in view, on solid ground,
    and leave the game unpaused. One of them must be able to walk; an enemy that
    only stands still can still yield `idle`, but not `walk` or a jump.
-2. **Run.** From the scratch directory:
+2. **Run.** From the scratch directory, point the probe at the whole animation
+   directory so every actor's file is indexed:
 
    ```text
-   python sr1_clip_label_probe.py --attach SRX.exe --sra <RAZIEL.SRA> \
+   python sr1_clip_label_probe.py --attach SRX.exe --sra-dir <OBJECT> \
        --motion-seconds 20 --max-actors 8
    ```
 
    Let the subject stand, walk a little, and jump a few times. The probe reads
-   motion, not rhythm.
+   motion, not rhythm. `CLIPMAP files=... clips=... distinct=... ambiguous=...
+   collisions=... elapsed=...` confirms what was indexed before the hook arms.
 3. **Read.** Check the `IDENTITY` line first: `verdict=STABLE` and
    `adopted=object-node` (or a deliberate `adopted=shape`) mean per-actor
-   attribution is trustworthy. Then read each `LABELS` line. A field at
-   `unknown` is missing evidence; repeat that behaviour rather than forcing a
-   value.
+   attribution is trustworthy. Then read each `ACTOR` line. `file=<name>
+   clips=<n>` means every clip that actor selected was named from that one file;
+   `file=ambiguous files=<a|b>` and `reason=slot-mismatch` are refusals. Then read
+   each `LABELS` line. A field at `unknown` is missing evidence; repeat that
+   behaviour rather than forcing a value.
 
 ### What the multi-actor mode cannot establish
 
@@ -489,6 +508,147 @@ absence of evidence.
 - **Two instances of one model can share a shape key.** The alternative key is
   adopted only when the shape count still separates the live ids; otherwise the
   run reports the ambiguity instead of merging identical bodies.
+
+## Whole-directory indexing: one map across every actor file
+
+### Why a single file is insufficient
+
+One `.SRA` names one body's tables, and a live actor can only be labelled from
+the file that contains the table it selected. The two files the sessions
+actually exercised show how little a single index covers:
+
+| File | Clips | Slots | Role |
+|---|---:|---:|---|
+| `RAZIEL.SRA` | 230 | 66 | player body |
+| `SLUAGH.SRA` | 23 | 24 | a 24-slot enemy |
+
+Indexing only `RAZIEL.SRA` leaves every sluagh sample `unmapped`: its clip
+payloads are not in the player's 230 tables. The directory holds **227** `.SRA`
+files, and a scene can contain actors from any of them. Without a directory
+index, a real capture session would measure motion and then fail to name most of
+the actors it observed.
+
+### The directory index
+
+`--sra-dir <DIR>` indexes every `*.SRA` in the directory, in sorted name order.
+`--sra <FILE>` remains the single-file mode. Supplying both is a typed error
+(`SraSourceError`), and an empty or missing directory is the same class of error,
+never an empty map.
+
+For each file the probe:
+
+1. parses the record container and enumerates **one packed table per payload
+   record, in file order** (the same rule the single-file index uses);
+2. infers the file's bit-plane stride, because the slot count is the model bone
+   count and is **not stored in the `.SRA`**; and
+3. fingerprints the same invariant content view — 16 header bytes plus the
+   complete bit-plane block — so a table has the same key whether it came from
+   the file or from memory.
+
+The stride is inferred by requiring a table at each record start and keeping the
+**largest** stride that still enumerates every record; over-striding reads past
+the inline command and fails. A bounded fallback scan covers records whose table
+starts a few bytes in. Each file is read and released before the next one, so
+memory stays flat: only clip descriptors are kept, never all payload bytes. The
+whole directory takes about 2.5 s for 227 files.
+
+```text
+CLIPMAP files=227 clips=1001 distinct=910 ambiguous=55 collisions=32 elapsed=2.46s
+```
+
+`clips` follows the existing one-table-per-record rule; many small effect files
+contain no structurally valid table, so the total is below the record count.
+`distinct` is the number of unique fingerprints, `ambiguous` counts keys with
+more than one candidate (including a duplicate inside one file), and
+`collisions` counts keys that appear in **more than one file**.
+
+### The attribution rule
+
+For one actor the probe collects every packed fingerprint its own phases
+observed, then looks each one up in the directory map. The candidate files are
+first narrowed to those whose stride is compatible with the actor's slot count;
+only then does the file count decide:
+
+| Observation | Output | Labels |
+|---|---|---|
+| All mapped fingerprints resolve to one stride-compatible file | `ACTOR ... file=SLUAGH.SRA clips=23` | Use that file's `fingerprint -> index` map. |
+| Two or more stride-compatible files remain | `ACTOR ... file=ambiguous files=A.SRA\|B.SRA` | **None.** Every field stays `unknown` with `reason=ambiguous-file`. |
+| Candidates exist but none is stride-compatible | `ACTOR ... reason=slot-mismatch` | **None.** The body size contradicts the file. |
+| No fingerprint maps to any file | `ACTOR ... file=none` | All `unknown`; the samples are unmapped. |
+
+The per-file index is also the label space: `idle=23` for a sluagh means clip 23
+of `SLUAGH.SRA`, not clip 23 of the player. An actor is never labelled from a
+combined or guessed map.
+
+### Cross-file collision policy
+
+Two actor files can ship the same clip payload. That is expected, and it must be
+reported, not resolved:
+
+- every candidate `(file, clip index)` is kept;
+- the fingerprint is marked `ambiguous`, counted in `collisions=`, and never
+  resolved to the first occurrence;
+- an actor whose frames span two files prints both and receives no label.
+
+In the single-select modes (`--segments`, `--auto-windows`) a cross-file
+ambiguous key is omitted from the display index and therefore counted as
+`unmapped`; the `collisions=` count on `CLIPMAP` states how many keys were
+omitted. A silent pick is never an option.
+
+### The slot-count cross-check
+
+A file's size is fixed by its model's bone count, and the byte stride of each
+bit-plane is `ceil(3 * slots / 8)`. The stride is the part the file actually
+constrains, so the check compares strides:
+
+| Actor observation | Attributed file | Verdict |
+|---|---|---|
+| `slots=24` (stride 9) | `SLUAGH.SRA`, stride 9 | match: labels allowed |
+| `slots=66` (stride 25) | `RAZIEL.SRA`, stride 25 | match: labels allowed |
+| `slots=24` (stride 9) | a stride-25 file | **`reason=slot-mismatch`**, no labels |
+
+A mismatch is a mapping error, not a clip result: the fingerprint matched, but
+the observed body size cannot be the body that file describes. The probe prints
+the refusal and labels nothing. The exact bone count is not recoverable from the
+file (several counts share one stride), which is why the invariant is stride
+equality and the printed slot count is the actor's observed value.
+
+### The three-step procedure for a scene with several actors
+
+1. **Index first.** Start the run with `--sra-dir <OBJECT>` and wait for the
+   `CLIPMAP` line. `files` should cover the directory and `collisions` should be
+   the expected cross-actor payload count; nothing is attached until indexing
+   finishes.
+2. **Drive every actor you need.** Stand, walk and jump with each body of
+   interest; a body you never move still gets `idle` but cannot get `walk` or a
+   jump. The run measures each object independently and needs no per-actor
+   window.
+3. **Attribute before labelling.** For each actor read `file=` (one file),
+   `file=ambiguous files=` (two files) or `reason=slot-mismatch` first. Then read
+   the per-file `LABELS` block. A refusal is a valid result; re-run with a
+   narrower scene or a corrected slot count rather than forcing an index.
+
+### What the directory index cannot establish
+
+- **Identical payloads across actors.** When two files ship the same table, the
+  fingerprint is `ambiguous`; the probe cannot say which actor owns the shared
+  payload, so it names neither.
+- **An actor whose file is not in the directory.** Only indexed files can be
+  named. A file outside `--sra-dir` leaves its actor `file=none` and its samples
+  `unmapped`; widening the directory is the fix.
+- **The exact bone count from the file.** Slot count is not stored. The probe
+  checks stride compatibility and reports the actor's observed slot count; two
+  counts in the same alignment group are indistinguishable.
+- **A file whose stride cannot be pinned.** A file that never fully enumerates
+  at any bounded stride is indexed best-effort; its clips may be missing or its
+  stride may round into a neighbouring group. Such a file is not silently
+  treated as correct.
+- **Duplicate tables inside one record.** The index keeps the first table per
+  record, as the single-file path always has. A nested duplicate table is not
+  enumerated.
+- **Agreement is still non-semantic.** A file match says where the clip lives and
+  that the stride is compatible. It does not name the pose, prove the clip is
+  unique to that file, or turn agreement into truth.
 
 ## Why time windows were replaced
 
@@ -923,17 +1083,30 @@ plus one `PHASE` line per phase); the template is the primary result.
 - **Not every frame is sampled.** A table active for a single frame may never
   win a phase bucket. Absence from the top buckets is not proof the table is
   unused.
+- **A directory index is not a scene index.** It names the files that were
+  indexed, not the actors that are alive. An actor whose file is outside
+  `--sra-dir`, or whose payload is shared by two files, stays `file=none` or
+  `file=ambiguous`; neither is a clip label.
 
 ## Verification
 
 | Gate | Result |
 |---|---|
-| `--selftest` | 54 cases, 54 green; the existing fingerprint, segment, keyed, phase and jump cases plus the horizontal dead-band, exact-threshold, walk-commit, no-motion and uncalibrated cases; the identity STABLE/CHURN line cases; and the per-actor label cases (`actor-labels-measured`, `actor-line-shape`, `actor-unknown-no-motion`, `actor-unknown-too-few`, `actor-unknown-low-agreement`, `actor-unknown-no-jumps`, `actor-block-bounded`) |
-| `--live-selftest` | 24 cases, 24 green in a real Frida runtime; adds `multi-actor-independent`, `multi-actor-own-labels`, `multi-actor-no-bleed`, `identity-churn-no-merge` and `horizontal-hysteresis` on top of the previous hardware-surface cases |
-| `--dry-run` | prints the plan; attaches nothing. It names the per-actor aggregation, the identity verdict, both hysteresis families with their constants, the unknown reasons and the label gates |
+| `--selftest` | 61 cases, 61 green; the existing fingerprint, segment, keyed, phase, jump, horizontal and identity cases, the per-actor label cases, and the directory cases (`sra-dir-two-files`, `sra-dir-per-actor-file`, `sra-dir-cross-collision`, `sra-dir-slot-mismatch`, `sra-dir-clipmap-line`, `sra-dir-source-conflict`, `sra-dir-empty`) |
+| `--live-selftest` | 29 cases, 29 green in a real Frida runtime; adds `sra-dir-two-files`, `sra-dir-cross-collision`, `sra-dir-slot-mismatch`, `sra-dir-source-conflict` and `sra-dir-empty` on top of the multi-actor and hardware-surface cases |
+| `--dry-run` | prints the plan; attaches nothing. It names the per-actor aggregation, the identity verdict, both hysteresis families with their constants, the unknown reasons, the directory index, the attribution/refusal rules and the label gates |
 | `py_compile` | clean |
 | `node --check` on `--print-agent` | clean |
 | `cargo test` | 694 green, unchanged by this docs-only slice |
+
+The directory cases build two three-plane synthetic files at 66 and 24 slots with
+disjoint fingerprints, then assert that each file indexes at its own stride and
+that each actor is attributed to its own file. A third file repeats one payload,
+and the case asserts the meeting point is `ambiguous` with both candidates and no
+label. The mismatch case feeds a 24-slot observation to a stride-25 file and
+asserts `reason=slot-mismatch`. The last two cases assert the typed source
+conflict and the empty-directory error. Indexing the shipped directory measured
+`files=227 clips=1001 distinct=910 ambiguous=55 collisions=32` in `2.46 s`.
 
 The live harness spawns a throwaway system process, never the game. It
 exercises the real `NativePointer`, `Memory`, `Process`, `Interceptor`,
@@ -969,6 +1142,16 @@ empty segment.
 - [ ] The multi-actor procedure has three steps and names the result lines.
 - [ ] The multi-actor limitations include an idle-only actor, an actor whose AI
       never engages, and agreement not being semantic truth.
+- [ ] The directory index states the per-file clip counts, the one-table-per-
+      record rule and the bounded, per-file memory use, with measured elapsed
+      time and `CLIPMAP` counts.
+- [ ] The attribution rule names one file, `file=ambiguous files=<a|b>`, and
+      `file=none`, and says no label is produced in the last two cases.
+- [ ] The cross-file collision policy keeps every candidate and never resolves
+      to the first occurrence.
+- [ ] The slot-count cross-check is stated as a stride equality, with
+      `reason=slot-mismatch` refusing to label.
+- [ ] `--sra` and `--sra-dir` together and an empty directory are typed errors.
 - [ ] The two-run incompatibility and the low coverage are the stated reason
       for replacing time windows, not a preference.
 - [ ] The vertical signal is named, its validation is described, and the
@@ -978,7 +1161,8 @@ empty segment.
 - [ ] The packed fingerprint is described as content, not as a raw byte range
       at a fixed position.
 - [ ] The keyed fingerprint names its bounded view and excludes the pointer.
-- [ ] The collision policy is explicit: lowest index, `ambiguous` reported.
+- [ ] The collision policy is explicit: lowest index within one file, every
+      cross-file candidate kept and marked `ambiguous`.
 - [ ] The jump section states the detection rule, the resampler, the agreement
       metric and the label gate with both constants.
 - [ ] Per-jump output is bounded by `--max-jumps` and per-actor output by
@@ -991,11 +1175,17 @@ empty segment.
 
 ## Next step
 
+> **2026-11-15 directory revision.** The probe now indexes a whole `*.SRA`
+> directory and attributes each live actor to the file its own clips came from.
+> The scratch probe is green at 61 host cases and 29 live-runtime cases. Indexing
+> the shipped directory measured `files=227 clips=1001 distinct=910 ambiguous=55
+> collisions=32` in `2.46 s`. The next capture should confirm that a real scene
+> with several actors produces one `file=` attribution per actor and an
+> `ambiguous` or `slot-mismatch` refusal where the directory cannot decide.
+
 > **2026-11-15 multi-actor revision.** The probe now labels every observed live
 > object from its own motion, with a measured identity verdict and a documented
-> `unknown` policy. The scratch probe is green at 54 host cases and 24
-> live-runtime cases; the identity stability of a real capture is still the
-> first thing to read in the next session.
+> `unknown` policy.
 
 The multi-actor mode is measured but has not yet been run against a live scene
 with several actors. The next capture should confirm the `IDENTITY` verdict in
