@@ -355,6 +355,9 @@ invariant_fp = FNV-1a 32-bit over, in this order:
 key = "<frame_count>:<divisor>:<invariant_fp as 8 lowercase hex digits>"
 ```
 
+`slot_count` is the **observed body's** covered slot count, not a global player
+value; see "Small bodies" below for the byte-level difference and the proof.
+
 Included, and why each is form-invariant:
 
 - `+0x00` table/stream count, `+0x01..+0x03` the three per-channel bytes,
@@ -409,6 +412,134 @@ Uniqueness over the 230 `RAZIEL.SRA` clips at 66 slots: the invariant view gives
 collision, and the four extra collisions are the price of dropping the
 form-dependent word. The mapping policy is unchanged: the index keeps the
 lowest clip and reports `ambiguous`.
+
+### Small bodies: the stride belongs to the body, not to the player (2026-11-15)
+
+The definition above is form-invariant, but it was under-specified about **whose**
+slot count supplies `align8(3 * slot_count)`. The probe answered that question
+with the global `--slots` value (the player's 66) for every observed body. That
+is correct for `RAZIEL.SRA` and wrong for every smaller body, which is why a
+real directory run matched `slots=66` and returned `file=none` for `slots=24`
+and `slots=3`.
+
+**The byte-level difference.** Take `SLUAGH.SRA` record 0 and `RAZIEL.SRA`
+record 0. Both tables use `flags=0x05` (angle + translation), so both hash a
+flags byte plus two planes. Everything else differs:
+
+| | `RAZIEL.SRA` record 0 | `SLUAGH.SRA` record 0 |
+|---|---|---|
+| body slots (observed) | 66 | 24 |
+| table/stream count (`+0x00`) | 3 | 2 |
+| plane stride `ceil(3*slots/8)` | 25 bytes | 9 bytes |
+| planes present (`flags=0x05`) | 2 | 2 |
+| bit-plane block length | `1 + 2*25 = 51` | `1 + 2*9 = 19` |
+| file block base | `+0x14 + 3*4 = +0x20` | `+0x14 + 2*4 = +0x1c` |
+| memory block base | `+0x18 + 3*8 = +0x30` | `+0x18 + 2*8 = +0x28` |
+| file-to-memory block shift | `+0x10` | `+0x0C` |
+
+Two independent consequences follow, and only the first was already handled:
+
+1. **The block shift is `4 + 4 * table_count`, not a constant `0x10`.** A
+   two-stream table shifts by `0x0C`, a three-stream table by `0x10`. The file
+   side (`+0x14 + 4*count`) and the memory side (`+0x18 + 8*count`) both already
+   used the count, so the base was never the defect.
+2. **The hashed window is `1 + present * ceil(3 * slots / 8)`, and `slots` is the
+   observed body's.** Hashing a 24-slot table with the player's 25-byte planes
+   reads `51 - 19 = 32` bytes past the block. Those bytes are the `align4`
+   padding and the inline value stream (the command word and its palette), so
+   the digest is stable per form but describes the wrong window. Measured for
+   `SLUAGH.SRA` record 0: the file form and a relocated memory form agree at
+   `13:333:f60344d6` when both use 9-byte planes, and the memory form hashes to
+   `13:333:4a378f68` at 25-byte planes. One clip, two keys, and the file index
+   only holds the first.
+
+**The corrected invariant.** The key is a function of the table's own content
+and of the body's slot count:
+
+```text
+invariant_fp(slots) = FNV-1a 32-bit over, in this order:
+  1. table bytes +0x00..+0x10   (16 bytes, includes the stream count)
+  2. the bit-plane block at +0x14 + 4*count (file)
+     or +0x18 + 8*count (memory): flags byte then `present` planes of
+     ceil(3 * slots / 8) bytes each
+
+key = "<frame_count>:<divisor>:<invariant_fp as 8 lowercase hex digits>"
+slots = the observed body's covered slot count, i.e. the sum of its channel
+        slot counts (66 for the player body, 24 for `SLUAGH.SRA`)
+```
+
+Why that is invariant across forms for any slot count and any stream count:
+
+- the 16-byte header and the flags byte are literal content, copied unchanged by
+  relocation;
+- the stream count is inside those 16 bytes, and it only moves the block, which
+  both sides derive from it;
+- the plane stride is a property of the model, so the file's inferred stride and
+  the live body's `ceil(3*slots/8)` are the same number for the same body. The
+  file side infers it from the records; the runtime derives it from the channel
+  coverage. The existing attribution rule already compares exactly this stride,
+  so the fingerprint and the `slot-mismatch` check now agree by construction;
+- the key text does not change for the player body: its stride was already 25,
+  so `a1f48a74` (clip 0) and `3acaf951` (clip 2) are unchanged.
+
+The fingerprint is therefore not a single global constant: it is
+`fingerprint(table content, slots)`. Two bodies with different slot counts give
+the same table two different keys, which is intended — the key names a clip of a
+specific body, and the directory index already stores `(file, per-file index)`.
+
+**Proof.** Both forms are constructed for the same small clip and hashed:
+
+| Case | Form | slots | streams | key |
+|---|---|---:|---:|---|
+| synthetic 24-slot clip | file | 24 | 2 | `13:333:31e138ac` |
+| synthetic 24-slot clip | memory | 24 | 2 | `13:333:31e138ac` |
+| same memory bytes | memory | 66 | 2 | differs |
+| `SLUAGH.SRA` record 0 | file | 24 | 2 | `13:333:f60344d6` |
+| `SLUAGH.SRA` record 0 | memory | 24 | 2 | `13:333:f60344d6` |
+| `RAZIEL.SRA` record 0 | file | 66 | 3 | `50:100:a1f48a74` |
+| `RAZIEL.SRA` record 0 | memory | 66 | 3 | `50:100:a1f48a74` |
+
+The synthetic pair is the regression test: `--selftest` case
+`fingerprint-small-body-form-invariant` builds a 24-slot, 2-stream record,
+relocates it the way the engine does, and asserts one key for both forms and a
+different key at the player's stride. `--live-selftest` case
+`fingerprint-small-body-cross-form` does the same across the boundary: the host
+builds the file form and the real agent builds the memory form through the same
+hook the capture uses, then compares the two keys.
+
+**Re-measured index (227 files).** The file side is unchanged, so the directory
+totals are identical; what changed is how many files can be reached by a live
+body at all:
+
+```text
+CLIPMAP files=227 clips=1001 distinct=910 ambiguous=55 collisions=32 elapsed=2.57s
+files_with_clips=143 files_without_a_table=84
+files_with_a_matching_key:        before=34  after=143
+files_usable_after_attribution:   before=30  after=143
+```
+
+All 143 files that index at least one clip now resolve at least one
+actor-reachable fingerprint; the other 84 files hold no structurally valid
+table. Before the fix, 30 files could be used: the 30 files at the player's
+66-slot stride. The raw count was 34, because four smaller files (strides 13, 56,
+57 and 63) hashed at 25-byte planes into keys that exist in the map — but every
+one of those keys belongs to a 66-slot file, so the attribution rule refuses the
+small actor as `slot-mismatch`. They were matches, not attributions.
+
+The stride distribution shows why the defect was not a corner case: 30 files are
+66-slot bodies, 3 are 24-slot, and the remaining 110 are other sizes (strides
+3..64), so most of the corpus was unreachable from a live body of its own size.
+
+The player's confirmed keys are unchanged: `RAZIEL[0]=50:100:a1f48a74`,
+`RAZIEL[2]=12:209:3acaf951`, `RAZIEL[35]=2:700:c003c0fc`,
+`RAZIEL[36]=1:100:d4224b95`, `RAZIEL[37]=2:400:876bcf9b`,
+`RAZIEL[55]=6:580:e5bb630f`.
+
+**Limit.** `slots` is the sum of the observed channel slot counts, so the
+invariant holds while the channels tile the model's slot space. A body whose
+channels cover a strict subset would hash a shorter window than its file's
+stride; that body is reported `file=none`, exactly as before, and is not
+silently mapped to a neighbouring stride. No measured file has that shape.
 
 The extended scan still finds **0 genuine additional tables** in the measured
 corpus: every extra structural match at a non-base offset is a `+0x04`/`+0x08`
