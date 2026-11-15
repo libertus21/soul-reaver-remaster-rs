@@ -1089,6 +1089,33 @@ impl MotionState {
     }
 }
 
+/// Default idle clip: **CONFIRMED** by runtime observation.
+///
+/// The clip-labelling probe watched the player's selected packed table while
+/// the operator stood still: clip `55` (`6:580`) held coverage `1.00` in three
+/// of four runs. One earlier run observed clip `0` (`50:100`) at the same
+/// coverage, so idle appears to have more than one variant, likely section- or
+/// variant-dependent; `55` is the most frequent observation and is the default.
+/// See `docs/changes/runtime-capture/clip-labelling.md`.
+pub const DEFAULT_IDLE_CLIP: usize = 55;
+
+/// Default moving clip: **CONFIRMED** by runtime observation.
+///
+/// The walk window selected clip `2` (`12:209:3acaf951`) with coverage `0.91`.
+/// That invariant fingerprint was predicted from the shipped file before the
+/// run and then matched, so the file-side prediction and the runtime selection
+/// agree.
+pub const DEFAULT_WALK_CLIP: usize = 2;
+
+/// Default airborne clip: **PARTIAL / UNKNOWN**, not confirmed.
+///
+/// The jump window was not dominated by a single clip: clip `27` held `0.16`,
+/// clip `16` `0.15`, clip `2` `0.12` and clip `37` `0.07`, with `0.21` keyed.
+/// That spread is consistent with jump-up, fall and land being distinct clips,
+/// which the probe cannot separate inside one window. `27` has the largest
+/// share and is kept only as a documented best-effort default.
+pub const DEFAULT_JUMP_CLIP: usize = 27;
+
 /// Explicit state-to-clip mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClipMap {
@@ -1100,17 +1127,24 @@ pub struct ClipMap {
 impl ClipMap {
     /// Default presentation mapping for `clip_count` clips.
     ///
-    /// The shipped tables carry no clip identity, so this is an explicit
-    /// presentation choice, not a recovered mapping: idle is the first clip,
-    /// walk the middle clip and jump the last clip. It is deterministic and
-    /// always in range; override it with `--clip-idle/--clip-walk/--clip-jump`
-    /// or freeze one clip with `--clip <N>`.
+    /// The shipped tables carry no clip identity, so these indices are a
+    /// runtime observation of the table the engine selected per state, not a
+    /// field recovered from the file: [`DEFAULT_IDLE_CLIP`] and
+    /// [`DEFAULT_WALK_CLIP`] are confirmed, [`DEFAULT_JUMP_CLIP`] is a
+    /// best-effort partial.
+    ///
+    /// Each default is clamped to the last decoded clip, so an animation with
+    /// fewer clips than a measured index falls back to its last clip instead of
+    /// returning an out-of-range error or panicking. A zero-clip animation maps
+    /// every state to `0`, exactly like the previous saturating behaviour.
+    /// Override the map with `--clip-idle/--clip-walk/--clip-jump` or freeze one
+    /// clip with `--clip <N>`.
     pub fn for_clip_count(clip_count: usize) -> Self {
         let last = clip_count.saturating_sub(1);
         Self {
-            idle: 0,
-            walk: last / 2,
-            jump: last,
+            idle: DEFAULT_IDLE_CLIP.min(last),
+            walk: DEFAULT_WALK_CLIP.min(last),
+            jump: DEFAULT_JUMP_CLIP.min(last),
         }
     }
 
@@ -1853,6 +1887,63 @@ mod tests {
             MotionState::Airborne,
             "airborne wins over the committed horizontal delta"
         );
+    }
+
+    #[test]
+    fn default_map_uses_the_runtime_labelled_indices() {
+        let map = ClipMap::for_clip_count(230);
+        assert_eq!(map.idle, DEFAULT_IDLE_CLIP);
+        assert_eq!(map.walk, DEFAULT_WALK_CLIP);
+        assert_eq!(map.jump, DEFAULT_JUMP_CLIP);
+        assert_eq!(
+            (map.idle, map.walk, map.jump),
+            (55, 2, 27),
+            "the defaults are the measured indices, not positional guesses"
+        );
+    }
+
+    #[test]
+    fn default_map_clamps_indices_past_the_clip_count() {
+        let single = ClipMap::for_clip_count(1);
+        assert_eq!((single.idle, single.walk, single.jump), (0, 0, 0));
+
+        let short = ClipMap::for_clip_count(10);
+        assert_eq!(
+            (short.idle, short.walk, short.jump),
+            (9, 2, 9),
+            "each default past the last clip falls back to the last clip"
+        );
+
+        let empty = ClipMap::for_clip_count(0);
+        assert_eq!((empty.idle, empty.walk, empty.jump), (0, 0, 0));
+    }
+
+    #[test]
+    fn default_map_selection_switches_on_state_change_and_restarts_at_local_zero() {
+        let mut selector = ClipSelector::new(ClipSelection {
+            fixed: None,
+            map: ClipMap::for_clip_count(230),
+        });
+        assert_eq!(selector.clip(), DEFAULT_IDLE_CLIP);
+
+        assert!(selector.observe(5, MotionState::Idle));
+        assert_eq!(selector.clip(), DEFAULT_IDLE_CLIP);
+        assert_eq!(selector.local_tick(9), 4);
+        assert!(!selector.observe(10, MotionState::Idle));
+        assert_eq!(selector.clip(), DEFAULT_IDLE_CLIP);
+        assert_eq!(selector.local_tick(10), 5);
+
+        assert!(selector.observe(11, MotionState::Moving));
+        assert_eq!(selector.clip(), DEFAULT_WALK_CLIP);
+        assert_eq!(
+            selector.local_tick(11),
+            0,
+            "the walk clip restarts at local tick 0"
+        );
+
+        assert!(selector.observe(12, MotionState::Airborne));
+        assert_eq!(selector.clip(), DEFAULT_JUMP_CLIP);
+        assert_eq!(selector.local_tick(12), 0);
     }
 
     #[test]

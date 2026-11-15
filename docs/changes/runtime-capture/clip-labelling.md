@@ -9,8 +9,10 @@ segment aggregation, the keyed-locomotion hypothesis, and the exact operator
 procedure. The probe itself stays in the session scratch directory because it
 carries module-relative anchors and engine field offsets.
 
-Nothing was launched, attached or instrumented for this slice. No production
-code changed and no golden moved.
+The first revision of this note described a docs-only slice: nothing was
+launched and no production code changed. The capture has since been run (see
+"Runtime result" below), and the measured idle and walk indices are now the
+default state map in `sra::ClipMap::for_clip_count`. No golden digest moved.
 
 ## Quick path
 
@@ -20,6 +22,39 @@ code changed and no golden moved.
 4. Read the final `LABELS` line. A numeric index is a packed clip; `keyed`
    and `unmapped` are producer classes, not indices. The probe prints both the
    invariant key and the legacy digest for the dominant sample.
+
+## Runtime result (2026-11-14)
+
+The three-window capture was run against our own build and produced these
+labels. `unmapped` was `0.00` in all three segments, so every sampled table
+mapped to a file index after the invariant-fingerprint fix.
+
+| Index | State | Evidence class | Measurement |
+|---:|---|---|---|
+| 55 | idle | **CONFIRMED** | Coverage `1.00`, observed in 3 of 4 runs. |
+| 2 | walk | **CONFIRMED** | Coverage `0.91`, `fp=12:209:3acaf951`; predicted from the file before the run, then confirmed. |
+| 27 | jump | **PARTIAL / UNKNOWN** | Coverage `0.16`; four clips shared the window (`27:0.16`, `16:0.15`, `2:0.12`, `37:0.07`, keyed `0.21`). |
+
+Supporting `--list-clips` facts for those indices: clip `0` is frames `50`
+divisor `100`, clip `2` is frames `12` divisor `209`, clip `27` is frames `6`
+divisor `240`, clip `55` is frames `6` divisor `580`.
+
+Two caveats belong to the result, not to a footnote:
+
+- **Idle has a variant.** One earlier run reported clip `0` (`50:100`) at
+  coverage `1.00` instead of clip `55`. Both runs are clean, so idle appears to
+  select more than one table, likely per section or variant. `55` is the most
+  frequent observation and is the default.
+- **Jump is not confirmed.** A single timed window contains jump-up, fall and
+  land, so a spread across four clips is expected; the probe cannot separate
+  them. `27` is the largest share and is kept as a documented best-effort
+  default only.
+
+These values are wired into `sra::ClipMap::for_clip_count` with a per-index
+provenance doc comment, clamped to the decoded clip count so a short animation
+falls back to its last clip, and remain overridable with
+`--clip-idle/--clip-walk/--clip-jump`. See
+`docs/notes/packed-channel-format.md`, "State defaults".
 
 ## The keyed hypothesis (test pending)
 
@@ -299,8 +334,8 @@ Rules that keep the output honest:
   promise that the same state always picks it. Context, speed, weapon, damage
   or progression can change the selection.
 - **The label is not a semantic name in the file.** The `.SRA` carries no
-  idle/walk/jump identifier. `idle=0` means "the engine selected packed clip
-  0 while the operator stood still", not "clip 0 is named idle".
+  idle/walk/jump identifier. `idle=55` means "the engine selected packed clip
+  55 while the operator stood still", not "clip 55 is named idle".
 - **A keyed key is not a clip index.** The file index lists packed tables
   only. A keyed key proves the producer and separates frame arrays at their
   first frame; it does not name a clip, and `LABELS` reports it as `keyed`.
@@ -325,7 +360,7 @@ Rules that keep the output honest:
 | `--dry-run` | prints the plan; attaches nothing |
 | `py_compile` | clean |
 | `node --check` on `--print-agent` | clean |
-| `cargo test` | 683 green on the current `main` base; `packed_channel` owns the invariant definition and its file/memory tests |
+| `cargo test` | 688 green after wiring the labelled defaults; `packed_channel` owns the invariant definition and its file/memory tests |
 
 The live harness spawns a throwaway system process, never the game. It
 exercises the real `NativePointer`, `Memory`, `Process`, `Interceptor`,
@@ -353,10 +388,10 @@ reporting an empty segment.
 
 ## Next step
 
-Run the three-window capture. A `dominant=keyed` walk settles the hypothesis
-and makes the keyed path the target of the next decoder slice. A
-`dominant=unmapped` walk refutes it and leaves the raw packed keys in
-`unmapped_top`; feed those keys to `--match-unmapped` to decide whether the
-walk table lives in another `.SRA` or is built at runtime. Do not change the
-heuristic on a single unmapped window: re-run it first, because that is an
-unobserved table, not a wrong label.
+Idle and walk are labelled; jump is not. A jump slice would need the operator to
+hold jump-up, fall and land as three separate windows (or the probe to segment
+by vertical velocity) so each clip is measured on its own, then repeat the idle
+window on a different section to characterise the clip-0 variant. Until then,
+`27` stays a documented PARTIAL and must not be reported as a confirmed jump
+clip. Do not change the heuristic on a single unmapped window: re-run it first,
+because that is an unobserved table, not a wrong label.

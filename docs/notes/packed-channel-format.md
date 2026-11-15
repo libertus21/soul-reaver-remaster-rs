@@ -440,13 +440,41 @@ missing clip.
 invariant keys; an old probe key that contains the pointer half is expected to
 be `absent`.
 
-**UNKNOWN, not a failure**: the shipped tables do not identify idle, walk or
-jump. The presentation default maps states to distinct clips by position
-(`idle = 0`, `walk = clip_count / 2`, `jump = clip_count - 1`) and is
-overridable. Measured candidates a human can map with `--list-clips`:
-low-motion, loop-like 48-50 frame tables (clips 0, 50, 98 for the player) are
-plausible idle/locomotion, while high-motion one-shot tables (clip 16) are
-plausible jump/attack. These are motion metrics, not identities.
+### State defaults: runtime-labelled clips (2026-11-14)
+
+The shipped tables still carry no state identity, so the default map is a
+runtime observation of the table the engine selected, not a decoded field. The
+clip-labelling probe watched the player's packed table while the operator held
+one state, mapped the invariant fingerprint back to the file index, and
+reported the coverage of the dominant bucket
+(`docs/changes/runtime-capture/clip-labelling.md`).
+
+| Index | State | Evidence class | How it was measured |
+|---:|---|---|---|
+| 55 | idle | **CONFIRMED** | Clip `55` (`6:580`) held coverage `1.00` in 3 of 4 runs of the still window. |
+| 2 | walk | **CONFIRMED** | The moving window selected clip `2` (`12:209:3acaf951`) with coverage `0.91`; the fingerprint was predicted from this file before the run, then matched. |
+| 27 | jump | **PARTIAL / UNKNOWN** | The jump window was split: `27:0.16`, `16:0.15`, `2:0.12`, `37:0.07`, keyed `0.21`. Not a single clip. |
+
+`unmapped` was `0.00` in all three segments after the invariant-fingerprint
+fix, so every sampled table now maps to a file index.
+
+Two caveats are part of the record:
+
+- **Idle has a variant.** One earlier run observed clip `0` (`50:100`) at
+  coverage `1.00` instead of clip `55`. Both observations are clean, so idle
+  most likely selects different tables per section or variant; `55` is the most
+  frequent and is the default.
+- **Jump is not confirmed.** A spread of four clips plus keyed samples is
+  consistent with jump-up, fall and land being distinct clips, which one
+  timed window cannot separate. `27` has the largest share and is kept as a
+  documented best-effort default only.
+
+The default map lives in `sra::ClipMap::for_clip_count`: each index is clamped
+to the last decoded clip, so an animation with fewer clips than a measured
+index falls back to its last clip instead of returning
+`ClipError::OutOfRange`. `--clip-idle`, `--clip-walk` and `--clip-jump` still
+override individual entries with strict validation, and `--clip <N>` still
+freezes one clip.
 
 Selection reads only existing deterministic signals: `player_grounded()` and
 whether stage 9 committed a non-zero horizontal delta (`player_moving()`).

@@ -1647,11 +1647,20 @@ mod tests {
         assert_eq!(
             defaults.clip_selection(10).expect("in range").map,
             ClipMap {
-                idle: 0,
-                walk: 4,
+                idle: 9,
+                walk: 2,
                 jump: 9
             },
-            "the default map is deterministic and always in range"
+            "the measured defaults clamp to the last decoded clip"
+        );
+        assert_eq!(
+            defaults.clip_selection(230).expect("in range").map,
+            ClipMap {
+                idle: 55,
+                walk: 2,
+                jump: 27
+            },
+            "the shipped player resolves the measured indices"
         );
 
         let bad_map = parse(&["--bigfile", "B", "--clip-walk", "10"]).expect("parses");
@@ -1674,6 +1683,89 @@ mod tests {
             parse(&["--bigfile", "B", "--clip", "x"]),
             Err(PlayError::InvalidClip("x".to_string()))
         );
+    }
+
+    #[test]
+    fn each_clip_override_replaces_only_its_own_default() {
+        let defaults = ClipMap::for_clip_count(230);
+        assert_eq!(
+            defaults,
+            ClipMap {
+                idle: 55,
+                walk: 2,
+                jump: 27
+            },
+            "the documented default map"
+        );
+
+        let idle = parse(&["--bigfile", "B", "--clip-idle", "64"])
+            .expect("parses")
+            .clip_selection(230)
+            .expect("in range")
+            .map;
+        assert_eq!(
+            idle,
+            ClipMap {
+                idle: 64,
+                walk: 2,
+                jump: 27
+            }
+        );
+
+        let walk = parse(&["--bigfile", "B", "--clip-walk", "8"])
+            .expect("parses")
+            .clip_selection(230)
+            .expect("in range")
+            .map;
+        assert_eq!(
+            walk,
+            ClipMap {
+                idle: 55,
+                walk: 8,
+                jump: 27
+            }
+        );
+
+        let jump = parse(&["--bigfile", "B", "--clip-jump", "30"])
+            .expect("parses")
+            .clip_selection(230)
+            .expect("in range")
+            .map;
+        assert_eq!(
+            jump,
+            ClipMap {
+                idle: 55,
+                walk: 2,
+                jump: 30
+            }
+        );
+    }
+
+    #[test]
+    fn default_map_falls_back_when_the_animation_has_fewer_clips() {
+        let container = crate::sra::synthetic_animation_container(
+            &[0x001, 0x001],
+            2,
+            100,
+            &[1024.0, 0.0, 0.0, 0.0],
+        );
+        let animation = crate::sra::SraAnimation::load(container, 2).expect("one synthetic table");
+        assert_eq!(animation.clips().len(), 1, "the fixture has one clip");
+
+        let options = parse(&["--bigfile", "B", "--sra", "R.SRA"]).expect("defaults parse");
+        let selection = options
+            .clip_selection(animation.clips().len())
+            .expect("a default past the clip count must still resolve");
+        assert_eq!(
+            selection.map,
+            ClipMap {
+                idle: 0,
+                walk: 0,
+                jump: 0
+            },
+            "every default falls back to the only decoded clip"
+        );
+        assert_eq!(selection.fixed, None);
     }
 
     #[test]
