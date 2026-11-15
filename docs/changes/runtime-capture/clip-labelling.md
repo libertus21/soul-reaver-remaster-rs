@@ -19,16 +19,29 @@ Jump labelling no longer asks a human to keep a rhythm. The probe classifies
 each observed frame by the player's own vertical velocity and aggregates per
 phase, so the measurement does not depend on the operator's cadence.
 
+Labels are no longer transferred between actors. A clip index measured for the
+player is not a label for an enemy: the shipped files have different clip and
+slot counts, so an index such as `55` may not even exist for another body. The
+default mode now measures **every live object that the hook observes**,
+independently, and derives idle/walk from each object's own observed horizontal
+motion. An object that cannot be measured is printed as `unknown` with the
+measured reason; nothing is carried across actors. This multi-actor revision is
+a scratch-probe change only: the committed artifact is this note, no engine code
+changed, and no golden digest moved.
+
 ## Quick path
 
-1. Start the game and load a save where Raziel stands on solid ground.
-2. Run the probe in its default mode with the path to `RAZIEL.SRA`:
-   `--attach SRX.exe --sra <RAZIEL.SRA> --slots 66 --motion-seconds 15`.
-3. Stand still for a moment, then jump normally and land. No steady rhythm is
-   required; the probe reads vertical motion, not your timing.
-4. Read `ZCALIB`, the four `PHASE` lines and the final `LABELS` line. A
-   numeric index is a packed clip; `unknown` means the phase was too thin or
-   the signal failed calibration.
+1. Start the game and load a save where the actors you care about are visible,
+   on solid ground, with at least one of them free to walk.
+2. Run the probe in its default mode with the path to the `.SRA` file whose
+   clip indices you want (for example `RAZIEL.SRA` for the player):
+   `--attach SRX.exe --sra <RAZIEL.SRA> --motion-seconds 20`.
+3. Let each actor stand still, then walk a little, then jump normally once or
+   twice. No steady rhythm is required; the probe reads each object's own
+   vertical and horizontal motion, not your timing.
+4. Read the `IDENTITY` verdict first, then one `ACTOR` / `PHASE` / `LABELS`
+   block per object. A numeric index is a packed clip; `unknown` means that
+   field was not measured well enough to name a clip.
 
 For a repeating action such as jumping, three windows cannot separate its
 phases. Use the per-jump aligned template in "Per-jump alignment: the primary
@@ -256,21 +269,27 @@ already validated by the staging-split probe) and works in segments:
 2. Every animation invocation contributes the active table fingerprint for
    its object.
 3. The host waits for the announced duration, then stops the segment.
-4. The agent returns one aggregate for the segment: per-fingerprint sample
-   counts for the selected player object.
+4. The agent returns the segment aggregate: per-fingerprint sample counts, and
+   in the default mode one measured block per object plus the identity verdict.
 
-### Player selection
+### Player selection versus per-object aggregation
 
-There is no player id in the data. The probe chooses the object with the
-largest covered slot count in the segment (Raziel's body is 66 slots) and
-requires at least 40 covered slots. Other objects are counted as candidates
-but never merged into the player's histogram. If no object reaches the
-threshold, the largest one is still used and the line says `low_slots=1`.
+The operator-paced segment mode still selects one object: it has no motion
+signal, so it uses the object with the largest covered slot count in the
+segment and requires at least 40 covered slots. That mode is a single-actor
+capture and is reported as such.
 
-### Aggregation
+The default `--by-motion` mode no longer selects a player. Every object the
+hook observes is tracked under its own identity (see "Per-object identity and
+its measured stability"), labelled from its own samples, and printed in its own
+block. `--max-actors` (default `8`) bounds how many blocks are printed; when
+more objects qualify, the ones with the most samples are kept and a single
+`ACTORS dropped=<n>` line says so. Nothing is merged across objects.
 
-For the selected object the probe classifies every sample as **packed**,
-**keyed**, or **unmapped**, and prints one line per segment:
+### Segment aggregation (operator-paced mode)
+
+For its selected object the operator-paced mode still classifies every sample
+as **packed**, **keyed**, or **unmapped**, and prints one line per segment:
 
 ```text
 CLIPLABEL segment=idle seconds=10.0 packed=1.00 keyed=0.00 unmapped=0.00 clips=55:0.96,6:0.02 dominant=55 coverage=0.96 fp=6:580:<hash> legacy=6:580:<hash>
@@ -302,6 +321,174 @@ Rules that keep the output honest:
 - An empty segment prints `note=empty`; it is missing evidence, not a vote.
 - Only one line per segment and one `LABELS` line are printed. There is no
   per-call text, and the host enforces a hard line cap.
+
+## Multi-actor labelling: one measured map per live object
+
+### Why per-actor measurement is required
+
+Per-actor indices cannot be transferred, and the shipped files prove it:
+
+| File | Clips | Slots |
+|---|---:|---:|
+| `RAZIEL.SRA` | 230 | 66 |
+| `SLUAGH.SRA` | 23 | 24 |
+
+Index `55` does not exist for the sluagh. A map copied from the player would
+name a clip that the other body cannot select, and a 24-slot body cannot fill a
+66-slot template. Every actor therefore needs its own measured map, and the
+measurement must not require a human timing window per actor. The same root
+pose-slot signal that already gives trustworthy vertical phases also gives
+horizontal motion for free, so one operator run can label several actors at
+once.
+
+### Per-object identity and its measured stability
+
+The object base is recovered from the invocation context exactly as before, and
+its identity is a hash of that recovered base. A hash is used so the printed
+`id=<hex>` is not an address. The object pointer may rebind every frame when
+the engine uses a per-frame arena, so stability is **measured, not assumed**:
+
+- `distinct` is the number of different ids seen in the whole segment.
+- `expected` is the largest number of different ids seen in one invocation
+  sweep, capped at `32`. A sweep ends when an id repeats, which is what a normal
+  per-object loop does once per frame.
+- `STABLE` means `distinct` is within a small slack of `expected`
+  (`max(2, 25% of expected)`); `CHURN` means it is far above, or the sweep cap
+  was hit.
+
+The pose-shape scan that discovers the pose-array field is scored against the
+object's own slot count, not the player's, so a 24-slot body is not judged
+against a 66-slot layout. `--min-slots` gates only the single-actor segment
+mode; the multi-actor mode observes every object with at least one slot and
+bounds the printed blocks with `--max-actors` and the sample ordering.
+
+```text
+IDENTITY distinct=3 expected=3 cap=32 key=object-node verdict=STABLE alt=shape alt_distinct=3 alt_verdict=STABLE adopted=object-node ambiguous=0
+```
+
+A content-only alternative key is also evaluated: a digest of the covered slot
+count and the channel slot ranges. It survives pointer rebinding but collides
+for two instances of the same model. It is adopted (`adopted=shape`) only when
+it is itself stable **and** does not collapse distinct live ids; otherwise
+`ambiguous=1` is printed and the pointer key is kept. On `CHURN` with no
+unambiguous alternative, no actor is labelled: the run prints
+`ACTORS count=0 reason=identity-churn` instead of inventing per-id actors. That
+is the difference between "I could not attribute samples" and "this actor
+idled".
+
+### Horizontal motion for idle and walk
+
+The root pose slot translation is read as three world components. The shipped
+world is Z-up, so the first two components are the ground plane and the third is
+the vertical already used for phases. Horizontal speed is the distance between
+two consecutive samples of the same object, in world units per sampled frame.
+
+| Constant | Value | Role |
+|---|---:|---|
+| `H_ENTER` | `1.5` | Larger threshold: speed above it starts a walk |
+| `H_LEAVE` | `0.5` | Smaller threshold: speed below it returns to idle |
+| `H_HOLD` | `3` | Consecutive frames required before idle/walk commits |
+
+The machine is the same shape as the vertical one: enter above `H_ENTER`, leave
+below `H_LEAVE`, and hold the current state inside the dead band for `H_HOLD`
+consecutive samples before a change. That is what stops a speed that sits at the
+threshold from flapping idle/walk. A calibrated series that never exceeds
+`H_ENTER` is measured **no-motion**; it is not reported as idle-walking.
+
+The vertical machine is reused unchanged: `DZ_ENTER = 4.0`, `DZ_LEAVE = 1.5`,
+`DZ_HOLD = 3`, ascent/fall/land, and the per-jump aligned template that carries
+`jump_up`, `fall` and `land`. Only the sample source changed (each actor now
+contributes its own series), not the logic or the thresholds.
+
+### Per-actor output
+
+Each measured object prints one bounded block:
+
+```text
+ACTOR id=<hex> slots=66 samples=44 identity=STABLE
+PHASE id=<hex> name=idle frames=22 clips=55:0.91,2:0.09 dominant=55 coverage=0.91
+PHASE id=<hex> name=walk frames=22 clips=2:1.00 dominant=2 coverage=1.00
+PHASE id=<hex> name=ascent frames=0 clips=- dominant=unknown coverage=0.00
+PHASE id=<hex> name=fall frames=0 clips=- dominant=unknown coverage=0.00
+PHASE id=<hex> name=land frames=0 clips=- dominant=unknown coverage=0.00
+LABELS id=<hex> slots=66 idle=55 walk=2 jump_up=unknown fall=unknown land=unknown agreement=0.91 source=runtime-motion reason=no-jumps
+```
+
+`idle` and `walk` come from the horizontal states; `ascent`, `fall` and `land`
+from the vertical phases. `jump_up`, `fall` and `land` follow the same per-jump
+template gate as before, one template per actor. Output stays bounded:
+`--max-actors` limits blocks, each block has one `ACTOR`, five `PHASE` and one
+`LABELS` line, and the host line cap grows to fit exactly that many blocks. The
+`CALIB actors=<n> zcalib=<n>/<n> hcalib=<n>/<n> movers=<n>` summary line is the
+only segment-wide calibration text.
+
+### An unmeasured actor says `unknown`
+
+No label is produced without measurement. When a field cannot be established,
+the `LABELS` line names the measured reason:
+
+| Reason | Meaning |
+|---|---|
+| `too-few-samples` | The object was observed, but below the minimum sample count (`12`); every field is `unknown`. |
+| `no-motion` | Horizontal speed never exceeded `H_ENTER`, so `walk` is `unknown`. `idle` may still be measured. |
+| `no-idle` | The object never sat below `H_LEAVE`; `idle` is `unknown`. |
+| `no-jumps` | Fewer complete arcs than `--min-jumps`; the jump fields are `unknown`. |
+| `low-agreement` | A phase or bucket existed but its coverage was below `0.40` or the weakest used bucket agreed below `0.60`. |
+| `uncalibrated` | The vertical or horizontal signal failed its sample, finite or range check. |
+| `identity-churn` | Object identity was unstable and no unambiguous alternative key existed; no actor was labelled. |
+
+If every field is unknown the line uses the reason form with no agreement and no
+source:
+
+```text
+LABELS id=<hex> slots=8 idle=unknown walk=unknown jump_up=unknown fall=unknown land=unknown reason=too-few-samples
+```
+
+Defaulting such an actor to the player's `55`/`2`/`35`/`36`/`37` would be
+fabrication: those numbers were measured on a different body with a different
+clip and slot count. A documented `unknown` is a successful measurement of the
+absence of evidence.
+
+### The three-step multi-actor procedure
+
+1. **Prepare.** Load a save with the actors you want in view, on solid ground,
+   and leave the game unpaused. One of them must be able to walk; an enemy that
+   only stands still can still yield `idle`, but not `walk` or a jump.
+2. **Run.** From the scratch directory:
+
+   ```text
+   python sr1_clip_label_probe.py --attach SRX.exe --sra <RAZIEL.SRA> \
+       --motion-seconds 20 --max-actors 8
+   ```
+
+   Let the subject stand, walk a little, and jump a few times. The probe reads
+   motion, not rhythm.
+3. **Read.** Check the `IDENTITY` line first: `verdict=STABLE` and
+   `adopted=object-node` (or a deliberate `adopted=shape`) mean per-actor
+   attribution is trustworthy. Then read each `LABELS` line. A field at
+   `unknown` is missing evidence; repeat that behaviour rather than forcing a
+   value.
+
+### What the multi-actor mode cannot establish
+
+- **An idle-only actor has no walk label.** If the object never crosses
+  `H_ENTER`, `walk` is `unknown`, by construction. That is the honest result,
+  not a failure to try.
+- **An actor whose AI never engages cannot be labelled.** If a creature never
+  moves or jumps in the session, its motion states were never selected and the
+  probe has nothing to attribute. Scripted idles are measured; unobserved
+  states are not.
+- **Identity is measured, not guaranteed.** A busy arena with per-frame pointer
+  rebinding can produce `CHURN`; the probe then refuses to label rather than
+  merge objects. A scene with more than the sweep cap of live ids is reported
+  as churn even if identity was in fact stable.
+- **Agreement is not semantic truth.** `agreement=0.91` says the same clip
+  occupied the same relative position or state in 91% of the measured samples
+  for that actor. It does not name the pose, and it does not prove the clip is
+  the only one the engine could select there.
+- **Two instances of one model can share a shape key.** The alternative key is
+  adopted only when the shape count still separates the live ids; otherwise the
+  run reports the ambiguity instead of merging identical bodies.
 
 ## Why time windows were replaced
 
@@ -356,22 +543,27 @@ per-object sites. The offset of the object field that points at the pose array
 is then discovered **once per object** by a bounded scan of aligned pointer
 fields, scored by pose shape: a near-orthonormal 3x3 rotation block per sampled
 slot and a finite translation. The offset is cached; the pointer is re-read
-every frame because the pose array lives in a per-frame arena. Each sample is
-`float 12` (Z) of slot 0.
+every frame because the pose array lives in a per-frame arena. Each sample takes
+the slot-0 translation: component 12 is Z, and components 10 and 11 are the
+horizontal X/Y used for idle/walk.
 
-The probe does not trust the signal. It prints one bounded calibration line:
+The probe does not trust the signal. In the single-actor segment mode it prints
+one bounded calibration line:
 
 ```text
 ZCALIB signal=root-slot-z samples=812 zmin=-4831.5 zmax=-4632.0 dzmin=-37.2 dzmax=39.8 sign_changes=41 flat=0.12 calibrated=yes
 ```
 
+In the multi-actor default, calibration is summarised once for the segment as
+`CALIB actors=<n> zcalib=<n>/<n> hcalib=<n>/<n> movers=<n>`, and a failed
+signal makes that actor's fields `unknown` with `reason=uncalibrated`.
+
 Calibration requires at least 24 samples, at least 95% finite values and
 `|z| <= 1e6` world units. The line also shows the observed range, the `dz`
 range, how often `dz` changes sign and the flat fraction, so a wrong signal is
 visible immediately: standing should be flat with about zero sign changes, and
-a jump must change sign. If calibration fails, the run prints
-`calibrated=no reason=<insufficient|nonfinite|range|no-player>` and **no phase
-is labelled**; an uncalibrated run is missing evidence, not a result.
+a jump must change sign. If calibration fails, that actor's phases are not
+labelled; an uncalibrated actor is missing evidence, not a result.
 
 ## Phases and hysteresis
 
@@ -405,7 +597,9 @@ landing distinguishable from the initial stance.
 
 There are no windows. Every sampled frame contributes to exactly one phase, and
 each phase is aggregated over the whole run: frame count, mapped clip
-distribution, keyed share, dominant clip and coverage.
+distribution, keyed share, dominant clip and coverage. In the multi-actor
+default the same `PHASE` line carries `id=<hex>` and the block repeats per
+actor; the single-actor view below is the operator-paced output.
 
 ```text
 PHASE name=ascent frames=41 clips=27:0.88,16:0.07 dominant=27 coverage=0.88
@@ -419,29 +613,36 @@ mixed phase is visible rather than hidden behind one number. A phase whose
 dominant clip is `keyed` or `unmapped` keeps that class; it never becomes a
 clip index.
 
-The run ends with one line that is directly usable:
+The single-actor run ends with one line that is directly usable:
 
 ```text
 LABELS raziel idle=55 walk=2 jump_up=27 fall=2 land=55 source=runtime-vertical
 ```
 
 `jump_up`, `fall` and `land` are this run's measurement (`ASCENT`, `FALL`,
-`LANDED`). `idle` and `walk` are **carried**: a jump run does not observe
-either state, so their values are the confirmed three-segment labels and can
-be overridden with `--idle-clip` / `--walk-clip`.
+`LANDED`). In that single-actor mode `idle` and `walk` are **carried**: a jump
+run does not observe either state, so their values are the confirmed
+three-segment labels and can be overridden with `--idle-clip` / `--walk-clip`.
+In the multi-actor default nothing is carried: `idle` and `walk` come from that
+actor's own horizontal states, and every field is `unknown` when it was not
+measured.
 
 A phase is printed as `unknown` when its frame count is below `6` or its
-dominant coverage is below `0.40`, and every field is `unknown` when the run is
-uncalibrated. A thin or blended phase is not worth a guess.
+dominant coverage is below `0.40`, and every field is `unknown` when the actor
+is uncalibrated. A thin or blended phase is not worth a guess.
 
 ### Modes and flags
 
 | Flag | Meaning |
 |---|---|
-| `--by-motion` | Default mode: one run, frames classified by vertical motion, aggregated per phase. |
+| `--by-motion` | Default mode: one run, every observed object classified by its own horizontal and vertical motion, aggregated per phase. |
 | `--motion-seconds <SECONDS>` | Length of that single run (default `15`). `--total` overrides it. |
-| `--dz-enter`, `--dz-leave`, `--dz-hold` | Override the hysteresis constants; `leave` must stay below `enter`. |
-| `--idle-clip`, `--walk-clip` | Carried labels for the final line (defaults `55` and `2`). |
+| `--dz-enter`, `--dz-leave`, `--dz-hold` | Override the vertical hysteresis constants; `leave` must stay below `enter`. |
+| `--h-enter`, `--h-leave`, `--h-hold` | Override the horizontal idle/walk hysteresis constants; `leave` must stay below `enter`. |
+| `--max-actors <N>` | Maximum actor blocks printed per run (default `8`). |
+| `--min-slots <N>` | Minimum covered slots for the single-actor segment player (default `40`); it does not gate the multi-actor mode. |
+| `--idle-clip`, `--walk-clip` | Carried labels for the single-actor segment line only. |
+| `--slots` | Model slot count the host uses to validate the file tables (default `66`); it is not a per-actor filter. |
 | `--segments` | Named, operator-paced segments (the three-prompt capture). Still supported. |
 | `--auto-windows <SECONDS>` | Diagnostic time series, one numbered window per step. Still supported, no longer used for labelling. |
 | `--total <SECONDS>` | Stop after this much wall time. |
@@ -449,29 +650,34 @@ uncalibrated. A thin or blended phase is not worth a guess.
 Supplying `--by-motion` together with `--segments`, `--segment` or
 `--auto-windows` is a typed error, never a silent override.
 
-### The three-step jump procedure
+### The three-step single-actor jump procedure
 
-1. **Stand.** Load a save where Raziel stands on solid ground in a quiet room,
-   focus the game window and leave the game unpaused.
+1. **Stand.** Load a save where the subject stands on solid ground in a quiet
+   room, focus the game window and leave the game unpaused.
 2. **Run.** From the scratch directory:
 
    ```text
    python sr1_clip_label_probe.py --attach SRX.exe --sra <RAZIEL.SRA> \
-       --slots 66 --motion-seconds 15
+       --slots 66 --motion-seconds 15 --max-actors 1
    ```
 
    Wait for `CLIPLABEL HOST attached`, then for the `SEGMENT name=motion`
    prompt. Stand still for a second, then jump normally and land, as many times
    as fits in the run. No rhythm is required.
-3. **Read.** Check `ZCALIB` first: `calibrated=yes` and a `dz` range that
-   changes sign. Then read the `PHASE` lines and the `LABELS` line. A phase
-   printed `unknown` is missing evidence, not a negative.
+3. **Read.** Check `IDENTITY` and `CALIB` first. Then read the `PHASE` lines and
+   the `LABELS` line of that block. A field printed `unknown` is missing
+   evidence, not a negative.
 
 ### How to read the result
 
 | Pattern | Reading |
 |---|---|
-| `calibrated=no` | The vertical signal failed. Do not read the phases; re-run and check `ZCALIB`. |
+| `verdict=CHURN` | Object identity was unstable. Do not read per-actor labels; the run refuses them instead of merging objects. |
+| `adopted=shape` | The content key separated the live ids and replaced the unstable pointer key. |
+| `ambiguous=1` | The alternative key would merge distinct live ids; it was reported, not used. |
+| `reason=too-few-samples` | The object was seen, but not enough to measure. Re-run with more time on that actor. |
+| `reason=no-motion` | The actor never crossed `H_ENTER`; `walk` is legitimately unknown. |
+| `calibrated=no` | The vertical signal failed. Do not read the phases; re-run and check `CALIB`. |
 | One clip dominates `ascent` and a different one dominates `fall` | The two phases are distinct animations. That is the jump profile. |
 | The same clip dominates `ascent` and `fall` | One animation covers the airborne body; the phase split is real but the clip is shared. |
 | `land` dominated by the `ground` clip | Landing returns to the stance animation; the phase boundary is real but the clip is shared. |
@@ -673,24 +879,27 @@ plus one `PHASE` line per phase); the template is the primary result.
 
 ## What it cannot establish
 
-- **One actor, one build.** The measurements are Raziel's shipped body in
-  this build. Other actors, builds and animation sets are unobserved.
+- **Per actor, per build.** Each label is one body in this build. A map is not
+  transferable between actors (different clip and slot counts) and is not a
+  claim about a different build or animation set.
 - **A state may pick different producers as the state machine evolves.** The
   label is the table or producer the engine selected in that window, not a
   promise that the same state always picks it. Context, speed, weapon, damage
   or progression can change the selection.
 - **The label is not a semantic name in the file.** The `.SRA` carries no
   idle/walk/jump identifier. `idle=55` means "the engine selected packed clip
-  55 while the operator stood still", not "clip 55 is named idle".
+  55 while the object's measured horizontal speed stayed below `H_LEAVE`", not
+  "clip 55 is named idle".
 - **A keyed key is not a clip index.** The file index lists packed tables
   only. A keyed key proves the producer and separates frame arrays at their
   first frame; it does not name a clip, and `LABELS` reports it as `keyed`.
 - **The keyed frame layout is only partly observed.** The frame count and the
   frame-array pointer are read; the stride, a divisor and the interpolation
   are not established here.
-- **The player is inferred, not identified.** The probe uses the
-  largest-coverage object. A scene with another 66-slot actor could compete
-  for that role.
+- **Actor identity is measured.** In the operator-paced single-actor mode the
+  object is inferred by its slot coverage. In the default mode every object is
+  tracked by a hashed identity whose stability is printed; a `CHURN` verdict
+  refuses labels instead of guessing which samples belong together.
 - **The vertical signal is measured; the phase-to-clip mapping is still an
   inference.** `ASCENT` means "the root pose slot's Z was rising for at least
   `DZ_HOLD` frames". It does not prove the engine's state machine considered
@@ -704,9 +913,10 @@ plus one `PHASE` line per phase); the template is the primary result.
 - **A phase label is not a semantic name.** `jump_up=27` means "the engine
   selected packed clip 27 while the root slot was rising", not "clip 27 is
   named jump-up".
-- **`idle` and `walk` are carried, not re-measured.** A jump run never observes
-  either state; their values come from the confirmed three-segment capture and
-  are printed as such.
+- **`idle` and `walk` are measured in the default mode and carried only in the
+  single-actor segment mode.** A single-actor jump run never observes either
+  state; the multi-actor run derives both from each object's own horizontal
+  speed, and prints `unknown` when it did not.
 - **No transitions or blends are modelled.** A phase boundary is committed
   after `DZ_HOLD` frames, so the first frames after a boundary may still carry
   the previous phase. Dense transitions are not resolved.
@@ -718,12 +928,12 @@ plus one `PHASE` line per phase); the template is the primary result.
 
 | Gate | Result |
 |---|---|
-| `--selftest` | 40 cases, 40 green; adds `motion-zcalib-rate` and `jump-identical-detected`, `jump-identical-agreement`, `jump-outlier-localized`, `jump-too-few-unknown`, `jump-ground-zero`, `jump-resample-exact`, `jump-line-shape` and `jump-labels-identical` on top of the fingerprint, segment, keyed and phase cases |
-| `--live-selftest` | 19 cases, 19 green in a real Frida runtime; the agent's own detector feeds the host template, adding `jump-identical-template`, `jump-outlier-localized`, `jump-too-few-unknown`, `jump-ground-zero` and `jump-resample-exact` |
-| `--dry-run` | prints the plan; attaches nothing. It names the per-jump detector, the nearest-center resampler, the template, and both label constants (`--min-jumps 3`, `--jump-agreement 0.60`) |
+| `--selftest` | 54 cases, 54 green; the existing fingerprint, segment, keyed, phase and jump cases plus the horizontal dead-band, exact-threshold, walk-commit, no-motion and uncalibrated cases; the identity STABLE/CHURN line cases; and the per-actor label cases (`actor-labels-measured`, `actor-line-shape`, `actor-unknown-no-motion`, `actor-unknown-too-few`, `actor-unknown-low-agreement`, `actor-unknown-no-jumps`, `actor-block-bounded`) |
+| `--live-selftest` | 24 cases, 24 green in a real Frida runtime; adds `multi-actor-independent`, `multi-actor-own-labels`, `multi-actor-no-bleed`, `identity-churn-no-merge` and `horizontal-hysteresis` on top of the previous hardware-surface cases |
+| `--dry-run` | prints the plan; attaches nothing. It names the per-actor aggregation, the identity verdict, both hysteresis families with their constants, the unknown reasons and the label gates |
 | `py_compile` | clean |
 | `node --check` on `--print-agent` | clean |
-| `cargo test` | 688 green, unchanged by this docs-only slice |
+| `cargo test` | 694 green, unchanged by this docs-only slice |
 
 The live harness spawns a throwaway system process, never the game. It
 exercises the real `NativePointer`, `Memory`, `Process`, `Interceptor`,
@@ -734,13 +944,31 @@ jump cases drive the agent's `detectJumps` with synthetic arcs, then assert the
 template on the returned records: three identical arcs reach `1.00` per bucket,
 one outlier lowers only its own bucket, fewer than the minimum arcs and a
 grounded series both produce `unknown`, and the resampler is exact for a known
-length. A missing Frida capability fails loudly before any hook is armed,
-rather than reporting an empty segment.
+length. The multi-actor case drives three objects with 66, 24 and 8 slots
+through the real hook and asserts that each block carries only its own clips:
+the walker labels `idle` and `walk`, the never-moving actor labels `idle` and
+`walk=unknown reason=no-motion`, and the 5-sample actor prints
+`reason=too-few-samples`. The churn case rebinds the object pointer every frame
+and asserts `verdict=CHURN`, `ambiguous=1` and zero merged actors. The
+hysteresis case runs the agent's own horizontal machine over a dead-band series
+and an exact-threshold series and asserts both stay idle. A missing Frida
+capability fails loudly before any hook is armed, rather than reporting an
+empty segment.
 
 ## Reviewer checklist
 
 - [ ] The diff contains no addresses, module-relative numbers, disassembly,
       game bytes or absolute install paths.
+- [ ] The per-actor rationale states the measured clip-count and slot-count
+      difference, so a transferred index is visibly impossible.
+- [ ] Per-object identity names its key, prints `distinct` versus `expected`,
+      and states the `STABLE`/`CHURN` rule.
+- [ ] Horizontal idle/walk states reuse the vertical hysteresis shape and name
+      `H_ENTER`, `H_LEAVE` and `H_HOLD`.
+- [ ] The unknown reasons are enumerated and defaulting is called fabrication.
+- [ ] The multi-actor procedure has three steps and names the result lines.
+- [ ] The multi-actor limitations include an idle-only actor, an actor whose AI
+      never engages, and agreement not being semantic truth.
 - [ ] The two-run incompatibility and the low coverage are the stated reason
       for replacing time windows, not a preference.
 - [ ] The vertical signal is named, its validation is described, and the
@@ -753,7 +981,8 @@ rather than reporting an empty segment.
 - [ ] The collision policy is explicit: lowest index, `ambiguous` reported.
 - [ ] The jump section states the detection rule, the resampler, the agreement
       metric and the label gate with both constants.
-- [ ] Per-jump output is bounded by `--max-jumps`; there is no per-call text.
+- [ ] Per-jump output is bounded by `--max-jumps` and per-actor output by
+      `--max-actors`; there is no per-call text.
 - [ ] The procedure names the three actions and the three result lines.
 - [ ] The confirm/refute table appears before the run, not after it.
 - [ ] The limitations section is not softened into a promise of semantic
@@ -761,6 +990,16 @@ rather than reporting an empty segment.
 - [ ] `cargo test` stays at its baseline.
 
 ## Next step
+
+> **2026-11-15 multi-actor revision.** The probe now labels every observed live
+> object from its own motion, with a measured identity verdict and a documented
+> `unknown` policy. The scratch probe is green at 54 host cases and 24
+> live-runtime cases; the identity stability of a real capture is still the
+> first thing to read in the next session.
+
+The multi-actor mode is measured but has not yet been run against a live scene
+with several actors. The next capture should confirm the `IDENTITY` verdict in
+a busy area, then compare two actors' LABELS blocks to show that the maps differ.
 
 > **2026-11-15 resolution.** The aligned per-jump template was run twice. Every
 > jump played `35 -> (keyed transition) -> 36 -> (keyed transition) -> 37` (24
