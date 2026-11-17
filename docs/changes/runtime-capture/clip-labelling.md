@@ -7,9 +7,10 @@ selected table, and maps packed tables to a clip index. This note records the
 failure of the heuristic, the packed and keyed fingerprint schemes, the
 segment aggregation, the keyed-locomotion hypothesis, the per-jump aligned
 template that now carries the jump result, the whole-directory index that
-attributes each actor to its source file, and the exact operator procedure.
-The probe itself stays in the session scratch directory because it carries
-module-relative anchors and engine field offsets.
+attributes each actor to its source file, the persistent per-file store that
+lets one encounter per actor type accumulate across sessions, and the exact
+operator procedure. The probe itself stays in the session scratch directory
+because it carries module-relative anchors and engine field offsets.
 
 The first revision of this note described a docs-only slice: nothing was
 launched and no production code changed. The capture has since been run (see
@@ -57,6 +58,10 @@ not labelled.
    the file its clips came from; `file=ambiguous` and `reason=slot-mismatch` are
    refusals, not labels. A numeric index is a per-file packed clip; `unknown`
    means that field was not measured well enough to name a clip.
+5. The run ends by merging each `file=`-attributed body into the persistent
+   store and printing one `STORE` line per file. `--labels-print` shows what is
+   already known; `--labels-for <FILE>` prints one mapping. One encounter per
+   actor type is enough because the file is shared by every zone.
 
 For a repeating action such as jumping, three windows cannot separate its
 phases. Use the per-jump aligned template in "Per-jump alignment: the primary
@@ -650,6 +655,198 @@ equality and the printed slot count is the actor's observed value.
   that the stride is compatible. It does not name the pose, prove the clip is
   unique to that file, or turn agreement into truth.
 
+## Persistent label store: one encounter per actor type
+
+### Why one encounter per actor type is enough
+
+No zone in the game contains every enemy, so a capture that required all of them
+in one sitting would wait for a scene that does not exist. The requirement is
+imaginary because the measurement unit is the **file**, not the zone and not the
+instance.
+
+A creature's `.SRA` is shipped once and shared by every zone the creature
+appears in: `SLUAGH.SRA` is the same file wherever a sluagh runs. A clip index
+is a property of that file, so clip `23` of `SLUAGH.SRA` names the same table in
+`under1` and anywhere else. One clean encounter with one sluagh therefore
+measures the sluagh type for the whole game. A zone is only where a body happens
+to be; the label belongs to its file.
+
+The store is therefore keyed by `.SRA` file name and never by object instance
+id. The instance id (`id=<hex>`) is a hashed, per-session object identity used to
+keep samples from different bodies apart inside one run. It is not stable across
+sessions and it is not a label key.
+
+The probe already labels every live object from its own motion, so it needs no
+human-controlled enemy and no per-actor timing window: the enemy only has to
+move. One run in one area measures the one or two types present there, and each
+later area adds the types it introduces.
+
+There are 19 actor containers among the 227 shipped `.SRA` files: `skinner`,
+`sluagh`, `ronin`, `wallcr`, `hunter`, `vwraith`, `morlock`, `vlgra`, `aluka`,
+`walbosb`, `walboss`, `kain`, `vlgrb`, `wrshp`, `vlgrc`, `alukabss`, `roninbss`,
+`skinbos` and `soul`. The store turns "one run per type" from an exhaustive
+single session into an incremental habit.
+
+### The store file and schema
+
+One JSON file at `--labels-store <FILE>`, default `~/.sr1_clip_labels.json`. One
+entry per `.SRA` file:
+
+```json
+{
+  "version": 1,
+  "entries": {
+    "SLUAGH.SRA": {
+      "file": "SLUAGH.SRA",
+      "slots": 24,
+      "idle": 12,
+      "walk": 3,
+      "jump_up": 8,
+      "fall": 9,
+      "land": 10,
+      "evidence": "runtime-motion",
+      "agreement": 0.91,
+      "samples": 380,
+      "runs": 2,
+      "updated": "2026-11-15T01:00:00Z"
+    }
+  },
+  "conflicts": []
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `file` | The `.SRA` file name: the key and the only stable measurement unit. |
+| `slots` | The actor's observed slot count, filled on first measurement. |
+| `idle`, `walk`, `jump_up`, `fall`, `land` | A per-file clip index, or the string `unknown`. |
+| `evidence` | `runtime-motion`: the value came from that actor's own measured motion. No other evidence class is written. |
+| `agreement` | The strongest agreement among the measurements that set or replaced a value; `0.00` when nothing was measured. |
+| `samples` | Sum of the samples contributed by the measurements behind the entry. |
+| `runs` | Measurements of this file, not object instances. |
+| `updated` | ISO 8601 UTC time of the last change to the entry. |
+| `conflicts` | Append-only audit list; see the conflict rule. |
+
+A run contributes **one measurement per file**. Two live instances of the same
+body share a file, so the instance with more samples is recorded and `runs`
+counts runs, not instances. An actor whose every field is `unknown` writes
+nothing: `runs` counts measurements with at least one measured field.
+
+### Merge policy
+
+The merge is field by field, so one run can fill `walk` without disturbing a
+confirmed `idle`:
+
+| Stored | Incoming | Result |
+|---|---|---|
+| `unknown` | a clip index | **fill** the field; printed as `added=` |
+| a clip index | `unknown` | keep the stored value |
+| a clip index | the same index | keep; counted as unchanged |
+| a clip index | a different index, **strictly higher** agreement | **replace**; the previous value is recorded as `superseded`; printed as `updated=` |
+| a clip index | a different index, equal or lower agreement | **conflict**; the stored value stays |
+
+`runs` increments on every measurement of that file, including one that changed
+nothing. `agreement` only moves forward (the maximum) and `samples` only
+accumulates (the sum). `updated` moves only when the entry changed, so an
+`unchanged=all` line still proves the run observed and reconfirmed the file.
+
+### The conflict rule
+
+A disagreement is never resolved silently. When an incoming value differs and its
+agreement is not strictly higher, the store appends a record and keeps the
+stored value:
+
+```json
+{"file": "SLUAGH.SRA", "field": "walk", "stored": 3, "incoming": 5,
+ "stored_agreement": 0.91, "incoming_agreement": 0.74,
+ "runs": 3, "resolution": "conflict", "at": "<iso8601>"}
+```
+
+A replacement made at strictly higher agreement is recorded the same way with
+`"resolution": "superseded"`, so both values and the run number stay in the audit
+trail. `resolution` is the only difference between the two records. An
+unresolved conflict is counted in `conflicts=`; a supersede is reported as
+`updated=`. The store keeps the stronger value: it does not average, vote, or
+drop the older one from the record.
+
+### Reading and writing
+
+| Flag or moment | Effect |
+|---|---|
+| `--labels-store <FILE>` | Store path; default `~/.sr1_clip_labels.json`. |
+| `--labels-print` | Print the whole store as a stable table sorted by file name. Attaches nothing. |
+| `--labels-for <FILE>` | Print one file's stored mapping for the engine. Attaches nothing. |
+| End of a capture run | Merge every `file=`-attributed actor and print one `STORE` line per file plus a summary. |
+
+```text
+STORE file=SLUAGH.SRA added=idle,walk updated=- conflicts=0 runs=1
+STORE file=RAZIEL.SRA unchanged=all runs=3
+STORE path=<store> entries=2 conflicts=0
+STORE file=SLUAGH.SRA slots=24 idle=12 walk=3 jump_up=8 fall=9 land=10 agreement=0.91 samples=380 runs=2 evidence=runtime-motion updated=2026-11-15T01:00:00Z
+STORE file=WALLCR.SRA state=absent
+```
+
+Only the default `--by-motion` mode writes. It is the only mode that attributes
+each body to a `.SRA` file; the operator-paced single-actor modes label one
+selected object and never write to the store.
+
+A store that is unreadable, not JSON, or not the store shape is refused:
+`STORE error=<reason> refused=1` when writing, exit `2` when reading. It is never
+recreated empty, because that would erase measured evidence. A missing file is
+the normal first run, not a corrupt store.
+
+### The incremental workflow
+
+1. **Play normally.** No save is prepared for a target enemy list; any area works.
+2. **When a type you have not measured moves, run the probe once.** Point it at
+   the whole animation directory (`--sra-dir <OBJECT>`) and use the default
+   `--by-motion` run. The enemy does not need to be controlled; it needs to show
+   idle, walk, or a jump in that window.
+3. **Read the `LABELS` block per body, then the `STORE` lines.** `added=` is new
+   evidence, `updated=` is a stronger value that superseded an older one, and
+   `conflicts=` asks for a second clean run rather than a forced value.
+
+The store accumulates across sessions; do not delete it between runs. A run that
+adds nothing prints `unchanged=all`, which still confirms the map and increments
+`runs`.
+
+### Which actor types remain unmeasured
+
+Only what a run measured is in the store. Each entry describes exactly one file;
+nothing is copied across files.
+
+Confirmed by runtime for `RAZIEL.SRA` only: `idle=55 walk=2 jump_up=35 fall=36
+land=37`. Every other actor type is `unknown` until its own file is measured. A
+missing entry and an entry whose fields are `unknown` mean the same thing to the
+engine.
+
+The engine must not invent those values. Until a file has a measured field, the
+caller keeps its existing fallback and treats the store value as absent.
+"Absent" is not zero, not the player's index, and not a positional guess: index
+`55` does not exist in a 23-clip body. A documented `unknown` is a successful
+measurement of the absence of evidence.
+
+### What the store cannot establish
+
+- **Per build.** A stored index names a table in this build's file. A different
+  animation set can renumber or replace clips; the store is evidence for the
+  files it was measured against, not a semantic name.
+- **An index that was never selected.** A field is written only when the engine
+  selected a clip during a measured phase. A state the actor never performs stays
+  `unknown`; absence from the store is not proof the clip is unused.
+- **A semantic label.** `walk=3` means "the engine selected clip 3 while the
+  object's measured horizontal speed exceeded `H_ENTER`", not "clip 3 is named
+  walk".
+- **A stronger run is not a truer one.** The merge trusts `agreement` as the
+  tiebreak, so a clean but wrong window can outrank a noisy correct one. The
+  conflict record is what keeps that visible to a human.
+- **Two instances of one body.** The entry is per file, so two sluaghs cannot
+  hold different values. One measurement per run is kept.
+- **Slot count is structural.** A `slots` disagreement is recorded as a conflict;
+  it is not evidence about animation.
+- **Where a run came from.** The store records the file, values, counts and time,
+  not the zone, save, or operator.
+
 ## Why time windows were replaced
 
 > **Secondary view.** The per-jump aligned template in the next section is the
@@ -806,6 +1003,9 @@ is uncalibrated. A thin or blended phase is not worth a guess.
 | `--segments` | Named, operator-paced segments (the three-prompt capture). Still supported. |
 | `--auto-windows <SECONDS>` | Diagnostic time series, one numbered window per step. Still supported, no longer used for labelling. |
 | `--total <SECONDS>` | Stop after this much wall time. |
+| `--labels-store <FILE>` | Persistent per-file label store (default `~/.sr1_clip_labels.json`); every capture run merges into it. |
+| `--labels-print` | Print the store as a sorted table and exit; attaches nothing. |
+| `--labels-for <FILE>` | Print one `.SRA`'s stored mapping and exit; attaches nothing. |
 
 Supplying `--by-motion` together with `--segments`, `--segment` or
 `--auto-windows` is a typed error, never a silent override.
@@ -1092,9 +1292,9 @@ plus one `PHASE` line per phase); the template is the primary result.
 
 | Gate | Result |
 |---|---|
-| `--selftest` | 61 cases, 61 green; the existing fingerprint, segment, keyed, phase, jump, horizontal and identity cases, the per-actor label cases, and the directory cases (`sra-dir-two-files`, `sra-dir-per-actor-file`, `sra-dir-cross-collision`, `sra-dir-slot-mismatch`, `sra-dir-clipmap-line`, `sra-dir-source-conflict`, `sra-dir-empty`) |
-| `--live-selftest` | 29 cases, 29 green in a real Frida runtime; adds `sra-dir-two-files`, `sra-dir-cross-collision`, `sra-dir-slot-mismatch`, `sra-dir-source-conflict` and `sra-dir-empty` on top of the multi-actor and hardware-surface cases |
-| `--dry-run` | prints the plan; attaches nothing. It names the per-actor aggregation, the identity verdict, both hysteresis families with their constants, the unknown reasons, the directory index, the attribution/refusal rules and the label gates |
+| `--selftest` | 67 cases, 67 green; the existing fingerprint, segment, keyed, phase, jump, horizontal and identity cases, the per-actor label cases, the directory cases (`sra-dir-two-files`, `sra-dir-per-actor-file`, `sra-dir-cross-collision`, `sra-dir-slot-mismatch`, `sra-dir-clipmap-line`, `sra-dir-source-conflict`, `sra-dir-empty`) and the six store cases |
+| `--live-selftest` | 35 cases, 35 green in a real Frida runtime; adds `sra-dir-two-files`, `sra-dir-cross-collision`, `sra-dir-slot-mismatch`, `sra-dir-source-conflict`, `sra-dir-empty` and the six store cases on top of the multi-actor and hardware-surface cases |
+| `--dry-run` | prints the plan; attaches nothing. It names the per-actor aggregation, the identity verdict, both hysteresis families with their constants, the unknown reasons, the directory index, the attribution/refusal rules, the store schema and merge/conflict policy, and the label gates |
 | `py_compile` | clean |
 | `node --check` on `--print-agent` | clean |
 | `cargo test` | 694 green, unchanged by this docs-only slice |
@@ -1107,6 +1307,15 @@ label. The mismatch case feeds a 24-slot observation to a stride-25 file and
 asserts `reason=slot-mismatch`. The last two cases assert the typed source
 conflict and the empty-directory error. Indexing the shipped directory measured
 `files=227 clips=1001 distinct=910 ambiguous=55 collisions=32` in `2.46 s`.
+
+The six store cases use real temporary files and cover the merge policy end to
+end: an empty store gains a full entry from one measurement; a second measurement
+fills previously-`unknown` fields while leaving a confirmed field alone; a
+disagreeing equal-or-lower agreement records a `conflict` and keeps the stored
+value; a disagreeing strictly-higher agreement replaces the value and records the
+previous one as `superseded`; write-then-read reproduces an identical mapping; and
+a corrupt file (invalid JSON and a valid JSON of the wrong shape) is refused with
+the file left intact rather than recreated empty.
 
 The live harness spawns a throwaway system process, never the game. It
 exercises the real `NativePointer`, `Memory`, `Process`, `Interceptor`,
@@ -1171,13 +1380,32 @@ empty segment.
 - [ ] The confirm/refute table appears before the run, not after it.
 - [ ] The limitations section is not softened into a promise of semantic
       clip names.
+- [ ] The store is keyed by `.SRA` file name, and the section says why one
+      encounter per actor type is enough and no single zone is required.
+- [ ] The store schema names every field, `unknown` is allowed, and `runs`
+      counts measurements rather than instances.
+- [ ] The merge policy is a field-by-field table: fill unknown, keep confirmed,
+      replace only at strictly higher agreement, conflict otherwise.
+- [ ] The conflict rule records both values and the run count, and the stored
+      value is kept on an unresolved conflict.
+- [ ] A corrupt or unreadable store is refused and never recreated empty.
+- [ ] `--labels-print` and `--labels-for` attach nothing.
 - [ ] `cargo test` stays at its baseline.
 
 ## Next step
 
+> **2026-11-15 store revision.** The probe now merges every `file=`-attributed
+> actor into a persistent per-file store, so one encounter per actor type
+> accumulates across sessions and no zone with every enemy is required. The
+> scratch probe is green at 67 host cases and 35 live-runtime cases, including
+> the six store cases. The next capture should collect the 19 actor containers
+> still unmeasured, one area at a time, and let `--labels-print` show the store
+> fill in.
+
 > **2026-11-15 directory revision.** The probe now indexes a whole `*.SRA`
 > directory and attributes each live actor to the file its own clips came from.
-> The scratch probe is green at 61 host cases and 29 live-runtime cases. Indexing
+> At that revision the scratch probe was green at 61 host cases and 29
+> live-runtime cases. Indexing
 > the shipped directory measured `files=227 clips=1001 distinct=910 ambiguous=55
 > collisions=32` in `2.46 s`. The next capture should confirm that a real scene
 > with several actors produces one `file=` attribution per actor and an
