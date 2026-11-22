@@ -108,6 +108,16 @@ explicit `save failed` line per broken one. An empty Enter prints a skip line
 and writes nothing. `capture > visual > motion`, and motion never overwrites
 visual. It requires a window: `--headless` refuses it with a typed error.
 
+`--clip-assign <SPEC> --sra-dir <DIR>` records the same visual assignment with
+no window, so identifying a clip never depends on keyboard focus. `SPEC` is
+`HUNTER.SRA:idle=2,walk=7`; the file name is mandatory (`:idle=2` is refused)
+and the flag may be repeated for more files. It validates the file against the
+resolved actor set and each clip against that file's decoded count, prints
+`clip-assign file=HUNTER.SRA idle=2 walk=7`, then writes both stores and prints
+the same `saved`/`failed`/version-control lines. A later normal run consumes the
+stored labels; playback is never special-cased. It is incompatible with
+`--clip-inspect`.
+
 Windowed mode needs `--textures` and a display:
 
 ```text
