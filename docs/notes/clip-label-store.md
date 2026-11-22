@@ -76,6 +76,35 @@ The accepted `RAZIEL.SRA` map is the controlled-capture result documented in
 confirmed value without a measurement; the probe's precedence rule protects
 `capture` from `motion`.
 
+## Visual evidence
+
+`--clip-inspect <N> --sra-dir <DIR>` plays clip `N` on every resolved actor,
+looped, in a window. `[` and `]` move to the previous/next clip, clamped to the
+target file's clip count; `Tab` cycles the target `.SRA`; `1`..`5` assign the
+current clip to `idle`, `walk`, `jump_up`, `fall` and `land`; `Z` or Backspace
+clears pending assignments; Enter saves them. The window title and a printed
+status line always carry the clip, its frames/divisor/duration and the pending
+assignments.
+
+A visual field is written through `LabelStore::save_visual`, the normal store
+write path, with:
+
+- the label as a JSON string;
+- `field_method: "visual"` in the entry's per-field map;
+- an `assigned_at` stamp in `field_assigned_at` (and at the entry level);
+- `evidence: "visual"` when every labelled field in the entry is visual.
+
+The write preserves every other field, including `slots`, `agreement`, `runs`
+and `samples`. A visual-only entry carries no `runs` or `samples`: the user's
+explicit action is the evidence, and the engine never fabricates counters. The
+parser tolerates those absent fields.
+
+The precedence is `capture > visual > motion`, resolved per field before any
+timestamp comparison. `motion` never replaces `visual`; `visual` may replace
+`motion`; `capture` is never replaced by either. Within one method the newer
+`assigned_at` (or `updated`) wins. At playback the engine consumes a visual
+label exactly like a motion label.
+
 ## Verification
 
 - `engine::actors::tests::the_versioned_store_parses_to_the_measured_labels`
@@ -90,3 +119,11 @@ confirmed value without a measurement; the probe's precedence rule protects
 - `engine::actors::tests::label_stores_merge_per_field_with_the_newer_updated_winning`
   proves the per-field merge: newer wins, a missing field keeps the older
   value, and a home-only file is admitted.
+- `engine::actors::tests::a_visual_assignment_writes_method_and_assigned_at_without_run_metadata`
+  proves the visual save path, its metadata and the absent counters.
+- `engine::actors::tests::precedence_is_motion_then_visual_then_capture` pins
+  the evidence precedence.
+- `engine::actors::tests::clip_inspect_selects_clip_n_for_every_actor_and_clamps_shorter_files`
+  proves clip selection and per-file clamping.
+- `engine::play::tests::clip_inspect_parses_but_refuses_headless_and_a_missing_sra_dir`
+  pins the typed refusals.

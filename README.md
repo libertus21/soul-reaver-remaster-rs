@@ -98,6 +98,14 @@ order is `--labels-store <FILE>`, then that repository copy, then the probe's
 `~/.sr1_clip_labels.json`. A missing copy falls through; a malformed one fails
 loudly with its path. See `docs/notes/clip-label-store.md`.
 
+`--clip-inspect <N> --sra-dir <DIR>` opens a window where every resolved actor
+plays clip `N` looped. `[`/`]` change the clip (clamped to the file), `Tab`
+cycles the target `.SRA`, `1`..`5` assign the current clip to
+idle/walk/jump_up/fall/land, `Z`/Backspace clears pending assignments and Enter
+saves them as `visual` evidence; `capture > visual > motion`, and motion never
+overwrites visual. It requires a window: `--headless` refuses it with a typed
+error.
+
 Windowed mode needs `--textures` and a display:
 
 ```text

@@ -137,6 +137,9 @@ fn error_tag(error: &PlayError) -> u8 {
         PlayError::InvalidClip(_) => 12,
         PlayError::UnitAndGroup => 13,
         PlayError::CullReportRequiresHeadless => 14,
+        // Clip-inspect options: appended for the same golden-stability reason.
+        PlayError::ClipInspectRequiresWindow => 15,
+        PlayError::ClipInspectRequiresSraDir => 16,
     }
 }
 

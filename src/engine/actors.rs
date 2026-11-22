@@ -14,6 +14,7 @@
 //! None of this enters `FrameState` or the canonical fold, so headless digests
 //! and goldens cannot move.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -23,7 +24,8 @@ use crate::engine::live::{LiveArena, LiveId};
 use crate::engine::scene::{ActorPose, SceneAssets};
 use crate::pose::SlotPose;
 use crate::sra::{
-    ClipLabels, ClipSelector, PlaybackLoop, SraAnimation, units_per_second_for_fps,
+    ClipLabels, ClipSelector, MotionState, PlaybackLoop, SraAnimation, SraClipInfo,
+    units_per_second_for_fps,
 };
 
 /// Case-insensitive index of `<NAME>.SRA` files in one directory.
@@ -98,19 +100,87 @@ impl SraDirectory {
 /// The store schema is the probe's: `{"entries": {"FILE.SRA": {...}}}` with
 /// optional `idle`, `walk`, `jump_up`, `fall` and `land` fields. A value may be
 /// a JSON string (`"55"` or `"unknown"`) or a JSON number; anything else is a
-/// missing label. Extra fields (`evidence`, `agreement`, `runs`, ...) are
-/// ignored by this consumer except `updated`, which orders two stores when
-/// they are merged.
+/// missing label. Extra fields (`agreement`, `runs`, `samples`, ...) are
+/// ignored by this consumer. `field_method` and `field_assigned_at` carry the
+/// per-field evidence class and, for a visual assignment, its timestamp.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LabelStore {
     entries: BTreeMap<String, StoredLabels>,
 }
 
-/// The labels of one store entry plus the entry's `updated` stamp.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// How one stored field was obtained. The ordering is the precedence:
+/// `motion < visual < capture`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LabelMethod {
+    Motion = 0,
+    Visual = 1,
+    Capture = 2,
+}
+
+impl LabelMethod {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "motion" => Some(Self::Motion),
+            "visual" => Some(Self::Visual),
+            "capture" => Some(Self::Capture),
+            _ => None,
+        }
+    }
+
+    /// Resolve a legacy entry-level evidence tag when no `field_method` exists.
+    fn from_evidence(raw: Option<&str>) -> Option<Self> {
+        match raw {
+            Some("visual") => Some(Self::Visual),
+            Some("runtime-capture") => Some(Self::Capture),
+            Some(other) if !other.is_empty() => Some(Self::Motion),
+            _ => None,
+        }
+    }
+}
+
+/// The five label fields, in store order.
+const STATES: [MotionState; 5] = [
+    MotionState::Idle,
+    MotionState::Moving,
+    MotionState::Ascending,
+    MotionState::Falling,
+    MotionState::Landing,
+];
+
+fn field_index(state: MotionState) -> usize {
+    match state {
+        MotionState::Idle => 0,
+        MotionState::Moving => 1,
+        MotionState::Ascending => 2,
+        MotionState::Falling => 3,
+        MotionState::Landing => 4,
+    }
+}
+
+fn state_for_field(field: &str) -> Option<MotionState> {
+    STATES
+        .into_iter()
+        .find(|state| state.label_field() == field)
+}
+
+/// The labels of one store entry plus its per-field evidence metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StoredLabels {
     labels: ClipLabels,
     updated: Option<String>,
+    methods: [Option<LabelMethod>; 5],
+    assigned_at: [Option<String>; 5],
+}
+
+impl Default for StoredLabels {
+    fn default() -> Self {
+        Self {
+            labels: ClipLabels::NONE,
+            updated: None,
+            methods: [None; 5],
+            assigned_at: [None, None, None, None, None],
+        }
+    }
 }
 
 impl LabelStore {
@@ -146,39 +216,66 @@ impl LabelStore {
             let Json::Object(fields) = value else {
                 continue;
             };
-            let mut labels = ClipLabels::NONE;
-            let mut updated = None;
+            let mut stored = StoredLabels::default();
+            let mut evidence = None;
+            let mut top_assigned = None;
+            let mut global_method = None;
+            let mut methods = Vec::new();
+            let mut assigned = Vec::new();
             for (field, value) in fields {
-                if field == "updated" {
-                    updated = match &value {
-                        Json::String(stamp) | Json::Number(stamp) => Some(stamp.clone()),
-                        Json::Null | Json::Bool(_) | Json::Array(_) | Json::Object(_) => None,
-                    };
-                    continue;
+                match field.as_str() {
+                    "updated" => stored.updated = json_string(&value),
+                    "assigned_at" => top_assigned = json_string(&value),
+                    "evidence" => evidence = json_string(&value),
+                    "field_method" => match value {
+                        Json::Object(pairs) => methods = pairs,
+                        other => {
+                            global_method =
+                                json_string(&other).and_then(|raw| LabelMethod::parse(&raw));
+                        }
+                    },
+                    "field_assigned_at" => match value {
+                        Json::Object(pairs) => assigned = pairs,
+                        other => top_assigned = top_assigned.or_else(|| json_string(&other)),
+                    },
+                    other => {
+                        if let Some(state) = state_for_field(other) {
+                            stored.labels.set(state, label_index(&value));
+                        }
+                    }
                 }
-                let slot = match field.as_str() {
-                    "idle" => &mut labels.idle,
-                    "walk" => &mut labels.walk,
-                    "jump_up" => &mut labels.jump_up,
-                    "fall" => &mut labels.fall,
-                    "land" => &mut labels.land,
-                    _ => continue,
-                };
-                *slot = label_index(&value);
             }
-            by_name.insert(file.to_ascii_uppercase(), StoredLabels { labels, updated });
+            let evidence_method = LabelMethod::from_evidence(evidence.as_deref());
+            for state in STATES {
+                let index = field_index(state);
+                let field = state.label_field();
+                stored.methods[index] = methods
+                    .iter()
+                    .find(|(key, _)| key == field)
+                    .and_then(|(_, value)| json_string(value))
+                    .and_then(|raw| LabelMethod::parse(&raw))
+                    .or(global_method)
+                    .or(evidence_method);
+                stored.assigned_at[index] = assigned
+                    .iter()
+                    .find(|(key, _)| key == field)
+                    .and_then(|(_, value)| json_string(value))
+                    .or_else(|| top_assigned.clone());
+            }
+            by_name.insert(file.to_ascii_uppercase(), stored);
         }
         Ok(Self { entries: by_name })
     }
 
-    /// Merge two stores field by field, the newer `updated` winning.
+    /// Merge two stores field by field.
     ///
-    /// For every file and state, a label from the source with the newer
-    /// ISO-8601 `updated` stamp replaces the other. A field only present in
-    /// one source is taken from it. Equal stamps keep the base (the
-    /// repository copy, passed first) so the result is deterministic. This is
-    /// what lets a probe-written home store reach the renderer without
-    /// discarding the versioned repository copy.
+    /// The field's method decides first: `motion < visual < capture`. A
+    /// `motion` value never replaces a `visual` or `capture` value, and a
+    /// `visual` value never replaces a `capture` value. Within one method the
+    /// newer field stamp wins (`assigned_at`, else the entry's `updated`).
+    /// A field only present in one source is taken from it, so a partial entry
+    /// cannot erase an older measured state. Ties keep the base (the repository
+    /// copy, passed first), which keeps the merge deterministic.
     pub fn merge(base: Self, overlay: Self) -> Self {
         let mut entries = base.entries;
         for (file, incoming) in overlay.entries {
@@ -186,15 +283,7 @@ impl LabelStore {
                 None => {
                     entries.insert(file, incoming);
                 }
-                Some(current) => {
-                    let prefer_incoming =
-                        is_newer(incoming.updated.as_deref(), current.updated.as_deref());
-                    current.labels =
-                        merge_labels(current.labels, incoming.labels, prefer_incoming);
-                    if prefer_incoming {
-                        current.updated = incoming.updated;
-                    }
-                }
+                Some(current) => merge_entry(current, &incoming),
             }
         }
         Self { entries }
@@ -219,22 +308,53 @@ impl LabelStore {
     }
 }
 
-/// Take each labelled state from `incoming` only when that source is newer.
-///
-/// A state missing from `incoming` keeps the base value, so a partial newer
-/// entry cannot erase an older measured state.
-fn merge_labels(base: ClipLabels, incoming: ClipLabels, prefer_incoming: bool) -> ClipLabels {
-    if !prefer_incoming {
-        return base;
+fn merge_entry(current: &mut StoredLabels, incoming: &StoredLabels) {
+    for state in STATES {
+        let index = field_index(state);
+        let Some(incoming_clip) = incoming.labels.clip_for(state) else {
+            continue;
+        };
+        if current.labels.clip_for(state).is_none() {
+            current.labels.set(state, Some(incoming_clip));
+            current.methods[index] = resolved_method(incoming, index);
+            current.assigned_at[index] = incoming.assigned_at[index].clone();
+            continue;
+        }
+        let current_method = resolved_method(current, index).unwrap_or(LabelMethod::Capture);
+        let incoming_method = resolved_method(incoming, index).unwrap_or(LabelMethod::Capture);
+        let take = match incoming_method.cmp(&current_method) {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => field_stamp(incoming, index) > field_stamp(current, index),
+        };
+        if take {
+            current.labels.set(state, Some(incoming_clip));
+            current.methods[index] = Some(incoming_method);
+            current.assigned_at[index] = incoming.assigned_at[index].clone();
+        }
     }
-    let pick = |newer: Option<usize>, older: Option<usize>| newer.or(older);
-    ClipLabels {
-        idle: pick(incoming.idle, base.idle),
-        walk: pick(incoming.walk, base.walk),
-        jump_up: pick(incoming.jump_up, base.jump_up),
-        fall: pick(incoming.fall, base.fall),
-        land: pick(incoming.land, base.land),
+    if is_newer(incoming.updated.as_deref(), current.updated.as_deref()) {
+        current.updated = incoming.updated.clone();
     }
+}
+
+/// A labelled field with no recorded method is legacy evidence, protected as a
+/// capture; an unlabelled field has no method at all.
+fn resolved_method(stored: &StoredLabels, index: usize) -> Option<LabelMethod> {
+    stored.methods[index].or_else(|| {
+        STATES
+            .get(index)
+            .and_then(|state| stored.labels.clip_for(*state))
+            .map(|_| LabelMethod::Capture)
+    })
+}
+
+fn field_stamp(stored: &StoredLabels, index: usize) -> String {
+    let stamp = stored.assigned_at[index]
+        .as_deref()
+        .or(stored.updated.as_deref())
+        .unwrap_or("");
+    stamp_key(stamp)
 }
 
 /// Compare two ISO-8601 UTC stamps. A digits-only key ignores separators and
@@ -256,6 +376,228 @@ fn label_index(value: &Json) -> Option<usize> {
         Json::Number(text) | Json::String(text) => text.parse::<usize>().ok(),
         Json::Null | Json::Bool(_) | Json::Array(_) | Json::Object(_) => None,
     }
+}
+
+fn json_string(value: &Json) -> Option<String> {
+    match value {
+        Json::String(text) | Json::Number(text) => Some(text.clone()),
+        Json::Null | Json::Bool(_) | Json::Array(_) | Json::Object(_) => None,
+    }
+}
+
+impl LabelStore {
+    /// Write visual assignments into the store at `path`, preserving every
+    /// existing field.
+    ///
+    /// Each assigned field becomes a JSON string label with
+    /// `field_method: "visual"` and an `assigned_at` stamp in
+    /// `field_assigned_at`. `runs`/`samples` are never fabricated: a visual
+    /// field simply carries no such metadata. An entry whose labelled fields
+    /// are all visual gets `evidence: "visual"`; a mixed entry keeps its
+    /// existing evidence tag. The file is written as UTF-8 with no BOM.
+    pub fn save_visual(
+        path: &Path,
+        assignments: &[(String, MotionState, usize)],
+        assigned_at: &str,
+    ) -> Result<(), String> {
+        let mut root = match std::fs::read_to_string(path) {
+            Ok(text) => JsonParser::parse(&text)
+                .map_err(|error| format!("cannot parse labels store {}: {error}", path.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Json::Object(vec![
+                ("conflicts".to_string(), Json::Array(Vec::new())),
+                ("entries".to_string(), Json::Object(Vec::new())),
+                ("version".to_string(), Json::Number("1".to_string())),
+            ]),
+            Err(error) => {
+                return Err(format!(
+                    "cannot read labels store {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let Json::Object(members) = &mut root else {
+            return Err("the labels store must be a JSON object".to_string());
+        };
+        let entries = object_field(members, "entries");
+        for (file, state, clip) in assignments {
+            let fields = entry_fields(entries, &file.to_ascii_uppercase());
+            set_field(fields, state.label_field(), Json::String(clip.to_string()));
+            let methods = object_field(fields, "field_method");
+            set_field(methods, state.label_field(), Json::String("visual".to_string()));
+            let stamps = object_field(fields, "field_assigned_at");
+            set_field(stamps, state.label_field(), Json::String(assigned_at.to_string()));
+            set_field(fields, "updated", Json::String(assigned_at.to_string()));
+            set_field(fields, "assigned_at", Json::String(assigned_at.to_string()));
+        }
+        for (file, _, _) in assignments {
+            let fields = entry_fields(entries, &file.to_ascii_uppercase());
+            if entry_is_visual(fields) {
+                set_field(fields, "evidence", Json::String("visual".to_string()));
+            }
+        }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "cannot create labels store directory {}: {error}",
+                    parent.display()
+                )
+            })?;
+        }
+        std::fs::write(path, root_text(&root).into_bytes())
+            .map_err(|error| format!("cannot write labels store {}: {error}", path.display()))
+    }
+}
+
+fn root_text(root: &Json) -> String {
+    let mut out = String::new();
+    root.write(&mut out, 0);
+    out.push('\n');
+    out
+}
+
+/// Find or create an object-valued field and return its members.
+fn object_field<'a>(fields: &'a mut Vec<(String, Json)>, key: &str) -> &'a mut Vec<(String, Json)> {
+    let position = match fields.iter().position(|(name, _)| name == key) {
+        Some(position) => position,
+        None => {
+            fields.push((key.to_string(), Json::Object(Vec::new())));
+            fields.len() - 1
+        }
+    };
+    if !matches!(fields[position].1, Json::Object(_)) {
+        fields[position].1 = Json::Object(Vec::new());
+    }
+    match &mut fields[position].1 {
+        Json::Object(members) => members,
+        _ => unreachable!("the field was just replaced with an object"),
+    }
+}
+
+/// Find or create one entry object and return its members.
+fn entry_fields<'a>(
+    entries: &'a mut Vec<(String, Json)>,
+    file: &str,
+) -> &'a mut Vec<(String, Json)> {
+    let position = match entries.iter().position(|(name, _)| name == file) {
+        Some(position) => position,
+        None => {
+            entries.push((file.to_string(), Json::Object(Vec::new())));
+            entries.len() - 1
+        }
+    };
+    if !matches!(entries[position].1, Json::Object(_)) {
+        entries[position].1 = Json::Object(Vec::new());
+    }
+    match &mut entries[position].1 {
+        Json::Object(members) => members,
+        _ => unreachable!("the entry was just replaced with an object"),
+    }
+}
+
+fn set_field(fields: &mut Vec<(String, Json)>, key: &str, value: Json) {
+    match fields.iter_mut().find(|(name, _)| name == key) {
+        Some((_, slot)) => *slot = value,
+        None => fields.push((key.to_string(), value)),
+    }
+}
+
+/// Whether every labelled field in the entry carries a `visual` method.
+fn entry_is_visual(fields: &[(String, Json)]) -> bool {
+    let methods = fields
+        .iter()
+        .find(|(name, _)| name == "field_method")
+        .and_then(|(_, value)| match value {
+            Json::Object(members) => Some(members),
+            _ => None,
+        });
+    let mut any = false;
+    for state in STATES {
+        let field = state.label_field();
+        if !fields.iter().any(|(name, _)| name == field) {
+            continue;
+        }
+        any = true;
+        let method = methods
+            .and_then(|members| members.iter().find(|(name, _)| name == field))
+            .and_then(|(_, value)| json_string(value));
+        if method.as_deref() != Some("visual") {
+            return false;
+        }
+    }
+    any
+}
+
+impl Json {
+    fn write(&self, out: &mut String, indent: usize) {
+        match self {
+            Self::Null => out.push_str("null"),
+            Self::Bool(value) => out.push_str(if *value { "true" } else { "false" }),
+            Self::Number(text) => out.push_str(text),
+            Self::String(text) => write_json_string(text, out),
+            Self::Array(values) => {
+                out.push('[');
+                if !values.is_empty() {
+                    out.push('\n');
+                    for (index, value) in values.iter().enumerate() {
+                        indent_into(out, indent + 1);
+                        value.write(out, indent + 1);
+                        if index + 1 < values.len() {
+                            out.push(',');
+                        }
+                        out.push('\n');
+                    }
+                    indent_into(out, indent);
+                }
+                out.push(']');
+            }
+            Self::Object(members) => {
+                let mut ordered: Vec<&(String, Json)> = members.iter().collect();
+                ordered.sort_by(|left, right| left.0.cmp(&right.0));
+                out.push('{');
+                if !ordered.is_empty() {
+                    out.push('\n');
+                    for (index, (key, value)) in ordered.iter().enumerate() {
+                        indent_into(out, indent + 1);
+                        write_json_string(key, out);
+                        out.push_str(": ");
+                        value.write(out, indent + 1);
+                        if index + 1 < ordered.len() {
+                            out.push(',');
+                        }
+                        out.push('\n');
+                    }
+                    indent_into(out, indent);
+                }
+                out.push('}');
+            }
+        }
+    }
+}
+
+fn indent_into(out: &mut String, indent: usize) {
+    for _ in 0..indent {
+        out.push_str("  ");
+    }
+}
+
+fn write_json_string(text: &str, out: &mut String) {
+    out.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other if (other as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", other as u32));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
 }
 
 /// One live actor whose `.SRA` could not be resolved or bound.
@@ -327,6 +669,17 @@ impl ActorAnimation {
     /// The clip selected for the current state, or `None` for rest.
     pub fn current_clip(&self) -> Option<usize> {
         self.selector.clip_opt()
+    }
+
+    /// Descriptor of one clip of this actor's file.
+    pub fn clip_info(&self, clip: usize) -> Option<SraClipInfo> {
+        self.animation.clip_info(clip).ok()
+    }
+
+    /// The clip an inspector plays: the requested index clamped to this file.
+    pub fn inspect_clip(&self, clip: usize) -> Option<usize> {
+        let count = self.clip_count();
+        (count > 0).then(|| clip.min(count - 1))
     }
 
     /// Observe the actor's position once per simulation tick.
@@ -577,6 +930,109 @@ impl ActorAnimations {
         }
         poses
     }
+
+    /// Every resolved actor plays one inspected clip, looped from the global
+    /// tick. Each actor clamps the request to its own file, so a shorter file
+    /// never errors while a longer one still shows the requested clip.
+    pub fn inspect_poses(
+        &self,
+        live: &LiveArena,
+        tick: u64,
+        fps: u32,
+        clip: usize,
+        player: Option<LiveId>,
+        player_yaw: Option<f32>,
+    ) -> Vec<ActorPose> {
+        let mut poses = Vec::new();
+        for actor in &self.resolved {
+            if live.get(actor.id).is_err() {
+                continue;
+            }
+            let Some(clip) = actor.inspect_clip(clip) else {
+                continue;
+            };
+            let animation = actor
+                .animation
+                .poses_for_clip_tick(
+                    clip,
+                    tick,
+                    units_per_second_for_fps(fps),
+                    PlaybackLoop::Loop,
+                )
+                .ok();
+            let is_player = Some(actor.id) == player;
+            poses.push(ActorPose {
+                actor: actor.id,
+                yaw_binary: if is_player {
+                    player_yaw.unwrap_or(0.0)
+                } else {
+                    0.0
+                },
+                animation,
+            });
+        }
+        poses
+    }
+
+    /// Distinct `.SRA` files with their clip counts, in file-name order.
+    pub fn files(&self) -> Vec<(String, usize)> {
+        let mut files = BTreeMap::new();
+        for actor in &self.resolved {
+            files
+                .entry(actor.sra_file.clone())
+                .or_insert(actor.clip_count());
+        }
+        files.into_iter().collect()
+    }
+
+    /// The descriptor of `clip` in one distinct file.
+    pub fn file_clip_info(&self, file: &str, clip: usize) -> Option<SraClipInfo> {
+        self.resolved
+            .iter()
+            .find(|actor| actor.sra_file == file)
+            .and_then(|actor| actor.clip_info(clip))
+    }
+
+    /// The one-time `--clip-inspect` startup lines.
+    ///
+    /// The first line names the inspected clip and, from the first resolved
+    /// file, its frame count, divisor and duration. One line per distinct file
+    /// then makes every file's clip count visible.
+    pub fn inspect_lines(&self, clip: usize) -> Vec<String> {
+        let files = self.files();
+        let mut per_file = Vec::new();
+        let mut summary = None;
+        for (file, count) in &files {
+            let index = clip.min(count.saturating_sub(1));
+            let info = self
+                .resolved
+                .iter()
+                .find(|actor| &actor.sra_file == file)
+                .and_then(|actor| actor.clip_info(index));
+            let (frames, divisor, duration) = info.map_or((0, 0, 0.0), |info| {
+                (
+                    info.frame_count,
+                    info.divisor,
+                    duration_seconds(info.frame_count, info.divisor),
+                )
+            });
+            summary.get_or_insert((frames, divisor, duration));
+            per_file.push(format!(
+                "clip-inspect sra={file} clips={count} clip={index} frames={frames} divisor={divisor} dur={duration:.3}"
+            ));
+        }
+        let (frames, divisor, duration) = summary.unwrap_or((0, 0, 0.0));
+        let mut lines = vec![format!(
+            "clip-inspect clip={clip} frames={frames} divisor={divisor} dur={duration:.3} actors={}",
+            self.resolved.len()
+        )];
+        lines.extend(per_file);
+        lines
+    }
+}
+
+fn duration_seconds(frames: usize, divisor: i16) -> f64 {
+    frames as f64 * f64::from(divisor) / crate::sra::ANIMATION_UNITS_PER_SECOND as f64
 }
 
 /// A deliberately small JSON value, enough for the probe's store.
@@ -790,7 +1246,10 @@ mod tests {
         ActorAnimation, ActorAnimations, LabelStore, SraDirectory, UnresolvedActor,
     };
     use crate::engine::live::LiveId;
-    use crate::sra::{ClipLabels, synthetic_animation_container};
+    use crate::sra::{
+        ClipLabels, MotionState, SraAnimation, synthetic_animation_container,
+        synthetic_multi_clip_container,
+    };
 
     fn animation(frames: u16, values: &[f32]) -> crate::sra::SraAnimation {
         let container = synthetic_animation_container(&[0x001], frames, 100, values);
@@ -1075,5 +1534,166 @@ mod tests {
             Some(17),
             "a home-only file is admitted by the merge"
         );
+    }
+
+    #[test]
+    fn a_visual_assignment_writes_method_and_assigned_at_without_run_metadata() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("clip-labels.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"conflicts":[],"entries":{"HUNTER.SRA":{"slots":24}}}"#,
+        )
+        .expect("write a base store");
+
+        LabelStore::save_visual(
+            &path,
+            &[
+                ("HUNTER.SRA".to_string(), MotionState::Idle, 2),
+                ("HUNTER.SRA".to_string(), MotionState::Moving, 7),
+            ],
+            "2026-11-22T12:00:00Z",
+        )
+        .expect("the visual save must succeed");
+
+        let text = std::fs::read_to_string(&path).expect("read the store");
+        let store = LabelStore::parse(&text).expect("the written store must parse");
+        let labels = store.for_sra("hunter.sra");
+        assert_eq!((labels.idle, labels.walk), (Some(2), Some(7)));
+        assert_eq!((labels.jump_up, labels.fall, labels.land), (None, None, None));
+        assert!(text.contains("\"field_method\""), "the method is per field");
+        assert!(text.contains("\"visual\""), "the method name is visual");
+        assert!(text.contains("\"field_assigned_at\""));
+        assert!(text.contains("2026-11-22T12:00:00Z"));
+        assert_eq!(
+            text.matches("\"runs\"").count(),
+            0,
+            "visual evidence must not fabricate run counts"
+        );
+        assert_eq!(
+            text.matches("\"samples\"").count(),
+            0,
+            "visual evidence must not fabricate sample counts"
+        );
+        assert_eq!(
+            text.matches("\"slots\"").count(),
+            1,
+            "unrelated entry metadata is preserved"
+        );
+    }
+
+    fn store_with(file: &str, clip: usize, method: &str, stamp: &str) -> LabelStore {
+        LabelStore::parse(&format!(
+            r#"{{"entries":{{"{file}":{{"idle":"{clip}","field_method":{{"idle":"{method}"}},"updated":"{stamp}"}}}}}}"#
+        ))
+        .expect("the synthetic store parses")
+    }
+
+    #[test]
+    fn precedence_is_motion_then_visual_then_capture() {
+        let motion = store_with("HUNTER.SRA", 1, "motion", "2026-11-01T00:00:00Z");
+        let visual = store_with("HUNTER.SRA", 2, "visual", "2026-11-02T00:00:00Z");
+        let capture = store_with("HUNTER.SRA", 3, "capture", "2026-11-03T00:00:00Z");
+
+        let visual_over_motion = LabelStore::merge(motion, visual.clone());
+        assert_eq!(
+            visual_over_motion.for_sra("HUNTER.SRA").idle,
+            Some(2),
+            "visual evidence may replace a motion label"
+        );
+        let capture_over_visual = LabelStore::merge(visual.clone(), capture.clone());
+        assert_eq!(
+            capture_over_visual.for_sra("HUNTER.SRA").idle,
+            Some(3),
+            "capture evidence outranks visual"
+        );
+        let visual_over_capture = LabelStore::merge(capture, visual);
+        assert_eq!(
+            visual_over_capture.for_sra("HUNTER.SRA").idle,
+            Some(3),
+            "visual evidence never replaces capture"
+        );
+        let motion_over_visual = LabelStore::merge(
+            store_with("HUNTER.SRA", 2, "visual", "2026-11-02T00:00:00Z"),
+            store_with("HUNTER.SRA", 1, "motion", "2026-11-09T00:00:00Z"),
+        );
+        assert_eq!(
+            motion_over_visual.for_sra("HUNTER.SRA").idle,
+            Some(2),
+            "motion evidence never replaces visual, even when newer"
+        );
+    }
+
+    #[test]
+    fn a_visual_entry_without_run_metadata_is_tolerated() {
+        let store = LabelStore::parse(
+            r#"{
+                "entries": {
+                    "HUNTER.SRA": {
+                        "idle": "2", "walk": "7",
+                        "field_method": {"idle": "visual", "walk": "visual"},
+                        "field_assigned_at": {
+                            "idle": "2026-11-22T12:00:00Z",
+                            "walk": "2026-11-22T12:00:00Z"
+                        },
+                        "assigned_at": "2026-11-22T12:00:00Z",
+                        "evidence": "visual",
+                        "updated": "2026-11-22T12:00:00Z"
+                    }
+                }
+            }"#,
+        )
+        .expect("a visual-only entry parses without runs or samples");
+        let labels = store.for_sra("HUNTER.SRA");
+        assert_eq!((labels.idle, labels.walk), (Some(2), Some(7)));
+        assert_eq!(labels.labelled(), 2);
+    }
+
+    fn multi_clip_animation(clips: &[(u16, i16)]) -> SraAnimation {
+        let container = synthetic_multi_clip_container(&[0x001], clips);
+        SraAnimation::load(container, 1).expect("one synthetic table per clip")
+    }
+
+    #[test]
+    fn clip_inspect_selects_clip_n_for_every_actor_and_clamps_shorter_files() {
+        let long = multi_clip_animation(&[(1, 100), (2, 100), (3, 100)]);
+        let short = multi_clip_animation(&[(1, 100), (2, 100)]);
+        let actors = ActorAnimations {
+            resolved: vec![
+                ActorAnimation::new(
+                    LiveId { index: 0, generation: 0 },
+                    "hunter".to_string(),
+                    "HUNTER.SRA".to_string(),
+                    long,
+                    ClipLabels::NONE,
+                ),
+                ActorAnimation::new(
+                    LiveId { index: 1, generation: 0 },
+                    "sluagh".to_string(),
+                    "SLUAGH.SRA".to_string(),
+                    short,
+                    ClipLabels::NONE,
+                ),
+            ],
+            unresolved: Vec::new(),
+        };
+        assert_eq!(actors.resolved()[0].inspect_clip(2), Some(2));
+        assert_eq!(
+            actors.resolved()[1].inspect_clip(2),
+            Some(1),
+            "a shorter file clamps to its own last clip"
+        );
+        assert_eq!(actors.resolved()[0].inspect_clip(9), Some(2));
+        let lines = actors.inspect_lines(2);
+        assert!(
+            lines[0].starts_with("clip-inspect clip=2 frames=3 divisor=100"),
+            "the startup line names the requested clip: {lines:?}"
+        );
+        assert!(lines.iter().any(|line| {
+            line.contains("sra=HUNTER.SRA") && line.contains("clips=3")
+        }));
+        assert!(lines.iter().any(|line| {
+            line.contains("sra=SLUAGH.SRA") && line.contains("clips=2")
+        }));
     }
 }
