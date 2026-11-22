@@ -1116,6 +1116,17 @@ impl MotionState {
             Self::Falling
         }
     }
+
+    /// The label-store field name for this state.
+    pub fn label_field(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Moving => "walk",
+            Self::Ascending => "jump_up",
+            Self::Falling => "fall",
+            Self::Landing => "land",
+        }
+    }
 }
 
 /// Shortest landing window, in 60 Hz ticks.
@@ -1344,6 +1355,17 @@ impl ClipLabels {
         }
     }
 
+    /// Set or clear the clip index for one motion state.
+    pub fn set(&mut self, state: MotionState, clip: Option<usize>) {
+        match state {
+            MotionState::Idle => self.idle = clip,
+            MotionState::Moving => self.walk = clip,
+            MotionState::Ascending => self.jump_up = clip,
+            MotionState::Falling => self.fall = clip,
+            MotionState::Landing => self.land = clip,
+        }
+    }
+
     /// Number of states that carry a measured label.
     pub fn labelled(&self) -> usize {
         [
@@ -1557,6 +1579,12 @@ pub(crate) fn synthetic_animation_container(
     divisor: i16,
     values: &[f32],
 ) -> Vec<u8> {
+    encode_single_record_container(&synthetic_record(masks, frame_count, divisor, values))
+}
+
+/// Build one payload record with one table, for tests.
+#[cfg(test)]
+fn synthetic_record(masks: &[u16], frame_count: u16, divisor: i16, values: &[f32]) -> Vec<u8> {
     let slot_count = masks.len();
     let stride_bits = ((3 * slot_count + 7) / 8) * 8;
     let block_base = 0x20;
@@ -1588,7 +1616,37 @@ pub(crate) fn synthetic_animation_container(
             }
         }
     }
-    encode_single_record_container(&record)
+    record
+}
+
+/// Build a multi-clip animation container, one clip per payload record.
+#[cfg(test)]
+pub(crate) fn synthetic_multi_clip_container(
+    masks: &[u16],
+    clips: &[(u16, i16)],
+) -> Vec<u8> {
+    let records: Vec<Vec<u8>> = clips
+        .iter()
+        .map(|&(frames, divisor)| synthetic_record(masks, frames, divisor, &[0.0]))
+        .collect();
+    let count = records.len() + 1;
+    let preamble_size = 8 + 4 * count;
+    let payload_base = preamble_size.div_ceil(PAYLOAD_ALIGN).max(1) * PAYLOAD_ALIGN;
+    let directory_len = 4 * (records.len() + 1);
+    let mut bytes = vec![0u8; payload_base + directory_len];
+    bytes[0..4].copy_from_slice(&(count as u32).to_le_bytes());
+    let mut offset = directory_len;
+    for (index, record) in records.iter().enumerate() {
+        let at = payload_base + index * 4;
+        bytes[at..at + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+        offset += record.len();
+    }
+    let terminator = payload_base + records.len() * 4;
+    bytes[terminator..terminator + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    for record in &records {
+        bytes.extend_from_slice(record);
+    }
+    bytes
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -25,7 +25,7 @@ use winit::window::{Window, WindowId};
 
 use crate::cli_out::outln;
 use crate::engine::actor::ActorProfile;
-use crate::engine::actors::ActorAnimations;
+use crate::engine::actors::{ActorAnimations, LabelStore};
 use crate::engine::assets::{AssetRequest, AssetStore, ImmediateSource};
 use crate::engine::backend_wgpu::WgpuBackend;
 use crate::engine::class::RenderClass;
@@ -41,7 +41,7 @@ use crate::object_texture::PageBank;
 use crate::pose;
 use crate::render::{self, FlyCamera, OrbitCamera};
 use crate::sra::{
-    ANIMATION_FPS, ClipError, ClipMap, ClipSelection, ClipSelector, PlaybackLoop,
+    ANIMATION_FPS, ClipError, ClipMap, ClipSelection, ClipSelector, MotionState, PlaybackLoop,
     units_per_second_for_fps,
 };
 
@@ -238,6 +238,9 @@ pub struct PlayOptions {
     pub clip_fall: Option<usize>,
     /// Explicit landing clip (`--clip-land <N>`).
     pub clip_land: Option<usize>,
+    /// Clip inspector (`--clip-inspect <N>`): every resolved actor plays clip
+    /// `N`, looped, while keys assign the current clip to a state.
+    pub clip_inspect: Option<usize>,
     /// Deterministic diagnostic input sequence (`--input-script`, headless only).
     pub input_script: Option<InputScript>,
     /// Explicit player position that overrides the authored record
@@ -381,6 +384,7 @@ impl PlayOptions {
             clip_jump_up: None,
             clip_fall: None,
             clip_land: None,
+            clip_inspect: None,
             input_script: None,
             player_pos: None,
             cull_report: false,
@@ -460,6 +464,9 @@ impl PlayOptions {
                 "--clip-land" => {
                     options.clip_land = Some(clip_value(args, index, "--clip-land")?)
                 }
+                "--clip-inspect" => {
+                    options.clip_inspect = Some(clip_value(args, index, "--clip-inspect")?)
+                }
                 "--input-script" => {
                     let raw = value(args, index, "--input-script")?;
                     options.input_script = Some(
@@ -520,6 +527,14 @@ impl PlayOptions {
         }
         if options.cull_report && !options.headless {
             return Err(PlayError::CullReportRequiresHeadless);
+        }
+        if options.clip_inspect.is_some() {
+            if options.headless {
+                return Err(PlayError::ClipInspectRequiresWindow);
+            }
+            if options.sra_dir.is_none() {
+                return Err(PlayError::ClipInspectRequiresSraDir);
+            }
         }
         if options.headless {
             if options.ticks.is_none() {
@@ -584,6 +599,8 @@ pub enum PlayError {
     InvalidInputScript(String),
     InputScriptRequiresHeadless,
     CullReportRequiresHeadless,
+    ClipInspectRequiresWindow,
+    ClipInspectRequiresSraDir,
     InvalidPlayerPos(String),
     InvalidCamDistance(String),
     InvalidCamHeight(String),
@@ -630,6 +647,14 @@ impl fmt::Display for PlayError {
             Self::CullReportRequiresHeadless => write!(
                 f,
                 "--cull-report requires --headless: the diagnostic is a fixed-tick run"
+            ),
+            Self::ClipInspectRequiresWindow => write!(
+                f,
+                "--clip-inspect requires a window: it cannot run with --headless"
+            ),
+            Self::ClipInspectRequiresSraDir => write!(
+                f,
+                "--clip-inspect requires --sra-dir <DIR>: it inspects per-actor .SRA files"
             ),
             Self::InvalidPlayerPos(value) => write!(
                 f,
@@ -1280,6 +1305,10 @@ fn open_window(
     };
     let event_loop =
         EventLoop::new().map_err(|error| RunError::Window(format!("event loop: {error}")))?;
+    let base_title = format!("soul reaver - {unit}");
+    let inspect = options
+        .clip_inspect
+        .map(|clip| ClipInspector::new(clip, options.labels_store_path()));
     let mut app = PlayApp {
         frame,
         assets,
@@ -1300,7 +1329,7 @@ fn open_window(
         last_frame: Instant::now(),
         last_dt: 0.0,
         init_error: None,
-        title: format!("soul reaver - {unit}"),
+        title: base_title.clone(),
         animation,
         clip_selector,
         actors: ActorAnimations::default(),
@@ -1314,6 +1343,8 @@ fn open_window(
         } else {
             PlaybackLoop::Loop
         },
+        inspect,
+        base_title,
     };
     event_loop
         .run_app(&mut app)
@@ -1488,6 +1519,175 @@ fn player_camera_world(
     (eye, target)
 }
 
+/// The five label fields the inspector can assign.
+const LABEL_STATES: [MotionState; 5] = [
+    MotionState::Idle,
+    MotionState::Moving,
+    MotionState::Ascending,
+    MotionState::Falling,
+    MotionState::Landing,
+];
+
+fn label_state_index(state: MotionState) -> usize {
+    match state {
+        MotionState::Idle => 0,
+        MotionState::Moving => 1,
+        MotionState::Ascending => 2,
+        MotionState::Falling => 3,
+        MotionState::Landing => 4,
+    }
+}
+
+/// Interactive `--clip-inspect` state: the current clip, the file it is being
+/// assigned for, and the pending state assignments.
+///
+/// None of this enters `FrameState`. It only decides what the per-actor
+/// presentation path plays and what the visual save writes.
+#[derive(Debug, Clone, Default)]
+struct ClipInspector {
+    clip: usize,
+    target: usize,
+    files: Vec<(String, usize)>,
+    pending: BTreeMap<String, [Option<usize>; 5]>,
+    save_path: PathBuf,
+}
+
+impl ClipInspector {
+    fn new(clip: usize, save_path: PathBuf) -> Self {
+        Self {
+            clip,
+            target: 0,
+            files: Vec::new(),
+            pending: BTreeMap::new(),
+            save_path,
+        }
+    }
+
+    fn configure(&mut self, files: Vec<(String, usize)>) {
+        self.files = files;
+        self.target = self.target.min(self.files.len().saturating_sub(1));
+        self.clamp();
+    }
+
+    fn clamp(&mut self) {
+        if let Some(count) = self.target_count() {
+            self.clip = self.clip.min(count.saturating_sub(1));
+        }
+    }
+
+    fn target_file(&self) -> Option<&str> {
+        self.files.get(self.target).map(|(file, _)| file.as_str())
+    }
+
+    fn target_count(&self) -> Option<usize> {
+        self.files.get(self.target).map(|(_, count)| *count)
+    }
+
+    fn next_file(&mut self) {
+        if !self.files.is_empty() {
+            self.target = (self.target + 1) % self.files.len();
+            self.clamp();
+        }
+    }
+
+    fn previous_clip(&mut self) {
+        self.clip = self.clip.saturating_sub(1);
+    }
+
+    fn next_clip(&mut self) {
+        if let Some(last) = self.target_count().and_then(|count| count.checked_sub(1)) {
+            self.clip = (self.clip + 1).min(last);
+        }
+    }
+
+    fn assign(&mut self, state: MotionState) {
+        let Some(file) = self.target_file() else {
+            return;
+        };
+        let file = file.to_string();
+        self.pending.entry(file).or_insert([None; 5])[label_state_index(state)] = Some(self.clip);
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    fn pending_summary(&self) -> String {
+        let mut parts = Vec::new();
+        for (file, slots) in &self.pending {
+            for state in LABEL_STATES {
+                if let Some(clip) = slots[label_state_index(state)] {
+                    parts.push(format!("{file}:{}= {clip}", state.label_field()));
+                }
+            }
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(",")
+        }
+    }
+
+    /// Save every pending assignment through the normal store write path.
+    fn save(&mut self) -> Result<usize, String> {
+        let assigned_at = utc_now_iso8601();
+        let mut assignments = Vec::new();
+        for (file, slots) in &self.pending {
+            for state in LABEL_STATES {
+                if let Some(clip) = slots[label_state_index(state)] {
+                    assignments.push((file.clone(), state, clip));
+                }
+            }
+        }
+        if assignments.is_empty() {
+            return Ok(0);
+        }
+        LabelStore::save_visual(&self.save_path, &assignments, &assigned_at)?;
+        self.pending.clear();
+        Ok(assignments.len())
+    }
+}
+
+fn utc_now_iso8601() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    format_utc(seconds)
+}
+
+/// Format epoch seconds as `YYYY-MM-DDTHH:MM:SSZ`.
+fn format_utc(seconds: u64) -> String {
+    let days = (seconds / 86_400) as i64;
+    let remainder = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        remainder / 3_600,
+        (remainder % 3_600) / 60,
+        remainder % 60
+    )
+}
+
+/// Days since 1970-01-01 to a proleptic Gregorian date (Howard Hinnant).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    (year + i64::from(month <= 2), month as u32, day as u32)
+}
+
 struct PlayApp {
     frame: FrameState,
     assets: SceneAssets,
@@ -1528,6 +1728,10 @@ struct PlayApp {
     actor_exclude: Option<crate::engine::live::LiveId>,
     anim_fps: u32,
     anim_policy: PlaybackLoop,
+    /// `--clip-inspect`: forced clip plus pending visual assignments.
+    inspect: Option<ClipInspector>,
+    /// The window title before the inspector appends its status.
+    base_title: String,
 }
 
 impl PlayApp {
@@ -1589,6 +1793,16 @@ impl PlayApp {
         let player_yaw = self.frame.player_yaw_binary();
         let fps = self.anim_fps;
         let policy = self.anim_policy;
+        if let Some(clip) = self.inspect.as_ref().map(|inspect| inspect.clip) {
+            return self.actors.inspect_poses(
+                self.frame.live(),
+                tick,
+                fps,
+                clip,
+                player,
+                player_yaw,
+            );
+        }
         let mut poses = self.actors.poses(
             self.frame.live(),
             tick,
@@ -1630,7 +1844,77 @@ impl PlayApp {
             outln!("{line}");
         }
         self.actors = actors;
+        if let Some(inspect) = self.inspect.as_mut() {
+            inspect.configure(self.actors.files());
+            let clip = inspect.clip;
+            for line in self.actors.inspect_lines(clip) {
+                outln!("{line}");
+            }
+        }
+        if self.inspect.is_some() {
+            outln!("{}", self.inspect_status_line());
+            if let Some(window) = &self.window {
+                window.set_title(&self.inspect_title());
+            }
+        }
         Ok(())
+    }
+
+    /// The inspector status: current clip geometry, target file and pending
+    /// assignments, so what is on screen is always identifiable.
+    fn inspect_status_line(&self) -> String {
+        let Some(inspect) = &self.inspect else {
+            return self.base_title.clone();
+        };
+        let Some(file) = inspect.target_file() else {
+            return format!("clip-inspect clip={} files=0 pending=none", inspect.clip);
+        };
+        let count = inspect.target_count().unwrap_or(0);
+        let clip = inspect.clip.min(count.saturating_sub(1));
+        let (frames, divisor, duration) = self.actors.file_clip_info(file, clip).map_or(
+            (0, 0, 0.0),
+            |info| {
+                (
+                    info.frame_count,
+                    info.divisor,
+                    info.frame_count as f64 * f64::from(info.divisor)
+                        / crate::sra::ANIMATION_UNITS_PER_SECOND as f64,
+                )
+            },
+        );
+        format!(
+            "clip-inspect clip={clip} frames={frames} divisor={divisor} dur={duration:.3} target={file} files={} pending={}",
+            inspect.files.len(),
+            inspect.pending_summary()
+        )
+    }
+
+    fn inspect_title(&self) -> String {
+        match &self.inspect {
+            Some(_) => format!("{} - {}", self.base_title, self.inspect_status_line()),
+            None => self.base_title.clone(),
+        }
+    }
+
+    fn refresh_inspect(&mut self, window: &Window) {
+        if self.inspect.is_none() {
+            return;
+        }
+        outln!("{}", self.inspect_status_line());
+        window.set_title(&self.inspect_title());
+    }
+
+    fn save_inspect(&mut self, window: &Window) {
+        let Some(inspect) = self.inspect.as_mut() else {
+            return;
+        };
+        let store = inspect.save_path.display().to_string();
+        match inspect.save() {
+            Ok(0) => outln!("clip-inspect save skipped: no pending assignment"),
+            Ok(fields) => outln!("clip-inspect saved fields={fields} store={store}"),
+            Err(error) => outln!("clip-inspect save failed: {error}"),
+        }
+        window.set_title(&self.inspect_title());
     }
 
     fn camera_view(&mut self, aspect: f32) -> CameraView {
@@ -1696,6 +1980,13 @@ impl PlayApp {
     /// mode, and exit on `Esc`.
     fn handle_key(&mut self, window: &Window, event: &KeyEvent) -> bool {
         self.keys.update(event);
+        if event.state == ElementState::Pressed && !event.repeat && self.inspect.is_some() {
+            if matches!(&event.logical_key, Key::Named(NamedKey::Enter)) {
+                self.save_inspect(window);
+            } else {
+                self.handle_inspect_key(window, &event.logical_key);
+            }
+        }
         if event.state == ElementState::Pressed && !event.repeat {
             match &event.logical_key {
                 Key::Named(NamedKey::Escape) => return true,
@@ -1720,6 +2011,60 @@ impl PlayApp {
             }
         }
         false
+    }
+
+    /// Inspector keys, ignored when `--clip-inspect` is absent. `[`/`]` clamp to
+    /// the target file's clip count, `1`..`5` assign the current clip to a
+    /// state, `Z`/Backspace clear pending assignments and `Tab` cycles the
+    /// target `.SRA`. Saving is Enter, handled by the caller.
+    fn handle_inspect_key(&mut self, window: &Window, key: &Key) {
+        let changed = {
+            let Some(inspect) = self.inspect.as_mut() else {
+                return;
+            };
+            let mut changed = false;
+            match key {
+                Key::Character(text) if text.as_str() == "[" => {
+                    inspect.previous_clip();
+                    changed = true;
+                }
+                Key::Character(text) if text.as_str() == "]" => {
+                    inspect.next_clip();
+                    changed = true;
+                }
+                Key::Character(text) if text.eq_ignore_ascii_case("z") => {
+                    inspect.clear();
+                    changed = true;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    inspect.clear();
+                    changed = true;
+                }
+                Key::Named(NamedKey::Tab) => {
+                    inspect.next_file();
+                    changed = true;
+                }
+                Key::Character(text) => {
+                    let state = match text.as_str() {
+                        "1" => Some(MotionState::Idle),
+                        "2" => Some(MotionState::Moving),
+                        "3" => Some(MotionState::Ascending),
+                        "4" => Some(MotionState::Falling),
+                        "5" => Some(MotionState::Landing),
+                        _ => None,
+                    };
+                    if let Some(state) = state {
+                        inspect.assign(state);
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+            changed
+        };
+        if changed {
+            self.refresh_inspect(window);
+        }
     }
 
     /// Mouse orbit/pan/zoom in orbit mode, look in fly mode, and orbit the
@@ -1883,17 +2228,19 @@ impl ApplicationHandler for PlayApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        CameraMode, CullReport, InputScript, PLAYER_CAMERA_DISTANCE, PLAYER_CAMERA_HEIGHT,
-        PLAYER_FALLBACK_YAW_BINARY, PLAYER_LOOK_HEIGHT, PlayError, PlayOptions, RunError,
-        apply_script_tick, cull_report, player_camera_world, run_script_ticks, third_person_mvp,
+        CameraMode, ClipInspector, CullReport, InputScript, PLAYER_CAMERA_DISTANCE,
+        PLAYER_CAMERA_HEIGHT, PLAYER_FALLBACK_YAW_BINARY, PLAYER_LOOK_HEIGHT, PlayError,
+        PlayOptions, RunError, apply_script_tick, cull_report, format_utc, player_camera_world,
+        run_script_ticks, third_person_mvp,
     };
     use crate::engine::clock::ObjectTick;
     use crate::engine::collision::CollisionMesh;
+    use crate::engine::actors::LabelStore;
     use crate::engine::frame::FrameState;
     use crate::engine::input::InputButton;
     use crate::engine::world::World;
     use crate::level::{ObjectRecord, ObjectReport};
-    use crate::sra::{ClipError, ClipMap};
+    use crate::sra::{ClipError, ClipMap, MotionState};
     use std::path::PathBuf;
 
     fn argv(input: &[&str]) -> Vec<String> {
@@ -1989,6 +2336,7 @@ mod tests {
         assert_eq!(options.player_pos, None);
         assert_eq!(options.cam_distance, None);
         assert_eq!(options.cam_height, None);
+        assert_eq!(options.clip_inspect, None);
     }
 
     #[test]
@@ -2866,6 +3214,88 @@ mod tests {
             target[2] - half_height <= 0.0,
             "the feet fit"
         );
+    }
+
+    #[test]
+    fn clip_inspect_parses_but_refuses_headless_and_a_missing_sra_dir() {
+        let options = parse(&[
+            "--bigfile", "B.DAT", "--sra-dir", "OBJECT", "--clip-inspect", "2",
+        ])
+        .expect("the inspector flags must parse");
+        assert_eq!(options.clip_inspect, Some(2));
+
+        let headless = parse(&[
+            "--bigfile", "B.DAT", "--sra-dir", "OBJECT", "--clip-inspect", "2", "--headless",
+        ]);
+        assert!(
+            matches!(headless, Err(PlayError::ClipInspectRequiresWindow)),
+            "the inspector requires a window: {headless:?}"
+        );
+
+        let no_dir = parse(&["--bigfile", "B.DAT", "--clip-inspect", "2"]);
+        assert!(
+            matches!(no_dir, Err(PlayError::ClipInspectRequiresSraDir)),
+            "the inspector requires --sra-dir: {no_dir:?}"
+        );
+    }
+
+    #[test]
+    fn inspector_navigation_clamps_to_each_file_and_pending_is_per_file() {
+        let mut inspector = ClipInspector::new(2, PathBuf::from("labels.json"));
+        inspector.configure(vec![
+            ("HUNTER.SRA".to_string(), 10),
+            ("SLUAGH.SRA".to_string(), 3),
+        ]);
+        assert_eq!(inspector.clip, 2);
+
+        inspector.next_clip();
+        assert_eq!(inspector.clip, 3);
+        for _ in 0..20 {
+            inspector.next_clip();
+        }
+        assert_eq!(inspector.clip, 9, "next clamps at the target's last clip");
+        for _ in 0..20 {
+            inspector.previous_clip();
+        }
+        assert_eq!(inspector.clip, 0, "previous clamps at clip 0");
+
+        inspector.clip = 9;
+        inspector.next_file();
+        assert_eq!(inspector.target_file(), Some("SLUAGH.SRA"));
+        assert_eq!(inspector.clip, 2, "switching target clamps to its clip count");
+
+        inspector.assign(MotionState::Idle);
+        assert_eq!(
+            inspector.pending_summary(),
+            "SLUAGH.SRA:idle= 2",
+            "the assignment belongs to the target .SRA"
+        );
+        inspector.clear();
+        assert_eq!(inspector.pending_summary(), "none");
+    }
+
+    #[test]
+    fn epoch_seconds_format_as_iso8601_utc() {
+        assert_eq!(format_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn inspector_save_writes_assignments_to_the_store_and_clears_pending() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("clip-labels.json");
+        let mut inspector = ClipInspector::new(2, path.clone());
+        inspector.configure(vec![("HUNTER.SRA".to_string(), 10)]);
+        inspector.assign(MotionState::Idle);
+        inspector.assign(MotionState::Moving);
+
+        assert_eq!(inspector.save().expect("save"), 2);
+        assert_eq!(inspector.pending_summary(), "none");
+
+        let store = LabelStore::load(&path).expect("the saved store parses");
+        let labels = store.for_sra("HUNTER.SRA");
+        assert_eq!((labels.idle, labels.walk), (Some(2), Some(2)));
+        assert_eq!(labels.labelled(), 2);
     }
 }
 
