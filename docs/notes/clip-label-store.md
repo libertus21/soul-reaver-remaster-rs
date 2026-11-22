@@ -22,6 +22,12 @@ location, `~/.sr1_clip_labels.json`, which lives outside version control. The
 engine merges both, so a fresh probe run reaches the renderer and a lost home
 file still leaves the committed measurements intact.
 
+A visual save writes **both** stores, with the same `assigned_at` stamp: the
+home copy is durable without git involvement, and the repository copy is the
+versioned record. A `git checkout` or `git pull` can discard an uncommitted
+repository change, but it cannot discard the home copy. Each write is attempted
+even when the other fails, and a failure is reported per path.
+
 `.gitignore` is a whitelist, so the copy is allowed explicitly:
 
 ```text
@@ -94,6 +100,27 @@ write path, with:
 - an `assigned_at` stamp in `field_assigned_at` (and at the entry level);
 - `evidence: "visual"` when every labelled field in the entry is visual.
 
+The save writes the probe's home store and the repository copy with the same
+assignments and stamp. The console is the audit trail:
+
+```text
+clip-inspect saved file=HUNTER.SRA fields=idle=2,walk=7 home=<path> repo=data/clip-labels.json
+clip-inspect version-control repo=data/clip-labels.json is modified; commit it to keep the measurement
+```
+
+The `saved` line names only the targets that actually wrote. A failed target
+gets its own line and is never hidden behind a success:
+
+```text
+clip-inspect save failed path=<path> reason=<detail>
+```
+
+Enter with nothing pending prints `clip-inspect save skipped: no pending
+assignments` and writes nothing. Pending assignments are cleared only when both
+writes succeed, so a partial failure can be retried with another Enter. The
+status line carries `pending=` and `saved=`; `saved=` stays `none` until a save
+writes both stores.
+
 The write preserves every other field, including `slots`, `agreement`, `runs`
 and `samples`. A visual-only entry carries no `runs` or `samples`: the user's
 explicit action is the evidence, and the engine never fabricates counters. The
@@ -113,7 +140,8 @@ label exactly like a motion label.
 - `engine::actors::tests::a_malformed_store_reports_the_failing_path` proves a
   bad file fails loudly with its path.
 - `engine::play::tests::label_store_lookup_is_explicit_then_repo_then_home`
-  pins the single-path order.
+  pins the single-path lookup order (the helper is test-only now that the
+  inspector saves to both stores).
 - `engine::play::tests::label_store_sources_merge_repo_and_home_by_default`
   proves both default sources are read and an explicit store stays alone.
 - `engine::actors::tests::label_stores_merge_per_field_with_the_newer_updated_winning`
@@ -121,6 +149,13 @@ label exactly like a motion label.
   value, and a home-only file is admitted.
 - `engine::actors::tests::a_visual_assignment_writes_method_and_assigned_at_without_run_metadata`
   proves the visual save path, its metadata and the absent counters.
+- `engine::play::tests::inspector_save_dual_writes_home_and_repo_with_equivalent_fields`
+  proves a visual save writes both stores with equivalent fields and stamps,
+  and that the console names both targets plus the uncommitted repository copy.
+- `engine::play::tests::inspector_save_writes_the_healthy_target_and_reports_the_failed_one`
+  proves a broken target never blocks the other and is reported per path.
+- `engine::play::tests::inspector_save_with_nothing_pending_is_loud_and_writes_nothing`
+  proves an empty Enter prints the skip line and writes nothing.
 - `engine::actors::tests::precedence_is_motion_then_visual_then_capture` pins
   the evidence precedence.
 - `engine::actors::tests::clip_inspect_selects_clip_n_for_every_actor_and_clamps_shorter_files`

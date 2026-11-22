@@ -268,7 +268,7 @@ impl PlayOptions {
     /// file names.
     pub const REPO_LABELS_STORE: &'static str = "data/clip-labels.json";
 
-    /// The primary label store path, in documented lookup order.
+    /// The single-path label store, in documented lookup order.
     ///
     /// 1. `--labels-store <FILE>` when given (explicit wins, even if missing).
     /// 2. [`Self::REPO_LABELS_STORE`] relative to the current directory when
@@ -276,10 +276,11 @@ impl PlayOptions {
     /// 3. The probe's user-home default (`~/.sr1_clip_labels.json`, resolved
     ///    from `USERPROFILE` or `HOME`).
     ///
-    /// The actor loader does not read only this path: it uses
-    /// [`Self::labels_store_sources`] so the repository copy and the home copy
-    /// are merged per field. This method remains the single-path answer for
-    /// callers that need one location, such as the clip inspector's save path.
+    /// The actor loader reads [`Self::labels_store_sources`] so the repository
+    /// copy and the home copy are merged per field, and the clip inspector
+    /// saves to both durable targets instead of one. This helper stays as the
+    /// single-path lookup that pins the documented order in tests.
+    #[cfg(test)]
     pub fn labels_store_path(&self) -> PathBuf {
         self.labels_store_path_with(Path::new(Self::REPO_LABELS_STORE))
     }
@@ -315,6 +316,7 @@ impl PlayOptions {
 
     /// Lookup order with an injectable repository path, so the order is
     /// testable without changing the process directory.
+    #[cfg(test)]
     fn labels_store_path_with(&self, repo: &Path) -> PathBuf {
         if let Some(path) = &self.labels_store {
             return path.clone();
@@ -1307,9 +1309,13 @@ fn open_window(
     let event_loop =
         EventLoop::new().map_err(|error| RunError::Window(format!("event loop: {error}")))?;
     let base_title = format!("soul reaver - {unit}");
-    let inspect = options
-        .clip_inspect
-        .map(|clip| ClipInspector::new(clip, options.labels_store_path()));
+    let inspect = options.clip_inspect.map(|clip| {
+        ClipInspector::new(
+            clip,
+            default_labels_store(),
+            PathBuf::from(PlayOptions::REPO_LABELS_STORE),
+        )
+    });
     let mut app = PlayApp {
         frame,
         assets,
@@ -1550,17 +1556,25 @@ struct ClipInspector {
     target: usize,
     files: Vec<(String, usize)>,
     pending: BTreeMap<String, [Option<usize>; 5]>,
-    save_path: PathBuf,
+    /// The probe's durable home store: no git involvement, so a branch switch
+    /// or checkout cannot discard it.
+    home_path: PathBuf,
+    /// The versioned repository copy under version control.
+    repo_path: PathBuf,
+    /// The ISO-8601 stamp of the last save that wrote both stores.
+    saved: Option<String>,
 }
 
 impl ClipInspector {
-    fn new(clip: usize, save_path: PathBuf) -> Self {
+    fn new(clip: usize, home_path: PathBuf, repo_path: PathBuf) -> Self {
         Self {
             clip,
             target: 0,
             files: Vec::new(),
             pending: BTreeMap::new(),
-            save_path,
+            home_path,
+            repo_path,
+            saved: None,
         }
     }
 
@@ -1629,9 +1643,48 @@ impl ClipInspector {
         }
     }
 
-    /// Save every pending assignment through the normal store write path.
-    fn save(&mut self) -> Result<usize, String> {
+    /// The `saved=` marker for the status line: the stamp of the last save that
+    /// wrote both stores, or `none` when no complete save has happened.
+    fn saved_summary(&self) -> &str {
+        self.saved.as_deref().unwrap_or("none")
+    }
+
+    /// Save every pending assignment to BOTH durable stores.
+    ///
+    /// The probe's home store and the versioned repository copy receive the
+    /// same assignments and the same `assigned_at` stamp, so the merge stays
+    /// consistent. Each write is attempted even when the other fails: a broken
+    /// target never costs the other one, and the report names every failure.
+    /// Pending assignments are cleared only when both writes succeed.
+    fn save(&mut self) -> VisualSaveReport {
+        let files = self.pending_fields();
+        if files.is_empty() {
+            return VisualSaveReport::skipped();
+        }
         let assigned_at = utc_now_iso8601();
+        let assignments = self.pending_assignments();
+        let home = SaveOutcome {
+            path: self.home_path.clone(),
+            result: LabelStore::save_visual(&self.home_path, &assignments, &assigned_at),
+        };
+        let repo = SaveOutcome {
+            path: self.repo_path.clone(),
+            result: LabelStore::save_visual(&self.repo_path, &assignments, &assigned_at),
+        };
+        let complete = home.result.is_ok() && repo.result.is_ok();
+        if complete {
+            self.pending.clear();
+            self.saved = Some(assigned_at);
+        }
+        VisualSaveReport {
+            files,
+            home: Some(home),
+            repo: Some(repo),
+        }
+    }
+
+    /// The pending assignments as store-write tuples.
+    fn pending_assignments(&self) -> Vec<(String, MotionState, usize)> {
         let mut assignments = Vec::new();
         for (file, slots) in &self.pending {
             for state in LABEL_STATES {
@@ -1640,12 +1693,98 @@ impl ClipInspector {
                 }
             }
         }
-        if assignments.is_empty() {
-            return Ok(0);
+        assignments
+    }
+
+    /// One `(file, "idle=2,walk=7")` pair per `.SRA` file with pending work.
+    fn pending_fields(&self) -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        for (file, slots) in &self.pending {
+            let fields: Vec<String> = LABEL_STATES
+                .into_iter()
+                .filter_map(|state| {
+                    let clip = slots[label_state_index(state)]?;
+                    Some(format!("{}={clip}", state.label_field()))
+                })
+                .collect();
+            if !fields.is_empty() {
+                files.push((file.clone(), fields.join(",")));
+            }
         }
-        LabelStore::save_visual(&self.save_path, &assignments, &assigned_at)?;
-        self.pending.clear();
-        Ok(assignments.len())
+        files
+    }
+}
+
+/// The result of writing to one durable target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SaveOutcome {
+    path: PathBuf,
+    result: Result<(), String>,
+}
+
+/// What one Enter press did, and the exact console lines that report it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VisualSaveReport {
+    /// `(file, "idle=2,walk=7")` for every file that had pending assignments.
+    /// Empty means Enter was pressed with nothing pending.
+    files: Vec<(String, String)>,
+    home: Option<SaveOutcome>,
+    repo: Option<SaveOutcome>,
+}
+
+impl VisualSaveReport {
+    fn skipped() -> Self {
+        Self {
+            files: Vec::new(),
+            home: None,
+            repo: None,
+        }
+    }
+
+    /// The console lines for this report.
+    ///
+    /// Empty pending is never silent, and a failed target is never hidden
+    /// behind a success line: only targets that actually wrote are named in
+    /// `saved`, and every failure gets its own `save failed` line.
+    fn lines(&self) -> Vec<String> {
+        if self.files.is_empty() {
+            return vec!["clip-inspect save skipped: no pending assignments".to_string()];
+        }
+        let home = self.home.as_ref().filter(|outcome| outcome.result.is_ok());
+        let repo = self.repo.as_ref().filter(|outcome| outcome.result.is_ok());
+        let mut lines = Vec::new();
+        if home.is_some() || repo.is_some() {
+            let mut targets = String::new();
+            if let Some(home) = home {
+                targets.push_str(&format!(" home={}", home.path.display()));
+            }
+            if let Some(repo) = repo {
+                targets.push_str(&format!(" repo={}", repo.path.display()));
+            }
+            for (file, fields) in &self.files {
+                lines.push(format!(
+                    "clip-inspect saved file={file} fields={fields}{targets}"
+                ));
+            }
+        }
+        for outcome in [self.home.as_ref(), self.repo.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(reason) = &outcome.result {
+                lines.push(format!(
+                    "clip-inspect save failed path={} reason={reason}",
+                    outcome.path.display()
+                ));
+            }
+        }
+        if let Some(repo) = repo {
+            lines.push(format!(
+                "clip-inspect version-control repo={} is modified; commit it to keep the measurement",
+                repo.path.display()
+            ));
+        }
+        lines
     }
 }
 
@@ -1868,7 +2007,11 @@ impl PlayApp {
             return self.base_title.clone();
         };
         let Some(file) = inspect.target_file() else {
-            return format!("clip-inspect clip={} files=0 pending=none", inspect.clip);
+            return format!(
+                "clip-inspect clip={} files=0 pending=none saved={}",
+                inspect.clip,
+                inspect.saved_summary()
+            );
         };
         let count = inspect.target_count().unwrap_or(0);
         let clip = inspect.clip.min(count.saturating_sub(1));
@@ -1884,9 +2027,10 @@ impl PlayApp {
             },
         );
         format!(
-            "clip-inspect clip={clip} frames={frames} divisor={divisor} dur={duration:.3} target={file} files={} pending={}",
+            "clip-inspect clip={clip} frames={frames} divisor={divisor} dur={duration:.3} target={file} files={} pending={} saved={}",
             inspect.files.len(),
-            inspect.pending_summary()
+            inspect.pending_summary(),
+            inspect.saved_summary()
         )
     }
 
@@ -1909,11 +2053,9 @@ impl PlayApp {
         let Some(inspect) = self.inspect.as_mut() else {
             return;
         };
-        let store = inspect.save_path.display().to_string();
-        match inspect.save() {
-            Ok(0) => outln!("clip-inspect save skipped: no pending assignment"),
-            Ok(fields) => outln!("clip-inspect saved fields={fields} store={store}"),
-            Err(error) => outln!("clip-inspect save failed: {error}"),
+        let report = inspect.save();
+        for line in report.lines() {
+            outln!("{line}");
         }
         window.set_title(&self.inspect_title());
     }
@@ -3242,7 +3384,11 @@ mod tests {
 
     #[test]
     fn inspector_navigation_clamps_to_each_file_and_pending_is_per_file() {
-        let mut inspector = ClipInspector::new(2, PathBuf::from("labels.json"));
+        let mut inspector = ClipInspector::new(
+            2,
+            PathBuf::from("home-labels.json"),
+            PathBuf::from("repo-labels.json"),
+        );
         inspector.configure(vec![
             ("HUNTER.SRA".to_string(), 10),
             ("SLUAGH.SRA".to_string(), 3),
@@ -3281,22 +3427,124 @@ mod tests {
         assert_eq!(format_utc(1_700_000_000), "2023-11-14T22:13:20Z");
     }
 
+    fn inspector_with_targets(clip: usize, dir: &std::path::Path) -> ClipInspector {
+        ClipInspector::new(
+            clip,
+            dir.join("home").join(".sr1_clip_labels.json"),
+            dir.join("repo").join("data").join("clip-labels.json"),
+        )
+    }
+
     #[test]
-    fn inspector_save_writes_assignments_to_the_store_and_clears_pending() {
+    fn inspector_save_dual_writes_home_and_repo_with_equivalent_fields() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("clip-labels.json");
-        let mut inspector = ClipInspector::new(2, path.clone());
+        let mut inspector = inspector_with_targets(2, dir.path());
         inspector.configure(vec![("HUNTER.SRA".to_string(), 10)]);
         inspector.assign(MotionState::Idle);
+        inspector.clip = 7;
         inspector.assign(MotionState::Moving);
 
-        assert_eq!(inspector.save().expect("save"), 2);
-        assert_eq!(inspector.pending_summary(), "none");
+        let report = inspector.save();
+        let lines = report.lines();
+        assert_eq!(
+            inspector.pending_summary(),
+            "none",
+            "both writes succeeding clears pending"
+        );
+        assert!(inspector.saved.is_some(), "a complete save sets the saved marker");
 
-        let store = LabelStore::load(&path).expect("the saved store parses");
-        let labels = store.for_sra("HUNTER.SRA");
-        assert_eq!((labels.idle, labels.walk), (Some(2), Some(2)));
-        assert_eq!(labels.labelled(), 2);
+        let home = LabelStore::load(&inspector.home_path).expect("home store parses");
+        let repo = LabelStore::load(&inspector.repo_path).expect("repo store parses");
+        assert_eq!(
+            home, repo,
+            "dual write produces equivalent field content and stamps in both stores"
+        );
+        for store in [&home, &repo] {
+            let labels = store.for_sra("HUNTER.SRA");
+            assert_eq!((labels.idle, labels.walk), (Some(2), Some(7)));
+        }
+
+        assert!(
+            lines.iter().any(|line| line
+                .contains("clip-inspect saved file=HUNTER.SRA fields=idle=2,walk=7")),
+            "the save line names the file and its fields: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("home=") && line.contains("repo=")),
+            "the save line names both written targets: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line
+                .starts_with("clip-inspect version-control repo=")
+                && line.contains("commit it to keep the measurement")),
+            "a written repo copy is flagged as uncommitted: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn inspector_save_writes_the_healthy_target_and_reports_the_failed_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, "not a directory").expect("block the home parent");
+        let home = blocked.join(".sr1_clip_labels.json");
+        let repo = dir.path().join("repo.json");
+        let mut inspector = ClipInspector::new(2, home.clone(), repo.clone());
+        inspector.configure(vec![("HUNTER.SRA".to_string(), 10)]);
+        inspector.assign(MotionState::Idle);
+
+        let report = inspector.save();
+        let lines = report.lines();
+
+        let store = LabelStore::load(&repo).expect("the healthy target is still written");
+        assert_eq!(store.for_sra("HUNTER.SRA").idle, Some(2));
+        assert!(!home.exists(), "the blocked target stays unwritten");
+        assert!(
+            lines.iter().any(|line| line.contains(&format!(
+                "clip-inspect save failed path={}",
+                home.display()
+            ))),
+            "the failed target is named: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("clip-inspect saved file=HUNTER.SRA")
+                && line.contains(&format!("repo={}", repo.display()))),
+            "the healthy target is reported as saved: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains(&format!("home={}", home.display()))),
+            "the failed target is never claimed as saved: {lines:?}"
+        );
+        assert_eq!(
+            inspector.pending_summary(),
+            "HUNTER.SRA:idle= 2",
+            "a partial save keeps pending so Enter can retry"
+        );
+        assert!(
+            inspector.saved.is_none(),
+            "a partial save is not recorded as complete"
+        );
+    }
+
+    #[test]
+    fn inspector_save_with_nothing_pending_is_loud_and_writes_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut inspector = inspector_with_targets(2, dir.path());
+        inspector.configure(vec![("HUNTER.SRA".to_string(), 10)]);
+
+        let report = inspector.save();
+        assert_eq!(
+            report.lines(),
+            vec!["clip-inspect save skipped: no pending assignments".to_string()],
+            "an empty Enter is never silent"
+        );
+        assert!(
+            !inspector.home_path.exists() && !inspector.repo_path.exists(),
+            "nothing may be written with no pending assignments"
+        );
+        assert!(inspector.pending.is_empty());
+        assert!(inspector.saved.is_none());
     }
 }
 
