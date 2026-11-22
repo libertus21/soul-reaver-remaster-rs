@@ -215,9 +215,10 @@ pub struct PlayOptions {
     pub sra_dir: Option<PathBuf>,
     /// Persistent per-file label store (`--labels-store <FILE>`).
     ///
-    /// Lookup order is documented on [`PlayOptions::labels_store_path`]:
-    /// explicit, then the versioned `data/clip-labels.json`, then the probe's
-    /// `~/.sr1_clip_labels.json`. Only read when a directory was supplied.
+    /// Lookup order is documented on [`PlayOptions::labels_store_sources`]:
+    /// explicit, then the versioned `data/clip-labels.json` merged with the
+    /// probe's `~/.sr1_clip_labels.json`. Only read when a directory was
+    /// supplied.
     pub labels_store: Option<PathBuf>,
     /// Presentation playback rate, in frames per second for a divisor-100 clip.
     pub anim_fps: u32,
@@ -274,8 +275,8 @@ impl PlayOptions {
     ///
     /// The actor loader does not read only this path: it uses
     /// [`Self::labels_store_sources`] so the repository copy and the home copy
-    /// are merged per field. This method remains the single-path answer for
-    /// callers that need one location.
+    /// are merged per field. This method is the test-only single-path answer.
+    #[cfg(test)]
     pub fn labels_store_path(&self) -> PathBuf {
         self.labels_store_path_with(Path::new(Self::REPO_LABELS_STORE))
     }
@@ -311,6 +312,7 @@ impl PlayOptions {
 
     /// Lookup order with an injectable repository path, so the order is
     /// testable without changing the process directory.
+    #[cfg(test)]
     fn labels_store_path_with(&self, repo: &Path) -> PathBuf {
         if let Some(path) = &self.labels_store {
             return path.clone();
