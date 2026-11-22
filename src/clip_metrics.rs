@@ -12,8 +12,202 @@
 //! `docs/notes/clip-metrics.md`: offline motion alone cannot give a clip its
 //! runtime-selected identity, and this module says so instead of inventing one.
 
+use crate::object::{bone_world_offsets, ObjectModel};
 use crate::pose::BINARY_ANGLE_UNITS_PER_TURN;
 use crate::sra::{SraAnimation, ANIMATION_UNITS_PER_SECOND};
+
+/// The three region columns printed for every clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Region {
+    /// Feet and legs: low rest height, not far from the body axis.
+    Leg,
+    /// Pelvis and torso: middle rest height, close to the body axis.
+    Hip,
+    /// Head and arms/hands: high rest height close to the axis, or any bone
+    /// whose lateral rest offset is far from the axis.
+    Upper,
+}
+
+impl Region {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Leg => "leg",
+            Self::Hip => "hip",
+            Self::Upper => "upper",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Leg => 0,
+            Self::Hip => 1,
+            Self::Upper => 2,
+        }
+    }
+}
+
+/// One bone's rest geometry and derived region.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoneRegion {
+    pub bone: usize,
+    pub region: Region,
+    /// Accumulated rest translation along the model's vertical axis (`+Z`).
+    pub rest_z: f64,
+    /// Horizontal distance from the body's vertical axis in the rest pose.
+    pub lateral: f64,
+}
+
+/// Regions used by every clip in one file.
+///
+/// `Skeleton` assigns a region per bone from the archived model's rest offsets.
+/// `Proxy` is the documented slot-third stand-in used when no model is loaded.
+/// `Unavailable` means a model was supplied but its bone count disagrees with
+/// the animation's slot count; the shares then fall back to the proxy and the
+/// output says why.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RegionPlan {
+    Skeleton {
+        bones: Vec<BoneRegion>,
+        low_z: f64,
+        high_z: f64,
+        lateral: f64,
+    },
+    Proxy,
+    Unavailable { slots: usize, bones: usize },
+}
+
+impl RegionPlan {
+    /// Derive regions from `model`'s rest skeleton for `slots` animation slots.
+    ///
+    /// The slot count and the model bone count must agree exactly; a mismatch is
+    /// reported, never padded. The vertical bands are fractions of the bones'
+    /// rest `Z` extent and the lateral threshold is the median horizontal
+    /// radius, so every skeleton supplies its own scale and no absolute world
+    /// unit is hardcoded.
+    pub fn from_model(model: &ObjectModel, slots: usize) -> Self {
+        let bones = model.bones.len();
+        if bones != slots || bones == 0 {
+            return Self::Unavailable { slots, bones };
+        }
+        let offsets = bone_world_offsets(&model.bones);
+        let mut zs = Vec::with_capacity(bones);
+        let mut laterals = Vec::with_capacity(bones);
+        let mut rest = Vec::with_capacity(bones);
+        for offset in &offsets {
+            let rest_z = f64::from(offset[2]);
+            let x = f64::from(offset[0]);
+            let y = f64::from(offset[1]);
+            let lateral = (x * x + y * y).sqrt();
+            zs.push(rest_z);
+            laterals.push(lateral);
+            rest.push((rest_z, lateral));
+        }
+        zs.sort_by(f64::total_cmp);
+        laterals.sort_by(f64::total_cmp);
+        let (low_z, high_z) = match (zs.first().copied(), zs.last().copied()) {
+            (Some(min), Some(max)) if max - min > f64::EPSILON => {
+                (min + (max - min) * LOW_BAND, min + (max - min) * HIGH_BAND)
+            }
+            _ => (f64::NEG_INFINITY, f64::INFINITY),
+        };
+        let median_lateral = quantile(&laterals, 0.5);
+        let lateral = if median_lateral > f64::EPSILON {
+            median_lateral * LATERAL_MARGIN
+        } else {
+            f64::INFINITY
+        };
+        let bones = rest
+            .into_iter()
+            .enumerate()
+            .map(|(bone, (rest_z, side))| BoneRegion {
+                bone,
+                region: classify(rest_z, side, low_z, high_z, lateral),
+                rest_z,
+                lateral: side,
+            })
+            .collect();
+        Self::Skeleton {
+            bones,
+            low_z,
+            high_z,
+            lateral,
+        }
+    }
+
+    /// Region of one animation slot, or `None` when the proxy applies.
+    pub fn region_of(&self, slot: usize) -> Option<Region> {
+        match self {
+            Self::Skeleton { bones, .. } => bones.get(slot).map(|bone| bone.region),
+            Self::Proxy | Self::Unavailable { .. } => None,
+        }
+    }
+
+    /// Header marker: the region basis, never presented as more than it is.
+    pub fn marker(&self) -> String {
+        match self {
+            Self::Proxy => "region=proxy".to_string(),
+            Self::Skeleton { .. } => "region=skeleton".to_string(),
+            Self::Unavailable { slots, bones } => format!(
+                "region=unavailable reason=bone-slot-mismatch slots={slots} bones={bones}"
+            ),
+        }
+    }
+
+    /// Assignment lines for inspection: the derived thresholds and one line per
+    /// bone. Empty when no skeleton was used.
+    pub fn assignment_lines(&self) -> Vec<String> {
+        let Self::Skeleton {
+            bones,
+            low_z,
+            high_z,
+            lateral,
+        } = self
+        else {
+            return Vec::new();
+        };
+        let mut lines = Vec::with_capacity(bones.len() + 1);
+        lines.push(format!(
+            "region-basis skeleton low_z={low_z:.1} high_z={high_z:.1} lateral={lateral:.1}"
+        ));
+        lines.extend(bones.iter().map(|bone| {
+            format!(
+                "region-bone slot={} zone={} rest_z={:.1} lateral={:.1}",
+                bone.bone,
+                bone.region.label(),
+                bone.rest_z,
+                bone.lateral
+            )
+        }));
+        lines
+    }
+}
+
+fn classify(rest_z: f64, lateral: f64, low_z: f64, high_z: f64, threshold: f64) -> Region {
+    if lateral >= threshold {
+        Region::Upper
+    } else if rest_z <= low_z {
+        Region::Leg
+    } else if rest_z >= high_z {
+        Region::Upper
+    } else {
+        Region::Hip
+    }
+}
+
+/// Linear-interpolated quantile of an ascending slice.
+fn quantile(sorted: &[f64], fraction: f64) -> f64 {
+    match sorted.len() {
+        0 => 0.0,
+        1 => sorted[0],
+        len => {
+            let position = fraction.clamp(0.0, 1.0) * (len - 1) as f64;
+            let lower = position.floor() as usize;
+            let upper = position.ceil() as usize;
+            let weight = position - lower as f64;
+            sorted[lower] * (1.0 - weight) + sorted[upper] * weight
+        }
+    }
+}
 
 /// Degrees per binary-angle unit (`4096` units per turn).
 pub const DEGREES_PER_BINARY_UNIT: f64 = 360.0 / BINARY_ANGLE_UNITS_PER_TURN as f64;
@@ -33,6 +227,14 @@ pub const AIR_MAX_FRAMES: usize = 3;
 pub const LAND_MIN_VARC: f64 = 1.0;
 /// Default number of candidates shown per state.
 pub const DEFAULT_TOP: usize = 5;
+/// Lower vertical band as a fraction of the skeleton's rest `Z` extent.
+pub const LOW_BAND: f64 = 0.4;
+/// Upper vertical band as a fraction of the skeleton's rest `Z` extent.
+pub const HIGH_BAND: f64 = 0.7;
+/// Fraction of the median bone radius that counts as a lateral (arm) offset.
+/// Slightly below `1.0` so a bone sitting on the median still counts as far
+/// instead of splitting on floating-point noise.
+pub const LATERAL_MARGIN: f64 = 0.95;
 
 /// The five locomotion states this table ranks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,11 +303,13 @@ pub struct ClipMotion {
     pub period_lag: usize,
     /// `1 / (1 + residual_degrees)` at the best lag (`1.0` = exact repeat).
     pub period_score: f64,
-    /// Share of total rotation in the lowest slot third (proxy for legs).
+    /// Share of total motion on bones assigned to the leg region. Under the
+    /// proxy this is the lowest slot third; under the skeleton it is real
+    /// low-height geometry.
     pub leg: f64,
-    /// Share of total rotation in the middle slot third (proxy for hips).
+    /// Share of total motion on bones assigned to the hip/torso region.
     pub hip: f64,
-    /// Share of total rotation in the highest slot third (proxy for head/arms).
+    /// Share of total motion on bones assigned to the head/arm region.
     pub upper: f64,
     /// The state this clip is the top candidate for, if any.
     pub guess: Option<LocomotionState>,
@@ -133,8 +337,16 @@ impl ClipMotion {
     ///
     /// `frames[k][slot]` is one decoded frame. Lanes `0..=2` are angles and
     /// `8..=10` are translation. Frame count is the slice length, so a caller
-    /// cannot disagree with the data it passes.
-    pub fn from_lanes(index: usize, divisor: i16, frames: &[Vec<[f32; 12]>]) -> Self {
+    /// cannot disagree with the data it passes. A skeleton plan assigns each
+    /// slot to its real body region and adds the per-frame translation
+    /// displacement to that slot's motion; the proxy plan keeps the historical
+    /// angular-only slot-third split.
+    pub fn from_lanes(
+        index: usize,
+        divisor: i16,
+        frames: &[Vec<[f32; 12]>],
+        regions: &RegionPlan,
+    ) -> Self {
         let frame_count = frames.len();
         let slots = frames.first().map_or(0, Vec::len);
         let duration_s = frame_count as f64 * f64::from(divisor) / ANIMATION_UNITS_PER_SECOND as f64;
@@ -164,7 +376,7 @@ impl ClipMotion {
         let (varc, hdisp_x, hdisp_y) = root_translation(frames, root);
         let (ang_mean, ang_max) = angular_velocity(frames, slots);
         let (period_lag, period_score) = periodicity(frames, slots);
-        let (leg, hip, upper) = region_shares(frames, slots);
+        let (leg, hip, upper) = region_shares(frames, slots, regions);
 
         Self {
             varc,
@@ -274,28 +486,45 @@ fn periodicity(frames: &[Vec<[f32; 12]>], slots: usize) -> (usize, f64) {
     if best_lag == 0 { (0, 0.0) } else { (best_lag, best_score) }
 }
 
-/// Per-region share of total rotation.
+/// Per-region share of total motion.
 ///
-/// The `.SRA` carries no descriptor parent tree or per-bone rest offsets, so the
-/// offline path cannot place a bone by its true height. It uses the slot order
-/// as a deterministic stand-in: the first third is the lowest region (legs), the
-/// middle third the hips/torso and the last third the upper region (head/arms).
-/// This is an **arbitrary proxy**, named as such in `docs/notes/clip-metrics.md`;
-/// it never feeds the state ranking or the validation gate.
-fn region_shares(frames: &[Vec<[f32; 12]>], slots: usize) -> (f64, f64, f64) {
+/// With a [`RegionPlan::Skeleton`] each slot's motion is the per-frame angular
+/// delta plus the per-frame translation displacement, summed over the clip;
+/// the region owns the bones assigned by [`RegionPlan::from_model`]. With no
+/// skeleton the slot-third proxy is kept exactly as before: angular motion only,
+/// lowest third `leg`, middle third `hip`, highest third `upper`. A proxy is
+/// never presented as a skeleton measurement.
+fn region_shares(
+    frames: &[Vec<[f32; 12]>],
+    slots: usize,
+    plan: &RegionPlan,
+) -> (f64, f64, f64) {
+    let skeleton = matches!(plan, RegionPlan::Skeleton { .. });
     let mut region = [0.0f64; 3];
     let mut total = 0.0f64;
     if frames.len() >= 2 {
         for slot in 0..slots {
-            let zone = slot * 3 / slots;
-            let mut motion = 0.0f64;
+            let zone = plan
+                .region_of(slot)
+                .map_or_else(|| (slot * 3 / slots).min(2), Region::index);
+            let mut angular = 0.0f64;
+            let mut translation = 0.0f64;
             for pair in frames.windows(2) {
                 for axis in 0..3 {
-                    motion += angular_delta(pair[1][slot][axis], pair[0][slot][axis]).abs();
+                    angular += angular_delta(pair[1][slot][axis], pair[0][slot][axis]).abs();
+                }
+                if skeleton {
+                    let distance_squared: f64 = (8..=10)
+                        .map(|lane| {
+                            let delta = f64::from(pair[1][slot][lane]) - f64::from(pair[0][slot][lane]);
+                            delta * delta
+                        })
+                        .sum();
+                    translation += distance_squared.sqrt();
                 }
             }
-            motion *= DEGREES_PER_BINARY_UNIT;
-            region[zone.min(2)] += motion;
+            let motion = angular * DEGREES_PER_BINARY_UNIT + translation;
+            region[zone] += motion;
             total += motion;
         }
     }
@@ -324,10 +553,13 @@ fn angular_delta(to: f32, from: f32) -> f64 {
 pub struct ClipMetricsReport {
     pub clips: Vec<ClipMotion>,
     pub shortlist: [(LocomotionState, Vec<usize>, Confidence); 5],
+    /// Region basis that produced every clip's `leg`/`hip`/`upper` shares.
+    pub regions: RegionPlan,
 }
 
 impl ClipMetricsReport {
-    pub fn from_clips(mut clips: Vec<ClipMotion>) -> Self {
+    /// Build a report and record which region basis produced its shares.
+    pub fn from_clips(mut clips: Vec<ClipMotion>, regions: RegionPlan) -> Self {
         let mut shortlist = LocomotionState::ALL.map(|state| {
             let ranked = rank(&clips, state);
             let indices: Vec<usize> = ranked.iter().map(|clip| clip.index).collect();
@@ -371,7 +603,11 @@ impl ClipMetricsReport {
                 }
             }
         }
-        Self { clips, shortlist }
+        Self {
+            clips,
+            shortlist,
+            regions,
+        }
     }
 
     /// Indices ranked for `state`, best first.
@@ -470,8 +706,17 @@ fn confidence(state: LocomotionState, ranked: &[&ClipMotion]) -> Confidence {
     }
 }
 
-/// Decode every clip of `animation` and build its report.
+/// Decode every clip of `animation` and build its report with the slot-third
+/// proxy.
 pub fn analyze_animation(animation: &SraAnimation) -> Result<ClipMetricsReport, String> {
+    analyze_animation_with_regions(animation, &RegionPlan::Proxy)
+}
+
+/// Decode every clip and derive its region shares from `regions`.
+pub fn analyze_animation_with_regions(
+    animation: &SraAnimation,
+    regions: &RegionPlan,
+) -> Result<ClipMetricsReport, String> {
     let mut clips = Vec::with_capacity(animation.clip_count());
     for clip in 0..animation.clip_count() {
         let frame_count = animation
@@ -482,9 +727,9 @@ pub fn analyze_animation(animation: &SraAnimation) -> Result<ClipMetricsReport, 
         for frame in 0..frame_count {
             frames.push(animation.decode_clip_lanes(clip, frame)?);
         }
-        clips.push(ClipMotion::from_lanes(clip, divisor, &frames));
+        clips.push(ClipMotion::from_lanes(clip, divisor, &frames, regions));
     }
-    Ok(ClipMetricsReport::from_clips(clips))
+    Ok(ClipMetricsReport::from_clips(clips, regions.clone()))
 }
 
 fn format_seconds(value: f64) -> String {
@@ -544,7 +789,8 @@ pub fn shortlist_text(report: &ClipMetricsReport, top: usize) -> String {
     format!("SHORTLIST {}", parts.join(" "))
 }
 
-/// Full report: a header, one row per clip, then the shortlist.
+/// Full report: a header, the region basis, one row per clip, then the
+/// shortlist. A skeleton basis also prints the bone-to-region assignment.
 pub fn report_text(
     sra_label: &str,
     slots: usize,
@@ -552,10 +798,16 @@ pub fn report_text(
     top: usize,
 ) -> String {
     let mut text = format!(
-        "clip-metrics sra={sra_label} slots={slots} clips={} source=heuristic (ranking, not ground truth)\n{}",
+        "clip-metrics sra={sra_label} slots={slots} clips={} source=heuristic {} (ranking, not ground truth)\n",
         report.clips.len(),
-        rows_text(report),
+        report.regions.marker(),
     );
+    let assignment = report.regions.assignment_lines();
+    if !assignment.is_empty() {
+        text.push_str(&assignment.join("\n"));
+        text.push('\n');
+    }
+    text.push_str(&rows_text(report));
     if !report.clips.is_empty() {
         text.push('\n');
     }
@@ -662,7 +914,7 @@ mod tests {
     #[test]
     fn a_still_clip_has_zero_motion_and_full_period_score() {
         let frames = constant(8, 2, 10.0);
-        let metrics = ClipMotion::from_lanes(3, 100, &frames);
+        let metrics = ClipMotion::from_lanes(3, 100, &frames, &RegionPlan::Proxy);
         assert_eq!(metrics.frames, 8);
         assert_eq!(metrics.ang_mean, 0.0);
         assert_eq!(metrics.ang_max, 0.0);
@@ -679,7 +931,7 @@ mod tests {
         frames[1][0] = lane(0.0, [4.0, 3.0, 15.0]);
         frames[2][0] = lane(0.0, [2.0, 0.0, 12.0]);
         frames[3][0] = lane(0.0, [3.0, 1.0, 16.0]);
-        let metrics = ClipMotion::from_lanes(0, 100, &frames);
+        let metrics = ClipMotion::from_lanes(0, 100, &frames, &RegionPlan::Proxy);
         assert!((metrics.varc - 6.0).abs() < 1e-9);
         assert!((metrics.hdisp_x - 3.0).abs() < 1e-9);
         assert!((metrics.hdisp_y - 5.0).abs() < 1e-9);
@@ -690,7 +942,7 @@ mod tests {
     fn angular_velocity_wraps_at_the_turn_boundary() {
         let mut frames = constant(3, 1, 4090.0);
         frames[1][0] = lane(10.0, [0.0; 3]);
-        let metrics = ClipMotion::from_lanes(0, 100, &frames);
+        let metrics = ClipMotion::from_lanes(0, 100, &frames, &RegionPlan::Proxy);
         let expected = 16.0 * DEGREES_PER_BINARY_UNIT;
         assert!((metrics.ang_max - expected).abs() < 1e-9, "{metrics:?}");
     }
@@ -702,7 +954,7 @@ mod tests {
         frames[0][2] = lane(0.0, [0.0; 3]);
         frames[1][2] = lane(100.0, [0.0; 3]);
         frames[2][2] = lane(200.0, [0.0; 3]);
-        let metrics = ClipMotion::from_lanes(0, 100, &frames);
+        let metrics = ClipMotion::from_lanes(0, 100, &frames, &RegionPlan::Proxy);
         assert_eq!(metrics.leg, 0.0);
         assert_eq!(metrics.hip, 0.0);
         assert_eq!(metrics.upper, 1.0);
@@ -711,10 +963,10 @@ mod tests {
     #[test]
     fn shortlist_orders_are_total_and_deterministic() {
         let clips = vec![
-            ClipMotion::from_lanes(0, 100, &constant(1, 1, 0.0)),
-            ClipMotion::from_lanes(1, 100, &constant(1, 1, 0.0)),
+            ClipMotion::from_lanes(0, 100, &constant(1, 1, 0.0), &RegionPlan::Proxy),
+            ClipMotion::from_lanes(1, 100, &constant(1, 1, 0.0), &RegionPlan::Proxy),
         ];
-        let report = ClipMetricsReport::from_clips(clips);
+        let report = ClipMetricsReport::from_clips(clips, RegionPlan::Proxy);
         // Jump and fall collapse onto the same one-frame clip, so the metrics
         // refuse to name either air state.
         assert!(report.candidates(LocomotionState::Fall).is_empty());
@@ -730,9 +982,9 @@ mod tests {
     #[test]
     fn validation_names_the_top_and_the_miss() {
         let report = ClipMetricsReport::from_clips(vec![
-            ClipMotion::from_lanes(0, 100, &ramping(4, 1000.0)),
-            ClipMotion::from_lanes(5, 100, &ramping(8, 50.0)),
-        ]);
+            ClipMotion::from_lanes(0, 100, &ramping(4, 1000.0), &RegionPlan::Proxy),
+            ClipMotion::from_lanes(5, 100, &ramping(8, 50.0), &RegionPlan::Proxy),
+        ], RegionPlan::Proxy);
         let (passed, text) = validate(
             &report,
             &[Expectation { state: LocomotionState::Idle, index: 0 }],
@@ -740,5 +992,95 @@ mod tests {
         assert_eq!(passed, 0);
         assert!(text.contains("CLASSIFIER VALIDATION pass=0/1"));
         assert!(text.contains("expected=0 top=5 result=fail"), "{text}");
+    }
+
+    fn bone(local: [i16; 3]) -> crate::object::Bone {
+        crate::object::Bone {
+            first_vertex: 0,
+            last_vertex: 0,
+            local,
+            parent: u16::MAX,
+        }
+    }
+
+    fn geometric_model() -> ObjectModel {
+        let mut bones = Vec::new();
+        // Eight low legs close to the axis.
+        for z in [0, 2, 4, 6, 8, 10, 12, 14] {
+            bones.push(bone([1, 0, z]));
+        }
+        // Two hips at mid height.
+        bones.push(bone([0, 0, 50]));
+        bones.push(bone([0, 0, 60]));
+        // Ten lateral arms at every height band.
+        for z in [40, 45, 50, 55, 60, 65, 70, 75, 80, 90] {
+            bones.push(bone([60, 0, z]));
+        }
+        ObjectModel {
+            bones,
+            ..ObjectModel::default()
+        }
+    }
+
+    fn core_model() -> ObjectModel {
+        ObjectModel {
+            bones: vec![bone([0, 0, 0]), bone([0, 0, 50]), bone([0, 0, 100])],
+            ..ObjectModel::default()
+        }
+    }
+
+    #[test]
+    fn skeleton_regions_come_from_rest_geometry_not_slot_order() {
+        let plan = RegionPlan::from_model(&geometric_model(), 20);
+        for slot in 0..8 {
+            assert_eq!(plan.region_of(slot), Some(Region::Leg), "slot {slot}");
+        }
+        for slot in 8..10 {
+            assert_eq!(plan.region_of(slot), Some(Region::Hip), "slot {slot}");
+        }
+        for slot in 10..20 {
+            assert_eq!(plan.region_of(slot), Some(Region::Upper), "slot {slot}");
+        }
+        let lines = plan.assignment_lines();
+        assert_eq!(lines.len(), 21, "one threshold line plus one line per bone");
+        assert!(lines[0].starts_with("region-basis skeleton low_z=36.0 high_z=63.0"));
+        assert!(plan.marker().contains("region=skeleton"));
+
+        // With no lateral spread the vertical bands alone drive the regions.
+        let core = RegionPlan::from_model(&core_model(), 3);
+        assert_eq!(core.region_of(0), Some(Region::Leg));
+        assert_eq!(core.region_of(1), Some(Region::Hip));
+        assert_eq!(core.region_of(2), Some(Region::Upper));
+    }
+
+    #[test]
+    fn skeleton_shares_use_the_bone_region_and_count_translation() {
+        let plan = RegionPlan::from_model(&geometric_model(), 20);
+        // Only an arm slot carries translation; every angle is constant.
+        let mut frames = constant(3, 20, 0.0);
+        frames[1][12] = lane(0.0, [10.0, 0.0, 0.0]);
+        let metrics = ClipMotion::from_lanes(0, 100, &frames, &plan);
+        assert_eq!((metrics.leg, metrics.hip), (0.0, 0.0));
+        assert_eq!(metrics.upper, 1.0);
+        // The same frames under the proxy ignore translation, so the proxy sees
+        // no motion at all and reports zeros.
+        let proxy = ClipMotion::from_lanes(0, 100, &frames, &RegionPlan::Proxy);
+        assert_eq!((proxy.leg, proxy.hip, proxy.upper), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn a_bone_slot_mismatch_is_named_and_falls_back_to_the_proxy() {
+        let plan = RegionPlan::from_model(&geometric_model(), 21);
+        assert_eq!(
+            plan.marker(),
+            "region=unavailable reason=bone-slot-mismatch slots=21 bones=20"
+        );
+        assert!(plan.assignment_lines().is_empty());
+        let frames = constant(3, 20, 0.0);
+        let metrics = ClipMotion::from_lanes(0, 100, &frames, &plan);
+        let report = ClipMetricsReport::from_clips(vec![metrics], plan);
+        let text = report_text("SYNTH.SRA", 21, &report, 5);
+        assert!(text.contains("region=unavailable reason=bone-slot-mismatch slots=21 bones=20"));
+        assert!(!text.contains("region-bone"));
     }
 }

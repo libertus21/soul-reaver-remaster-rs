@@ -19,17 +19,23 @@ SLUAGH.SRA   idle=8   walk=1
 ## Command
 
 ```text
---clip-metrics --sra <FILE.SRA> [--slots <N>] [--top <N>]
+--clip-metrics --sra <FILE.SRA> [--slots <N>] [--bigfile <DAT> --entry <INDEX>] [--top <N>]
 --clip-metrics --sra-dir <DIR>  [--slots <N>] [--top <N>]
 --clip-metrics --sra-dir <DIR>  --validate [--top <N>]
 ```
 
-`--slots <N>` is the model bone count stated directly. When it is omitted the
-tool tries `1..=128` and keeps the count that decodes the most clips, preferring
-the larger count on a tie. That inference is a **best-effort default**: an
-`.SRA` has no slot-count field and a trailing empty slot is indistinguishable
-from a real one, so it can over-count. Pass `--slots` when the model bone count
-is known. The validation gate always passes explicit counts.
+`--bigfile <DAT> --entry <INDEX>` loads the archived object model for the same
+actor and derives the `leg`/`hip`/`upper` regions from that model's real bone
+tree and rest offsets. The model's bone count becomes the slot count. Both flags
+must be given together, and they apply only to one `--sra` file.
+
+`--slots <N>` is the model bone count stated directly. When it is omitted (and
+no `--bigfile/--entry` model is loaded) the tool tries `1..=128` and keeps the
+count that decodes the most clips, preferring the larger count on a tie. That
+inference is a **best-effort default**: an `.SRA` has no slot-count field and a
+trailing empty slot is indistinguishable from a real one, so it can over-count.
+Pass `--slots` when the model bone count is known. The validation gate always
+passes explicit counts.
 
 `--validate` scores the shortlist against the runtime-measured fixtures in
 `data/clip-labels.json` (see `docs/notes/clip-label-store.md`). Those fixtures are
@@ -38,8 +44,10 @@ is known. The validation gate always passes explicit counts.
 ## Metrics
 
 Every metric is computed from decoded poses: the packed angle lanes, plus the
-packed translation lanes the angle-only presentation path discards. No mesh, no
-`--bigfile`, no `--entry` and no window are needed.
+packed translation lanes the angle-only presentation path discards. No mesh and
+no window are needed. The optional `--bigfile/--entry` skeleton basis reads the
+archived object model's bone table; without it the region columns are the proxy
+described below.
 
 | Field | Meaning |
 |---|---|
@@ -51,7 +59,7 @@ packed translation lanes the angle-only presentation path discards. No mesh, no
 | `ang_max` | Largest single-frame total rotation delta, in degrees. |
 | `period_lag` | Best autocorrelation lag over `1..=frames/2` (`0` when `frames < 2`). |
 | `score` | `1 / (1 + residual_degrees)` at that lag (`1.0` = exact repeat). |
-| `leg`, `hip`, `upper` | Share of total rotation in each slot third (see below). |
+| `leg`, `hip`, `upper` | Share of total per-bone motion in each region (see below). |
 
 Every angle delta is wrapped into `[-half_turn, half_turn]` before it is summed,
 so a stored angle crossing the turn boundary never becomes a full-turn spike.
@@ -72,14 +80,48 @@ is allowed and means adjacent frames repeat; a perfectly still clip scores `1.0`
 at lag `1`. Lags beyond `frames/2` are not searched, so a nearly full-length lag
 cannot win on a handful of samples.
 
-### Region heuristic and its limit
+### Regions: archived skeleton, proxy fallback
 
-The `.SRA` carries no descriptor parent tree and no per-bone rest offsets; those
-live in the archived object model, which this mode deliberately does not require.
-The region split is therefore a deterministic **proxy**: the first slot third is
-reported as `leg`, the middle third as `hip` and the last third as `upper`
-(head/arms). It is an arbitrary stand-in for height, not the archived skeleton.
-It never feeds the state ranking or the validation gate.
+The `.SRA` carries no parent tree or rest offsets, but the archived object model
+does. With `--bigfile/--entry` the tool loads that model, walks each bone's
+`+18` parent word (`0xFFFF` is a root) and accumulates the rest `local`
+translations, exactly like `object::bone_world_offsets`. Slot `i` is bone `i`;
+the animation slot count and the model bone count must match exactly.
+
+Each bone's region comes from its rest position, never its slot index:
+
+- **leg**: at or below the lower vertical band, close enough to the axis.
+- **hip**: between the vertical bands, close to the axis (pelvis and torso).
+- **upper**: any bone whose horizontal radius is at least the skeleton's lateral
+  threshold (arms and hands, at any height), or any bone above the upper vertical
+  band that stays close to the axis (neck and head).
+
+The bands are fractions of the skeleton's own rest `Z` extent: `low_z = min +
+0.4 * (max - min)` and `high_z = min + 0.7 * (max - min)`. The lateral threshold
+is `0.95 * median bone radius`, so a bone sitting on the median counts as far
+instead of splitting on floating-point noise. All three numbers are relative to
+the model, so no absolute world unit is hardcoded, and the output prints the
+derived values plus every bone's `rest_z` and lateral radius for inspection.
+
+Per-bone motion is the per-frame angular delta (in degrees) plus the per-frame
+translation displacement; the region share is its sum over the whole clip
+divided by the total. This is why the shares differ from the old proxy.
+
+Without `--bigfile/--entry` the old **proxy** remains: lowest slot third `leg`,
+middle third `hip`, highest third `upper`, angular motion only. The header says
+`region=proxy`. If a model is supplied but its bone count disagrees with the
+animation slot count, the tool prints
+`region=unavailable reason=bone-slot-mismatch slots=<n> bones=<m>` and uses the
+proxy for that file. The proxy is never labelled as a skeleton measurement.
+
+The proxy was wrong because slot order is not body order. `HUNTER.SRA` clip 2 is
+a slow idle where the head and the hanging arms move; the proxy put every moving
+slot in its middle third and printed `leg 0.00 hip 1.00 upper 0.00`. The
+skeleton assigns those slots to `upper` from their real rest positions and
+prints `upper 1.00`.
+
+The region basis is a measurement column only. It does not feed the state
+ranking or the validation gate.
 
 ## Ranking
 
@@ -184,8 +226,12 @@ HUNTER candidate still needs in-game confirmation.
 - Metrics rank; they do not name. A shortlist member is a candidate to confirm,
   never a measured identity.
 - The `.SRA` has no clip id, state byte, slot count, parent tree or rest offsets.
-  The region split is a slot-index proxy and the root slot is a translation-lane
-  heuristic.
+  The root slot is a translation-lane heuristic. Regions are skeleton-derived
+  only when `--bigfile/--entry` is supplied; otherwise the output says
+  `region=proxy` and uses slot thirds.
+- The skeleton fixes what the region columns mean. It does **not** validate the
+  classifier: the gate stayed at `2/7` after connecting it, because near-identical
+  loops and the 33 identical one-frame zero-motion clips remain ambiguous.
 - One-frame clips are all "still" by construction; they cannot carry motion
   semantics.
 - Several near-identical loops can share one motion profile; the runtime-selected
