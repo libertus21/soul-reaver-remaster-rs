@@ -102,9 +102,11 @@ loudly with its path. See `docs/notes/clip-label-store.md`.
 plays clip `N` looped. `[`/`]` change the clip (clamped to the file), `Tab`
 cycles the target `.SRA`, `1`..`5` assign the current clip to
 idle/walk/jump_up/fall/land, `Z`/Backspace clears pending assignments and Enter
-saves them as `visual` evidence; `capture > visual > motion`, and motion never
-overwrites visual. It requires a window: `--headless` refuses it with a typed
-error.
+saves them as `visual` evidence to both the probe's home store and
+`data/clip-labels.json`, with one reported line per written target and an
+explicit `save failed` line per broken one. An empty Enter prints a skip line
+and writes nothing. `capture > visual > motion`, and motion never overwrites
+visual. It requires a window: `--headless` refuses it with a typed error.
 
 Windowed mode needs `--textures` and a display:
 
