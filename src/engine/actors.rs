@@ -888,4 +888,51 @@ mod tests {
         assert!(LabelStore::parse("[]").is_err());
         assert!(LabelStore::parse(r#"{"entries": []}"#).is_ok());
     }
+
+    #[test]
+    fn a_malformed_store_reports_the_failing_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("clip-labels.json");
+        std::fs::write(&path, "{").expect("write a malformed store");
+
+        let error = LabelStore::load(&path).expect_err("a malformed store must fail");
+        assert!(error.contains("cannot parse labels store"));
+        assert!(
+            error.contains(&path.display().to_string()),
+            "the error must name the resolved path: {error}"
+        );
+    }
+
+    #[test]
+    fn the_versioned_store_parses_to_the_measured_labels() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("data")
+            .join("clip-labels.json");
+        let bytes = std::fs::read(&path).expect("the committed store must be readable");
+        assert_ne!(
+            bytes.first().copied(),
+            Some(0xEF),
+            "the committed store must be UTF-8 without a BOM"
+        );
+
+        let store = LabelStore::load(&path).expect("the committed store must parse");
+        assert_eq!(store.len(), 2, "only the two measured files are stored");
+
+        let raziel = store.for_sra("RAZIEL.SRA");
+        assert_eq!(
+            (
+                raziel.idle,
+                raziel.walk,
+                raziel.jump_up,
+                raziel.fall,
+                raziel.land
+            ),
+            (Some(55), Some(2), Some(35), Some(36), Some(37)),
+            "the confirmed Raziel capture must survive version control"
+        );
+
+        let sluagh = store.for_sra("SLUAGH.SRA");
+        assert_eq!((sluagh.idle, sluagh.walk), (Some(8), Some(1)));
+        assert_eq!(sluagh.jump_up, None, "unmeasured states stay at rest");
+    }
 }

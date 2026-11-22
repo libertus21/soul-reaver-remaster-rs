@@ -11,6 +11,12 @@
 !.gitignore
 !.gitattributes
 
+# The measured clip-label store is our own data, not a game asset: it holds
+# only clip indices and `.SRA` file names. It is versioned so a lost home
+# directory cannot lose every measurement. See docs/notes/clip-label-store.md.
+!data/
+!data/clip-labels.json
+
 # Build output is never committed (later rules win over the *.rs
 # re-allow above, so generated sources under target/ stay ignored).
 /target/

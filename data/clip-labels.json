@@ -1,0 +1,55 @@
+{
+  "conflicts": [],
+  "entries": {
+    "RAZIEL.SRA": {
+      "agreement": 0.7098591549295775,
+      "evidence": "runtime-capture",
+      "fall": "36",
+      "field_agreement": {
+        "idle": 1,
+        "walk": 0.91,
+        "jump_up": 1,
+        "fall": 1,
+        "land": 1
+      },
+      "field_run_median": {
+        "idle": 18.5,
+        "walk": 15.0
+      },
+      "file": "RAZIEL.SRA",
+      "idle": "55",
+      "jump_up": "35",
+      "land": "37",
+      "run_median": 8.0,
+      "runs": 4,
+      "samples": 3008,
+      "slots": 66,
+      "updated": "2026-11-15T16:50:24Z",
+      "walk": "2"
+    },
+    "SLUAGH.SRA": {
+      "agreement": 0.8233918128654971,
+      "evidence": "runtime-motion",
+      "fall": "unknown",
+      "field_agreement": {
+        "idle": 0.5238095238095238,
+        "walk": 0.5361305361305362
+      },
+      "field_run_median": {
+        "idle": 11.0,
+        "walk": 230.0
+      },
+      "file": "SLUAGH.SRA",
+      "idle": "8",
+      "jump_up": "unknown",
+      "land": "unknown",
+      "run_median": 9.0,
+      "runs": 2,
+      "samples": 1354,
+      "slots": 24,
+      "updated": "2026-11-22T03:24:01Z",
+      "walk": "1"
+    }
+  },
+  "version": 1
+}

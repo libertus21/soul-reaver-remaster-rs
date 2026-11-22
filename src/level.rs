@@ -1079,6 +1079,45 @@ pub fn read_group_objects(
     Ok(rows)
 }
 
+/// One room of an archive level family: its self-declared name, placed objects
+/// and integer room triangles.
+#[derive(Debug, PartialEq, Eq)]
+pub struct GroupWorldRoom {
+    pub name: String,
+    pub objects: ObjectReport,
+    pub triangles: RoomTriangles,
+}
+
+/// `--play --group`: every matching room's objects and collision triangles.
+///
+/// Discovery and ordering are [`discover_group`]'s, so this is the same family
+/// the `--level-* --group` modes select. Each entry's bytes are read and parsed
+/// once, then the object array and triangles are decoded from that one parse,
+/// exactly like [`read_entry_world`].
+pub fn read_group_world(
+    path: &Path,
+    prefix: &str,
+) -> Result<Vec<GroupWorldRoom>, LevelError> {
+    let mut rooms = Vec::new();
+    for (unit, bytes) in discover_group(path, prefix)? {
+        let data = &bytes[unit.structure.data_base..];
+        let objects = object_report(data).map_err(|error| LevelError::GroupParseFailed {
+            name: unit.name.clone(),
+            detail: error.to_string(),
+        })?;
+        let triangles = room_triangles(data).map_err(|error| LevelError::GroupParseFailed {
+            name: unit.name.clone(),
+            detail: error.to_string(),
+        })?;
+        rooms.push(GroupWorldRoom {
+            name: unit.name,
+            objects,
+            triangles,
+        });
+    }
+    Ok(rooms)
+}
+
 /// Parse one archive entry with the same in-memory reader as a loose `.PCM`.
 fn entry_unit(path: &Path, index: usize) -> Result<(LevelUnit, Vec<u8>), LevelError> {
     let bytes = entry_bytes(path, index)?;
@@ -1089,19 +1128,26 @@ fn entry_unit(path: &Path, index: usize) -> Result<(LevelUnit, Vec<u8>), LevelEr
 }
 
 /// True when `name` is exactly `prefix` followed by one or more ASCII digits.
+///
+/// The comparison is ASCII case-insensitive: `--group UNDER` selects `under1`.
 fn group_member(name: &str, prefix: &str) -> bool {
-    name.strip_prefix(prefix)
+    let name = name.to_ascii_lowercase();
+    let prefix = prefix.to_ascii_lowercase();
+    name.strip_prefix(&prefix)
         .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Numeric suffix as the sort key, so `under10` follows `under9`.
 fn group_rank(name: &str, prefix: &str) -> u64 {
-    name.strip_prefix(prefix).and_then(|suffix| suffix.parse().ok()).unwrap_or(u64::MAX)
+    let name = name.to_ascii_lowercase();
+    let prefix = prefix.to_ascii_lowercase();
+    name.strip_prefix(&prefix).and_then(|suffix| suffix.parse().ok()).unwrap_or(u64::MAX)
 }
 
 /// Scan every archive entry, keep those that parse as a `.PCM` whose own name
-/// is `prefix` + digits, and return them in numeric-suffix order. Entries are
-/// read into memory only; nothing is extracted.
+/// is `prefix` + digits (case-insensitive in the prefix), and return them in
+/// numeric-suffix order. Entries are read into memory only; nothing is
+/// extracted.
 fn discover_group(path: &Path, prefix: &str) -> Result<Vec<(LevelUnit, Vec<u8>)>, LevelError> {
     if prefix.is_empty() {
         return Err(LevelError::GroupEmptyPrefix);
@@ -2569,6 +2615,9 @@ mod tests {
             .expect("group must discover two rooms");
         let names: Vec<&str> = rows.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(names, vec!["under1", "under2"]);
+        let upper = read_group_geometry(&group_archive(tmp.path()), "UNDER")
+            .expect("the prefix match is case-insensitive");
+        assert_eq!(upper.len(), 2);
         let vertices: u32 = rows.iter().map(|(_, g)| g.vertices).sum();
         let faces: u32 = rows.iter().map(|(_, g)| g.faces).sum();
         assert_eq!((vertices, faces), (6, 2));
@@ -2584,6 +2633,32 @@ mod tests {
         assert_eq!(mesh.vertices[0], [0.0, 0.0, 0.0]);
         assert_eq!(mesh.vertices[3], [10.0, 0.0, 0.0], "world-space position is not transformed");
         assert_eq!(mesh.indices, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn group_world_reads_per_room_objects_and_triangles_from_one_parse() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let rooms = read_group_world(&group_archive(tmp.path()), "under")
+            .expect("group must read both rooms");
+
+        let names: Vec<&str> = rooms.iter().map(|room| room.name.as_str()).collect();
+        assert_eq!(names, vec!["under1", "under2"]);
+        assert_eq!(rooms[0].objects.count, 0, "the synthetic rooms place nothing");
+        assert_eq!(
+            rooms[0].triangles.vertices.len(),
+            3,
+            "each room keeps its own vertex array"
+        );
+        assert_eq!(
+            rooms[0].triangles.faces,
+            vec![[0, 1, 2]],
+            "face indices stay local to the room; the world rebases them"
+        );
+        assert_eq!(
+            rooms[1].triangles.vertices,
+            vec![[10, 0, 0], [14, 0, 0], [10, 4, 0]]
+        );
+        assert_eq!(rooms[1].triangles.faces, vec![[0, 1, 2]]);
     }
 
     #[test]

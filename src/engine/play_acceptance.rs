@@ -208,6 +208,59 @@ fn headless_line_has_the_documented_contract_and_counts() {
 }
 
 #[test]
+fn group_loads_every_member_room_and_reports_rooms() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("BIGFILE.DAT");
+    let bytes = synthetic_archive(&[
+        (
+            suffix("under1"),
+            pcm_room(
+                "under1",
+                &[("raziel", [1, 0, 0]), ("marker", [2, 0, 0])],
+            ),
+        ),
+        (
+            suffix("under2"),
+            pcm_room(
+                "under2",
+                &[("capsule0", [50, 0, 0]), ("marker", [3, 0, 0])],
+            ),
+        ),
+        (suffix("capsule0"), named_model("capsule0")),
+    ]);
+    std::fs::write(&path, bytes).expect("synthetic archive");
+
+    let world = World::load_group(&path, "under").expect("the family must load");
+    assert_eq!(world.level.name, "group-under");
+    assert_eq!(world.level.rooms, 2, "both archived rooms are loaded");
+    assert_eq!(world.placed.len(), 4, "records from both rooms share one world");
+
+    let mut frame = FrameState::new(world);
+    assert_eq!(
+        frame.player_position(),
+        Some([1, 0, 0]),
+        "the player binds the first room's raziel record"
+    );
+
+    let report = headless_run(&mut frame, &path, 3).expect("the family must tick");
+    assert_eq!(report.unit, "group-under");
+    assert_eq!(report.rooms, 2);
+    assert_eq!(report.placed, 4);
+    assert_eq!(report.admitted, 2, "raziel and capsule0 are admitted");
+    assert_eq!(report.tracked, 2, "the bound player and capsule0 are tracked");
+    assert_eq!(report.skipped_markers, 2, "one marker per room");
+    assert_eq!(report.inert, 0);
+    assert_eq!(report.unresolved, 0);
+    assert_eq!(report.live, 2, "the player plus the second room's actor");
+    assert_eq!(report.ticks, 3);
+    let expected = format!(
+        "engine unit=group-under rooms=2 placed=4 admitted=2 tracked=2 skipped_markers=2 inert=0 unresolved=0 live=2 ticks=3 digest={:016x}",
+        report.digest
+    );
+    assert_eq!(report.line(), expected, "the contract line format is unchanged");
+}
+
+#[test]
 fn markers_never_enter_the_tracker() {
     let (_dir, path) = fixture(
         &[

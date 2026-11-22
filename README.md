@@ -73,13 +73,27 @@ local vertical is confirmed to be `+Z`, the same as the world
 
 ## Play mode (engine skeleton)
 
-`--play` runs the deterministic engine skeleton on one archive unit. It is a
+`--play` runs the deterministic engine skeleton on one archive unit, or on a
+whole multi-room level family with `--group <PREFIX>`. It is a
 skeleton, not a playable game: actor AI, body animation, scripts, audio,
 streaming, particles, menus, warps and save are absent. The close-out and the
 post-milestone consolidation are in
 `docs/changes/engine-skeleton/milestone-report.md`. Room collision runs on the
 horizontal `X`/`Y` plane of the **Z-up** world, with gravity and the player
 camera on `Z` (`docs/notes/up-axis.md`, `docs/notes/engine-collision.md`).
+
+`--group` loads every archived unit named `PREFIX` + digits (ASCII
+case-insensitive, numeric-suffix order), the same selection as
+`--level-objects --group` and `--level-render --group`. All rooms' placed
+records share one world, all room triangles share one collision mesh, and the
+player binds the first `raziel` record in family order. `--unit` and `--group`
+are mutually exclusive. See `docs/notes/play-group.md`, including the fixed
+48-slot tracker limit that a very large family such as `cathy` exceeds.
+
+The per-actor animation store is versioned at `data/clip-labels.json`. Lookup
+order is `--labels-store <FILE>`, then that repository copy, then the probe's
+`~/.sr1_clip_labels.json`. A missing copy falls through; a malformed one fails
+loudly with its path. See `docs/notes/clip-label-store.md`.
 
 Windowed mode needs `--textures` and a display:
 

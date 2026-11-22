@@ -1460,7 +1460,9 @@ If the entry is ever corrupted again:
    `kept_capture=` rather than `updated=` for a confirmed field.
 
 The engine reads this store on its own branch; this slice changes the probe and
-this note only.
+this note only. The engine's lookup order is `--labels-store`, then the
+versioned `data/clip-labels.json`, then `~/.sr1_clip_labels.json`; see
+`docs/notes/clip-label-store.md`.
 
 ## Verification
 
