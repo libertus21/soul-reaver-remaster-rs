@@ -7,9 +7,10 @@ selected table, and maps packed tables to a clip index. This note records the
 failure of the heuristic, the packed and keyed fingerprint schemes, the
 segment aggregation, the keyed-locomotion hypothesis, the per-jump aligned
 template that now carries the jump result, the whole-directory index that
-attributes each actor to its source file, and the exact operator procedure.
-The probe itself stays in the session scratch directory because it carries
-module-relative anchors and engine field offsets.
+attributes each actor to its source file, the persistent per-file store that
+lets one encounter per actor type accumulate across sessions, and the exact
+operator procedure. The probe itself stays in the session scratch directory
+because it carries module-relative anchors and engine field offsets.
 
 The first revision of this note described a docs-only slice: nothing was
 launched and no production code changed. The capture has since been run (see
@@ -57,6 +58,10 @@ not labelled.
    the file its clips came from; `file=ambiguous` and `reason=slot-mismatch` are
    refusals, not labels. A numeric index is a per-file packed clip; `unknown`
    means that field was not measured well enough to name a clip.
+5. The run ends by merging each `file=`-attributed body into the persistent
+   store and printing one `STORE` line per file. `--labels-print` shows what is
+   already known; `--labels-for <FILE>` prints one mapping. One encounter per
+   actor type is enough because the file is shared by every zone.
 
 For a repeating action such as jumping, three windows cannot separate its
 phases. Use the per-jump aligned template in "Per-jump alignment: the primary
@@ -895,6 +900,9 @@ is uncalibrated. A thin or blended phase is not worth a guess.
 | `--segments` | Named, operator-paced segments (the three-prompt capture). Still supported. |
 | `--auto-windows <SECONDS>` | Diagnostic time series, one numbered window per step. Still supported, no longer used for labelling. |
 | `--total <SECONDS>` | Stop after this much wall time. |
+| `--labels-store <FILE>` | Persistent per-file label store (default `~/.sr1_clip_labels.json`); every capture run merges into it. |
+| `--labels-print` | Print the store as a sorted table and exit; attaches nothing. |
+| `--labels-for <FILE>` | Print one `.SRA`'s stored mapping and exit; attaches nothing. |
 
 Supplying `--by-motion` together with `--segments`, `--segment` or
 `--auto-windows` is a typed error, never a silent override.
@@ -1207,6 +1215,15 @@ memory form hash to one key and that the player's stride does not.
 memory form in the real agent through the same hook the capture uses, then
 asserts both keys are equal and the geometry reports `slots=24`.
 
+The six store cases use real temporary files and cover the merge policy end to
+end: an empty store gains a full entry from one measurement; a second measurement
+fills previously-`unknown` fields while leaving a confirmed field alone; a
+disagreeing equal-or-lower agreement records a `conflict` and keeps the stored
+value; a disagreeing strictly-higher agreement replaces the value and records the
+previous one as `superseded`; write-then-read reproduces an identical mapping; and
+a corrupt file (invalid JSON and a valid JSON of the wrong shape) is refused with
+the file left intact rather than recreated empty.
+
 The live harness spawns a throwaway system process, never the game. It
 exercises the real `NativePointer`, `Memory`, `Process`, `Interceptor`,
 `NativeCallback` and `NativeFunction` bindings. The keyed case asserts the
@@ -1278,9 +1295,27 @@ empty segment.
 - [ ] The confirm/refute table appears before the run, not after it.
 - [ ] The limitations section is not softened into a promise of semantic
       clip names.
+- [ ] The store is keyed by `.SRA` file name, and the section says why one
+      encounter per actor type is enough and no single zone is required.
+- [ ] The store schema names every field, `unknown` is allowed, and `runs`
+      counts measurements rather than instances.
+- [ ] The merge policy is a field-by-field table: fill unknown, keep confirmed,
+      replace only at strictly higher agreement, conflict otherwise.
+- [ ] The conflict rule records both values and the run count, and the stored
+      value is kept on an unresolved conflict.
+- [ ] A corrupt or unreadable store is refused and never recreated empty.
+- [ ] `--labels-print` and `--labels-for` attach nothing.
 - [ ] `cargo test` stays at its baseline.
 
 ## Next step
+
+> **2026-11-15 store revision.** The probe now merges every `file=`-attributed
+> actor into a persistent per-file store, so one encounter per actor type
+> accumulates across sessions and no zone with every enemy is required. The
+> scratch probe is green at 67 host cases and 35 live-runtime cases, including
+> the six store cases. The next capture should collect the 19 actor containers
+> still unmeasured, one area at a time, and let `--labels-print` show the store
+> fill in.
 
 > **2026-11-15 directory revision.** The probe now indexes a whole `*.SRA`
 > directory and attributes each live actor to the file its own clips came from.
