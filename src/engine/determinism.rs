@@ -136,6 +136,7 @@ fn error_tag(error: &PlayError) -> u8 {
         PlayError::InvalidCamHeight(_) => 11,
         PlayError::InvalidClip(_) => 12,
         PlayError::UnitAndGroup => 13,
+        PlayError::CullReportRequiresHeadless => 14,
     }
 }
 
