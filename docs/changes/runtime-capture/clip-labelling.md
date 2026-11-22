@@ -1042,7 +1042,7 @@ uncalibrated. A thin, blended or flickering phase is not worth a guess.
 | `--segments` | Named, operator-paced segments (the three-prompt capture). Still supported. |
 | `--auto-windows <SECONDS>` | Diagnostic time series, one numbered window per step. Still supported, no longer used for labelling. |
 | `--total <SECONDS>` | Stop after this much wall time. |
-| `--labels-store <FILE>` | Persistent per-file label store (default `~/.sr1_clip_labels.json`); every capture run merges into it. |
+| `--labels-store <FILE>` | Persistent per-file label store (default `~/.sr1_clip_labels.json`); every run merges into it. Each field records its method, and a confirmed capture is never replaced by free play. |
 | `--labels-print` | Print the store as a sorted table and exit; attaches nothing. |
 | `--labels-for <FILE>` | Print one `.SRA`'s stored mapping and exit; attaches nothing. |
 
@@ -1327,13 +1327,148 @@ plus one `PHASE` line per phase); the template is the primary result.
   `--sra-dir`, or whose payload is shared by two files, stays `file=none` or
   `file=ambiguous`; neither is a clip label.
 
+## The persistent label store
+
+### What the store is
+
+One JSON file at `--labels-store` (default `~/.sr1_clip_labels.json`), keyed by
+`.SRA` file name. Each entry holds `idle`, `walk`, `jump_up`, `fall` and `land`,
+each `unknown` or a per-file clip index string, beside `slots`, `agreement`,
+`run_median`, `samples`, `runs`, `evidence`, `updated`, `field_agreement`,
+`field_run_median` and `field_method`. `runs` counts measurements, not
+instances; `samples` counts observed frames. A value with no method recorded is
+resolved from the entry's `evidence` tag, so the store stays readable by a
+consumer that only knows the older schema.
+
+### The incident: a free-play number replaced a confirmed capture
+
+The store was corrupted by a bad merge and looked like this:
+
+```json
+"RAZIEL.SRA": { "idle": "0", "jump_up": "0", "fall": "0",
+                "land": "unknown", "walk": "2" }
+```
+
+The confirmed values are `idle=55 walk=2 jump_up=35 fall=36 land=37`, measured
+by two controlled captures with template agreement `1.00`. The merge compared
+`agreement` numbers produced by **different measurement methods**: a free-play
+phase-coverage number (for example `0.71`) and a jump-template agreement (for
+example `0.83`) are not the same scale. A weak free-play run printed a
+numerically larger number and replaced confirmed values with `0` and `unknown`.
+The comparison was the bug, not the numbers.
+
+The store had already been hand-corrected and a `.bak` exists. This revision
+does not rewrite that file; the fix is the precedence rule below, plus the
+documented restore procedure.
+
+### The measurement method, recorded per field
+
+Every stored field carries `field_method` beside `field_agreement`:
+
+| Value | Meaning |
+|---|---|
+| `capture` | A controlled run: the operator deliberately held the state in a named segment window. This is how `55 / 2 / 35 / 36 / 37` were obtained. |
+| `motion` | A free-play derivation: the default `--by-motion` run classified every observed object by its own motion. |
+
+Labelling is honest by construction: only the named segment modes
+(`--segments`, `--segment`) emit a `capture` measurement, and `--by-motion`
+always emits `motion`. A high agreement never promotes a run to `capture`;
+`method-motion-not-inferred-from-agreement` pins that in `--live-selftest`.
+
+A named segment run writes `capture` only when the source is one file
+(`--sra`), because the store is keyed by file name. With `--sra-dir` the
+segment mode cannot attribute the observed object to a file, so it prints
+`STORE capture skipped reason=no-file-attribution` and writes nothing. A single
+`jump` window cannot name `fall` or `land`; the aligned jump template from
+`--by-motion` remains the source for those fields.
+
+A legacy entry has no `field_method`. Its entry-level `evidence` tag is the
+recorded provenance: `runtime-capture` means `capture`, any other non-empty
+evidence means `motion`. A value with no provenance at all is treated as
+`capture`, so an unexplained stored value is never replaced by free play. The
+resolved method is persisted the first time a field is touched.
+
+### The precedence table
+
+Resolved per field, in this order:
+
+| Stored | Incoming | Result | Record |
+|---|---|---|---|
+| `unknown` | any measured value | fill | `added` |
+| any | `unknown` | keep | — |
+| `capture` | `motion` | **keep stored** | `conflict`, `resolution="kept-capture"` |
+| `motion` | `capture` | **replace** | `superseded` |
+| same method, incoming agreement strictly higher | | replace | `superseded` |
+| same method, equal or lower agreement | | keep stored | `conflict` |
+| equal value, incoming `capture`, stored `motion` | | keep value, promote provenance | `promoted-capture` |
+
+Agreement only orders two values of the **same** method. Across methods it is
+not compared at all. A disagreement never lowers the stored `field_agreement`,
+and a run that only lost conflicts cannot raise the entry-level `agreement`;
+otherwise a weak run could erode the protection of the value it failed to beat.
+
+### Zero samples is never a number
+
+`0` is a legal clip index (idle has a real variant at clip `0`), so it is not
+special-cased. The rule is about absence of evidence, not about the value:
+
+- a phase whose recorded frame count is zero is `unknown`;
+- a field whose measurement had zero samples is `unknown`;
+- a value that is not a non-negative decimal integer (`-1`, `keyed`, `unmapped`,
+  an empty string) is normalized to `unknown`.
+
+The write path enforces this at three points: the phase gate, the per-field
+measurement (`frames` travels with each field), and the merge. A numeric label
+therefore cannot be written from an empty phase, which is how an unintended `0`
+could appear.
+
+### The file must be written without a UTF-8 BOM
+
+The engine's parser rejects byte `0xEF` at offset 0. The store is therefore
+written as UTF-8 bytes with no BOM (binary write of an explicit `utf-8`
+encode), and the loader refuses a BOM'd file with `error=bom` instead of
+extending bytes the engine cannot read. `--selftest` asserts the written file's
+first byte is `{` and that it round-trips.
+
+### Current store state and restore from `.bak`
+
+After the hand correction the `RAZIEL.SRA` entry is:
+
+```json
+"RAZIEL.SRA": {
+  "idle": "55", "walk": "2", "jump_up": "35", "fall": "36", "land": "37",
+  "agreement": 0.71,
+  "field_agreement": {"idle": 1.0, "walk": 0.91,
+                      "jump_up": 1.0, "fall": 1.0, "land": 1.0},
+  "evidence": "runtime-capture"
+}
+```
+
+`SLUAGH.SRA` holds `idle=8 walk=1` from free play with its own agreements.
+
+If the entry is ever corrupted again:
+
+1. Do not re-run a capture against the broken file: a merge would keep the
+   corrupt values as if they were confirmed.
+2. Copy `.sr1_clip_labels.json.bak` over the store. The `.bak` holds the
+   pre-corruption state; delete the file only if every value is reproducible
+   and losing the other entries is acceptable.
+3. Confirm with `--labels-print`: `RAZIEL.SRA` must show
+   `55 / 2 / 35 / 36 / 37`, and every field must be a non-negative index or
+   `unknown`.
+4. Re-run only the missing measurement, then check that the merge line says
+   `kept_capture=` rather than `updated=` for a confirmed field.
+
+The engine reads this store on its own branch; this slice changes the probe and
+this note only.
+
 ## Verification
 
 | Gate | Result |
 |---|---|
-| `--selftest` | 76 cases, 76 green; the fingerprint, segment, keyed, phase, jump, horizontal and identity cases, the per-actor label cases, the directory cases (`sra-dir-two-files`, `sra-dir-per-actor-file`, `sra-dir-cross-collision`, `sra-dir-slot-mismatch`, `sra-dir-clipmap-line`, `sra-dir-source-conflict`, `sra-dir-empty`), the run-length cases (`run-length-exact`, `run-length-gap-breaks`, `run-gate-holds`, `run-gate-alternates`, `run-gate-coverage`, `run-gate-mixed-labels`, `phase-line-run-stats`, `actor-measurement-run-median`), the store cases (`store-missing-is-empty`, `store-first-fill`, `store-fill-unknown`, `store-conflict-keeps`, `store-supersede`, `store-roundtrip`, `store-corrupt-refused`) and `fingerprint-form-invariant` |
-| `--live-selftest` | 37 cases, 37 green in a real Frida runtime; adds the `run-length` scenarios (`run-length-live-holds`, `run-length-live-alternates`, `run-length-live-mixed`, `run-length-live-exact`, `run-length-live-coverage`) and the per-body slot-stride cases (`slot-stride-24-matches-file`, `slot-stride-24-not-66`, `slot-stride-tiny-bodies`) on top of the multi-actor, directory and hardware-surface cases |
-| `--dry-run` | prints the plan; attaches nothing. It names the per-actor aggregation, the identity verdict, both hysteresis families with their constants, the run gate, the unknown reasons (including `low-run-length`), the directory index, the attribution/refusal rules, the store and the label gates |
+| `--selftest` | 87 cases, 87 green; the fingerprint, segment, keyed, phase, jump, horizontal and identity cases, the per-actor label cases, the directory cases (`sra-dir-two-files`, `sra-dir-per-actor-file`, `sra-dir-cross-collision`, `sra-dir-slot-mismatch`, `sra-dir-clipmap-line`, `sra-dir-source-conflict`, `sra-dir-empty`), the run-length cases (`run-length-exact`, `run-length-gap-breaks`, `run-gate-holds`, `run-gate-alternates`, `run-gate-coverage`, `run-gate-mixed-labels`, `phase-line-run-stats`, `actor-measurement-run-median`), the store cases (`store-missing-is-empty`, `store-first-fill`, `store-fill-unknown`, `store-conflict-keeps`, `store-supersede`, `store-kept-capture`, `store-capture-supersedes-motion`, `store-same-method-agreement`, `store-legacy-evidence-capture`, `store-zero-frame-unknown`, `store-zero-frame-actor-unknown`, `store-index-normalized`, `capture-measurement-from-segments`, `store-no-bom`, `store-bom-refused`, `store-roundtrip`, `store-corrupt-refused`, `store-entry-method-format`) and `fingerprint-form-invariant` |
+| `--live-selftest` | 40 cases, 40 green in a real Frida runtime; adds `method-motion-not-inferred-from-agreement`, `method-capture-from-controlled-window` and `store-capture-protected-live` on top of the run-length (`run-length-live-*`), per-body slot-stride (`slot-stride-*`), multi-actor, directory and hardware-surface cases |
+| `--dry-run` | prints the plan; attaches nothing. It names the per-actor aggregation, the identity verdict, both hysteresis families with their constants, the run gate, the unknown reasons (including `low-run-length`), the directory index, the attribution/refusal rules, the store method precedence, the store hygiene rules and the label gates |
 | `node --check` on `--print-agent` | clean |
 | `cargo test` | 694 green, unchanged by this docs-only slice |
 
@@ -1363,12 +1498,22 @@ prop bodies and asserts their file forms index at strides 2 and 1.
 The store cases use real temporary files and cover the merge policy end to end:
 an empty store gains a full entry from one measurement; a second measurement
 fills previously-`unknown` fields while leaving a confirmed field alone; a
-disagreeing equal-or-lower agreement records a `conflict` and keeps the stored
-value; a disagreeing strictly-higher agreement replaces the value and records the
-previous one as `superseded`; write-then-read reproduces an identical mapping;
-and a corrupt file (invalid JSON) is refused with the file left intact rather
-than recreated empty. Each entry records `run_median` beside `agreement`, and
-the merge/supersede/conflict records carry the incoming and stored run medians.
+disagreeing equal-or-lower same-method agreement records a `conflict` and keeps
+the stored value without lowering its stored agreement; a disagreeing
+strictly-higher same-method agreement replaces the value and records the
+previous one as `superseded`; a `motion` measurement cannot replace a `capture`
+value even at `0.99` against `0.60` (it records `kept-capture`); a `capture`
+value replaces a `motion` value even at lower agreement; a legacy
+`runtime-capture` entry with no `field_method` is protected the same way; an
+equal value from a `capture` run promotes the stored provenance; a zero-frame
+field and a zero-sample actor never produce a numeric label; a negative or
+class value normalizes to `unknown`; the controlled segment windows produce a
+`capture` measurement while a blended jump window stays `unknown`; the written
+file's first byte is `{`, it round-trips, a BOM'd file is refused as `bom`; and
+a corrupt file (invalid JSON) is refused with the file left intact rather than
+recreated empty. Each entry records `run_median` and `field_method` beside
+`agreement`, and the merge/supersede/conflict records carry the incoming and
+stored methods, agreements and run medians.
 
 The run-length cases assert the statistic on hand-built sequences
 (`run-length-exact`, `run-length-gap-breaks`), the held/flickering/thin gate
@@ -1454,6 +1599,20 @@ empty segment.
 - [ ] `low-run-length` and `low-agreement` are distinct, are reported per field,
       and the revised procedure reports a degraded phase instead of guessing.
 - [ ] The store records `run_median` beside `agreement`.
+- [ ] The store records `field_method` per field, and the section states which
+      run modes may emit `capture` and that agreement never promotes a run.
+- [ ] The precedence table puts method before agreement: `capture` is never
+      replaced by `motion`, `motion` is replaced by `capture`, and agreement
+      only orders values of one method.
+- [ ] The incident names the corrupted `RAZIEL.SRA` entry, what replaced what,
+      and why phase coverage and template agreement are incomparable scales.
+- [ ] A rejected run cannot lower the stored agreement or raise the entry-level
+      agreement.
+- [ ] Zero frames or zero samples always yield `unknown`; `0` is not
+      special-cased as a value.
+- [ ] The store is written without a UTF-8 BOM, a BOM'd file is refused, and a
+      test asserts the first byte is `{`.
+- [ ] The current corrected state is documented with the `.bak` restore path.
 - [ ] The keyed fingerprint names its bounded view and excludes the pointer.
 - [ ] The collision policy is explicit: lowest index within one file, every
       cross-file candidate kept and marked `ambiguous`.
@@ -1547,3 +1706,14 @@ repeating tail across runs.
 > guessing. The store records `run_median` beside `agreement`. The scratch probe
 > is green at 76 host cases and 34 live-runtime cases, including the run-length
 > and store cases. The confirmed map did not move.
+
+> **2026-11-22 store precedence revision.** The store now records
+> `field_method` per field and resolves method before agreement, so a free-play
+> number can never replace a confirmed controlled capture. The corrupted
+> `RAZIEL.SRA` entry (`idle=0 jump_up=0 fall=0 land=unknown`, left by comparing
+> a `0.71` phase coverage with a `0.83` template agreement) is the regression
+> this rule addresses; the hand-corrected `55 / 2 / 35 / 36 / 37` values are
+> untouched. The write path refuses a numeric label from a zero-frame phase, and
+> the store is written as UTF-8 with no BOM. The scratch probe is green at 87
+> host cases and 40 live-runtime cases, including the precedence, zero-frame and
+> BOM cases. The engine and the confirmed map did not move.
