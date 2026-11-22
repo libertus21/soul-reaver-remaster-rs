@@ -387,6 +387,10 @@ mod tests {
                 ],
             ),
             (
+                &["game", "play", "--bigfile", "B.DAT", "--group", "cathy"],
+                &["--play", "--bigfile", "B.DAT", "--group", "cathy"],
+            ),
+            (
                 &[
                     "game", "play", "--bigfile", "B.DAT", "--sra", "R.SRA", "--anim-fps", "25",
                     "--anim-once",

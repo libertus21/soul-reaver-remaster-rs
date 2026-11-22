@@ -11,9 +11,10 @@ use std::path::Path;
 
 use crate::engine::collision::CollisionMesh;
 use crate::engine::placed::{PlacedDb, PlacedObject};
-use crate::level::{self, LevelError};
+use crate::level::{self, GroupWorldRoom, LevelError};
 
-/// Loaded unit identity. `rooms` is 1 for the single-unit milestone.
+/// Loaded unit identity. `rooms` is 1 for a single unit and the number of
+/// family members for a `--group` load.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LevelData {
     pub name: String,
@@ -88,12 +89,72 @@ impl World {
             collision: CollisionMesh::default(),
         }
     }
+
+    /// Load a whole archive level family: every unit named `prefix` + digits.
+    ///
+    /// The family selection and numeric-suffix order are [`level::read_group_world`]'s,
+    /// the same discovery the `--level-* --group` modes use. Every room's placed
+    /// records enter one [`PlacedDb`], and every room's triangles are merged into
+    /// one collision mesh with face indices rebased by the running vertex base.
+    /// `level.entry` is the first member's archive entry, the room that also
+    /// binds the player (the first `raziel` placed record in family order).
+    pub fn load_group(dat: &Path, prefix: &str) -> Result<Self, WorldError> {
+        let rooms = level::read_group_world(dat, prefix)?;
+        let first = rooms.first().map(|room| room.name.clone());
+        let entry = first
+            .and_then(|name| level::resolve_unit_entry(dat, &name))
+            .unwrap_or(0);
+        Ok(Self::from_group_reports(
+            format!("group-{prefix}"),
+            entry,
+            rooms,
+        ))
+    }
+
+    /// Merge already parsed family rooms into one world.
+    fn from_group_reports(
+        name: String,
+        entry: usize,
+        rooms: Vec<GroupWorldRoom>,
+    ) -> Self {
+        let room_count = rooms.len();
+        let mut records = Vec::new();
+        let mut vertices: Vec<[i32; 3]> = Vec::new();
+        let mut faces: Vec<[u32; 3]> = Vec::new();
+        for room in rooms {
+            records.extend(
+                room.objects
+                    .objects
+                    .iter()
+                    .map(PlacedObject::from_record),
+            );
+            let base = u32::try_from(vertices.len()).unwrap_or(u32::MAX);
+            vertices.extend(room.triangles.vertices);
+            faces.extend(room.triangles.faces.iter().map(|face| {
+                [
+                    face[0].saturating_add(base),
+                    face[1].saturating_add(base),
+                    face[2].saturating_add(base),
+                ]
+            }));
+        }
+        Self {
+            level: LevelData {
+                name,
+                entry,
+                rooms: room_count,
+            },
+            placed: PlacedDb::from_records(records),
+            collision: CollisionMesh::from_room_triangles(&vertices, &faces),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{LevelData, World};
-    use crate::level::{ObjectRecord, ObjectReport};
+    use crate::engine::frame::FrameState;
+    use crate::level::{GroupWorldRoom, ObjectRecord, ObjectReport, RoomTriangles};
 
     fn record(
         name: &str,
@@ -142,5 +203,67 @@ mod tests {
 
         let raziel = world.placed.record(2).expect("raziel");
         assert_eq!((raziel.archetype, raziel.instance_id), (8, 3));
+    }
+
+    fn room(name: &str, objects: Vec<ObjectRecord>, triangles: RoomTriangles) -> GroupWorldRoom {
+        GroupWorldRoom {
+            name: name.to_string(),
+            objects: ObjectReport {
+                room_offset: 0,
+                count: objects.len() as u32,
+                array_offset: 0,
+                objects,
+            },
+            triangles,
+        }
+    }
+
+    #[test]
+    fn group_world_merges_rooms_rebases_faces_and_binds_the_first_player() {
+        let first = room(
+            "under1",
+            vec![record("raziel", [1, 0, 0], 4, 7, 1)],
+            RoomTriangles {
+                vertices: vec![[0, 0, 0], [4, 0, 0], [0, 4, 0]],
+                faces: vec![[0, 1, 2]],
+            },
+        );
+        let second = room(
+            "under2",
+            vec![record("capsule0", [50, 0, 0], 4, 7, 2)],
+            RoomTriangles {
+                vertices: vec![[10, 0, 0], [14, 0, 0], [10, 4, 0]],
+                faces: vec![[0, 1, 2]],
+            },
+        );
+
+        let world = World::from_group_reports("group-under".to_string(), 0, vec![first, second]);
+        assert_eq!(
+            world.level,
+            LevelData {
+                name: "group-under".to_string(),
+                entry: 0,
+                rooms: 2
+            }
+        );
+        assert_eq!(world.placed.len(), 2, "both rooms contribute records");
+        assert_eq!(world.placed.by_name("capsule0").len(), 1);
+        assert_eq!(
+            world.collision.surface_count(),
+            2,
+            "both rooms contribute a floor"
+        );
+        assert_eq!(
+            world.collision.ground_height(12, 1, 100),
+            Some(0),
+            "the second room's face indices must be rebased, or this point has no floor"
+        );
+
+        let frame = FrameState::new(world);
+        assert_eq!(
+            frame.player_position(),
+            Some([1, 0, 0]),
+            "the player binds the first raziel record in family order"
+        );
     }
 }

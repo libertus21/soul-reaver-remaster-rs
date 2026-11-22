@@ -194,6 +194,12 @@ pub struct PlayOptions {
     pub bigfile: PathBuf,
     pub textures: Option<PathBuf>,
     pub unit: String,
+    /// Archive level-family prefix (`--group <PREFIX>`).
+    ///
+    /// Loads every archived unit whose self-declared name is the prefix plus
+    /// ASCII digits, in numeric-suffix order, through the same discovery the
+    /// `--level-* --group` modes use. Mutually exclusive with `--unit`.
+    pub group: Option<String>,
     pub ticks: Option<u32>,
     pub headless: bool,
     pub camera: CameraMode,
@@ -209,8 +215,9 @@ pub struct PlayOptions {
     pub sra_dir: Option<PathBuf>,
     /// Persistent per-file label store (`--labels-store <FILE>`).
     ///
-    /// Defaults to the probe's `~/.sr1_clip_labels.json`. Only read when a
-    /// directory was supplied.
+    /// Lookup order is documented on [`PlayOptions::labels_store_path`]:
+    /// explicit, then the versioned `data/clip-labels.json`, then the probe's
+    /// `~/.sr1_clip_labels.json`. Only read when a directory was supplied.
     pub labels_store: Option<PathBuf>,
     /// Presentation playback rate, in frames per second for a divisor-100 clip.
     pub anim_fps: u32,
@@ -245,14 +252,40 @@ pub struct PlayOptions {
 impl PlayOptions {
     pub const DEFAULT_UNIT: &'static str = "under1";
 
-    /// The label store path, explicit or the probe's documented default.
+    /// Repository-relative copy of the measured label store.
     ///
-    /// The default is `~/.sr1_clip_labels.json`, resolved from `USERPROFILE`
-    /// (Windows) or `HOME`. No absolute path is compiled in: when neither
-    /// variable exists the store is read from the current directory and a
+    /// This copy is versioned so the measurements survive a lost home
+    /// directory. It is data, not a game asset: only clip indices and `.SRA`
+    /// file names.
+    pub const REPO_LABELS_STORE: &'static str = "data/clip-labels.json";
+
+    /// The label store path, in documented lookup order.
+    ///
+    /// 1. `--labels-store <FILE>` when given (explicit wins, even if missing).
+    /// 2. [`Self::REPO_LABELS_STORE`] relative to the current directory when
+    ///    that file exists.
+    /// 3. The probe's user-home default (`~/.sr1_clip_labels.json`, resolved
+    ///    from `USERPROFILE` or `HOME`).
+    ///
+    /// A missing repository copy falls through to the home path instead of
+    /// failing. A malformed file is never skipped: `LabelStore::load` reports
+    /// it with the resolved path. No absolute path is compiled in; when neither
+    /// environment variable exists the home form is a relative name and a
     /// missing file simply leaves every label at rest.
     pub fn labels_store_path(&self) -> PathBuf {
-        self.labels_store.clone().unwrap_or_else(default_labels_store)
+        self.labels_store_path_with(Path::new(Self::REPO_LABELS_STORE))
+    }
+
+    /// Lookup order with an injectable repository path, so the order is
+    /// testable without changing the process directory.
+    fn labels_store_path_with(&self, repo: &Path) -> PathBuf {
+        if let Some(path) = &self.labels_store {
+            return path.clone();
+        }
+        if repo.is_file() {
+            return repo.to_path_buf();
+        }
+        default_labels_store()
     }
 
     /// Resolve the state-to-clip mapping against the loaded clip count.
@@ -299,6 +332,7 @@ impl PlayOptions {
             bigfile: PathBuf::new(),
             textures: None,
             unit: Self::DEFAULT_UNIT.to_string(),
+            group: None,
             ticks: None,
             headless: false,
             camera: CameraMode::Fly,
@@ -320,6 +354,7 @@ impl PlayOptions {
             cam_height: None,
         };
         let mut bigfile = None;
+        let mut unit_given = false;
         let mut index = 0;
         while index < args.len() {
             let token = args[index].as_str();
@@ -328,7 +363,13 @@ impl PlayOptions {
                 "--textures" => {
                     options.textures = Some(PathBuf::from(value(args, index, "--textures")?));
                 }
-                "--unit" => options.unit = value(args, index, "--unit")?.to_string(),
+                "--unit" => {
+                    options.unit = value(args, index, "--unit")?.to_string();
+                    unit_given = true;
+                }
+                "--group" => {
+                    options.group = Some(value(args, index, "--group")?.to_string());
+                }
                 "--ticks" => {
                     let raw = value(args, index, "--ticks")?;
                     options.ticks = Some(
@@ -432,6 +473,9 @@ impl PlayOptions {
             return Err(PlayError::MissingArchive);
         };
         options.bigfile = bigfile;
+        if options.group.is_some() && unit_given {
+            return Err(PlayError::UnitAndGroup);
+        }
         if options.input_script.is_some() && !options.headless {
             return Err(PlayError::InputScriptRequiresHeadless);
         }
@@ -489,6 +533,7 @@ pub enum PlayError {
     UnknownOption(String),
     MissingValue(&'static str),
     MissingArchive,
+    UnitAndGroup,
     InvalidTicks(String),
     ZeroTicksHeadless,
     InvalidCamera(String),
@@ -507,6 +552,10 @@ impl fmt::Display for PlayError {
             Self::UnknownOption(option) => write!(f, "unknown option '{option}' for --play"),
             Self::MissingValue(option) => write!(f, "option '{option}' needs a value"),
             Self::MissingArchive => write!(f, "--play requires --bigfile <BIGFILE.DAT>"),
+            Self::UnitAndGroup => write!(
+                f,
+                "--unit and --group are mutually exclusive: pass one of them"
+            ),
             Self::InvalidTicks(value) => write!(
                 f,
                 "invalid value '{value}' for --ticks: expected a non-negative integer"
@@ -631,7 +680,11 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
         return Err(RunError::MissingTextures);
     }
 
-    let world = World::load(&options.bigfile, &options.unit).map_err(RunError::World)?;
+    let world = match &options.group {
+        Some(prefix) => World::load_group(&options.bigfile, prefix),
+        None => World::load(&options.bigfile, &options.unit),
+    }
+    .map_err(RunError::World)?;
     let textures = if options.headless {
         None
     } else {
@@ -1796,7 +1849,17 @@ mod tests {
         assert_eq!(options.sra, None);
         assert_eq!(options.sra_dir, None);
         assert_eq!(options.labels_store, None);
-        assert!(options.labels_store_path().ends_with(".sr1_clip_labels.json"));
+        assert_eq!(
+            options.labels_store_path(),
+            PathBuf::from(PlayOptions::REPO_LABELS_STORE),
+            "the versioned repository copy wins over the home path"
+        );
+        assert!(
+            options
+                .labels_store_path_with(std::path::Path::new("missing-labels.json"))
+                .ends_with(".sr1_clip_labels.json"),
+            "a missing repository copy falls back to the probe's home path"
+        );
         assert_eq!(options.anim_fps, super::ANIMATION_FPS);
         assert!(!options.anim_once);
         assert_eq!(
@@ -1853,6 +1916,63 @@ mod tests {
         assert_eq!(options.labels_store, Some(PathBuf::from("labels.json")));
         assert_eq!(options.anim_fps, 20);
         assert!(options.anim_once);
+    }
+
+    #[test]
+    fn group_is_parsed_and_is_mutually_exclusive_with_unit() {
+        let options = parse(&["--bigfile", "B", "--group", "cathy"])
+            .expect("a group prefix must parse");
+        assert_eq!(options.group.as_deref(), Some("cathy"));
+        assert_eq!(
+            options.unit, "under1",
+            "the default unit stays unset; the group selects the rooms"
+        );
+
+        assert_eq!(
+            parse(&[
+                "--bigfile", "B", "--group", "cathy", "--unit", "under1"
+            ]),
+            Err(PlayError::UnitAndGroup),
+            "the two selectors are mutually exclusive"
+        );
+        assert!(
+            PlayError::UnitAndGroup
+                .to_string()
+                .contains("mutually exclusive")
+        );
+
+        let explicit = parse(&["--bigfile", "B", "--unit", "under2"]).expect("unit parses");
+        assert_eq!(explicit.group, None);
+    }
+
+    #[test]
+    fn label_store_lookup_is_explicit_then_repo_then_home() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("clip-labels.json");
+        std::fs::write(&repo, "{}").expect("write the repository copy");
+
+        let explicit = parse(&["--bigfile", "B", "--labels-store", "mine.json"])
+            .expect("explicit store parses");
+        assert_eq!(
+            explicit.labels_store_path_with(&repo),
+            PathBuf::from("mine.json"),
+            "an explicit --labels-store wins even over an existing repo copy"
+        );
+
+        let default = parse(&["--bigfile", "B"]).expect("defaults parse");
+        assert_eq!(
+            default.labels_store_path_with(&repo),
+            repo,
+            "an existing repository copy is second in the lookup"
+        );
+
+        let missing = dir.path().join("absent.json");
+        assert!(
+            default
+                .labels_store_path_with(&missing)
+                .ends_with(".sr1_clip_labels.json"),
+            "a missing repository copy falls through to the home path"
+        );
     }
 
     #[test]

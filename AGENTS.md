@@ -9,7 +9,9 @@ mark it UNKNOWN in `docs/notes/`.
 1. GAME DATA IS READ-ONLY: `D:\Juego\planescape\Soul Reaver I-II`
    (game 1: `...\1\`). Never write there, never copy game bytes here.
 2. Whitelist `.gitignore` stays: only `*.rs`, `Cargo.toml`, `Cargo.lock`,
-   `*.md`, `.gitignore`, `.gitattributes` may be committed. Run
+   `*.md`, `.gitignore`, `.gitattributes`, and the measured clip-label store
+   at `data/clip-labels.json` may be committed. The store holds only clip
+   indices and `.SRA` names, never game bytes or addresses. Run
    `git status --short` before every commit and abort on surprises.
 3. Never commit: `*.dds`, `*.big`, `*.dat`, `*.ogg`, `*.ogv`, extracted
    files, decompiled code, Ghidra DBs, retail offsets/addresses.
