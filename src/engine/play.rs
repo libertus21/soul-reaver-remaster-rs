@@ -243,6 +243,11 @@ pub struct PlayOptions {
     /// Explicit player position that overrides the authored record
     /// (`--player-pos`, a test aid).
     pub player_pos: Option<[i32; 3]>,
+    /// Print the read-only per-object visibility line (`--cull-report`).
+    ///
+    /// Headless only: it reports the cull view and how many live objects the
+    /// last tick left visible, after the acceptance line. It changes no state.
+    pub cull_report: bool,
     /// Third-person boom distance override in world units (`--cam-distance`).
     pub cam_distance: Option<f32>,
     /// Third-person eye height override in world units (`--cam-height`).
@@ -350,6 +355,7 @@ impl PlayOptions {
             clip_land: None,
             input_script: None,
             player_pos: None,
+            cull_report: false,
             cam_distance: None,
             cam_height: None,
         };
@@ -465,6 +471,11 @@ impl PlayOptions {
                     index += 1;
                     continue;
                 }
+                "--cull-report" => {
+                    options.cull_report = true;
+                    index += 1;
+                    continue;
+                }
                 other => return Err(PlayError::UnknownOption(other.to_string())),
             }
             index += 2;
@@ -478,6 +489,9 @@ impl PlayOptions {
         }
         if options.input_script.is_some() && !options.headless {
             return Err(PlayError::InputScriptRequiresHeadless);
+        }
+        if options.cull_report && !options.headless {
+            return Err(PlayError::CullReportRequiresHeadless);
         }
         if options.headless {
             if options.ticks.is_none() {
@@ -541,6 +555,7 @@ pub enum PlayError {
     InvalidClip(String),
     InvalidInputScript(String),
     InputScriptRequiresHeadless,
+    CullReportRequiresHeadless,
     InvalidPlayerPos(String),
     InvalidCamDistance(String),
     InvalidCamHeight(String),
@@ -583,6 +598,10 @@ impl fmt::Display for PlayError {
             Self::InputScriptRequiresHeadless => write!(
                 f,
                 "--input-script requires --headless: the diagnostic is a fixed-tick run"
+            ),
+            Self::CullReportRequiresHeadless => write!(
+                f,
+                "--cull-report requires --headless: the diagnostic is a fixed-tick run"
             ),
             Self::InvalidPlayerPos(value) => write!(
                 f,
@@ -785,6 +804,61 @@ impl HeadlessReport {
     }
 }
 
+/// The read-only `--cull-report` diagnostic contract.
+///
+/// Printed as its own line after the acceptance line, so the acceptance
+/// contract is unchanged. `visible` counts the live objects whose `visible`
+/// flag the last stage-6 pass left set; that is exactly the set the scene
+/// copies into draw items. `activated + culled` is the live count at stage-6
+/// time, before any spawn queued this tick lands in stage 18.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CullReport {
+    pub eye: [i32; 3],
+    pub radius: i32,
+    pub live: usize,
+    pub visible: usize,
+    pub activated: usize,
+    pub culled: usize,
+}
+
+impl CullReport {
+    /// Render the exact diagnostic line. Field order is part of the contract.
+    pub fn line(&self) -> String {
+        format!(
+            "cull eye={},{},{} radius={} live={} visible={} activated={} culled={}",
+            self.eye[0],
+            self.eye[1],
+            self.eye[2],
+            self.radius,
+            self.live,
+            self.visible,
+            self.activated,
+            self.culled,
+        )
+    }
+}
+
+/// Build the diagnostic from the frame state the last tick left behind.
+///
+/// Pure and read-only: it reads the view, the live arena and the stage-2
+/// scratch block and changes nothing.
+fn cull_report(frame: &FrameState) -> CullReport {
+    let view = frame.view();
+    let scratch = frame.scratch();
+    CullReport {
+        eye: view.eye,
+        radius: view.radius,
+        live: frame.live().len(),
+        visible: frame
+            .live()
+            .iter()
+            .filter(|(_, object)| object.visible)
+            .count(),
+        activated: scratch.activated(),
+        culled: scratch.culled(),
+    }
+}
+
 /// One-time placed-database counts produced by the headless boot pass.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct SeedCounts {
@@ -930,6 +1004,7 @@ fn headless_run_with_actors(
     let counts = boot_world(frame, bigfile)?;
     let mut start = 0;
     if ticks > 0 {
+        frame.cull_to_player();
         frame
             .run_tick(ObjectTick::step(0))
             .map_err(RunError::engine)?;
@@ -947,6 +1022,7 @@ fn finish_headless(
     start: u64,
 ) -> Result<HeadlessReport, RunError> {
     for index in start..u64::from(ticks) {
+        frame.cull_to_player();
         frame
             .run_tick(ObjectTick::step(index))
             .map_err(RunError::engine)?;
@@ -975,6 +1051,9 @@ fn run_headless(
     let report =
         headless_run_with_actors(&mut frame, &options.bigfile, ticks, assets, options)?;
     outln!("{}", report.line());
+    if options.cull_report {
+        outln!("{}", cull_report(&frame).line());
+    }
     Ok(())
 }
 
@@ -1066,6 +1145,7 @@ pub fn run_script_ticks(
     for index in 0..ticks {
         let before = frame.player_position();
         apply_script_tick(frame, script, index);
+        frame.cull_to_player();
         frame
             .run_tick(ObjectTick::step(index))
             .map_err(RunError::engine)?;
@@ -1103,6 +1183,9 @@ fn run_scripted(
     // movement report and state untouched.
     let _actors = load_actor_animations(&frame, assets, options)?;
     outln!("{}", report.line());
+    if options.cull_report {
+        outln!("{}", cull_report(&frame).line());
+    }
     Ok(())
 }
 
@@ -1772,9 +1855,9 @@ impl ApplicationHandler for PlayApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        CameraMode, InputScript, PLAYER_CAMERA_DISTANCE, PLAYER_CAMERA_HEIGHT,
+        CameraMode, CullReport, InputScript, PLAYER_CAMERA_DISTANCE, PLAYER_CAMERA_HEIGHT,
         PLAYER_FALLBACK_YAW_BINARY, PLAYER_LOOK_HEIGHT, PlayError, PlayOptions, RunError,
-        apply_script_tick, player_camera_world, run_script_ticks, third_person_mvp,
+        apply_script_tick, cull_report, player_camera_world, run_script_ticks, third_person_mvp,
     };
     use crate::engine::clock::ObjectTick;
     use crate::engine::collision::CollisionMesh;
@@ -2561,6 +2644,19 @@ mod tests {
         );
     }
 
+    /// A zone whose spawn sits far from the world origin, like the real
+    /// `cathy28` (`raziel` at `-2849,5455,11510`).
+    fn offset_world() -> World {
+        World::from_report(
+            "cathy28".to_string(),
+            1,
+            &report(vec![
+                record("raziel", [9000, -7000, 11510]),
+                record("monster_wallcr", [9600, -7000, 11510]),
+            ]),
+        )
+    }
+
     #[test]
     fn camera_distance_and_height_overrides_move_the_eye() {
         let player = [0.0, 0.0, 0.0];
@@ -2596,6 +2692,62 @@ mod tests {
                 "height {raw}"
             );
         }
+    }
+
+    #[test]
+    fn cull_report_line_is_the_documented_contract() {
+        let report = CullReport {
+            eye: [-2849, 5455, 11505],
+            radius: 4096,
+            live: 8,
+            visible: 8,
+            activated: 8,
+            culled: 0,
+        };
+        assert_eq!(
+            report.line(),
+            "cull eye=-2849,5455,11505 radius=4096 live=8 visible=8 activated=8 culled=0"
+        );
+    }
+
+    #[test]
+    fn cull_report_is_a_headless_only_diagnostic() {
+        assert_eq!(
+            parse(&["--bigfile", "B", "--cull-report"]),
+            Err(PlayError::CullReportRequiresHeadless)
+        );
+        let options = parse(&["--bigfile", "B", "--headless", "--cull-report"])
+            .expect("headless accepts the diagnostic");
+        assert!(options.cull_report);
+        assert!(
+            !parse(&["--bigfile", "B", "--headless"])
+                .expect("plain headless")
+                .cull_report
+        );
+    }
+
+    #[test]
+    fn scripted_ticks_cull_from_the_player_so_an_offset_zone_is_visible() {
+        let mut frame = FrameState::new(offset_world());
+        frame.queue_spawn("monster_wallcr", [9600, -7000, 11510]);
+        let report =
+            run_script_ticks(&mut frame, &InputScript::default(), 2).expect("script ticks");
+        assert!(report.player_bound);
+        assert_eq!(
+            frame.view().eye,
+            frame.player_position().expect("the player is bound"),
+            "the cull eye follows the player, not the world origin"
+        );
+        assert_eq!(frame.view().radius, crate::engine::frame::DEFAULT_CULL_RADIUS);
+        let rendered = frame
+            .live()
+            .iter()
+            .filter(|(_, object)| object.visible)
+            .count();
+        assert_eq!(rendered, 2, "the player body and the nearby enemy are drawn");
+        let diagnostic = cull_report(&frame);
+        assert_eq!(diagnostic.visible, 2);
+        assert_eq!(diagnostic.culled, 0);
     }
 
     #[test]

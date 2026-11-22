@@ -502,6 +502,32 @@ impl FrameState {
         self.view = view;
     }
 
+    /// The view stage 6 will use on the next tick.
+    pub fn view(&self) -> CullView {
+        self.view
+    }
+
+    /// Point the stage-6 cull eye at the bound player, keeping
+    /// [`DEFAULT_CULL_RADIUS`].
+    ///
+    /// The third-person camera follows the player, so distance culling must
+    /// agree with it. The original culls around the camera; a fixed origin eye
+    /// hides every actor in a zone whose spawn sits far from the world origin
+    /// (see `docs/notes/play-culling.md`).
+    ///
+    /// The eye is the player's position as of the **last completed tick**,
+    /// captured before the next tick's stages run. That makes the view a pure
+    /// function of the state the tick starts from, so a replay is identical; a
+    /// playerless world keeps whatever view it already has.
+    pub fn cull_to_player(&mut self) {
+        if let Some(eye) = self.player_position() {
+            self.view = CullView {
+                eye,
+                radius: DEFAULT_CULL_RADIUS,
+            };
+        }
+    }
+
     pub fn queue_input(&mut self, event: InputEvent) {
         self.input_queue.push(event);
     }
@@ -644,6 +670,7 @@ impl FrameState {
         let batch = self.clock.advance(delta);
         let count = batch.len();
         for tick in batch.ticks() {
+            self.cull_to_player();
             self.run_tick(*tick)?;
         }
         Ok(count)
@@ -1046,7 +1073,8 @@ fn hooks_for_class(class: RenderClass) -> Hooks {
 #[cfg(test)]
 mod tests {
     use super::{
-        CullView, FrameState, FrameStats, PLAYER_SPEED_UNITS_PER_TICK, STAGE_ORDER, Stage,
+        CullView, DEFAULT_CULL_RADIUS, FrameState, FrameStats, PLAYER_SPEED_UNITS_PER_TICK,
+        STAGE_ORDER, Stage,
     };
     use crate::engine::actor::ActorProfile;
     use crate::engine::collision::CollisionMesh;
@@ -1582,6 +1610,153 @@ mod tests {
         assert_eq!(frame.queued_input_len(), 0);
         assert_eq!(frame.player_position(), Some(before));
         assert_eq!(frame.ticks(), 60);
+    }
+
+    /// A zone whose spawn sits far from the world origin, like the real
+    /// `cathy28` (`raziel` at `-2849,5455,11510`). The second object is 600
+    /// units away, well inside the default radius but far outside it when the
+    /// eye is pinned to the origin.
+    fn world_spawned_far_from_origin() -> World {
+        World::from_report(
+            "cathy28".to_string(),
+            1,
+            &ObjectReport {
+                room_offset: 0,
+                count: 2,
+                array_offset: 0,
+                objects: vec![
+                    record("raziel", [9000, -7000, 11510]),
+                    record("monster_wallcr", [9600, -7000, 11510]),
+                ],
+            },
+        )
+    }
+
+    #[test]
+    fn an_origin_fixed_eye_culls_every_actor_in_an_offset_zone() {
+        // The regression fixture: without the driver sync, stage 6 uses
+        // `CullView::default()` and both actors are outside the 4096 radius.
+        let mut frame = FrameState::new(world_spawned_far_from_origin());
+        frame.queue_spawn("monster_wallcr", [9600, -7000, 11510]);
+        tick(&mut frame, 0); // stage 18 realizes the enemy after tick 0
+        assert_eq!(frame.live().len(), 2);
+        assert_eq!(frame.view(), CullView::default());
+
+        tick(&mut frame, 1);
+        assert_eq!(
+            frame.scratch().activated(),
+            0,
+            "the origin eye must not reach the offset spawn"
+        );
+        assert_eq!(frame.scratch().culled(), 2);
+        let player = frame.player().expect("the player is bound");
+        assert!(!frame.live().get(player).expect("live player").visible);
+    }
+
+    #[test]
+    fn cull_follows_the_player_so_an_offset_zone_draws_its_actors() {
+        let mut frame = FrameState::new(world_spawned_far_from_origin());
+        frame.queue_spawn("monster_wallcr", [9600, -7000, 11510]);
+        let spawn = frame.player_position().expect("the player is bound");
+        frame.cull_to_player();
+        assert_eq!(
+            frame.view(),
+            CullView {
+                eye: spawn,
+                radius: DEFAULT_CULL_RADIUS,
+            }
+        );
+        tick(&mut frame, 0);
+        frame.cull_to_player();
+        tick(&mut frame, 1);
+
+        assert_eq!(frame.scratch().activated(), 2, "player and nearby enemy");
+        assert_eq!(frame.scratch().culled(), 0);
+        let player = frame.player().expect("the player is bound");
+        assert!(
+            frame.live().get(player).expect("live player").visible,
+            "the player body must be drawn once the eye follows it"
+        );
+        assert!(
+            frame
+                .live()
+                .iter()
+                .find(|(_, object)| object.name == "monster_wallcr")
+                .map(|(_, object)| object.visible)
+                .unwrap_or(false),
+            "the enemy inside the radius must survive the cull"
+        );
+    }
+
+    #[test]
+    fn a_playerless_world_keeps_its_view() {
+        let mut frame = FrameState::new(empty_world());
+        let custom = CullView {
+            eye: [1, 2, 3],
+            radius: 10,
+        };
+        frame.set_view(custom);
+        frame.cull_to_player();
+        assert_eq!(frame.view(), custom, "no bound player, no view change");
+    }
+
+    #[test]
+    fn the_origin_player_keeps_the_default_view_and_the_under1_digest() {
+        // Determinism guard. With the player at the origin the eye is [0,0,0],
+        // which equals `CullView::default()`. `under1` therefore folds the same
+        // visibility bytes as before this change and its 60-tick digest stays
+        // `ede39c540a10ee39`. Any other unit may legitimately change digest.
+        let mut frame = FrameState::new(world_with_raziel());
+        assert_eq!(frame.player_position(), Some([0, 0, 0]));
+        frame.cull_to_player();
+        assert_eq!(frame.view(), CullView::default());
+    }
+
+    #[test]
+    fn the_frame_driver_points_the_cull_at_the_player_each_tick() {
+        let mut frame = FrameState::new(world_spawned_far_from_origin());
+        let spawn = frame.player_position().expect("the player is bound");
+        assert_eq!(frame.view(), CullView::default());
+        frame
+            .frame(Duration::from_secs(1))
+            .expect("the synthetic frame must tick");
+        assert!(frame.ticks() > 0, "one second runs real fixed ticks");
+        assert_eq!(
+            frame.view(),
+            CullView {
+                eye: spawn,
+                radius: DEFAULT_CULL_RADIUS,
+            },
+            "the windowed driver must feed the player eye back into stage 6"
+        );
+    }
+
+    #[test]
+    fn the_live_player_body_tracks_the_player_position_as_it_moves() {
+        // The scene copies `LiveObject.position` into `DrawItem.world`, so this
+        // is the body's rendered position. Requirement: it must equal
+        // `player_position()` and follow a committed move, not stay at spawn.
+        let mut frame = frame();
+        let player = frame.player().expect("the player is bound");
+        let spawn = frame.live().get(player).expect("live player").position;
+
+        frame.queue_input(InputEvent::press(InputButton::Forward));
+        tick(&mut frame, 0);
+
+        let moved = frame.player_position().expect("the player is bound");
+        assert_eq!(moved, [0, PLAYER_SPEED_UNITS_PER_TICK, 0], "forward is +Y");
+        assert_ne!(moved, spawn);
+        assert_eq!(
+            frame.live().get(player).expect("live player").position,
+            moved,
+            "the live entry the scene reads must carry the moved position"
+        );
+        let draw = frame
+            .scene()
+            .iter()
+            .find(|item| item.id == player)
+            .expect("stage 15 snapshots the player");
+        assert_eq!(draw.position, moved, "the drawn body follows the player");
     }
 
     #[test]
