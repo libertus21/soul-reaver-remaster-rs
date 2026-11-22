@@ -25,6 +25,7 @@ use winit::window::{Window, WindowId};
 
 use crate::cli_out::outln;
 use crate::engine::actor::ActorProfile;
+use crate::engine::actors::ActorAnimations;
 use crate::engine::assets::{AssetRequest, AssetStore, ImmediateSource};
 use crate::engine::backend_wgpu::WgpuBackend;
 use crate::engine::class::RenderClass;
@@ -33,7 +34,7 @@ use crate::engine::determinism::world_state_hash;
 use crate::engine::frame::{FrameError, FrameState, PLAYER_NAME};
 use crate::engine::input::{InputButton, InputEvent};
 use crate::engine::render_backend::RenderBackend;
-use crate::engine::scene::{CameraView, PlayerFacing, SceneAssets};
+use crate::engine::scene::{ActorPose, CameraView, PlayerFacing, SceneAssets};
 use crate::engine::spawn::{Admission, EngineNameTable};
 use crate::engine::world::{World, WorldError};
 use crate::object_texture::PageBank;
@@ -197,7 +198,20 @@ pub struct PlayOptions {
     pub headless: bool,
     pub camera: CameraMode,
     /// Presentation-only `.SRA` animation resource for the player mesh.
+    ///
+    /// This is the single-actor override; it keeps the explicit/default clip
+    /// map and applies only to the player. Per-actor resolution lives in
+    /// [`PlayOptions::sra_dir`].
     pub sra: Option<PathBuf>,
+    /// Directory of per-actor `.SRA` files (`--sra-dir <DIR>`).
+    ///
+    /// Each live actor name resolves its own `<UPPERNAME>.SRA` case-insensitively.
+    pub sra_dir: Option<PathBuf>,
+    /// Persistent per-file label store (`--labels-store <FILE>`).
+    ///
+    /// Defaults to the probe's `~/.sr1_clip_labels.json`. Only read when a
+    /// directory was supplied.
+    pub labels_store: Option<PathBuf>,
     /// Presentation playback rate, in frames per second for a divisor-100 clip.
     pub anim_fps: u32,
     /// Whether the animation wraps (`false`) or holds the last frame (`true`).
@@ -230,6 +244,16 @@ pub struct PlayOptions {
 
 impl PlayOptions {
     pub const DEFAULT_UNIT: &'static str = "under1";
+
+    /// The label store path, explicit or the probe's documented default.
+    ///
+    /// The default is `~/.sr1_clip_labels.json`, resolved from `USERPROFILE`
+    /// (Windows) or `HOME`. No absolute path is compiled in: when neither
+    /// variable exists the store is read from the current directory and a
+    /// missing file simply leaves every label at rest.
+    pub fn labels_store_path(&self) -> PathBuf {
+        self.labels_store.clone().unwrap_or_else(default_labels_store)
+    }
 
     /// Resolve the state-to-clip mapping against the loaded clip count.
     ///
@@ -279,6 +303,8 @@ impl PlayOptions {
             headless: false,
             camera: CameraMode::Fly,
             sra: None,
+            sra_dir: None,
+            labels_store: None,
             anim_fps: ANIMATION_FPS,
             anim_once: false,
             clip: None,
@@ -317,6 +343,13 @@ impl PlayOptions {
                 }
                 "--sra" => {
                     options.sra = Some(PathBuf::from(value(args, index, "--sra")?));
+                }
+                "--sra-dir" => {
+                    options.sra_dir = Some(PathBuf::from(value(args, index, "--sra-dir")?));
+                }
+                "--labels-store" => {
+                    options.labels_store =
+                        Some(PathBuf::from(value(args, index, "--labels-store")?));
                 }
                 "--anim-fps" => {
                     let raw = value(args, index, "--anim-fps")?;
@@ -418,6 +451,16 @@ impl PlayOptions {
         }
         Ok(options)
     }
+}
+
+/// The probe's default label store, resolved at runtime from the environment.
+fn default_labels_store() -> PathBuf {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map_or_else(
+            || PathBuf::from(".sr1_clip_labels.json"),
+            |home| Path::new(&home).join(".sr1_clip_labels.json"),
+        )
 }
 
 fn value<'a>(
@@ -634,9 +677,9 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
     if options.headless {
         let ticks = options.ticks.unwrap_or(60);
         if let Some(script) = &options.input_script {
-            return run_scripted(frame, script, ticks, &options.bigfile);
+            return run_scripted(frame, script, ticks, options, &mut assets);
         }
-        return run_headless(frame, ticks, &options.bigfile);
+        return run_headless(frame, ticks, options, &mut assets);
     }
 
     run_windowed(
@@ -802,16 +845,55 @@ fn boot_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunE
 
 /// Run the fixed tick sequence and build the acceptance report.
 ///
-/// This is the production headless path: the digest is computed with the same
-/// [`world_state_hash`] the determinism gate pins. Any tracker overflow becomes
-/// [`RunError::Invariant`] (exit 4).
+/// Test-only plain variant: the production path is
+/// [`headless_run_with_actors`], which runs the same ticks plus the one-time
+/// actor load. The digest is computed with the same [`world_state_hash`] the
+/// determinism gate pins. Any tracker overflow becomes [`RunError::Invariant`]
+/// (exit 4).
+#[cfg(test)]
 fn headless_run(
     frame: &mut FrameState,
     bigfile: &Path,
     ticks: u32,
 ) -> Result<HeadlessReport, RunError> {
     let counts = boot_world(frame, bigfile)?;
-    for index in 0..u64::from(ticks) {
+    finish_headless(frame, counts, ticks, 0)
+}
+
+/// Production headless path: boot, resolve and report per-actor animation, then
+/// run the same fixed ticks.
+///
+/// The boot pass defers its spawns to the post-frame stage, so the first tick is
+/// the point where the live list holds every boot actor. Running that tick is
+/// not extra work: the remaining ticks start at 1. Loading animation only reads
+/// files and never touches `FrameState`, so the digest cannot move.
+fn headless_run_with_actors(
+    frame: &mut FrameState,
+    bigfile: &Path,
+    ticks: u32,
+    assets: &mut SceneAssets,
+    options: &PlayOptions,
+) -> Result<HeadlessReport, RunError> {
+    let counts = boot_world(frame, bigfile)?;
+    let mut start = 0;
+    if ticks > 0 {
+        frame
+            .run_tick(ObjectTick::step(0))
+            .map_err(RunError::engine)?;
+        let _actors = load_actor_animations(frame, assets, options)?;
+        start = 1;
+    }
+    finish_headless(frame, counts, ticks, start)
+}
+
+/// The fixed-tick tail shared by the plain and per-actor headless paths.
+fn finish_headless(
+    frame: &mut FrameState,
+    counts: SeedCounts,
+    ticks: u32,
+    start: u64,
+) -> Result<HeadlessReport, RunError> {
+    for index in start..u64::from(ticks) {
         frame
             .run_tick(ObjectTick::step(index))
             .map_err(RunError::engine)?;
@@ -831,10 +913,46 @@ fn headless_run(
     })
 }
 
-fn run_headless(mut frame: FrameState, ticks: u32, bigfile: &Path) -> Result<(), RunError> {
-    let report = headless_run(&mut frame, bigfile, ticks)?;
+fn run_headless(
+    mut frame: FrameState,
+    ticks: u32,
+    options: &PlayOptions,
+    assets: &mut SceneAssets,
+) -> Result<(), RunError> {
+    let report =
+        headless_run_with_actors(&mut frame, &options.bigfile, ticks, assets, options)?;
     outln!("{}", report.line());
     Ok(())
+}
+
+/// Load per-actor animation when `--sra-dir` is active, printing the bounded
+/// load-time diagnostic. Without a directory this is an empty set and prints
+/// nothing, which keeps the default headless contract identical.
+fn load_actor_animations(
+    frame: &FrameState,
+    assets: &mut SceneAssets,
+    options: &PlayOptions,
+) -> Result<ActorAnimations, RunError> {
+    if options.sra_dir.is_none() {
+        return Ok(ActorAnimations::default());
+    }
+    let store = options.labels_store_path();
+    // `--sra` is the player's single-actor override: when it is present the
+    // per-actor set must not also bind the player, or the override wins only by
+    // chance of ordering. The player keeps the legacy selector.
+    let exclude = options.sra.is_some().then(|| frame.player()).flatten();
+    let actors = ActorAnimations::load(
+        frame,
+        assets,
+        options.sra_dir.as_deref(),
+        Some(store.as_path()),
+        exclude,
+    )
+    .map_err(RunError::Scene)?;
+    for line in actors.diagnostic_lines() {
+        outln!("{line}");
+    }
+    Ok(actors)
 }
 
 /// The stable one-line `--input-script` diagnostic contract.
@@ -922,10 +1040,15 @@ fn run_scripted(
     mut frame: FrameState,
     script: &InputScript,
     ticks: u32,
-    bigfile: &Path,
+    options: &PlayOptions,
+    assets: &mut SceneAssets,
 ) -> Result<(), RunError> {
-    let _counts = boot_world(&mut frame, bigfile)?;
+    let _counts = boot_world(&mut frame, &options.bigfile)?;
     let report = run_script_ticks(&mut frame, script, u64::from(ticks))?;
+    // The scripted run has already realized every deferred spawn. Resolving the
+    // one-time actor diagnostic here is still presentation-only and leaves the
+    // movement report and state untouched.
+    let _actors = load_actor_animations(&frame, assets, options)?;
     outln!("{}", report.line());
     Ok(())
 }
@@ -970,6 +1093,11 @@ fn open_window(
 ) -> Result<(), RunError> {
     let mode = options.camera;
     let unit = options.unit.as_str();
+    // The boot spawns land on the first tick, so per-actor animation is resolved
+    // lazily then (one pass, never per frame) instead of seeing only the player.
+    let actor_dir = options.sra_dir.clone();
+    let actor_store = options.labels_store_path();
+    let actor_exclude = options.sra.is_some().then(|| frame.player()).flatten();
     // The initial scene is the complete set of pages the first frame draws.
     // Decoding them here keeps a bad page strictly before the window.
     {
@@ -1011,6 +1139,11 @@ fn open_window(
         title: format!("soul reaver - {unit}"),
         animation,
         clip_selector,
+        actors: ActorAnimations::default(),
+        actors_loaded: actor_dir.is_none(),
+        actor_dir,
+        actor_store,
+        actor_exclude,
         anim_fps: options.anim_fps,
         anim_policy: if options.anim_once {
             PlaybackLoop::Once
@@ -1219,6 +1352,16 @@ struct PlayApp {
     animation: Option<crate::sra::SraAnimation>,
     /// State-driven clip selector; `None` when `--sra` is inactive.
     clip_selector: Option<ClipSelector>,
+    /// Per-actor animations from `--sra-dir`; empty when it is inactive.
+    actors: ActorAnimations,
+    /// Whether the one-time per-actor load has run (or cannot run).
+    actors_loaded: bool,
+    /// `--sra-dir`, kept until the first tick realizes the boot spawns.
+    actor_dir: Option<PathBuf>,
+    /// `--labels-store` or its documented default.
+    actor_store: PathBuf,
+    /// Player id excluded from the per-actor set when `--sra` is its override.
+    actor_exclude: Option<crate::engine::live::LiveId>,
     anim_fps: u32,
     anim_policy: PlaybackLoop,
 }
@@ -1268,6 +1411,62 @@ impl PlayApp {
             yaw_binary: yaw.unwrap_or(0.0),
             animation,
         })
+    }
+
+    /// Every live actor's pose for this frame.
+    ///
+    /// Per-actor animations from `--sra-dir` are observed first; the legacy
+    /// single-file `--sra` player pose is added only when the per-actor set did
+    /// not already cover that id. The player still turns on its produced yaw
+    /// even when it has no clip, exactly as the no-animation path did.
+    fn actor_poses(&mut self) -> Vec<ActorPose> {
+        let tick = self.frame.ticks();
+        let player = self.frame.player();
+        let player_yaw = self.frame.player_yaw_binary();
+        let fps = self.anim_fps;
+        let policy = self.anim_policy;
+        let mut poses = self.actors.poses(
+            self.frame.live(),
+            tick,
+            fps,
+            policy,
+            player,
+            player_yaw,
+        );
+        if let Some(facing) = self.player_facing()
+            && !poses.iter().any(|pose| pose.actor == facing.player)
+        {
+            poses.push(ActorPose {
+                actor: facing.player,
+                yaw_binary: facing.yaw_binary,
+                animation: facing.animation,
+            });
+        }
+        poses
+    }
+
+    /// Resolve per-actor animation once, after the first tick realized the
+    /// boot spawns. Skipped when no directory was supplied.
+    fn load_actors_if_ready(&mut self) -> Result<(), String> {
+        if self.actors_loaded || self.frame.ticks() == 0 {
+            return Ok(());
+        }
+        self.actors_loaded = true;
+        let Some(directory) = self.actor_dir.as_deref() else {
+            return Ok(());
+        };
+        let actors = ActorAnimations::load(
+            &self.frame,
+            &mut self.assets,
+            Some(directory),
+            Some(self.actor_store.as_path()),
+            self.actor_exclude,
+        )?;
+        for line in actors.diagnostic_lines() {
+            outln!("{line}");
+        }
+        self.actors = actors;
+        Ok(())
     }
 
     fn camera_view(&mut self, aspect: f32) -> CameraView {
@@ -1476,9 +1675,9 @@ impl ApplicationHandler for PlayApp {
             WindowEvent::RedrawRequested => {
                 let aspect = self.aspect();
                 let camera = self.camera_view(aspect);
-                let facing = self.player_facing();
+                let poses = self.actor_poses();
                 let live = self.frame.live();
-                let scene = self.assets.build_with_facing(live, camera, facing);
+                let scene = self.assets.build_with_poses(live, camera, &poses);
                 if let Some(backend) = &mut self.backend {
                     if let Err(error) = backend.draw(&scene) {
                         self.init_error = Some(error.to_string());
@@ -1503,6 +1702,11 @@ impl ApplicationHandler for PlayApp {
         self.last_dt = dt;
         if let Err(error) = self.frame.frame(Duration::from_secs_f32(dt)) {
             self.init_error = Some(format!("simulation tick failed: {error}"));
+            event_loop.exit();
+            return;
+        }
+        if let Err(error) = self.load_actors_if_ready() {
+            self.init_error = Some(error);
             event_loop.exit();
             return;
         }
@@ -1590,6 +1794,9 @@ mod tests {
         assert!(!options.headless);
         assert_eq!(options.camera, CameraMode::Fly);
         assert_eq!(options.sra, None);
+        assert_eq!(options.sra_dir, None);
+        assert_eq!(options.labels_store, None);
+        assert!(options.labels_store_path().ends_with(".sr1_clip_labels.json"));
         assert_eq!(options.anim_fps, super::ANIMATION_FPS);
         assert!(!options.anim_once);
         assert_eq!(
@@ -1626,6 +1833,10 @@ mod tests {
             "player",
             "--sra",
             "RAZIEL.SRA",
+            "--sra-dir",
+            "OBJECT",
+            "--labels-store",
+            "labels.json",
             "--anim-fps",
             "20",
             "--anim-once",
@@ -1638,6 +1849,8 @@ mod tests {
         assert!(options.headless);
         assert_eq!(options.camera, CameraMode::Player);
         assert_eq!(options.sra, Some(PathBuf::from("RAZIEL.SRA")));
+        assert_eq!(options.sra_dir, Some(PathBuf::from("OBJECT")));
+        assert_eq!(options.labels_store, Some(PathBuf::from("labels.json")));
         assert_eq!(options.anim_fps, 20);
         assert!(options.anim_once);
     }

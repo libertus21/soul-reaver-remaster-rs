@@ -658,11 +658,70 @@ CLI:
     [--clip-idle <N>] [--clip-walk <N>]
     [--clip-jump <N>]                 shortcut: sets jump-up, fall and land
     [--clip-jump-up <N>] [--clip-fall <N>] [--clip-land <N>]
+--play ... --sra-dir <DIR> \
+    [--labels-store <FILE>]           per-actor clips from the stored labels
 ```
 
 `--clip-jump <N>` sets all three airborne states together as a testing
 shortcut; an explicit per-state flag wins for that state. Every index is
 validated strictly against the decoded clip count (`ClipError::OutOfRange`).
+
+### Per-actor consumption contract (`--sra-dir`, 2026-11-21)
+
+`--sra <FILE>` remains the single-actor override for the player. It keeps the
+explicit/default five-state map and is not bound by the per-actor store.
+
+`--sra-dir <DIR>` binds every live actor to its own file. The rules are:
+
+1. **Resolution is the actor name, not the model entry.** For a live actor
+   named `sluagh`, the engine looks for `<DIR>/SLUAGH.SRA`, comparing the file
+   stem ASCII case-insensitively. Only direct `.SRA` files in that directory
+   participate. A miss is reported once, at load, as
+   `actor name=<n> sra=unresolved rest=1`; it is never retried per frame.
+2. **The actor key is the live actor block.** A live object is an actor when it
+   carries an actor block (`LiveObject::actor`) or has the `Raziel`/`Monster`
+   class. Props, markers and particles are not actors.
+3. **The slot count is the model's bone count.** The `.SRA` has no slot field,
+   so the file is loaded against the same bone count the model resolver reports
+   for that actor. A file that cannot decode for that slot count is unresolved
+   and stays at rest.
+4. **The store is the only label source.** The probe's
+   `~/.sr1_clip_labels.json` entry for the uppercase file name is read field by
+   field. A field may be a JSON string (`"55"`) or a JSON number; `"unknown"`,
+   `null`, a missing field or a missing store file is **rest** for that state.
+   The indices are per file: a label from `SLUAGH.SRA` is never applied to
+   `RAZIEL.SRA`.
+5. **Out-of-range labels are dropped, not clamped.** If the loaded file decodes
+   fewer clips than the stored label names, that state becomes rest. Clamping to
+   the last table would name a different clip than the one measured.
+6. **Missing evidence is the rest pose.** A state with no measured label plays
+   no clip at all. It never borrows the player's confirmed `55/2/35/36/37` map
+   and never guesses an index. An actor with no store entry therefore animates
+   nothing and is reported; that is the designed outcome, not a fallback bug.
+
+Each resolved actor owns its own `ClipSelector`, `MotionTracker` and landing
+window, so two instances of the same model can be in different states. Actor
+motion comes from the per-object integer position delta the engine already
+keeps: horizontal delta selects idle/walk, vertical delta selects ascending or
+falling, and the return to a zero delta opens the derived landing window. The
+player keeps its existing grounded/velocity signals, and its produced yaw still
+turns the body when it has no clip.
+
+The load is one pass, after the first tick has realized the boot spawns. It
+reads files and prints diagnostics only; it never writes `FrameState`, so no
+animation state enters the canonical fold and the headless digests
+(`under1` `ede39c540a10ee39`) cannot move.
+
+```text
+actors resolved=3 unresolved=1 labelled=3 rest=1
+actor name=raziel sra=RAZIEL.SRA clips=230 labels=idle=0,walk=2,jump_up=0,fall=0,land=-
+actor name=sluagh sra=SLUAGH.SRA clips=23 labels=idle=8,walk=1,jump_up=-,fall=-,land=-
+actor name=soul sra=unresolved rest=1
+```
+
+`resolved` and `unresolved` count actor instances; `labelled` counts resolved
+actors with at least one measured state, and `rest` counts every actor that
+plays no clip. Per-actor lines are deduplicated by name and printed once.
 
 ## Offline clip ranking (`--animate --rank-clips`)
 
