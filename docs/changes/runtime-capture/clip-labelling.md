@@ -8,7 +8,8 @@ failure of the heuristic, the packed and keyed fingerprint schemes, the
 segment aggregation, the keyed-locomotion hypothesis, the per-jump aligned
 template that now carries the jump result, the whole-directory index that
 attributes each actor to its source file, the persistent per-file store that
-lets one encounter per actor type accumulate across sessions, and the exact
+lets one encounter per actor type accumulate across sessions, the run-length
+gate that accepts a phase only when its dominant clip is held, and the exact
 operator procedure. The probe itself stays in the session scratch directory
 because it carries module-relative anchors and engine field offsets.
 
@@ -435,11 +436,11 @@ Each measured object prints one bounded block:
 
 ```text
 ACTOR id=<hex> slots=66 samples=44 identity=STABLE
-PHASE id=<hex> name=idle frames=22 clips=55:0.91,2:0.09 dominant=55 coverage=0.91
-PHASE id=<hex> name=walk frames=22 clips=2:1.00 dominant=2 coverage=1.00
-PHASE id=<hex> name=ascent frames=0 clips=- dominant=unknown coverage=0.00
-PHASE id=<hex> name=fall frames=0 clips=- dominant=unknown coverage=0.00
-PHASE id=<hex> name=land frames=0 clips=- dominant=unknown coverage=0.00
+PHASE id=<hex> name=idle frames=22 clips=55:0.91,2:0.09 dominant=55 coverage=0.91 run_median=18 run_p90=22 runs=1
+PHASE id=<hex> name=walk frames=22 clips=2:1.00 dominant=2 coverage=1.00 run_median=22 run_p90=22 runs=1
+PHASE id=<hex> name=ascent frames=0 clips=- dominant=unknown coverage=0.00 run_median=0 run_p90=0 runs=0
+PHASE id=<hex> name=fall frames=0 clips=- dominant=unknown coverage=0.00 run_median=0 run_p90=0 runs=0
+PHASE id=<hex> name=land frames=0 clips=- dominant=unknown coverage=0.00 run_median=0 run_p90=0 runs=0
 LABELS id=<hex> slots=66 idle=55 walk=2 jump_up=unknown fall=unknown land=unknown agreement=0.91 source=runtime-motion reason=no-jumps
 ```
 
@@ -462,7 +463,8 @@ the `LABELS` line names the measured reason:
 | `no-motion` | Horizontal speed never exceeded `H_ENTER`, so `walk` is `unknown`. `idle` may still be measured. |
 | `no-idle` | The object never sat below `H_LEAVE`; `idle` is `unknown`. |
 | `no-jumps` | Fewer complete arcs than `--min-jumps`; the jump fields are `unknown`. |
-| `low-agreement` | A phase or bucket existed but its coverage was below `0.40` or the weakest used bucket agreed below `0.60`. |
+| `low-agreement` | A phase or bucket existed but its coverage was below `0.40`, its dominant was `keyed`/`unmapped`, or the weakest used jump bucket agreed below `0.60`. |
+| `low-run-length` | The phase's dominant clip flickered: its median consecutive run was below `RUN_GATE_MIN` (`6`). It was seen intermittently through transitions, not held. |
 | `uncalibrated` | The vertical or horizontal signal failed its sample, finite or range check. |
 | `identity-churn` | Object identity was unstable and no unambiguous alternative key existed; no actor was labelled. |
 
@@ -727,16 +729,106 @@ The free-play run is therefore a **successful measurement of a mixture**, not a
 failed measurement of a state. Its `dominant=` values are the clip that happened
 to win a blend; they are not labels.
 
-**Recommendation.** Do not tune the thresholds and do not change the confirmed
-`55 / 2 / 35 / 36 / 37` map. Labels come from a window where the state is held;
-`--by-motion` free play is a coverage report. Two concrete next steps, both in
-the probe rather than in this note:
+### Why run length is the right discriminator
 
-1. Print a per-phase `runs=<median consecutive-sample run>` beside `coverage=`.
-   A held phase has long runs; a diluted phase has runs near `H_HOLD`. That makes
-   the difference visible instead of inferring it from coverage alone.
-2. Refuse a phase label when its median run is below `2 * H_HOLD` (6 samples),
-   even if coverage happens to clear `0.40`. A blend should say so.
+Coverage alone cannot tell a held phase from a mixture. Free play produced
+`idle dominant=0 coverage=0.30` and `walk dominant=42 coverage=0.33`, while the
+confirmed values are `55` and `2`; the confirmed windows instead produced
+`0.91-1.00`. The difference is not which clip won — it is whether that clip was
+**held**.
+
+The per-sample sequence carries that answer. A held phase is a long run of the
+same clip index; a diluted phase is many short runs, because each transition
+re-enters the previous bucket for up to `H_HOLD` samples and then leaves again.
+For one phase the probe now reports the **dominant clip's** consecutive run
+lengths (ties to the earlier sample; an absent or different sample breaks the
+run):
+
+- `run_median` — the middle run length in samples;
+- `run_p90` — the nearest-rank 90th percentile run;
+- `runs` — how many separate runs the dominant clip formed.
+
+A held phase has a few long runs; a diluted phase has many runs near one sample.
+That is exactly the difference free play and the dedicated windows already
+showed, made visible instead of inferred from coverage.
+
+### The run-length gate and its constant
+
+A phase may contribute a label only when it passes **both** the existing
+frame/coverage floor and the run gate:
+
+```text
+RUN_GATE_MIN = 2 * H_HOLD = 6 samples
+```
+
+The derivation is the leak bound. A state change is committed only after
+`H_HOLD` consecutive samples, so at each change up to `H_HOLD` samples can still
+carry the previous phase's clip. A genuine hold must therefore span at least
+twice that leak to be distinguishable from the transition itself. With the
+default `H_HOLD = 3`, a phase whose dominant clip never holds for six samples is
+a transition pattern, not a state.
+
+The gate reads the run statistics from the same ordered sample sequence that
+feeds coverage, so a phase can pass coverage and still be refused:
+
+```text
+PHASE id=<hex> name=walk frames=180 clips=2:0.91,24:0.09 dominant=2 coverage=0.91 run_median=12 run_p90=19 runs=15
+```
+
+The store records `run_median` beside `agreement`, so a consumer can see whether
+the value that set an entry actually held.
+
+### Two distinct unknown reasons
+
+The run gate adds a reason that must not be confused with the coverage floor:
+
+| Reason | Measured condition | Reading |
+|---|---|---|
+| `low-agreement` | The dominant clip's coverage is below `0.40`, or the dominant is `keyed`/`unmapped`, or a jump bucket agreed below `0.60`. | The phase was thin or blended; no clip was a stable winner. |
+| `low-run-length` | Coverage cleared `0.40`, but the dominant clip's `run_median` is below `RUN_GATE_MIN`. | A clip won the histogram by flickering through transitions; it was never held. |
+
+Both are honest `unknown` results, and they are reported per field, not per
+actor. An actor can pass one phase and fail another: the `LABELS` line keeps the
+measured value for the held phase and prints `unknown` plus the reason for the
+flickering one, for example `idle=55 walk=unknown ... reason=low-run-length`.
+A phase that passes the run gate but fails coverage reports `low-agreement`, so
+the two causes stay separable in the output.
+
+### Revised procedure
+
+Free-play observation is now usable for phases that hold, and a still-degraded
+phase is reported rather than guessed:
+
+1. Run the default `--by-motion` mode as before; no steady rhythm is required.
+2. Read the `PHASE` lines. `coverage` and `run_median`/`run_p90`/`runs` must
+   agree: a high coverage with `run_median` below `6` is a mixture, not a label.
+3. Read the `LABELS` line. A numeric field passed both gates. An `unknown` field
+   names which gate it failed: `low-run-length` asks for a longer hold;
+   `low-agreement` asks for a cleaner phase. Repeat the behaviour that held
+   rather than forcing a value.
+
+Do not tune `H_ENTER`/`H_LEAVE`/`H_HOLD` for free play, and do not change the
+confirmed `55 / 2 / 35 / 36 / 37` map. The gate is a discriminator, not a
+threshold to chase.
+
+### What the run-length gate cannot establish
+
+- **A held clip is not a semantic state.** A long run proves the engine selected
+  one table for at least `2 * H_HOLD` consecutive samples. It does not name the
+  pose or prove the state machine intent.
+- **A short run is not proof of a wrong clip.** A legitimate state can be
+  interrupted by a real transition; the gate refuses to name it, which is the
+  honest outcome, not a claim that the clip is wrong.
+- **The run is over sampled invocations, not wall-clock frames.** A hook that
+  samples unevenly changes the run length in samples; `rate` remains the place
+  to judge that.
+- **A very long take is still one run.** A clip held across an entire phase has
+  `runs=1`; the gate accepts it, but it cannot tell a single held pose from a
+  looping clip that selects one table.
+- **The store still trusts agreement as the tiebreak.** `run_median` is recorded
+  for confidence, not used to reorder values; a clean but wrong window can still
+  outrank a noisy correct one, and the conflict record is what keeps that
+  visible.
 
 For the record, the idle variant is real and stays a caveat: one earlier still
 window measured idle as clip `0` (`50:100`) at coverage `1.00`, so idle can
@@ -881,9 +973,10 @@ In the multi-actor default nothing is carried: `idle` and `walk` come from that
 actor's own horizontal states, and every field is `unknown` when it was not
 measured.
 
-A phase is printed as `unknown` when its frame count is below `6` or its
-dominant coverage is below `0.40`, and every field is `unknown` when the actor
-is uncalibrated. A thin or blended phase is not worth a guess.
+A phase is printed as `unknown` when its frame count is below `6`, its dominant
+coverage is below `0.40`, or its dominant clip's `run_median` is below
+`RUN_GATE_MIN` (`6`), and every field is `unknown` when the actor is
+uncalibrated. A thin, blended or flickering phase is not worth a guess.
 
 ### Modes and flags
 
@@ -1189,9 +1282,9 @@ plus one `PHASE` line per phase); the template is the primary result.
 
 | Gate | Result |
 |---|---|
-| `--selftest` | 68 cases, 68 green; the existing fingerprint, segment, keyed, phase, jump, horizontal and identity cases, the per-actor label cases, the directory cases (`sra-dir-two-files`, `sra-dir-per-actor-file`, `sra-dir-cross-collision`, `sra-dir-slot-mismatch`, `sra-dir-clipmap-line`, `sra-dir-source-conflict`, `sra-dir-empty`), and `fingerprint-small-body-form-invariant` |
-| `--live-selftest` | 36 cases, 36 green in a real Frida runtime; adds `fingerprint-small-body-cross-form`, `sra-dir-two-files`, `sra-dir-cross-collision`, `sra-dir-slot-mismatch`, `sra-dir-source-conflict` and `sra-dir-empty` on top of the multi-actor and hardware-surface cases |
-| `--dry-run` | prints the plan; attaches nothing. It names the per-actor aggregation, the identity verdict, both hysteresis families with their constants, the unknown reasons, the directory index, the attribution/refusal rules and the label gates |
+| `--selftest` | 76 cases, 76 green; the fingerprint, segment, keyed, phase, jump, horizontal and identity cases, the per-actor label cases, the directory cases (`sra-dir-two-files`, `sra-dir-per-actor-file`, `sra-dir-cross-collision`, `sra-dir-slot-mismatch`, `sra-dir-clipmap-line`, `sra-dir-source-conflict`, `sra-dir-empty`), the run-length cases (`run-length-exact`, `run-length-gap-breaks`, `run-gate-holds`, `run-gate-alternates`, `run-gate-coverage`, `run-gate-mixed-labels`, `phase-line-run-stats`, `actor-measurement-run-median`) and the store cases (`store-missing-is-empty`, `store-first-fill`, `store-fill-unknown`, `store-conflict-keeps`, `store-supersede`, `store-roundtrip`, `store-corrupt-refused`) |
+| `--live-selftest` | 34 cases, 34 green in a real Frida runtime; adds a `run-length` scenario driven through the real hook (`run-length-live-holds`, `run-length-live-alternates`, `run-length-live-mixed`, `run-length-live-exact`, `run-length-live-coverage`) on top of the multi-actor, directory and hardware-surface cases |
+| `--dry-run` | prints the plan; attaches nothing. It names the per-actor aggregation, the identity verdict, both hysteresis families with their constants, the run gate, the unknown reasons (including `low-run-length`), the directory index, the attribution/refusal rules, the store and the label gates |
 | `py_compile` | clean |
 | `node --check` on `--print-agent` | clean |
 | `cargo test` | 694 green, unchanged by this docs-only slice |
@@ -1215,14 +1308,25 @@ memory form hash to one key and that the player's stride does not.
 memory form in the real agent through the same hook the capture uses, then
 asserts both keys are equal and the geometry reports `slots=24`.
 
-The six store cases use real temporary files and cover the merge policy end to
-end: an empty store gains a full entry from one measurement; a second measurement
+The store cases use real temporary files and cover the merge policy end to end:
+an empty store gains a full entry from one measurement; a second measurement
 fills previously-`unknown` fields while leaving a confirmed field alone; a
 disagreeing equal-or-lower agreement records a `conflict` and keeps the stored
 value; a disagreeing strictly-higher agreement replaces the value and records the
-previous one as `superseded`; write-then-read reproduces an identical mapping; and
-a corrupt file (invalid JSON and a valid JSON of the wrong shape) is refused with
-the file left intact rather than recreated empty.
+previous one as `superseded`; write-then-read reproduces an identical mapping;
+and a corrupt file (invalid JSON) is refused with the file left intact rather
+than recreated empty. Each entry records `run_median` beside `agreement`, and
+the merge/supersede/conflict records carry the incoming and stored run medians.
+
+The run-length cases assert the statistic on hand-built sequences
+(`run-length-exact`, `run-length-gap-breaks`), the held/flickering/thin gate
+decisions (`run-gate-holds`, `run-gate-alternates`, `run-gate-coverage`), the
+per-field mixed `LABELS` line (`run-gate-mixed-labels`), the exact `PHASE`
+suffix (`phase-line-run-stats`), and that a per-file measurement carries
+`run_median` (`actor-measurement-run-median`). The live harness drives one real
+object whose idle clip holds and whose walk clip alternates every sample, then
+asserts that idle labels, walk is `unknown reason=low-run-length` at coverage
+`0.50`, and a thin phase stays `unknown reason=low-agreement`.
 
 The live harness spawns a throwaway system process, never the game. It
 exercises the real `NativePointer`, `Memory`, `Process`, `Interceptor`,
@@ -1284,6 +1388,13 @@ empty segment.
 - [ ] The free-play result is analysed as a mixture, the confirmed map is not
       changed, and the recommendation is a probe measurement, not a threshold
       tune.
+- [ ] The free-play dilution numbers are stated, and run length is named as the
+      discriminator between a held phase and a diluted one.
+- [ ] The run gate states `RUN_GATE_MIN = 2 * H_HOLD` and derives it from the
+      `H_HOLD` transition leak.
+- [ ] `low-run-length` and `low-agreement` are distinct, are reported per field,
+      and the revised procedure reports a degraded phase instead of guessing.
+- [ ] The store records `run_median` beside `agreement`.
 - [ ] The keyed fingerprint names its bounded view and excludes the pointer.
 - [ ] The collision policy is explicit: lowest index within one file, every
       cross-file candidate kept and marked `ambiguous`.
@@ -1351,3 +1462,12 @@ a busy area, then compare two actors' LABELS blocks to show that the maps differ
 Idle and walk are labelled; jump was still PARTIAL then. A clip is confirmed
 for a phase only when the same group occupies the same position in the
 repeating tail across runs.
+
+> **2026-11-21 run-length revision.** A phase now contributes a label only when
+> its dominant clip is held: `run_median >= RUN_GATE_MIN = 2 * H_HOLD = 6`. The
+> `PHASE` line carries `run_median`, `run_p90` and `runs`, and a flickering
+> phase is refused as `low-run-length`, distinct from `low-agreement`. Free play
+> is usable for phases that hold and reports a degraded phase instead of
+> guessing. The store records `run_median` beside `agreement`. The scratch probe
+> is green at 76 host cases and 34 live-runtime cases, including the run-length
+> and store cases. The confirmed map did not move.
