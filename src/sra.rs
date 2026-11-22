@@ -981,6 +981,20 @@ impl SraAnimation {
         })
     }
 
+    /// Decode one palette frame of one clip, keeping all twelve lanes.
+    ///
+    /// Offline metrics need the translation lanes the angle-only
+    /// [`Self::decode_clip_index`] discards. The lane order is angle `0..=2`,
+    /// scale `4..=6`, translation `8..=10` (`docs/notes/packed-channel-format.md`).
+    pub fn decode_clip_lanes(
+        &self,
+        clip: usize,
+        frame_index: usize,
+    ) -> Result<Vec<[f32; 12]>, String> {
+        let packed = self.table(clip)?;
+        packed_channel::decode_inline_lanes(&packed, self.slot_count, frame_index)
+    }
+
     /// Decode the frame selected by one frame-time unit in one clip.
     pub fn decode_clip_time(&self, clip: usize, frame_time: u16) -> Result<SraFrame, String> {
         self.decode_clip_index(clip, self.frame_index_for_clip_time(clip, frame_time)?)

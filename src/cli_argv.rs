@@ -378,6 +378,16 @@ mod tests {
             ),
             (
                 &[
+                    "game", "clip-metrics", "--sra", "HUNTER.SRA", "--slots", "44",
+                    "--top", "3", "--validate",
+                ],
+                &[
+                    "--clip-metrics", "--sra", "HUNTER.SRA", "--slots", "44",
+                    "--top", "3", "--validate",
+                ],
+            ),
+            (
+                &[
                     "game", "match-unmapped", "FPS.TXT", "--sra-dir", "OBJECT", "--slots", "66",
                     "--out", "MATCH.TXT",
                 ],

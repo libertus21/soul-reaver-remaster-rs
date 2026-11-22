@@ -56,6 +56,8 @@ mod cli_out;
 // Offline heuristic ranking for identifier-less `.SRA` clips; read by
 // `--animate --rank-clips` only.
 mod clip_rank;
+// Offline motion metrics and locomotion-state ranking; read by `--clip-metrics`.
+mod clip_metrics;
 // Launcher CLI arg parser (pure). Viewer only strips three no-op flags.
 #[allow(dead_code)]
 mod launcher_cli;
@@ -162,6 +164,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--animate") {
         return run_animate(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--clip-metrics") {
+        return run_clip_metrics(&args[1..]);
+    }
     if args.first().is_some_and(|a| a == "--match-unmapped") {
         return run_match_unmapped(&args[1..]);
     }
@@ -266,6 +271,8 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --facing --bigfile <BIGFILE.DAT> --entry <INDEX> --direction <DX>:<DY>");
         eprintln!("   or: soul-reaver-remaster-rs --animate --sra <FILE.SRA> --bigfile <BIGFILE.DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--anim-fps <N>] [--anim-once]");
         eprintln!("   or: soul-reaver-remaster-rs --animate --sra <FILE.SRA> --rank-clips --slots <N> [--top <N>]");
+        eprintln!("   or: soul-reaver-remaster-rs --clip-metrics --sra <FILE.SRA> [--slots <N>] [--top <N>] [--validate]");
+        eprintln!("   or: soul-reaver-remaster-rs --clip-metrics --sra-dir <DIR> [--slots <N>] [--top <N>] [--validate]");
         eprintln!("   or: soul-reaver-remaster-rs --srl-info <FILE.SRL>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
         eprintln!("one slot's raw 256x256 A1R5G5B5 image.");
@@ -518,28 +525,38 @@ fn run_animate(args: &[String]) -> ExitCode {
     if input.rank_clips {
         return run_rank_clips(&input, sra_bytes);
     }
-    let (dat, entry) = match (input.dat, input.entry) {
-        (Some(dat), Some(entry)) => (dat, entry),
+    // An offline mode (`--list-clips`, `--dump-unmapped`) can stand on an
+    // explicit `--slots`; the decode mode needs the model to skin vertices.
+    let offline = input.list_clips || input.dump_unmapped.is_some();
+    let model = match (input.dat, input.entry) {
+        (Some(dat), Some(entry)) => {
+            let entry_bytes = match object::read_entry_bytes(Path::new(dat), entry) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(error.exit_code());
+                }
+            };
+            match object::parse_object(&entry_bytes) {
+                Ok(model) => Some(model),
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return ExitCode::from(error.exit_code());
+                }
+            }
+        }
+        _ if offline && input.slots.is_some() => None,
         _ => {
-            eprintln!("error: --animate needs --bigfile <DAT> --entry <INDEX>");
+            eprintln!("error: --animate needs --bigfile <DAT> --entry <INDEX> (or --slots <N> for --list-clips/--dump-unmapped)");
             return ExitCode::from(1);
         }
     };
-    let entry_bytes = match object::read_entry_bytes(Path::new(dat), entry) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return ExitCode::from(error.exit_code());
-        }
+    let slot_count = match (&model, input.slots) {
+        (Some(model), _) => model.bones.len(),
+        (None, Some(slots)) => slots,
+        (None, None) => unreachable!("the model or an explicit slot count was required above"),
     };
-    let model = match object::parse_object(&entry_bytes) {
-        Ok(model) => model,
-        Err(error) => {
-            eprintln!("error: {error}");
-            return ExitCode::from(error.exit_code());
-        }
-    };
-    let animation = match sra::SraAnimation::load(sra_bytes, model.bones.len()) {
+    let animation = match sra::SraAnimation::load(sra_bytes, slot_count) {
         Ok(animation) => animation,
         Err(error) => {
             eprintln!("error: {error}");
@@ -557,6 +574,10 @@ fn run_animate(args: &[String]) -> ExitCode {
         outln!("{}", clip_listing(&animation, &sra_label));
         return ExitCode::SUCCESS;
     }
+    let Some(model) = model else {
+        eprintln!("error: --animate needs --bigfile <DAT> --entry <INDEX> to decode a frame");
+        return ExitCode::from(1);
+    };
     let clip = input.clip.unwrap_or(0);
     if let Err(error) = animation.validate_clip(clip) {
         eprintln!("error: {error}");
@@ -637,6 +658,312 @@ fn run_rank_clips(input: &AnimateInput<'_>, sra_bytes: Vec<u8>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `--clip-metrics`: decode every clip of one `.SRA` (or a directory) and print
+/// the offline motion table plus a per-state shortlist.
+fn run_clip_metrics(args: &[String]) -> ExitCode {
+    let input = match clip_metrics_input(args) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match (input.sra, input.sra_dir) {
+        (Some(path), None) => run_clip_metrics_file(&input, Path::new(path)),
+        (None, Some(dir)) => run_clip_metrics_dir(&input, Path::new(dir)),
+        _ => {
+            eprintln!("error: --clip-metrics needs exactly one of --sra <FILE> or --sra-dir <DIR>");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_clip_metrics_file(input: &ClipMetricsInput<'_>, path: &Path) -> ExitCode {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("error: cannot read {}: {error}", file_label(path));
+            return ExitCode::from(1);
+        }
+    };
+    let label = file_label(path);
+    let stem = path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (slots, expected) = match validation_expectations(&stem) {
+        Some((slots, expected)) if input.validate => (slots, Some(expected)),
+        _ => (match input.slots.or_else(|| infer_slot_count(&bytes)) {
+            Some(slots) => slots,
+            None => {
+                eprintln!(
+                    "error: cannot infer a slot count for {}; pass --slots <N>",
+                    file_label(path)
+                );
+                return ExitCode::from(1);
+            }
+        }, None),
+    };
+    let animation = match sra::SraAnimation::load(bytes, slots) {
+        Ok(animation) => animation,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let report = match clip_metrics::analyze_animation(&animation) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    outln!("{}", clip_metrics::report_text(&label, slots, &report, input.top));
+    if let Some(expected) = expected {
+        let expectations = clip_metrics::Expectation::from_labels(expected);
+        let (_, text) = clip_metrics::validate(&report, &expectations);
+        outln!("{text}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_clip_metrics_dir(input: &ClipMetricsInput<'_>, dir: &Path) -> ExitCode {
+    let mut files = match sra_files_in(dir) {
+        Ok(files) => files,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    files.sort();
+    if input.validate {
+        return run_clip_metrics_validation(input, &files);
+    }
+    let mut failed = false;
+    for path in &files {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("error: cannot read {}: {error}", file_label(path));
+                failed = true;
+                continue;
+            }
+        };
+        let slots = match input.slots.or_else(|| infer_slot_count(&bytes)) {
+            Some(slots) => slots,
+            None => {
+                eprintln!(
+                    "error: cannot infer a slot count for {}; pass --slots <N>",
+                    file_label(path)
+                );
+                failed = true;
+                continue;
+            }
+        };
+        match sra::SraAnimation::load(bytes, slots).and_then(|animation| {
+            clip_metrics::analyze_animation(&animation)
+        }) {
+            Ok(report) => outln!(
+                "{}",
+                clip_metrics::report_text(&file_label(path), slots, &report, input.top)
+            ),
+            Err(error) => {
+                eprintln!("error: {}: {error}", file_label(path));
+                failed = true;
+            }
+        }
+    }
+    if failed { ExitCode::from(1) } else { ExitCode::SUCCESS }
+}
+
+fn run_clip_metrics_validation(input: &ClipMetricsInput<'_>, files: &[std::path::PathBuf]) -> ExitCode {
+    let mut passed = 0usize;
+    let mut total = 0usize;
+    let mut blocks = Vec::new();
+    let mut shortlists = Vec::new();
+    for path in files {
+        let stem = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Some((slots, expected)) = validation_expectations(&stem) else {
+            continue;
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                eprintln!("error: cannot read {}: {error}", file_label(path));
+                return ExitCode::from(1);
+            }
+        };
+        let animation = match sra::SraAnimation::load(bytes, slots) {
+            Ok(animation) => animation,
+            Err(error) => {
+                eprintln!("error: {}: {error}", file_label(path));
+                return ExitCode::from(1);
+            }
+        };
+        let report = match clip_metrics::analyze_animation(&animation) {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("error: {}: {error}", file_label(path));
+                return ExitCode::from(1);
+            }
+        };
+        let expectations = clip_metrics::Expectation::from_labels(expected);
+        let (file_passed, text) = clip_metrics::validate(&report, &expectations);
+        passed += file_passed;
+        total += expectations.len();
+        blocks.push(text.replacen(
+            "CLASSIFIER VALIDATION",
+            &format!("CLASSIFIER VALIDATION {} ", file_label(path)),
+            1,
+        ));
+        shortlists.push(format!(
+            "{}: {}",
+            file_label(path),
+            clip_metrics::shortlist_text(&report, input.top)
+        ));
+    }
+    if total == 0 {
+        eprintln!("error: --validate found no RAZIEL.SRA or SLUAGH.SRA under the directory");
+        return ExitCode::from(1);
+    }
+    outln!("CLASSIFIER VALIDATION pass={passed}/{total} heuristic");
+    for block in blocks {
+        outln!("{block}");
+    }
+    for shortlist in shortlists {
+        outln!("{shortlist}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn sra_files_in(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {}", file_label(dir)));
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|error| format!("cannot read {}: {error}", file_label(dir)))? {
+        let path = entry
+            .map_err(|error| format!("cannot read {}: {error}", file_label(dir)))?
+            .path();
+        let is_sra = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sra"));
+        if is_sra && path.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+struct ClipMetricsInput<'a> {
+    sra: Option<&'a str>,
+    sra_dir: Option<&'a str>,
+    slots: Option<usize>,
+    top: usize,
+    validate: bool,
+}
+
+fn clip_metrics_input(args: &[String]) -> Result<ClipMetricsInput<'_>, String> {
+    let usage = "expected --clip-metrics (--sra <FILE.SRA> | --sra-dir <DIR>) [--slots <N>] [--top <N>] [--validate]";
+    let (mut sra, mut sra_dir, mut slots, mut top, mut validate) =
+        (None, None, None, None, false);
+    let mut at = 0;
+    while at < args.len() {
+        match args[at].as_str() {
+            "--validate" => {
+                validate = true;
+                at += 1;
+            }
+            token => {
+                let Some(value) = args.get(at + 1).map(String::as_str) else {
+                    return Err(usage.to_string());
+                };
+                match token {
+                    "--sra" => sra = Some(value),
+                    "--sra-dir" => sra_dir = Some(value),
+                    "--top" => {
+                        let count = value.parse::<usize>().map_err(|_| usage.to_string())?;
+                        if !(1..=64).contains(&count) {
+                            return Err(format!(
+                                "invalid value '{value}' for --top: expected an integer in 1..=64"
+                            ));
+                        }
+                        top = Some(count);
+                    }
+                    "--slots" => {
+                        let count = value.parse::<usize>().map_err(|_| usage.to_string())?;
+                        if count == 0 {
+                            return Err("--slots must be at least 1".to_string());
+                        }
+                        slots = Some(count);
+                    }
+                    _ => return Err(usage.to_string()),
+                }
+                at += 2;
+            }
+        }
+    }
+    if sra.is_some() == sra_dir.is_some() {
+        return Err(usage.to_string());
+    }
+    Ok(ClipMetricsInput {
+        sra,
+        sra_dir,
+        slots,
+        top: top.unwrap_or(clip_metrics::DEFAULT_TOP),
+        validate,
+    })
+}
+
+/// The largest slot count that decodes the most clips.
+///
+/// `.SRA` has no slot-count field, so this is a best-effort default only. It
+/// can over-count trailing empty slots; pass `--slots <N>` when the model's
+/// bone count is known. The validation gate always passes explicit counts.
+const MAX_INFERRED_SLOTS: usize = 128;
+
+fn infer_slot_count(bytes: &[u8]) -> Option<usize> {
+    let mut best: Option<(usize, usize)> = None;
+    for slots in 1..=MAX_INFERRED_SLOTS {
+        if let Ok(animation) = sra::SraAnimation::load(bytes.to_vec(), slots) {
+            let clips = animation.clip_count();
+            if best.is_none_or(|(best_clips, best_slots)| {
+                clips > best_clips || (clips == best_clips && slots > best_slots)
+            }) {
+                best = Some((clips, slots));
+            }
+        }
+    }
+    best.map(|(_, slots)| slots)
+}
+
+/// Runtime-measured validation fixtures, keyed by `.SRA` stem.
+///
+/// These are the gate's expectations (`docs/notes/clip-label-store.md`), used
+/// only to score the classifier. They never feed the classifier itself and are
+/// not written anywhere.
+fn validation_expectations(
+    stem: &str,
+) -> Option<(usize, &'static [(&'static str, usize)])> {
+    match stem.to_ascii_uppercase().as_str() {
+        "RAZIEL" => Some((
+            66,
+            &[
+                ("idle", 55),
+                ("walk", 2),
+                ("jump_up", 35),
+                ("fall", 36),
+                ("land", 37),
+            ],
+        )),
+        "SLUAGH" => Some((24, &[("idle", 8), ("walk", 1)])),
+        _ => None,
+    }
+}
+
 /// Resolve the frame `--animate` prints. An explicit `--frame` wins, then an
 /// explicit `--time`; only when neither is present does the playback clock
 /// apply (at tick 0, so the default frame is still the first palette frame).
@@ -663,7 +990,7 @@ fn animate_choice(
 }
 
 fn animate_input(args: &[String]) -> Result<AnimateInput<'_>, String> {
-    let usage = "expected --animate --sra <FILE> (--bigfile <DAT> --entry <INDEX> | --slots <N>) [--frame <N> | --time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once] [--list-clips] [--dump-unmapped <FILE>] [--rank-clips [--top <N>]]";
+    let usage = "expected --animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N> | --time <T>] [--clip <N>] [--anim-fps <N>] [--anim-once]; or --animate --sra <FILE> (--bigfile <DAT> --entry <INDEX> | --slots <N>) --list-clips|--rank-clips|--dump-unmapped <FILE> [--top <N>]";
     let (mut sra, mut dat, mut entry, mut frame, mut time, mut clip, mut dump_unmapped) =
         (None, None, None, None, None, None, None);
     let mut anim_fps = sra::ANIMATION_FPS;
@@ -3082,14 +3409,14 @@ mod cli_tests {
     use super::run_level_info;
     use super::{
         animate_choice, animate_input, animate_report, bone_hierarchy_input, clip_listing,
-        facing_input,
+        clip_metrics_input, facing_input,
         facing_report, fingerprint_keys, list_report, match_report, object_input,
         parse_direction, parse_fingerprint_key, pose_mode_conflict,
         resolve_texture_name, run_actor_census, run_audio, run_bigfile, dispatch, run_level_links,
         run_level_records, run_level_structure, run_mesh, run_mesh_all, run_level_geometry,
         run_level_objects, run_level_render, run_mesh_textured, run_mesh_with, run_object_info,
         run_object_mesh, run_object_mesh_with, run_textures, scan_sra_directory,
-        strip_launcher_noops, tshow_suffix, FrameChoice, MatchScan,
+        strip_launcher_noops, tshow_suffix, validation_expectations, FrameChoice, MatchScan,
     };
     use std::process::ExitCode;
     use std::rc::Rc;
@@ -4120,6 +4447,38 @@ mod cli_tests {
             ]))
             .is_err()
         );
+    }
+
+    #[test]
+    fn clip_metrics_input_requires_exactly_one_source_and_honours_top() {
+        let argv = |items: &[&str]| items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        let file_argv = argv(&["--sra", "HUNTER.SRA", "--slots", "44", "--top", "3"]);
+        let parsed =
+            clip_metrics_input(&file_argv).expect("file form must parse");
+        assert_eq!(
+            (parsed.sra, parsed.sra_dir, parsed.slots, parsed.top, parsed.validate),
+            (Some("HUNTER.SRA"), None, Some(44), 3, false)
+        );
+        let dir_argv = argv(&["--sra-dir", "OBJECT", "--validate"]);
+        let scan = clip_metrics_input(&dir_argv).expect("directory form must parse");
+        assert_eq!((scan.sra, scan.sra_dir, scan.validate), (None, Some("OBJECT"), true));
+        assert_eq!(scan.top, crate::clip_metrics::DEFAULT_TOP);
+
+        assert!(clip_metrics_input(&argv(&[])).is_err());
+        assert!(clip_metrics_input(&argv(&["--sra", "A.SRA", "--sra-dir", "B"])).is_err());
+        assert!(clip_metrics_input(&argv(&["--sra", "A.SRA", "--slots", "0"])).is_err());
+        assert!(clip_metrics_input(&argv(&["--sra", "A.SRA", "--top", "65"])).is_err());
+    }
+
+    #[test]
+    fn validation_expectations_are_the_measured_gate_only() {
+        let (slots, expected) = validation_expectations("raziel").expect("raziel fixture");
+        assert_eq!(slots, 66);
+        assert_eq!(expected.len(), 5);
+        let (slots, expected) = validation_expectations("SlUaGh").expect("sluagh fixture");
+        assert_eq!(slots, 24);
+        assert_eq!(expected, &[("idle", 8), ("walk", 1)]);
+        assert!(validation_expectations("HUNTER").is_none());
     }
 
     #[test]

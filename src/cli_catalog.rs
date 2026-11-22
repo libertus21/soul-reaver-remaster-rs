@@ -25,6 +25,9 @@ impl Capability {
         if token == "--cull-report" {
             return self.name == "play";
         }
+        if token == "--validate" {
+            return self.name == "clip-metrics";
+        }
         token == "--list-clips" && self.name == "animate"
     }
 
@@ -47,6 +50,8 @@ impl Capability {
                         | "--dump-unmapped"
                 ))
             || (self.name == "match-unmapped" && matches!(token, "--sra-dir" | "--slots"))
+            || (self.name == "clip-metrics"
+                && matches!(token, "--sra" | "--sra-dir" | "--slots" | "--top"))
             || (self.name == "play"
                 && matches!(
                     token,
@@ -77,7 +82,7 @@ impl Capability {
 pub const GROUPS: [&str; 6] = ["texture", "archive", "mesh", "audio", "level", "game"];
 
 /// Every existing mode, exactly once. This is the single source for help.
-pub const CAPABILITIES: [Capability; 38] = [
+pub const CAPABILITIES: [Capability; 39] = [
     Capability { group: "texture", name: "list", legacy: "--textures <BIG> --tlist [--map <MAP>]", summary: "List the remaster .BIG header and slot classes.", window: false },
     Capability { group: "texture", name: "show", legacy: "--textures <BIG> --tshow <SEL> [--map <MAP>]", summary: "Show one slot as its raw 256x256 image.", window: true },
     Capability { group: "texture", name: "file", legacy: "<FILE.DDS>", summary: "Show one .DDS texture file.", window: true },
@@ -115,6 +120,7 @@ pub const CAPABILITIES: [Capability; 38] = [
         Capability { group: "game", name: "play", legacy: "--play --bigfile <DAT> [--textures <BIG>] [--unit <NAME>] [--group <PREFIX>] [--ticks <N>] [--camera <MODE>] [--sra <FILE>] [--anim-fps <N>] [--anim-once] [--headless --input-script <SPEC> [--player-pos <X,Y,Z>]] [--cam-distance <N>] [--cam-height <N>] [--headless --cull-report]", summary: "Run the engine on an archive: a deterministic headless acceptance line with --headless, or a textured window; --group loads a whole level family (all `PREFIX`+digits rooms) instead of one --unit, and --sra animates the player mesh from a constant time-unit clock whose clips honor their divisors, and --anim-fps sets frames per second for a divisor-100 clip; --input-script prints the measured movement line; --cam-distance/--cam-height shape the player boom; --cull-report adds the read-only per-object visibility line.", window: true },
     Capability { group: "game", name: "facing", legacy: "--facing --bigfile <DAT> --entry <INDEX> --direction <DX>:<DY>", summary: "Print the yaw produced for a movement direction and the first skinned vertices.", window: false },
     Capability { group: "game", name: "animate", legacy: "--animate --sra <FILE> --bigfile <DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--anim-fps <N>] [--anim-once] [--list-clips] [--dump-unmapped <FILE>]", summary: "Decode one .SRA frame and print the first slot angles and skinned vertices; --frame overrides the divisor-aware playback clock, and --anim-fps sets frames per second for a divisor-100 clip; --list-clips prints the extended enumeration and --dump-unmapped writes the appended and rejected tables.", window: false },
+    Capability { group: "game", name: "clip-metrics", legacy: "--clip-metrics --sra <FILE.SRA> [--slots <N>] [--top <N>] [--validate]", summary: "Decode every clip offline and print root-arc, angular, periodicity and region metrics plus a heuristic idle/walk/jump_up/fall/land shortlist; --sra-dir scans a directory and --validate scores the RAZIEL/SLUAGH known labels.", window: false },
     Capability { group: "game", name: "match-unmapped", legacy: "--match-unmapped <FILE> --sra-dir <DIR> [--slots <N>] [--out <FILE>]", summary: "Search every .SRA in a directory for the runtime probe fingerprints in a file and report which file and record contains each; absent is a documented result.", window: false },
 ];
 
@@ -163,7 +169,7 @@ pub fn render_help(group: Option<&str>) -> String {
 mod tests {
     use super::{catalog, is_known_group, render_help, GROUPS};
 
-    const EXPECTED: [(&str, &str); 38] = [
+    const EXPECTED: [(&str, &str); 39] = [
         ("texture", "list"),
         ("texture", "show"),
         ("texture", "file"),
@@ -201,6 +207,7 @@ mod tests {
         ("game", "play"),
         ("game", "facing"),
         ("game", "animate"),
+        ("game", "clip-metrics"),
         ("game", "match-unmapped"),
     ];
 

@@ -711,6 +711,27 @@ pub struct ChannelLayout {
     pub value_selector: usize,
 }
 
+/// Decode one slot's twelve lanes, consuming every set lane from `stream`.
+///
+/// Lanes `0..=2` are binary angles, `4..=6` are scale and `8..=10` are
+/// translation; the unused lane between each group stays `0.0`. The walk is
+/// ascending lane order, so every set lane advances the stream exactly once.
+pub fn decode_slot_lanes(
+    planes: &BitPlanes<'_>,
+    stream: &mut ValueStream<'_>,
+    slot: usize,
+) -> Result<[f32; LANES], String> {
+    let mask = planes.slot_mask(slot)?;
+    let mut lanes = [0.0f32; LANES];
+    for lane in 0..LANES {
+        if mask & (1 << lane) == 0 {
+            continue;
+        }
+        lanes[lane] = stream.next_value()?;
+    }
+    Ok(lanes)
+}
+
 /// Decode one slot's angle triple, consuming every set lane from `stream`.
 ///
 /// The walk is ascending lane order, so scale and translation blocks are
@@ -721,18 +742,8 @@ pub fn decode_slot_angles(
     stream: &mut ValueStream<'_>,
     slot: usize,
 ) -> Result<[f32; 3], String> {
-    let mask = planes.slot_mask(slot)?;
-    let mut angles = [0.0f32; ANGLE_LANES];
-    for lane in 0..LANES {
-        if mask & (1 << lane) == 0 {
-            continue;
-        }
-        let value = stream.next_value()?;
-        if lane < ANGLE_LANES {
-            angles[lane] = value;
-        }
-    }
-    Ok(angles)
+    let lanes = decode_slot_lanes(planes, stream, slot)?;
+    Ok([lanes[0], lanes[1], lanes[2]])
 }
 
 /// Decode a channel window into per-slot angles and rotations.
@@ -824,6 +835,36 @@ pub fn decode_inline_channel(
     frame_index: usize,
 ) -> Result<DecodedChannel, String> {
     decode_inline_channel_with_end(table, slot_count, frame_index).map(|(decoded, _)| decoded)
+}
+
+/// Decode the whole file-form channel at one frame, keeping every lane.
+///
+/// This is the same walk as [`decode_inline_channel`], but it returns the raw
+/// twelve-lane window so a caller can read scale and translation alongside the
+/// angles. The angle-only presentation path is unchanged.
+pub fn decode_inline_lanes(
+    table: &PackedFrameTable<'_>,
+    slot_count: usize,
+    frame_index: usize,
+) -> Result<Vec<[f32; LANES]>, String> {
+    if slot_count == 0 {
+        return Err("packed channel: slot count 0 has no bit-plane stride".to_string());
+    }
+    let header = table.header();
+    let frame_count = usize::from(header.frame_count);
+    if frame_index >= frame_count {
+        return Err(format!(
+            "packed channel: frame index {frame_index} is outside the {frame_count}-frame table"
+        ));
+    }
+    let planes = table.bit_planes(slot_count)?;
+    let offset = table.inline_value_stream_offset(slot_count)?;
+    let mut stream = ValueStream::new(table.bytes(), offset, frame_count, frame_index)?;
+    let mut slots = Vec::with_capacity(slot_count);
+    for slot in 0..slot_count {
+        slots.push(decode_slot_lanes(&planes, &mut stream, slot)?);
+    }
+    Ok(slots)
 }
 
 /// First byte after the inline value stream consumed by a whole channel.
