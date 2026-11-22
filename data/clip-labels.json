@@ -1,16 +1,31 @@
 {
   "conflicts": [],
   "entries": {
+    "HUNTER.SRA": {
+      "assigned_at": "2026-11-22T22:07:24Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-22T22:07:24Z",
+        "walk": "2026-11-22T22:07:24Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "2",
+      "updated": "2026-11-22T22:07:24Z",
+      "walk": "7"
+    },
     "RAZIEL.SRA": {
       "agreement": 0.7098591549295775,
       "evidence": "runtime-capture",
       "fall": "36",
       "field_agreement": {
-        "idle": 1,
-        "walk": 0.91,
-        "jump_up": 1,
         "fall": 1,
-        "land": 1
+        "idle": 1,
+        "jump_up": 1,
+        "land": 1,
+        "walk": 0.91
       },
       "field_run_median": {
         "idle": 18.5,
