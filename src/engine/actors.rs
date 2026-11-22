@@ -99,10 +99,18 @@ impl SraDirectory {
 /// optional `idle`, `walk`, `jump_up`, `fall` and `land` fields. A value may be
 /// a JSON string (`"55"` or `"unknown"`) or a JSON number; anything else is a
 /// missing label. Extra fields (`evidence`, `agreement`, `runs`, ...) are
-/// ignored by this consumer.
+/// ignored by this consumer except `updated`, which orders two stores when
+/// they are merged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LabelStore {
-    entries: BTreeMap<String, ClipLabels>,
+    entries: BTreeMap<String, StoredLabels>,
+}
+
+/// The labels of one store entry plus the entry's `updated` stamp.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StoredLabels {
+    labels: ClipLabels,
+    updated: Option<String>,
 }
 
 impl LabelStore {
@@ -139,7 +147,15 @@ impl LabelStore {
                 continue;
             };
             let mut labels = ClipLabels::NONE;
+            let mut updated = None;
             for (field, value) in fields {
+                if field == "updated" {
+                    updated = match &value {
+                        Json::String(stamp) | Json::Number(stamp) => Some(stamp.clone()),
+                        Json::Null | Json::Bool(_) | Json::Array(_) | Json::Object(_) => None,
+                    };
+                    continue;
+                }
                 let slot = match field.as_str() {
                     "idle" => &mut labels.idle,
                     "walk" => &mut labels.walk,
@@ -150,16 +166,45 @@ impl LabelStore {
                 };
                 *slot = label_index(&value);
             }
-            by_name.insert(file.to_ascii_uppercase(), labels);
+            by_name.insert(file.to_ascii_uppercase(), StoredLabels { labels, updated });
         }
         Ok(Self { entries: by_name })
+    }
+
+    /// Merge two stores field by field, the newer `updated` winning.
+    ///
+    /// For every file and state, a label from the source with the newer
+    /// ISO-8601 `updated` stamp replaces the other. A field only present in
+    /// one source is taken from it. Equal stamps keep the base (the
+    /// repository copy, passed first) so the result is deterministic. This is
+    /// what lets a probe-written home store reach the renderer without
+    /// discarding the versioned repository copy.
+    pub fn merge(base: Self, overlay: Self) -> Self {
+        let mut entries = base.entries;
+        for (file, incoming) in overlay.entries {
+            match entries.get_mut(&file) {
+                None => {
+                    entries.insert(file, incoming);
+                }
+                Some(current) => {
+                    let prefer_incoming =
+                        is_newer(incoming.updated.as_deref(), current.updated.as_deref());
+                    current.labels =
+                        merge_labels(current.labels, incoming.labels, prefer_incoming);
+                    if prefer_incoming {
+                        current.updated = incoming.updated;
+                    }
+                }
+            }
+        }
+        Self { entries }
     }
 
     /// The stored labels for one `.SRA` file name, or no labels.
     pub fn for_sra(&self, file_name: &str) -> ClipLabels {
         self.entries
             .get(&file_name.to_ascii_uppercase())
-            .copied()
+            .map(|stored| stored.labels)
             .unwrap_or(ClipLabels::NONE)
     }
 
@@ -172,6 +217,36 @@ impl LabelStore {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// Take each labelled state from `incoming` only when that source is newer.
+///
+/// A state missing from `incoming` keeps the base value, so a partial newer
+/// entry cannot erase an older measured state.
+fn merge_labels(base: ClipLabels, incoming: ClipLabels, prefer_incoming: bool) -> ClipLabels {
+    if !prefer_incoming {
+        return base;
+    }
+    let pick = |newer: Option<usize>, older: Option<usize>| newer.or(older);
+    ClipLabels {
+        idle: pick(incoming.idle, base.idle),
+        walk: pick(incoming.walk, base.walk),
+        jump_up: pick(incoming.jump_up, base.jump_up),
+        fall: pick(incoming.fall, base.fall),
+        land: pick(incoming.land, base.land),
+    }
+}
+
+/// Compare two ISO-8601 UTC stamps. A digits-only key ignores separators and
+/// keeps the format's ordering; a missing or empty stamp is the oldest.
+fn is_newer(incoming: Option<&str>, base: Option<&str>) -> bool {
+    let incoming = incoming.map(stamp_key).unwrap_or_default();
+    let base = base.map(stamp_key).unwrap_or_default();
+    !incoming.is_empty() && incoming > base
+}
+
+fn stamp_key(stamp: &str) -> String {
+    stamp.chars().filter(char::is_ascii_digit).collect()
 }
 
 /// A JSON string or number is a label; `"unknown"`, `null` and other types are
@@ -333,23 +408,27 @@ impl ActorAnimations {
     ///
     /// Without `sra_dir` this is an empty set and performs no I/O, so the
     /// single-file `--sra` path and the default headless run are unchanged.
-    /// `labels_store` is only read when a directory was supplied; a missing
-    /// store file leaves every state at rest.
+    /// `labels_stores` is only read when a directory was supplied; the stores
+    /// are merged per field with the newer `updated` stamp winning. A missing
+    /// store file contributes nothing, so every state stays at rest when no
+    /// store exists.
     pub fn load(
         frame: &FrameState,
         assets: &mut SceneAssets,
         sra_dir: Option<&Path>,
-        labels_store: Option<&Path>,
+        labels_stores: &[PathBuf],
         exclude: Option<LiveId>,
     ) -> Result<Self, String> {
         let Some(sra_dir) = sra_dir else {
             return Ok(Self::default());
         };
         let directory = SraDirectory::load(sra_dir)?;
-        let store = match labels_store {
-            Some(path) => LabelStore::load(path)?,
-            None => LabelStore::default(),
-        };
+        let store = labels_stores
+            .iter()
+            .try_fold(LabelStore::default(), |store, path| {
+                let loaded = LabelStore::load(path)?;
+                Ok::<LabelStore, String>(LabelStore::merge(store, loaded))
+            })?;
         let mut resolved = Vec::new();
         let mut unresolved = Vec::new();
         for (id, object) in frame.live().iter() {
@@ -934,5 +1013,67 @@ mod tests {
         let sluagh = store.for_sra("SLUAGH.SRA");
         assert_eq!((sluagh.idle, sluagh.walk), (Some(8), Some(1)));
         assert_eq!(sluagh.jump_up, None, "unmeasured states stay at rest");
+    }
+
+    #[test]
+    fn label_stores_merge_per_field_with_the_newer_updated_winning() {
+        let repo = LabelStore::parse(
+            r#"{
+                "entries": {
+                    "RAZIEL.SRA": {
+                        "idle": "55", "walk": "2",
+                        "updated": "2026-11-15T16:50:24Z"
+                    },
+                    "SLUAGH.SRA": {
+                        "idle": "8", "walk": "1",
+                        "updated": "2026-11-22T03:24:01Z"
+                    }
+                }
+            }"#,
+        )
+        .expect("the repository store parses");
+        let home = LabelStore::parse(
+            r#"{
+                "entries": {
+                    "RAZIEL.SRA": {
+                        "idle": "60", "updated": "2026-11-22T20:20:38Z"
+                    },
+                    "SLUAGH.SRA": {
+                        "walk": "9", "updated": "2026-11-01T00:00:00Z"
+                    },
+                    "HUMAN.SRA": {
+                        "idle": "17", "updated": "2026-11-22T05:21:23Z"
+                    }
+                }
+            }"#,
+        )
+        .expect("the home store parses");
+
+        let merged = LabelStore::merge(repo, home);
+        let raziel = merged.for_sra("raziel.sra");
+        assert_eq!(
+            raziel.idle,
+            Some(60),
+            "the newer home field must reach the renderer"
+        );
+        assert_eq!(
+            raziel.walk,
+            Some(2),
+            "a state missing from the newer entry keeps the older measured value"
+        );
+
+        let sluagh = merged.for_sra("SLUAGH.SRA");
+        assert_eq!(sluagh.idle, Some(8), "the newer repository idle is kept");
+        assert_eq!(
+            sluagh.walk,
+            Some(1),
+            "an older home field must not override the repository copy"
+        );
+
+        assert_eq!(
+            merged.for_sra("HUMAN.SRA").idle,
+            Some(17),
+            "a home-only file is admitted by the merge"
+        );
     }
 }

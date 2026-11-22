@@ -17,10 +17,10 @@ install paths, so versioning it is safe.
 data/clip-labels.json
 ```
 
-This repository copy is the durable record. The probe's historical location,
-`~/.sr1_clip_labels.json`, still works but lives outside version control: if that
-home-directory file is lost, every measurement is lost. The committed copy makes
-the measurements reviewable and recoverable.
+This repository copy is the durable record. The probe writes its historical
+location, `~/.sr1_clip_labels.json`, which lives outside version control. The
+engine merges both, so a fresh probe run reaches the renderer and a lost home
+file still leaves the committed measurements intact.
 
 `.gitignore` is a whitelist, so the copy is allowed explicitly:
 
@@ -32,21 +32,30 @@ the measurements reviewable and recoverable.
 The file must stay UTF-8 **without a BOM**; the parser rejects byte `0xEF` at
 offset 0. A unit test asserts the committed file's first byte is `{`.
 
-## Engine lookup order
+## Engine lookup and merge
 
-`PlayOptions::labels_store_path` resolves one path, in this order:
+`PlayOptions::labels_store_sources` returns the stores to read:
 
-1. `--labels-store <FILE>`, when given. An explicit path wins even when it does
-   not exist; the existing "missing file means every state at rest" behaviour
-   applies.
-2. `data/clip-labels.json` relative to the current directory, when that file
-   exists. This is the versioned copy.
-3. The probe's user-home default, `~/.sr1_clip_labels.json` (from `USERPROFILE`
-   or `HOME`; a relative name when neither variable exists).
+1. `--labels-store <FILE>`, when given. An explicit path is the only source and
+   wins even when it does not exist; the existing "missing file means every
+   state at rest" behaviour applies.
+2. Otherwise both `data/clip-labels.json` (when it exists) and the probe's
+   user-home default, `~/.sr1_clip_labels.json` (from `USERPROFILE` or `HOME`).
 
-A missing repository copy is not an error: lookup falls through to the home
-path. A **malformed** copy is a loud error that names the resolved path; it is
-never silently skipped. The store is only read when `--sra-dir` is supplied.
+The two sources are **merged per field**: for each file and state, the label
+from the source with the newer ISO-8601 `updated` stamp wins. A state missing
+from the newer entry keeps the older measured value. Equal stamps keep the
+repository copy, so the result is deterministic.
+
+This merge is the consumption rule. Before it, the loader read the first
+existing file only, so a probe run that wrote `~/.sr1_clip_labels.json` never
+reached the renderer while the versioned copy existed. The repository copy stays
+the durable baseline; the home copy can add or refresh fields without replacing
+the whole entry.
+
+A missing source is not an error. A **malformed** source is a loud error that
+names the resolved path; it is never silently skipped. The stores are only read
+when `--sra-dir` is supplied.
 
 ## Schema and current values
 
@@ -75,4 +84,9 @@ confirmed value without a measurement; the probe's precedence rule protects
 - `engine::actors::tests::a_malformed_store_reports_the_failing_path` proves a
   bad file fails loudly with its path.
 - `engine::play::tests::label_store_lookup_is_explicit_then_repo_then_home`
-  pins the lookup order.
+  pins the single-path order.
+- `engine::play::tests::label_store_sources_merge_repo_and_home_by_default`
+  proves both default sources are read and an explicit store stays alone.
+- `engine::actors::tests::label_stores_merge_per_field_with_the_newer_updated_winning`
+  proves the per-field merge: newer wins, a missing field keeps the older
+  value, and a home-only file is admitted.
