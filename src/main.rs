@@ -271,7 +271,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --facing --bigfile <BIGFILE.DAT> --entry <INDEX> --direction <DX>:<DY>");
         eprintln!("   or: soul-reaver-remaster-rs --animate --sra <FILE.SRA> --bigfile <BIGFILE.DAT> --entry <INDEX> [--frame <N>] [--time <T>] [--anim-fps <N>] [--anim-once]");
         eprintln!("   or: soul-reaver-remaster-rs --animate --sra <FILE.SRA> --rank-clips --slots <N> [--top <N>]");
-        eprintln!("   or: soul-reaver-remaster-rs --clip-metrics --sra <FILE.SRA> [--slots <N>] [--top <N>] [--validate]");
+        eprintln!("   or: soul-reaver-remaster-rs --clip-metrics --sra <FILE.SRA> [--slots <N>] [--bigfile <DAT> --entry <INDEX>] [--top <N>] [--validate]");
         eprintln!("   or: soul-reaver-remaster-rs --clip-metrics --sra-dir <DIR> [--slots <N>] [--top <N>] [--validate]");
         eprintln!("   or: soul-reaver-remaster-rs --srl-info <FILE.SRL>");
         eprintln!("`--textures ... --tlist` lists slot classes; `--tshow <entry>` shows");
@@ -691,9 +691,23 @@ fn run_clip_metrics_file(input: &ClipMetricsInput<'_>, path: &Path) -> ExitCode 
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let model = match (input.bigfile, input.entry) {
+        (Some(dat), Some(index)) => match object::read_entry(Path::new(dat), index) {
+            Ok(model) => Some(model),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(error.exit_code());
+            }
+        },
+        _ => None,
+    };
     let (slots, expected) = match validation_expectations(&stem) {
         Some((slots, expected)) if input.validate => (slots, Some(expected)),
-        _ => (match input.slots.or_else(|| infer_slot_count(&bytes)) {
+        _ => (match input
+            .slots
+            .or_else(|| model.as_ref().map(|model| model.bones.len()))
+            .or_else(|| infer_slot_count(&bytes))
+        {
             Some(slots) => slots,
             None => {
                 eprintln!(
@@ -711,7 +725,10 @@ fn run_clip_metrics_file(input: &ClipMetricsInput<'_>, path: &Path) -> ExitCode 
             return ExitCode::from(1);
         }
     };
-    let report = match clip_metrics::analyze_animation(&animation) {
+    let regions = model.as_ref().map_or(clip_metrics::RegionPlan::Proxy, |model| {
+        clip_metrics::RegionPlan::from_model(model, animation.slot_count())
+    });
+    let report = match clip_metrics::analyze_animation_with_regions(&animation, &regions) {
         Ok(report) => report,
         Err(error) => {
             eprintln!("error: {error}");
@@ -864,12 +881,15 @@ struct ClipMetricsInput<'a> {
     slots: Option<usize>,
     top: usize,
     validate: bool,
+    bigfile: Option<&'a str>,
+    entry: Option<usize>,
 }
 
 fn clip_metrics_input(args: &[String]) -> Result<ClipMetricsInput<'_>, String> {
-    let usage = "expected --clip-metrics (--sra <FILE.SRA> | --sra-dir <DIR>) [--slots <N>] [--top <N>] [--validate]";
+    let usage = "expected --clip-metrics (--sra <FILE.SRA> | --sra-dir <DIR>) [--slots <N>] [--bigfile <DAT> --entry <INDEX>] [--top <N>] [--validate]";
     let (mut sra, mut sra_dir, mut slots, mut top, mut validate) =
         (None, None, None, None, false);
+    let (mut bigfile, mut entry) = (None, None);
     let mut at = 0;
     while at < args.len() {
         match args[at].as_str() {
@@ -884,6 +904,14 @@ fn clip_metrics_input(args: &[String]) -> Result<ClipMetricsInput<'_>, String> {
                 match token {
                     "--sra" => sra = Some(value),
                     "--sra-dir" => sra_dir = Some(value),
+                    "--bigfile" => bigfile = Some(value),
+                    "--entry" => {
+                        entry = Some(
+                            value
+                                .parse::<usize>()
+                                .map_err(|_| format!("invalid value '{value}' for --entry: expected an integer"))?,
+                        );
+                    }
                     "--top" => {
                         let count = value.parse::<usize>().map_err(|_| usage.to_string())?;
                         if !(1..=64).contains(&count) {
@@ -909,12 +937,20 @@ fn clip_metrics_input(args: &[String]) -> Result<ClipMetricsInput<'_>, String> {
     if sra.is_some() == sra_dir.is_some() {
         return Err(usage.to_string());
     }
+    if bigfile.is_some() != entry.is_some() {
+        return Err("--bigfile and --entry must be given together".to_string());
+    }
+    if bigfile.is_some() && sra_dir.is_some() {
+        return Err("--bigfile/--entry apply to one --sra file, not --sra-dir".to_string());
+    }
     Ok(ClipMetricsInput {
         sra,
         sra_dir,
         slots,
         top: top.unwrap_or(clip_metrics::DEFAULT_TOP),
         validate,
+        bigfile,
+        entry,
     })
 }
 
@@ -4468,6 +4504,22 @@ mod cli_tests {
         assert!(clip_metrics_input(&argv(&["--sra", "A.SRA", "--sra-dir", "B"])).is_err());
         assert!(clip_metrics_input(&argv(&["--sra", "A.SRA", "--slots", "0"])).is_err());
         assert!(clip_metrics_input(&argv(&["--sra", "A.SRA", "--top", "65"])).is_err());
+
+        let skeleton_argv = argv(&[
+            "--sra", "HUNTER.SRA", "--bigfile", "BIGFILE.DAT", "--entry", "231",
+        ]);
+        let skeleton =
+            clip_metrics_input(&skeleton_argv).expect("skeleton form must parse");
+        assert_eq!(
+            (skeleton.bigfile, skeleton.entry, skeleton.slots),
+            (Some("BIGFILE.DAT"), Some(231), None)
+        );
+        assert!(clip_metrics_input(&argv(&["--sra", "A.SRA", "--bigfile", "B.DAT"])).is_err());
+        assert!(clip_metrics_input(&argv(&["--sra", "A.SRA", "--entry", "1"])).is_err());
+        assert!(clip_metrics_input(&argv(&[
+            "--sra-dir", "OBJECT", "--bigfile", "B.DAT", "--entry", "1",
+        ]))
+        .is_err());
     }
 
     #[test]
