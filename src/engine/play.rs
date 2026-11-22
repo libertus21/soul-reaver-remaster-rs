@@ -278,8 +278,8 @@ impl PlayOptions {
     ///
     /// The actor loader does not read only this path: it uses
     /// [`Self::labels_store_sources`] so the repository copy and the home copy
-    /// are merged per field. This method is the test-only single-path answer.
-    #[cfg(test)]
+    /// are merged per field. This method remains the single-path answer for
+    /// callers that need one location, such as the clip inspector's save path.
     pub fn labels_store_path(&self) -> PathBuf {
         self.labels_store_path_with(Path::new(Self::REPO_LABELS_STORE))
     }
@@ -315,7 +315,6 @@ impl PlayOptions {
 
     /// Lookup order with an injectable repository path, so the order is
     /// testable without changing the process directory.
-    #[cfg(test)]
     fn labels_store_path_with(&self, repo: &Path) -> PathBuf {
         if let Some(path) = &self.labels_store {
             return path.clone();
