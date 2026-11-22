@@ -1292,6 +1292,98 @@ pub struct ClipSelection {
     pub map: ClipMap,
 }
 
+/// Per-state clip slots where a missing slot is the actor's **rest pose**.
+///
+/// This is the runtime-label form: an entry comes from the persistent label
+/// store and names only the states that were actually measured. A missing
+/// state plays no clip at all; it never borrows another actor's index and never
+/// falls back to an arbitrary table. Indices are validated against the loaded
+/// clip count by [`ClipLabels::validated`], so a stale store cannot address a
+/// table the file does not contain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClipLabels {
+    pub idle: Option<usize>,
+    pub walk: Option<usize>,
+    pub jump_up: Option<usize>,
+    pub fall: Option<usize>,
+    pub land: Option<usize>,
+}
+
+impl ClipLabels {
+    /// No measured label: every state stays at rest.
+    pub const NONE: Self = Self {
+        idle: None,
+        walk: None,
+        jump_up: None,
+        fall: None,
+        land: None,
+    };
+
+    /// The measured clip index for one motion state, or `None` for rest.
+    pub fn clip_for(&self, state: MotionState) -> Option<usize> {
+        match state {
+            MotionState::Idle => self.idle,
+            MotionState::Moving => self.walk,
+            MotionState::Ascending => self.jump_up,
+            MotionState::Falling => self.fall,
+            MotionState::Landing => self.land,
+        }
+    }
+
+    /// Number of states that carry a measured label.
+    pub fn labelled(&self) -> usize {
+        [
+            self.idle,
+            self.walk,
+            self.jump_up,
+            self.fall,
+            self.land,
+        ]
+        .into_iter()
+        .filter(Option::is_some)
+        .count()
+    }
+
+    /// Drop every index that is outside `0..clip_count`.
+    ///
+    /// A stored label is evidence from one run of one file. If the file now
+    /// decodes fewer tables, the label is stale: the state stays at rest rather
+    /// than clamping onto the last table, which would name a different clip.
+    pub fn validated(self, clip_count: usize) -> Self {
+        let keep = |clip: Option<usize>| clip.filter(|&index| index < clip_count);
+        Self {
+            idle: keep(self.idle),
+            walk: keep(self.walk),
+            jump_up: keep(self.jump_up),
+            fall: keep(self.fall),
+            land: keep(self.land),
+        }
+    }
+
+    /// Landing window derived from this map's `land` clip.
+    ///
+    /// With no `land` label there is no land clip to measure, so the minimum
+    /// window is used; it is presentation timing and never a decode.
+    pub fn landing_window(&self, animation: &SraAnimation) -> u64 {
+        self.land.map_or(LANDING_WINDOW_MIN_TICKS, |clip| {
+            let frames = animation.frame_count_of(clip).unwrap_or(0);
+            let divisor = animation.divisor_of(clip).unwrap_or(0);
+            landing_window_ticks(frames, divisor, ANIMATION_UNITS_PER_SECOND)
+        })
+    }
+}
+
+/// The clip source behind a [`ClipSelector`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipPlan {
+    /// `--clip <N>`: one clip, global tick.
+    Fixed(usize),
+    /// The confirmed default/CLI map: every state has an index.
+    Mapped(ClipMap),
+    /// Per-actor stored labels: a missing state is the rest pose.
+    Labelled(ClipLabels),
+}
+
 /// State-driven clip selector.
 ///
 /// Rule: the clip changes only when the observed motion state changes. On a
@@ -1306,12 +1398,14 @@ pub struct ClipSelection {
 /// `Landing -> Idle -> Landing`: the state only changes when the window closes.
 ///
 /// A fixed override (`--clip <N>`) ignores the state and uses the global tick,
-/// so it starts at frame 0 and never resets.
+/// so it starts at frame 0 and never resets. A labelled selector
+/// ([`ClipSelector::from_labels`]) may resolve a state to `None`, which means
+/// the actor keeps its rest pose for that state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClipSelector {
-    selection: ClipSelection,
+    plan: ClipPlan,
     tracker: MotionTracker,
-    clip: usize,
+    clip: Option<usize>,
     start_tick: u64,
     state: Option<MotionState>,
 }
@@ -1319,9 +1413,17 @@ pub struct ClipSelector {
 impl ClipSelector {
     /// Build a selector with an explicit landing window in ticks.
     pub fn new(selection: ClipSelection, landing_ticks: u64) -> Self {
-        let clip = selection.fixed.unwrap_or(selection.map.idle);
+        let plan = match selection.fixed {
+            Some(fixed) => ClipPlan::Fixed(fixed),
+            None => ClipPlan::Mapped(selection.map),
+        };
+        let clip = match plan {
+            ClipPlan::Fixed(fixed) => Some(fixed),
+            ClipPlan::Mapped(map) => Some(map.idle),
+            ClipPlan::Labelled(labels) => labels.idle,
+        };
         Self {
-            selection,
+            plan,
             tracker: MotionTracker::new(landing_ticks),
             clip,
             start_tick: 0,
@@ -1329,8 +1431,31 @@ impl ClipSelector {
         }
     }
 
+    /// Build a per-actor selector from stored labels.
+    ///
+    /// A missing label is `None` (rest), never a default index. The caller
+    /// validates the labels against the file's clip count before this call.
+    pub fn from_labels(labels: ClipLabels, landing_ticks: u64) -> Self {
+        Self {
+            plan: ClipPlan::Labelled(labels),
+            tracker: MotionTracker::new(landing_ticks),
+            clip: labels.idle,
+            start_tick: 0,
+            state: None,
+        }
+    }
+
     /// The active clip index.
+    ///
+    /// Kept for the existing callers: a labelled selector with no clip for the
+    /// current state reports `0`, but those callers must use
+    /// [`ClipSelector::clip_opt`] when "no clip" is meaningful.
     pub fn clip(&self) -> usize {
+        self.clip.unwrap_or(0)
+    }
+
+    /// The active clip index, or `None` when the state is the rest pose.
+    pub fn clip_opt(&self) -> Option<usize> {
         self.clip
     }
 
@@ -1358,18 +1483,22 @@ impl ClipSelector {
 
     /// Observe one tick's motion state. Returns `true` when the clip switched.
     pub fn observe(&mut self, tick: u64, state: MotionState) -> bool {
-        if self.selection.fixed.is_some() || self.state == Some(state) {
+        if matches!(self.plan, ClipPlan::Fixed(_)) || self.state == Some(state) {
             return false;
         }
         self.state = Some(state);
-        self.clip = self.selection.map.clip_for(state);
+        self.clip = match &self.plan {
+            ClipPlan::Fixed(fixed) => Some(*fixed),
+            ClipPlan::Mapped(map) => Some(map.clip_for(state)),
+            ClipPlan::Labelled(labels) => labels.clip_for(state),
+        };
         self.start_tick = tick;
         true
     }
 
     /// The tick the playback clock should use for this clip.
     pub fn local_tick(&self, tick: u64) -> u64 {
-        if self.selection.fixed.is_some() {
+        if matches!(self.plan, ClipPlan::Fixed(_)) {
             tick
         } else {
             tick.saturating_sub(self.start_tick)
@@ -2241,6 +2370,46 @@ mod tests {
             ),
             (0, 0, 0, 0, 0)
         );
+    }
+
+    #[test]
+    fn a_partial_label_map_leaves_missing_states_at_rest() {
+        let labels = ClipLabels {
+            idle: Some(4),
+            walk: Some(2),
+            ..ClipLabels::NONE
+        };
+        assert_eq!(labels.clip_for(MotionState::Idle), Some(4));
+        assert_eq!(labels.clip_for(MotionState::Moving), Some(2));
+        assert_eq!(labels.clip_for(MotionState::Ascending), None);
+        assert_eq!(labels.clip_for(MotionState::Falling), None);
+        assert_eq!(labels.clip_for(MotionState::Landing), None);
+        assert_eq!(labels.labelled(), 2);
+
+        let mut selector = ClipSelector::from_labels(labels, 4);
+        assert_eq!(selector.clip_opt(), Some(4));
+        assert!(selector.observe(0, MotionState::Idle));
+        assert_eq!(selector.clip_opt(), Some(4));
+        assert!(selector.observe(1, MotionState::Moving));
+        assert_eq!(selector.clip_opt(), Some(2));
+        assert!(selector.observe(2, MotionState::Ascending));
+        assert_eq!(selector.clip_opt(), None, "an unmeasured state is rest");
+        assert_eq!(selector.clip(), 0, "legacy callers keep the zero fallback");
+    }
+
+    #[test]
+    fn stale_labels_outside_the_short_animation_are_dropped_not_clamped() {
+        let labels = ClipLabels {
+            idle: Some(55),
+            walk: Some(0),
+            land: Some(7),
+            ..ClipLabels::NONE
+        };
+        let validated = labels.validated(1);
+        assert_eq!(validated.idle, None, "the stale index is not clamped");
+        assert_eq!(validated.walk, Some(0), "an in-range index is kept");
+        assert_eq!(validated.land, None);
+        assert_eq!(validated.labelled(), 1);
     }
 
     #[test]

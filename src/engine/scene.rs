@@ -11,7 +11,7 @@
 //! one scene-wide table in first-use order. The same state therefore produces
 //! the same draw order, the same handles and the same material table.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 
@@ -259,6 +259,19 @@ pub struct PlayerFacing {
     pub animation: Option<Vec<crate::pose::SlotPose>>,
 }
 
+/// One live actor's presentation pose for this frame.
+///
+/// `yaw_binary` is the produced root yaw (zero when the record carries none)
+/// and `animation` is the decoded clip for this tick, or `None` for the rest
+/// pose. The pose is keyed by [`LiveId`], so two instances of the same model
+/// with different motion maps never share a re-skinned mesh.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActorPose {
+    pub actor: LiveId,
+    pub yaw_binary: f32,
+    pub animation: Option<Vec<crate::pose::SlotPose>>,
+}
+
 /// Static scene assets plus the memoized object-model cache.
 ///
 /// The cache is memoization only: it never changes the scene produced by the
@@ -340,7 +353,7 @@ impl SceneAssets {
 
     /// Build the deterministic scene for `live`.
     pub fn build(&mut self, live: &LiveArena, camera: CameraView) -> RenderScene {
-        self.build_with_facing(live, camera, None)
+        self.build_with_poses(live, camera, &[])
     }
 
     /// [`SceneAssets::build`] plus the player's produced root facing.
@@ -359,6 +372,31 @@ impl SceneAssets {
         camera: CameraView,
         facing: Option<PlayerFacing>,
     ) -> RenderScene {
+        let poses: Vec<ActorPose> = facing
+            .map(|facing| ActorPose {
+                actor: facing.player,
+                yaw_binary: facing.yaw_binary,
+                animation: facing.animation,
+            })
+            .into_iter()
+            .collect();
+        self.build_with_poses(live, camera, &poses)
+    }
+
+    /// [`SceneAssets::build`] plus one pose per live actor that has one.
+    ///
+    /// A posed actor always gets its own mesh handle because the pose is keyed
+    /// by live id: two instances of the same model can be in different motion
+    /// states. Unposed actors keep the per-name rest-mesh cache and share a
+    /// handle exactly as before. Passing an empty slice is the plain build, and
+    /// an unresolved model falls back to the rest mesh, so the scene remains a
+    /// pure function of the live state plus this frame's poses.
+    pub fn build_with_poses(
+        &mut self,
+        live: &LiveArena,
+        camera: CameraView,
+        poses: &[ActorPose],
+    ) -> RenderScene {
         let mut material_pages: Vec<Option<u16>> = vec![None];
         let mut page_indices: BTreeMap<u16, u16> = BTreeMap::new();
         let mut meshes = vec![remap_mesh(
@@ -373,28 +411,37 @@ impl SceneAssets {
             class: RenderClass::Unclassified.code(),
         }];
 
+        let posed_by_id: HashMap<LiveId, &ActorPose> =
+            poses.iter().map(|pose| (pose.actor, pose)).collect();
         let mut handles: BTreeMap<String, MeshHandle> = BTreeMap::new();
         for (id, object) in live.iter() {
+            let posed = posed_by_id.get(&id).and_then(|pose| {
+                self.posed_mesh(
+                    &object.name,
+                    pose.yaw_binary,
+                    pose.animation.as_deref(),
+                )
+            });
+            if let Some(mesh) = posed {
+                let handle = MeshHandle(meshes.len() as u32);
+                meshes.push(remap_mesh(&mesh, &mut material_pages, &mut page_indices));
+                items.push(DrawItem {
+                    mesh: handle,
+                    world: object.position,
+                    visible: object.visible,
+                    class: object.class.code(),
+                });
+                continue;
+            }
             let handle = match handles.get(&object.name) {
                 Some(handle) => *handle,
                 None => {
-                    let posed = facing
-                        .as_ref()
-                        .filter(|facing| facing.player == id)
-                        .and_then(|facing| {
-                            self.posed_mesh(
-                                &object.name,
-                                facing.yaw_binary,
-                                facing.animation.as_deref(),
-                            )
-                        })
-                        .map(|mesh| remap_mesh(&mesh, &mut material_pages, &mut page_indices));
-                    let data = posed.unwrap_or_else(|| match self.object_mesh(&object.name) {
+                    let data = match self.object_mesh(&object.name) {
                         Some(mesh) => {
                             remap_mesh(&mesh, &mut material_pages, &mut page_indices)
                         }
                         None => MeshData::default(),
-                    });
+                    };
                     let handle = MeshHandle(meshes.len() as u32);
                     meshes.push(data);
                     handles.insert(object.name.clone(), handle);
@@ -503,7 +550,9 @@ fn remap_mesh(
 
 #[cfg(test)]
 mod tests {
-    use super::{CameraView, MeshHandle, PlayerFacing, RenderScene, SceneAssets, SourceMesh};
+    use super::{
+        ActorPose, CameraView, MeshHandle, PlayerFacing, RenderScene, SceneAssets, SourceMesh,
+    };
     use crate::engine::class::{RenderClass, classify};
     use crate::engine::live::{LiveArena, LiveObject};
 
@@ -681,6 +730,28 @@ mod tests {
             faced, rest,
             "the test assets carry no model resolver, so the player keeps the rest mesh"
         );
+    }
+
+    #[test]
+    fn an_actor_pose_without_a_resolved_model_keeps_the_rest_mesh() {
+        let live = arena();
+        let player = live
+            .iter()
+            .find(|(_, object)| object.name == "raziel__player")
+            .map(|(id, _)| id)
+            .expect("the fixture places the player");
+        let mut assets = assets();
+        let rest = assets.build(&live, CameraView::identity());
+        let posed = assets.build_with_poses(
+            &live,
+            CameraView::identity(),
+            &[ActorPose {
+                actor: player,
+                yaw_binary: 1024.0,
+                animation: None,
+            }],
+        );
+        assert_eq!(posed, rest, "no resolver means the rest mesh");
     }
 
     #[test]
