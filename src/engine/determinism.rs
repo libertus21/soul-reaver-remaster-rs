@@ -140,6 +140,10 @@ fn error_tag(error: &PlayError) -> u8 {
         // Clip-inspect options: appended for the same golden-stability reason.
         PlayError::ClipInspectRequiresWindow => 15,
         PlayError::ClipInspectRequiresSraDir => 16,
+        // Non-interactive clip-assign options: appended, never renumbered.
+        PlayError::InvalidClipAssign { .. } => 17,
+        PlayError::ClipAssignRequiresSraDir => 18,
+        PlayError::ClipAssignWithInspect => 19,
     }
 }
 

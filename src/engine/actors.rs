@@ -1454,7 +1454,11 @@ mod tests {
         );
 
         let store = LabelStore::load(&path).expect("the committed store must parse");
-        assert_eq!(store.len(), 2, "only the two measured files are stored");
+        assert_eq!(
+            store.len(),
+            3,
+            "every measured or visually confirmed file is stored"
+        );
 
         let raziel = store.for_sra("RAZIEL.SRA");
         assert_eq!(
@@ -1472,6 +1476,14 @@ mod tests {
         let sluagh = store.for_sra("SLUAGH.SRA");
         assert_eq!((sluagh.idle, sluagh.walk), (Some(8), Some(1)));
         assert_eq!(sluagh.jump_up, None, "unmeasured states stay at rest");
+
+        let hunter = store.for_sra("HUNTER.SRA");
+        assert_eq!((hunter.idle, hunter.walk), (Some(2), Some(7)));
+        assert_eq!(
+            (hunter.jump_up, hunter.fall, hunter.land),
+            (None, None, None),
+            "the visual pass covered locomotion only"
+        );
     }
 
     #[test]

@@ -183,6 +183,86 @@ fn parse_player_pos(raw: &str) -> Option<[i32; 3]> {
     values.next().is_none().then_some(position)
 }
 
+/// One parsed `--clip-assign <SPEC>` request.
+///
+/// The grammar is `FILE.SRA:state=clip[,state=clip...]`, with the states
+/// `idle`, `walk`, `jump_up`, `fall` and `land`. The file name is mandatory:
+/// without it the assignment would be anonymous, and this flag never applies
+/// one spec to every resolved file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipAssignment {
+    /// The `.SRA` file name exactly as written; resolution is case-insensitive.
+    pub file: String,
+    /// The state/clip pairs in the order they were written.
+    pub fields: Vec<(MotionState, usize)>,
+}
+
+impl ClipAssignment {
+    /// Parse one spec. Every refusal is a typed [`PlayError`], never a default.
+    fn parse(spec: &str) -> Result<Self, PlayError> {
+        let invalid = |reason: String| PlayError::InvalidClipAssign {
+            spec: spec.to_string(),
+            reason,
+        };
+        let (file, rest) = spec.split_once(':').ok_or_else(|| {
+            invalid("expected FILE.SRA:state=clip[,state=clip...]".to_string())
+        })?;
+        if file.is_empty() {
+            return Err(invalid(
+                "the .SRA file name is required; an anonymous assignment is refused".to_string(),
+            ));
+        }
+        if file.len() <= 4 || !file.to_ascii_lowercase().ends_with(".sra") {
+            return Err(invalid(format!(
+                "file name '{file}' must end with .SRA"
+            )));
+        }
+        if rest.is_empty() {
+            return Err(invalid("at least one state=clip pair is required".to_string()));
+        }
+        let mut fields = Vec::new();
+        for item in rest.split(',') {
+            let (field, clip) = item.split_once('=').ok_or_else(|| {
+                invalid(format!("'{item}' must be a state=clip pair"))
+            })?;
+            let state = clip_assign_state(field).ok_or_else(|| {
+                invalid(format!(
+                    "unknown state '{field}': expected idle, walk, jump_up, fall or land"
+                ))
+            })?;
+            if fields.iter().any(|(seen, _)| *seen == state) {
+                return Err(invalid(format!(
+                    "state '{}' is repeated",
+                    state.label_field()
+                )));
+            }
+            let clip = clip.parse::<usize>().map_err(|_| {
+                invalid(format!(
+                    "clip for '{}' must be a non-negative integer",
+                    state.label_field()
+                ))
+            })?;
+            fields.push((state, clip));
+        }
+        Ok(Self {
+            file: file.to_string(),
+            fields,
+        })
+    }
+}
+
+/// The five accepted `--clip-assign` field names.
+fn clip_assign_state(field: &str) -> Option<MotionState> {
+    match field {
+        "idle" => Some(MotionState::Idle),
+        "walk" => Some(MotionState::Moving),
+        "jump_up" => Some(MotionState::Ascending),
+        "fall" => Some(MotionState::Falling),
+        "land" => Some(MotionState::Landing),
+        _ => None,
+    }
+}
+
 /// Parsed `--play` options.
 ///
 /// `ticks` is resolved during parsing: headless defaults to 60, while `None`
@@ -242,6 +322,13 @@ pub struct PlayOptions {
     /// Clip inspector (`--clip-inspect <N>`): every resolved actor plays clip
     /// `N`, looped, while keys assign the current clip to a state.
     pub clip_inspect: Option<usize>,
+    /// Non-interactive visual assignments (`--clip-assign <SPEC>`, repeatable).
+    ///
+    /// Each entry names one resolved `.SRA` file and one or more state/clip
+    /// pairs. The run writes them through the inspector's visual save path and
+    /// never opens a window, so recording a clip does not depend on keyboard
+    /// focus.
+    pub clip_assign: Vec<ClipAssignment>,
     /// Deterministic diagnostic input sequence (`--input-script`, headless only).
     pub input_script: Option<InputScript>,
     /// Explicit player position that overrides the authored record
@@ -388,6 +475,7 @@ impl PlayOptions {
             clip_fall: None,
             clip_land: None,
             clip_inspect: None,
+            clip_assign: Vec::new(),
             input_script: None,
             player_pos: None,
             cull_report: false,
@@ -470,6 +558,10 @@ impl PlayOptions {
                 "--clip-inspect" => {
                     options.clip_inspect = Some(clip_value(args, index, "--clip-inspect")?)
                 }
+                "--clip-assign" => {
+                    let raw = value(args, index, "--clip-assign")?;
+                    options.clip_assign.push(ClipAssignment::parse(raw)?);
+                }
                 "--input-script" => {
                     let raw = value(args, index, "--input-script")?;
                     options.input_script = Some(
@@ -531,6 +623,14 @@ impl PlayOptions {
         if options.cull_report && !options.headless {
             return Err(PlayError::CullReportRequiresHeadless);
         }
+        if !options.clip_assign.is_empty() {
+            if options.clip_inspect.is_some() {
+                return Err(PlayError::ClipAssignWithInspect);
+            }
+            if options.sra_dir.is_none() {
+                return Err(PlayError::ClipAssignRequiresSraDir);
+            }
+        }
         if options.clip_inspect.is_some() {
             if options.headless {
                 return Err(PlayError::ClipInspectRequiresWindow);
@@ -539,7 +639,9 @@ impl PlayOptions {
                 return Err(PlayError::ClipInspectRequiresSraDir);
             }
         }
-        if options.headless {
+        // `--clip-assign` is a windowless one-shot, so it resolves ticks like
+        // the headless path even when the caller omits `--headless`.
+        if options.headless || !options.clip_assign.is_empty() {
             if options.ticks.is_none() {
                 options.ticks = Some(60);
             }
@@ -604,6 +706,12 @@ pub enum PlayError {
     CullReportRequiresHeadless,
     ClipInspectRequiresWindow,
     ClipInspectRequiresSraDir,
+    InvalidClipAssign {
+        spec: String,
+        reason: String,
+    },
+    ClipAssignRequiresSraDir,
+    ClipAssignWithInspect,
     InvalidPlayerPos(String),
     InvalidCamDistance(String),
     InvalidCamHeight(String),
@@ -659,6 +767,18 @@ impl fmt::Display for PlayError {
                 f,
                 "--clip-inspect requires --sra-dir <DIR>: it inspects per-actor .SRA files"
             ),
+            Self::InvalidClipAssign { spec, reason } => write!(
+                f,
+                "invalid value '{spec}' for --clip-assign: {reason}"
+            ),
+            Self::ClipAssignRequiresSraDir => write!(
+                f,
+                "--clip-assign requires --sra-dir <DIR>: it validates against per-actor .SRA files"
+            ),
+            Self::ClipAssignWithInspect => write!(
+                f,
+                "--clip-assign cannot be combined with --clip-inspect: one records non-interactively, the other is interactive"
+            ),
             Self::InvalidPlayerPos(value) => write!(
                 f,
                 "invalid value '{value}' for --player-pos: expected X,Y,Z integers"
@@ -691,6 +811,8 @@ pub enum RunError {
     /// An unreadable asset archive during headless boot: fail with exit code 2.
     Asset(String),
     Window(String),
+    /// A `--clip-assign` file/clip that the resolved actor set cannot satisfy.
+    ClipAssign(String),
     /// Engine invariant violated (tracker full, corrupt arena, impossible
     /// state). Exit code 4.
     Invariant(String),
@@ -737,6 +859,7 @@ impl fmt::Display for RunError {
             Self::Texture(detail) => write!(f, "cannot decode texture page: {detail}"),
             Self::Asset(detail) => write!(f, "cannot read the asset archive: {detail}"),
             Self::Window(detail) => write!(f, "cannot open the play window: {detail}"),
+            Self::ClipAssign(detail) => write!(f, "{detail}"),
             Self::Invariant(detail) => write!(f, "engine invariant failed: {detail}"),
         }
     }
@@ -751,7 +874,10 @@ impl std::error::Error for RunError {}
 /// every texture page used by the initial scene and only then create the winit
 /// event loop.
 pub fn run(options: &PlayOptions) -> Result<(), RunError> {
-    if !options.headless && options.textures.is_none() {
+    // `--clip-assign` records labels and exits; it never needs a window, so a
+    // caller can make the measurement without passing `--headless` at all.
+    let windowless = options.headless || !options.clip_assign.is_empty();
+    if !windowless && options.textures.is_none() {
         return Err(RunError::MissingTextures);
     }
 
@@ -760,7 +886,7 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
         None => World::load(&options.bigfile, &options.unit),
     }
     .map_err(RunError::World)?;
-    let textures = if options.headless {
+    let textures = if windowless {
         None
     } else {
         options.textures.as_deref()
@@ -773,7 +899,7 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
         // result is still a pure function of the same argv.
         let _placed = frame.place_player(position);
     }
-    let animation = if options.headless {
+    let animation = if windowless {
         None
     } else {
         match options.sra.as_deref() {
@@ -802,7 +928,7 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
         None => None,
     };
 
-    if options.headless {
+    if windowless {
         let ticks = options.ticks.unwrap_or(60);
         if let Some(script) = &options.input_script {
             return run_scripted(frame, script, ticks, options, &mut assets);
@@ -1064,6 +1190,15 @@ fn headless_run_with_actors(
         frame
             .run_tick(ObjectTick::step(0))
             .map_err(RunError::engine)?;
+        if !options.clip_assign.is_empty() {
+            apply_clip_assign(
+                options,
+                frame,
+                assets,
+                &default_labels_store(),
+                Path::new(PlayOptions::REPO_LABELS_STORE),
+            )?;
+        }
         let _actors = load_actor_animations(frame, assets, options)?;
         start = 1;
     }
@@ -1234,6 +1369,15 @@ fn run_scripted(
 ) -> Result<(), RunError> {
     let _counts = boot_world(&mut frame, &options.bigfile)?;
     let report = run_script_ticks(&mut frame, script, u64::from(ticks))?;
+    if !options.clip_assign.is_empty() {
+        apply_clip_assign(
+            options,
+            &frame,
+            assets,
+            &default_labels_store(),
+            Path::new(PlayOptions::REPO_LABELS_STORE),
+        )?;
+    }
     // The scripted run has already realized every deferred spawn. Resolving the
     // one-time actor diagnostic here is still presentation-only and leaves the
     // movement report and state untouched.
@@ -1616,11 +1760,17 @@ impl ClipInspector {
     }
 
     fn assign(&mut self, state: MotionState) {
-        let Some(file) = self.target_file() else {
+        let Some(file) = self.target_file().map(str::to_string) else {
             return;
         };
-        let file = file.to_string();
-        self.pending.entry(file).or_insert([None; 5])[label_state_index(state)] = Some(self.clip);
+        self.assign_clip(&file, state, self.clip);
+    }
+
+    /// Record one state/clip pair for `file`, whether it came from a key press
+    /// or from the non-interactive `--clip-assign` entry point.
+    fn assign_clip(&mut self, file: &str, state: MotionState, clip: usize) {
+        self.pending.entry(file.to_string()).or_insert([None; 5])
+            [label_state_index(state)] = Some(clip);
     }
 
     fn clear(&mut self) {
@@ -1786,6 +1936,143 @@ impl VisualSaveReport {
         }
         lines
     }
+}
+
+/// One validated `--clip-assign` pair: canonical `.SRA` file, state and clip.
+type ResolvedAssignment = (String, MotionState, usize);
+
+/// Resolve the `--clip-assign` specs against the files this run actually
+/// resolved, then write them through the inspector's save path and print both
+/// the resolved set and the per-target report.
+fn apply_clip_assign(
+    options: &PlayOptions,
+    frame: &FrameState,
+    assets: &mut SceneAssets,
+    home: &Path,
+    repo: &Path,
+) -> Result<(), RunError> {
+    let resolved = resolve_clip_assign_for_run(options, frame, assets)?;
+    for line in clip_assign_lines(&resolved) {
+        outln!("{line}");
+    }
+    let report = write_clip_assign(&resolved, home, repo);
+    for line in report.lines() {
+        outln!("{line}");
+    }
+    Ok(())
+}
+
+/// Resolve the specs against the per-actor animation set the normal path uses.
+///
+/// The set supplies both the accepted file names and each file's decoded clip
+/// count, so an unknown file or an out-of-range clip is refused before any
+/// store is touched.
+fn resolve_clip_assign_for_run(
+    options: &PlayOptions,
+    frame: &FrameState,
+    assets: &mut SceneAssets,
+) -> Result<Vec<ResolvedAssignment>, RunError> {
+    let Some(dir) = options.sra_dir.as_deref() else {
+        return Err(RunError::ClipAssign(
+            "--clip-assign requires --sra-dir <DIR>".to_string(),
+        ));
+    };
+    let stores = options.labels_store_sources();
+    let exclude = options.sra.is_some().then(|| frame.player()).flatten();
+    let actors = ActorAnimations::load(frame, assets, Some(dir), &stores, exclude)
+        .map_err(RunError::ClipAssign)?;
+    resolve_clip_assignments(&options.clip_assign, &actors.files())
+        .map_err(RunError::ClipAssign)
+}
+
+/// Validate specs against `(file, clip_count)` pairs, canonicalizing the file
+/// name. A repeated state in a later spec replaces the earlier one; the result
+/// is ordered by file and the store's canonical state order.
+fn resolve_clip_assignments(
+    specs: &[ClipAssignment],
+    resolved_files: &[(String, usize)],
+) -> Result<Vec<ResolvedAssignment>, String> {
+    let available = || {
+        if resolved_files.is_empty() {
+            "none".to_string()
+        } else {
+            resolved_files
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    };
+    let mut out: Vec<ResolvedAssignment> = Vec::new();
+    for spec in specs {
+        let Some((canonical, count)) = resolved_files
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&spec.file))
+            .cloned()
+        else {
+            return Err(format!(
+                "--clip-assign file '{}' is not a resolved .SRA in this run; available: {}",
+                spec.file,
+                available()
+            ));
+        };
+        for (state, clip) in &spec.fields {
+            if *clip >= count {
+                return Err(format!(
+                    "--clip-assign file '{canonical}' {}={clip} is outside its {count} decoded clips",
+                    state.label_field()
+                ));
+            }
+            match out
+                .iter_mut()
+                .find(|entry| entry.0.eq_ignore_ascii_case(&canonical) && entry.1 == *state)
+            {
+                Some(existing) => existing.2 = *clip,
+                None => out.push((canonical.clone(), *state, *clip)),
+            }
+        }
+    }
+    out.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| label_state_index(left.1).cmp(&label_state_index(right.1)))
+    });
+    Ok(out)
+}
+
+/// One `clip-assign file=NAME state=clip ...` line per resolved file.
+fn clip_assign_lines(resolved: &[ResolvedAssignment]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current: Option<&str> = None;
+    let mut fields: Vec<String> = Vec::new();
+    for (file, state, clip) in resolved {
+        if current != Some(file.as_str()) {
+            if let Some(previous) = current {
+                lines.push(format!("clip-assign file={previous} {}", fields.join(" ")));
+            }
+            current = Some(file.as_str());
+            fields.clear();
+        }
+        fields.push(format!("{}={clip}", state.label_field()));
+    }
+    if let Some(file) = current {
+        lines.push(format!("clip-assign file={file} {}", fields.join(" ")));
+    }
+    lines
+}
+
+/// Write validated assignments through the same dual-store visual save the
+/// interactive inspector uses. Pending is populated exactly like a key press.
+fn write_clip_assign(
+    resolved: &[ResolvedAssignment],
+    home: &Path,
+    repo: &Path,
+) -> VisualSaveReport {
+    let mut inspector = ClipInspector::new(0, home.to_path_buf(), repo.to_path_buf());
+    for (file, state, clip) in resolved {
+        inspector.assign_clip(file, *state, *clip);
+    }
+    inspector.save()
 }
 
 fn utc_now_iso8601() -> String {
@@ -2371,19 +2658,23 @@ impl ApplicationHandler for PlayApp {
 #[cfg(test)]
 mod tests {
     use super::{
-        CameraMode, ClipInspector, CullReport, InputScript, PLAYER_CAMERA_DISTANCE,
-        PLAYER_CAMERA_HEIGHT, PLAYER_FALLBACK_YAW_BINARY, PLAYER_LOOK_HEIGHT, PlayError,
-        PlayOptions, RunError, apply_script_tick, cull_report, format_utc, player_camera_world,
-        run_script_ticks, third_person_mvp,
+        CameraMode, ClipAssignment, ClipInspector, CullReport, InputScript,
+        PLAYER_CAMERA_DISTANCE, PLAYER_CAMERA_HEIGHT, PLAYER_FALLBACK_YAW_BINARY,
+        PLAYER_LOOK_HEIGHT, PlayError, PlayOptions, RunError, apply_script_tick, clip_assign_lines,
+        cull_report, format_utc, player_camera_world, resolve_clip_assignments, run_script_ticks,
+        third_person_mvp, write_clip_assign,
     };
     use crate::engine::clock::ObjectTick;
     use crate::engine::collision::CollisionMesh;
-    use crate::engine::actors::LabelStore;
+    use crate::engine::actors::{ActorAnimation, LabelStore};
     use crate::engine::frame::FrameState;
     use crate::engine::input::InputButton;
+    use crate::engine::live::LiveId;
     use crate::engine::world::World;
     use crate::level::{ObjectRecord, ObjectReport};
-    use crate::sra::{ClipError, ClipMap, MotionState};
+    use crate::sra::{
+        ClipError, ClipMap, MotionState, SraAnimation, synthetic_multi_clip_container,
+    };
     use std::path::PathBuf;
 
     fn argv(input: &[&str]) -> Vec<String> {
@@ -3545,6 +3836,242 @@ mod tests {
         );
         assert!(inspector.pending.is_empty());
         assert!(inspector.saved.is_none());
+    }
+
+    fn clip_assign_targets(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+        (
+            dir.join("home").join(".sr1_clip_labels.json"),
+            dir.join("repo").join("data").join("clip-labels.json"),
+        )
+    }
+
+    fn assignment(file: &str, fields: &[(MotionState, usize)]) -> ClipAssignment {
+        ClipAssignment {
+            file: file.to_string(),
+            fields: fields.to_vec(),
+        }
+    }
+
+    #[test]
+    fn clip_assign_spec_parses_every_state_and_accumulates_flags() {
+        let spec = ClipAssignment::parse("HUNTER.SRA:idle=2,walk=7,jump_up=3,fall=4,land=5")
+            .expect("a full spec parses");
+        assert_eq!(spec.file, "HUNTER.SRA");
+        assert_eq!(
+            spec.fields,
+            vec![
+                (MotionState::Idle, 2),
+                (MotionState::Moving, 7),
+                (MotionState::Ascending, 3),
+                (MotionState::Falling, 4),
+                (MotionState::Landing, 5),
+            ]
+        );
+
+        let options = parse(&[
+            "--bigfile", "B.DAT", "--sra-dir", "OBJECT", "--headless",
+            "--clip-assign", "HUNTER.SRA:idle=2,walk=7",
+            "--clip-assign", "SLUAGH.SRA:walk=1",
+        ])
+        .expect("repeating the flag accumulates files");
+        assert_eq!(options.clip_assign.len(), 2);
+        assert_eq!(options.clip_assign[0].file, "HUNTER.SRA");
+        assert_eq!(options.clip_assign[1].file, "SLUAGH.SRA");
+    }
+
+    #[test]
+    fn clip_assign_refuses_an_anonymous_or_repeated_or_unknown_spec() {
+        let anonymous = ClipAssignment::parse(":idle=2").expect_err("no file means no write");
+        assert!(
+            anonymous.to_string().contains("anonymous assignment is refused"),
+            "{anonymous}"
+        );
+
+        let repeated = ClipAssignment::parse("HUNTER.SRA:idle=2,idle=3")
+            .expect_err("a repeated state is ambiguous");
+        assert!(repeated.to_string().contains("state 'idle' is repeated"));
+
+        let unknown = ClipAssignment::parse("HUNTER.SRA:run=2")
+            .expect_err("only the five store fields are accepted");
+        assert!(
+            unknown.to_string().contains("unknown state 'run'"),
+            "{unknown}"
+        );
+        assert!(unknown.to_string().contains("idle, walk, jump_up, fall or land"));
+    }
+
+    #[test]
+    fn clip_assign_refuses_a_non_numeric_clip_and_a_missing_sra_suffix() {
+        let numeric = ClipAssignment::parse("HUNTER.SRA:idle=walk")
+            .expect_err("a clip must be an integer");
+        assert!(numeric.to_string().contains("non-negative integer"));
+
+        let suffix =
+            ClipAssignment::parse("HUNTER:idle=2").expect_err("the file must be a .SRA name");
+        assert!(suffix.to_string().contains("must end with .SRA"));
+    }
+
+    #[test]
+    fn clip_assign_refuses_an_unknown_file_and_lists_the_available_names() {
+        let resolved = [
+            ("HUNTER.SRA".to_string(), 10),
+            ("SLUAGH.SRA".to_string(), 3),
+        ];
+        let error = resolve_clip_assignments(
+            &[assignment("NOPE.SRA", &[(MotionState::Idle, 2)])],
+            &resolved,
+        )
+        .expect_err("an unknown file is refused");
+        assert!(error.contains("not a resolved .SRA"), "{error}");
+        assert!(error.contains("HUNTER.SRA"), "{error}");
+        assert!(error.contains("SLUAGH.SRA"), "{error}");
+    }
+
+    #[test]
+    fn clip_assign_refuses_a_clip_outside_the_file_count() {
+        let error = resolve_clip_assignments(
+            &[assignment("HUNTER.SRA", &[(MotionState::Idle, 10)])],
+            &[("HUNTER.SRA".to_string(), 10)],
+        )
+        .expect_err("clip 10 is the first index past a 10-clip file");
+        assert!(error.contains("idle=10"), "{error}");
+        assert!(error.contains("outside its 10 decoded clips"), "{error}");
+    }
+
+    #[test]
+    fn clip_assign_requires_sra_dir_and_refuses_the_interactive_inspector() {
+        assert!(matches!(
+            parse(&["--bigfile", "B.DAT", "--clip-assign", "HUNTER.SRA:idle=2"]),
+            Err(PlayError::ClipAssignRequiresSraDir)
+        ));
+        assert!(matches!(
+            parse(&[
+                "--bigfile", "B.DAT", "--sra-dir", "OBJECT",
+                "--clip-assign", "HUNTER.SRA:idle=2", "--clip-inspect", "2",
+            ]),
+            Err(PlayError::ClipAssignWithInspect)
+        ));
+    }
+
+    #[test]
+    fn clip_assign_without_headless_still_gets_the_headless_tick_default() {
+        let options = parse(&[
+            "--bigfile", "B.DAT", "--sra-dir", "OBJECT",
+            "--clip-assign", "HUNTER.SRA:idle=2",
+        ])
+        .expect("clip-assign is a windowless one-shot");
+        assert!(!options.headless, "the flag itself is what makes it windowless");
+        assert_eq!(options.ticks, Some(60), "the assignment run gets the headless default");
+    }
+
+    #[test]
+    fn clip_assign_writes_both_stores_with_visual_method() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (home, repo) = clip_assign_targets(dir.path());
+        let resolved = resolve_clip_assignments(
+            &[assignment(
+                "HUNTER.SRA",
+                &[(MotionState::Idle, 2), (MotionState::Moving, 7)],
+            )],
+            &[("HUNTER.SRA".to_string(), 10)],
+        )
+        .expect("resolves");
+        assert_eq!(
+            clip_assign_lines(&resolved),
+            vec!["clip-assign file=HUNTER.SRA idle=2 walk=7".to_string()]
+        );
+
+        let report = write_clip_assign(&resolved, &home, &repo);
+        for store in [&home, &repo] {
+            let loaded = LabelStore::load(store).expect("the written store parses");
+            let labels = loaded.for_sra("HUNTER.SRA");
+            assert_eq!((labels.idle, labels.walk), (Some(2), Some(7)));
+            let text = std::fs::read_to_string(store).expect("store text");
+            assert!(text.contains("\"field_method\""), "per-field method");
+            assert!(text.contains("\"visual\""), "visual evidence class");
+            assert!(text.contains("\"field_assigned_at\""), "per-field stamp");
+        }
+        assert!(
+            report
+                .lines()
+                .iter()
+                .any(|line| line.contains("clip-inspect saved file=HUNTER.SRA fields=idle=2,walk=7")),
+            "the shared save report names the file and fields: {:?}",
+            report.lines()
+        );
+    }
+
+    #[test]
+    fn headless_clip_assign_writes_through_the_shared_save_path() {
+        let options = parse(&[
+            "--bigfile", "B.DAT", "--headless", "--sra-dir", "OBJECT",
+            "--clip-assign", "HUNTER.SRA:idle=2,walk=7",
+        ])
+        .expect("headless accepts clip-assign");
+        assert!(options.headless);
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (home, repo) = clip_assign_targets(dir.path());
+        let resolved = resolve_clip_assignments(
+            &options.clip_assign,
+            &[("HUNTER.SRA".to_string(), 10)],
+        )
+        .expect("resolves against the headless actor set");
+        let report = write_clip_assign(&resolved, &home, &repo);
+        assert!(home.exists(), "the home target is written");
+        assert!(repo.exists(), "the repository target is written");
+        assert!(
+            report
+                .lines()
+                .iter()
+                .any(|line| line.contains("clip-inspect saved file=HUNTER.SRA")),
+            "{:?}",
+            report.lines()
+        );
+    }
+
+    #[test]
+    fn clip_assign_round_trips_through_the_normal_merge() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (home, repo) = clip_assign_targets(dir.path());
+        let resolved = resolve_clip_assignments(
+            &[assignment(
+                "HUNTER.SRA",
+                &[(MotionState::Idle, 2), (MotionState::Moving, 7)],
+            )],
+            &[("HUNTER.SRA".to_string(), 10)],
+        )
+        .expect("resolves");
+        write_clip_assign(&resolved, &home, &repo);
+
+        let merged = LabelStore::merge(
+            LabelStore::load(&home).expect("home store parses"),
+            LabelStore::load(&repo).expect("repo store parses"),
+        );
+        let animation = SraAnimation::load(
+            synthetic_multi_clip_container(&[0x001], &[(2, 100); 10]),
+            1,
+        )
+        .expect("ten synthetic clips");
+        let hunter = ActorAnimation::new(
+            LiveId {
+                index: 0,
+                generation: 0,
+            },
+            "hunter".to_string(),
+            "HUNTER.SRA".to_string(),
+            animation,
+            merged.for_sra("HUNTER.SRA"),
+        );
+        assert_eq!(hunter.labels().idle, Some(2));
+        assert_eq!(hunter.labels().walk, Some(7));
+        assert!(
+            hunter
+                .label_line()
+                .contains("labels=idle=2,walk=7,jump_up=-,fall=-,land=-"),
+            "{}",
+            hunter.label_line()
+        );
     }
 }
 
