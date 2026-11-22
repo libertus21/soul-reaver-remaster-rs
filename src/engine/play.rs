@@ -264,7 +264,7 @@ impl PlayOptions {
     /// file names.
     pub const REPO_LABELS_STORE: &'static str = "data/clip-labels.json";
 
-    /// The label store path, in documented lookup order.
+    /// The primary label store path, in documented lookup order.
     ///
     /// 1. `--labels-store <FILE>` when given (explicit wins, even if missing).
     /// 2. [`Self::REPO_LABELS_STORE`] relative to the current directory when
@@ -272,13 +272,41 @@ impl PlayOptions {
     /// 3. The probe's user-home default (`~/.sr1_clip_labels.json`, resolved
     ///    from `USERPROFILE` or `HOME`).
     ///
-    /// A missing repository copy falls through to the home path instead of
-    /// failing. A malformed file is never skipped: `LabelStore::load` reports
-    /// it with the resolved path. No absolute path is compiled in; when neither
-    /// environment variable exists the home form is a relative name and a
-    /// missing file simply leaves every label at rest.
+    /// The actor loader does not read only this path: it uses
+    /// [`Self::labels_store_sources`] so the repository copy and the home copy
+    /// are merged per field. This method remains the single-path answer for
+    /// callers that need one location.
     pub fn labels_store_path(&self) -> PathBuf {
         self.labels_store_path_with(Path::new(Self::REPO_LABELS_STORE))
+    }
+
+    /// Every label store to merge, in precedence order.
+    ///
+    /// An explicit `--labels-store` is the only source. Otherwise the
+    /// repository copy (when it exists) and the probe's home copy are both
+    /// returned, and `LabelStore::merge` keeps the newer `updated` per field.
+    /// Reading only the first existing file was the consumption gap: the probe
+    /// writes the home copy, which was ignored whenever the versioned copy
+    /// existed.
+    pub fn labels_store_sources(&self) -> Vec<PathBuf> {
+        self.labels_store_sources_with(Path::new(Self::REPO_LABELS_STORE))
+    }
+
+    /// The merge sources with an injectable repository path, so the order is
+    /// testable without changing the process directory.
+    fn labels_store_sources_with(&self, repo: &Path) -> Vec<PathBuf> {
+        if let Some(path) = &self.labels_store {
+            return vec![path.clone()];
+        }
+        let home = default_labels_store();
+        let mut sources = Vec::new();
+        if repo.is_file() {
+            sources.push(repo.to_path_buf());
+        }
+        if sources.first() != Some(&home) {
+            sources.push(home);
+        }
+        sources
     }
 
     /// Lookup order with an injectable repository path, so the order is
@@ -1068,7 +1096,7 @@ fn load_actor_animations(
     if options.sra_dir.is_none() {
         return Ok(ActorAnimations::default());
     }
-    let store = options.labels_store_path();
+    let stores = options.labels_store_sources();
     // `--sra` is the player's single-actor override: when it is present the
     // per-actor set must not also bind the player, or the override wins only by
     // chance of ordering. The player keeps the legacy selector.
@@ -1077,7 +1105,7 @@ fn load_actor_animations(
         frame,
         assets,
         options.sra_dir.as_deref(),
-        Some(store.as_path()),
+        &stores,
         exclude,
     )
     .map_err(RunError::Scene)?;
@@ -1232,7 +1260,7 @@ fn open_window(
     // The boot spawns land on the first tick, so per-actor animation is resolved
     // lazily then (one pass, never per frame) instead of seeing only the player.
     let actor_dir = options.sra_dir.clone();
-    let actor_store = options.labels_store_path();
+    let actor_store = options.labels_store_sources();
     let actor_exclude = options.sra.is_some().then(|| frame.player()).flatten();
     // The initial scene is the complete set of pages the first frame draws.
     // Decoding them here keeps a bad page strictly before the window.
@@ -1494,8 +1522,8 @@ struct PlayApp {
     actors_loaded: bool,
     /// `--sra-dir`, kept until the first tick realizes the boot spawns.
     actor_dir: Option<PathBuf>,
-    /// `--labels-store` or its documented default.
-    actor_store: PathBuf,
+    /// `--labels-store` or the merged repository-plus-home sources.
+    actor_store: Vec<PathBuf>,
     /// Player id excluded from the per-actor set when `--sra` is its override.
     actor_exclude: Option<crate::engine::live::LiveId>,
     anim_fps: u32,
@@ -1595,7 +1623,7 @@ impl PlayApp {
             &self.frame,
             &mut self.assets,
             Some(directory),
-            Some(self.actor_store.as_path()),
+            &self.actor_store,
             self.actor_exclude,
         )?;
         for line in actors.diagnostic_lines() {
@@ -2056,6 +2084,35 @@ mod tests {
                 .ends_with(".sr1_clip_labels.json"),
             "a missing repository copy falls through to the home path"
         );
+    }
+
+    #[test]
+    fn label_store_sources_merge_repo_and_home_by_default() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("clip-labels.json");
+        std::fs::write(&repo, "{}").expect("write the repository copy");
+
+        let explicit = parse(&["--bigfile", "B", "--labels-store", "mine.json"])
+            .expect("explicit store parses");
+        assert_eq!(
+            explicit.labels_store_sources_with(&repo),
+            vec![PathBuf::from("mine.json")],
+            "an explicit --labels-store is the only source"
+        );
+
+        let default = parse(&["--bigfile", "B"]).expect("defaults parse");
+        let sources = default.labels_store_sources_with(&repo);
+        assert_eq!(sources.len(), 2, "both copies are read and merged");
+        assert_eq!(sources[0], repo, "the repository copy is the base");
+        assert!(
+            sources[1].ends_with(".sr1_clip_labels.json"),
+            "the probe's home copy is the overlay"
+        );
+
+        let missing = dir.path().join("absent.json");
+        let home_only = default.labels_store_sources_with(&missing);
+        assert_eq!(home_only.len(), 1, "no repository copy means home only");
+        assert!(home_only[0].ends_with(".sr1_clip_labels.json"));
     }
 
     #[test]
