@@ -121,6 +121,20 @@ writes succeed, so a partial failure can be retried with another Enter. The
 status line carries `pending=` and `saved=`; `saved=` stays `none` until a save
 writes both stores.
 
+### Non-interactive assignment
+
+`--clip-assign <SPEC> --sra-dir <DIR>` is the second entry point to the same
+save path, for sessions where window keyboard focus cannot be trusted. `SPEC`
+is `FILE.SRA:state=clip[,state=clip...]` with the five fields above. The file
+name is mandatory: `:idle=2` is refused, never applied to every file. The flag
+may be repeated for multiple files and runs without a window, with or without
+`--headless`. It resolves the file against the live actor set, validates each
+clip against that file's decoded count, prints
+`clip-assign file=HUNTER.SRA idle=2 walk=7`, then writes through the shared
+`visual` save above and prints the same `saved`/`failed`/version-control lines.
+A later normal run consumes the labels through the ordinary merge; playback is
+not special-cased. `--clip-assign` and `--clip-inspect` are mutually exclusive.
+
 The write preserves every other field, including `slots`, `agreement`, `runs`
 and `samples`. A visual-only entry carries no `runs` or `samples`: the user's
 explicit action is the evidence, and the engine never fabricates counters. The
@@ -162,3 +176,9 @@ label exactly like a motion label.
   proves clip selection and per-file clamping.
 - `engine::play::tests::clip_inspect_parses_but_refuses_headless_and_a_missing_sra_dir`
   pins the typed refusals.
+- `engine::play::tests::clip_assign_writes_both_stores_with_visual_method`
+  proves the non-interactive entry point writes both stores with the `visual`
+  method and per-field stamp.
+- `engine::play::tests::clip_assign_round_trips_through_the_normal_merge`
+  proves a written `HUNTER.SRA` assignment survives the ordinary merge and is
+  what the normal actor binding reports as `labels=idle=2,walk=7`.
