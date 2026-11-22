@@ -1,4 +1,4 @@
-# Clip labelling from runtime table selection
+﻿# Clip labelling from runtime table selection
 
 The offline clip ranking cannot identify a real idle or walk, so the label
 source moves to the runtime: a probe observes which frame producer the engine
@@ -231,12 +231,21 @@ fp = <frame_count>:<divisor>:<8 hex digits>
 
 The block length is `1 + present * ceil(3 * slots / 8)`, and `slots` is the
 **observed body's** covered slot count, taken as the sum of its channel slot
-counts — 66 for the player body, 24 for `SLUAGH.SRA`. It is not the global
-`--slots` value. A first version used the global value, which is correct for the
-player and wrong for every smaller body: a 24-slot body has 9-byte planes, and
-hashing 25-byte planes read 32 bytes past the block into the inline value
-stream. The byte-level table, the corrected definition and the cross-form proof
-are in `docs/notes/packed-channel-format.md`, "Small bodies".
+counts â€” 66 for the player body, 24 for `SLUAGH.SRA`. It is not the global
+`--slots` value.
+
+That rule has to hold on **both** sides of the comparison. The file-side index
+already derived the stride per file, so it hashed small bodies at 9-byte planes.
+The runtime hash did not: it computed the stride from the global `CFG.slots`
+(default 66), so every runtime fingerprint assumed a 66-slot body and folded the
+padding and the inline value stream of a small body into the hash. A 24-slot body
+could therefore hold a clip perfectly â€” coverage `1.00`, a stable run â€” and still
+report `file=none`, `dominant=unmapped`. The previous small-body change fixed the
+file side and the documented invariant, not the runtime side; this revision
+threads the body's slot count into the runtime hash.
+
+The byte-level table, the corrected definition and the cross-form proof are in
+`docs/notes/packed-channel-format.md`, "Small bodies".
 
 The first version of this scheme hashed 20 header bytes. That included
 `+0x10..+0x13`, the low half of a field that is a 4-byte offset in the file and
@@ -259,6 +268,37 @@ pairs collide. The earlier 20-byte view had one collision, but it was not
 form-invariant, so its extra discrimination came from a pointer. The probe
 reports `ambiguous=<n>` at startup and maps an ambiguous key to the lowest
 index; it never hides the collision.
+
+### Per-body slot threading
+
+The hash takes an explicit `slots` argument. It is a parameter of the fingerprint
+function, not a field read from configuration, so the value is visible at every
+call site and cannot silently become the player's count.
+
+**Rule: no fingerprint may use a guessed or global slot count.** A call site that
+does not know the observed body's slot count must produce **no fingerprint** and
+count the omission; it must not hash with a default. The probe exposes that count
+as its no-slot counter, so a regression is visible instead of becoming a wrong
+key that quietly never matches.
+
+Every call site now supplies the body's observed count:
+
+| Call site | Slot count supplied |
+|---|---|
+| Live geometry snapshot (per hook invocation) | Sum of the body's channel slot ranges, computed in a first pass before any table is hashed |
+| Fingerprint case | The geometry's observed `slots` |
+| Segment case | 66 for the two 33-slot streams; 5 for the single small stream |
+| Keyed-null case | The geometry's observed `slots` |
+| Multi-actor case | 66 for the walker, 24 for the never-moving actor, 8 for the thin actor |
+| Run-length case | 66 for all three tables |
+| Real-interceptor case | 66 for the synthetic body |
+| Slot-stride case | 24 (two 12-slot streams), 3 and 2 for the tiny prop bodies |
+
+No call site remains without a slot count. The geometry snapshot is the only
+production path; it reads each channel's `(first, count)` into a list, sums the
+counts, and only then hashes the packed tables. A body whose channels cover zero
+slots yields no fingerprint and increments the no-slot counter rather than
+falling back.
 
 ## The keyed fingerprint
 
@@ -557,8 +597,8 @@ For each file the probe:
    record, in file order** (the same rule the single-file index uses);
 2. infers the file's bit-plane stride, because the slot count is the model bone
    count and is **not stored in the `.SRA`**; and
-3. fingerprints the same invariant content view — 16 header bytes plus the
-   complete bit-plane block — so a table has the same key whether it came from
+3. fingerprints the same invariant content view â€” 16 header bytes plus the
+   complete bit-plane block â€” so a table has the same key whether it came from
    the file or from memory.
 
 The stride is inferred by requiring a table at each record start and keeping the
@@ -566,10 +606,10 @@ The stride is inferred by requiring a table at each record start and keeping the
 the inline command and fails. A bounded fallback scan covers records whose table
 starts a few bytes in. Each file is read and released before the next one, so
 memory stays flat: only clip descriptors are kept, never all payload bytes. The
-whole directory takes about 2.5 s for 227 files.
+whole directory takes about 2 s for 227 files.
 
 ```text
-CLIPMAP files=227 clips=1001 distinct=910 ambiguous=55 collisions=32 elapsed=2.57s
+CLIPMAP files=227 clips=1001 distinct=910 ambiguous=55 collisions=32 elapsed=2.12s
 ```
 
 `clips` follows the existing one-table-per-record rule; many small effect files
@@ -594,12 +634,21 @@ All 143 files that index at least one clip now resolve at least one
 actor-reachable fingerprint. Before the fix 30 files were usable: the 30 at the
 player's 66-slot stride. The raw count was 34, because four smaller files
 (strides 13, 56, 57 and 63) hashed at 25-byte planes into keys that exist in the
-map — but each of those keys belongs to a 66-slot file, so the attribution rule
+map â€” but each of those keys belongs to a 66-slot file, so the attribution rule
 refuses the small actor as `slot-mismatch`. The measured stride distribution
-explains the scale of the failure — 30 files are 66-slot bodies, 3 are 24-slot,
-and the remaining 110 are other sizes — so a capture that only matched the
+explains the scale of the failure â€” 30 files are 66-slot bodies, 3 are 24-slot,
+and the remaining 110 are other sizes â€” so a capture that only matched the
 player left most of the corpus unreachable. The four non-66-slot actors in the
 failing run (`slots=24` twice, `slots=3`, `slots=2`) are exactly that class.
+
+That file-side reachability is necessary but not sufficient: the runtime key must
+use the same per-body stride, or a 24-slot body hashes the file's 9-byte-plane
+key into a 25-byte-plane key and still maps nothing. With the runtime count
+threaded through, a 24-slot runtime table can now match the **3** files that
+index at the 24-slot stride (`BABAR.SRA`, `RONIN.SRA`, `SLUAGH.SRA`). A 3-slot or
+2-slot body matches the matching small-stride files the same way; the runtime
+prints the actor's exact observed count while the file prints its inferred
+representative.
 
 The player's confirmed keys are unchanged, because its stride was already 25:
 `RAZIEL[0]=50:100:a1f48a74`, `RAZIEL[2]=12:209:3acaf951`,
@@ -696,8 +745,8 @@ equality and the printed slot count is the actor's observed value.
 
 ## Free-play labelling: why idle and walk came out diluted (2026-11-15)
 
-A free-play run of the player body — the human walking around, stopping and
-turning at will — reported these phase results for the `slots=66` actor:
+A free-play run of the player body â€” the human walking around, stopping and
+turning at will â€” reported these phase results for the `slots=66` actor:
 
 | Phase | Dominant clip | Coverage |
 |---|---:|---:|
@@ -734,7 +783,7 @@ to win a blend; they are not labels.
 Coverage alone cannot tell a held phase from a mixture. Free play produced
 `idle dominant=0 coverage=0.30` and `walk dominant=42 coverage=0.33`, while the
 confirmed values are `55` and `2`; the confirmed windows instead produced
-`0.91-1.00`. The difference is not which clip won — it is whether that clip was
+`0.91-1.00`. The difference is not which clip won â€” it is whether that clip was
 **held**.
 
 The per-sample sequence carries that answer. A held phase is a long run of the
@@ -744,9 +793,9 @@ For one phase the probe now reports the **dominant clip's** consecutive run
 lengths (ties to the earlier sample; an absent or different sample breaks the
 run):
 
-- `run_median` — the middle run length in samples;
-- `run_p90` — the nearest-rank 90th percentile run;
-- `runs` — how many separate runs the dominant clip formed.
+- `run_median` â€” the middle run length in samples;
+- `run_p90` â€” the nearest-rank 90th percentile run;
+- `runs` â€” how many separate runs the dominant clip formed.
 
 A held phase has a few long runs; a diluted phase has many runs near one sample.
 That is exactly the difference free play and the dedicated windows already
@@ -843,7 +892,7 @@ test that choice, because it never holds idle long enough to.
 > cannot align jumps of different lengths, which is why it diluted each phase.
 
 A single jump window blends three different animations: ascent, fall and
-landing. The measured jump window proves it — four clips shared it (`27:0.16`,
+landing. The measured jump window proves it â€” four clips shared it (`27:0.16`,
 `16:0.15`, `2:0.12`, `37:0.07`, keyed `0.21`) and no clip passed `0.16`
 coverage. Lengthening that window does not clean the blend; it averages more
 phases into the same histogram. A single window asks "which clip is jump?",
@@ -1282,10 +1331,9 @@ plus one `PHASE` line per phase); the template is the primary result.
 
 | Gate | Result |
 |---|---|
-| `--selftest` | 76 cases, 76 green; the fingerprint, segment, keyed, phase, jump, horizontal and identity cases, the per-actor label cases, the directory cases (`sra-dir-two-files`, `sra-dir-per-actor-file`, `sra-dir-cross-collision`, `sra-dir-slot-mismatch`, `sra-dir-clipmap-line`, `sra-dir-source-conflict`, `sra-dir-empty`), the run-length cases (`run-length-exact`, `run-length-gap-breaks`, `run-gate-holds`, `run-gate-alternates`, `run-gate-coverage`, `run-gate-mixed-labels`, `phase-line-run-stats`, `actor-measurement-run-median`) and the store cases (`store-missing-is-empty`, `store-first-fill`, `store-fill-unknown`, `store-conflict-keeps`, `store-supersede`, `store-roundtrip`, `store-corrupt-refused`) |
-| `--live-selftest` | 34 cases, 34 green in a real Frida runtime; adds a `run-length` scenario driven through the real hook (`run-length-live-holds`, `run-length-live-alternates`, `run-length-live-mixed`, `run-length-live-exact`, `run-length-live-coverage`) on top of the multi-actor, directory and hardware-surface cases |
+| `--selftest` | 76 cases, 76 green; the fingerprint, segment, keyed, phase, jump, horizontal and identity cases, the per-actor label cases, the directory cases (`sra-dir-two-files`, `sra-dir-per-actor-file`, `sra-dir-cross-collision`, `sra-dir-slot-mismatch`, `sra-dir-clipmap-line`, `sra-dir-source-conflict`, `sra-dir-empty`), the run-length cases (`run-length-exact`, `run-length-gap-breaks`, `run-gate-holds`, `run-gate-alternates`, `run-gate-coverage`, `run-gate-mixed-labels`, `phase-line-run-stats`, `actor-measurement-run-median`), the store cases (`store-missing-is-empty`, `store-first-fill`, `store-fill-unknown`, `store-conflict-keeps`, `store-supersede`, `store-roundtrip`, `store-corrupt-refused`) and `fingerprint-form-invariant` |
+| `--live-selftest` | 37 cases, 37 green in a real Frida runtime; adds the `run-length` scenarios (`run-length-live-holds`, `run-length-live-alternates`, `run-length-live-mixed`, `run-length-live-exact`, `run-length-live-coverage`) and the per-body slot-stride cases (`slot-stride-24-matches-file`, `slot-stride-24-not-66`, `slot-stride-tiny-bodies`) on top of the multi-actor, directory and hardware-surface cases |
 | `--dry-run` | prints the plan; attaches nothing. It names the per-actor aggregation, the identity verdict, both hysteresis families with their constants, the run gate, the unknown reasons (including `low-run-length`), the directory index, the attribution/refusal rules, the store and the label gates |
-| `py_compile` | clean |
 | `node --check` on `--print-agent` | clean |
 | `cargo test` | 694 green, unchanged by this docs-only slice |
 
@@ -1296,17 +1344,21 @@ and the case asserts the meeting point is `ambiguous` with both candidates and n
 label. The mismatch case feeds a 24-slot observation to a stride-25 file and
 asserts `reason=slot-mismatch`. The last two cases assert the typed source
 conflict and the empty-directory error. Indexing the shipped directory measured
-`files=227 clips=1001 distinct=910 ambiguous=55 collisions=32` in `2.57 s`, and
-the files that resolve an actor-reachable fingerprint went from `30` (usable) to
-`143`.
+`files=227 clips=1001 distinct=910 ambiguous=55 collisions=32` in `2.12 s`; 143
+files index at least one clip, and the 3 at the 24-slot stride are the ones a
+24-slot runtime table can match.
 
-The small-body cases are the regression for the stride defect.
-`fingerprint-small-body-form-invariant` builds one 24-slot, two-stream record,
-relocates it the way the engine does, and asserts that the file form and the
-memory form hash to one key and that the player's stride does not.
-`fingerprint-small-body-cross-form` builds the file form on the host and the
-memory form in the real agent through the same hook the capture uses, then
-asserts both keys are equal and the geometry reports `slots=24`.
+`slot-stride-24-matches-file` is the regression for the runtime-side defect. It
+builds a 24-slot body over **two** packed streams in real memory, hashes its table
+through the same path the capture uses, and asserts three things: the geometry
+reports `slots=24`; the runtime key equals the file key computed for a synthetic
+24-slot clip with the same header and block; and that file is indexed at stride
+9. `slot-stride-24-not-66` takes the same table and forces the 66-slot hash: it
+asserts the result equals the host's 66-slot expectation over the zero padding and
+the inline stream, and differs from the 24-slot key. That is the defect stated
+directly: the same bytes must hash differently when the body's slot count is
+wrong. `slot-stride-tiny-bodies` repeats the comparison for the 3-slot and 2-slot
+prop bodies and asserts their file forms index at strides 2 and 1.
 
 The store cases use real temporary files and cover the merge policy end to end:
 an empty store gains a full entry from one measurement; a second measurement
@@ -1383,8 +1435,15 @@ empty segment.
 - [ ] The fingerprint names whose slot count supplies the plane stride (the
       observed body's), and the 66-slot / 3-stream and 24-slot / 2-stream forms
       are compared byte-level, including the `+0x10` versus `+0x0C` block shift.
-- [ ] A small-body case proves one key for the file form and the memory form,
-      in `--selftest` and in `--live-selftest`.
+- [ ] The runtime fingerprint takes the observed body's slot count as an
+      explicit argument at every call site; no call site hashes with the global
+      `--slots`, and a missing count produces no fingerprint and a counted
+      omission.
+- [ ] A live case proves a 24-slot / 2-stream memory table hashes to the same
+      key as the file form of the same clip, and that the 66-slot hash of the
+      same bytes does not match.
+- [ ] A live case proves the 3-slot and 2-slot prop bodies hash and map at their
+      own strides.
 - [ ] The free-play result is analysed as a mixture, the confirmed map is not
       changed, and the recommendation is a probe measurement, not a threshold
       tune.
@@ -1436,12 +1495,29 @@ empty segment.
 > with several actors produces one `file=` attribution per actor and an
 > `ambiguous` or `slot-mismatch` refusal where the directory cannot decide.
 
-> **2026-11-15 small-body revision.** The runtime fingerprint now uses each
-> observed body's own plane stride, so a 24-slot body hashes 9-byte planes
-> instead of the player's 25. Every file that indexes a clip is now reachable
-> (`30` usable before, `143` after); the player's confirmed keys did not move.
-> Free play was analysed and is a mixture, not a label source; the thresholds and
-> the confirmed map stay as they are.
+> **2026-11-15 small-body revision.** This revision fixed the **file side** and
+> stated the rule: each body's own plane stride, so a 24-slot body hashes 9-byte
+> planes instead of the player's 25. The file-side index and the documented
+> invariant were corrected; the runtime hash was not, so the rule was still
+> false at the hook. Every file that indexes a clip became reachable on paper
+> (`30` usable before, `143` after), but a real 24-slot body still reported
+> `file=none` because its runtime key was built at the 66-slot stride. Free play
+> was analysed and is a mixture, not a label source; the thresholds and the
+> confirmed map stay as they are.
+
+> **2026-11-21 runtime-side stride revision.** The runtime hash now takes the
+> observed body's slot count as an explicit argument at every call site; the
+> global `--slots` is gone from the hash and a missing count yields no
+> fingerprint plus a counted omission. The geometry snapshot computes the sum of
+> the channel ranges in a first pass and hashes in a second, so no table is
+> hashed with a partial count. A live case proves a 24-slot / 2-stream memory
+> table and its file form hash to one key, that the 66-slot hash of the same
+> bytes differs, and that the 3-slot and 2-slot prop bodies hash and map at their
+> own strides. The scratch probe is green at 76 host cases and 37 live-runtime
+> cases. Directory totals are unchanged
+> (`files=227 clips=1001 distinct=910 ambiguous=55 collisions=32`); 143 files
+> index a clip and the 3 at the 24-slot stride (`BABAR.SRA`, `RONIN.SRA`,
+> `SLUAGH.SRA`) are now reachable from a 24-slot runtime table.
 
 > **2026-11-15 multi-actor revision.** The probe now labels every observed live
 > object from its own motion, with a measured identity verdict and a documented
