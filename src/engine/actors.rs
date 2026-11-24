@@ -1454,10 +1454,13 @@ mod tests {
         );
 
         let store = LabelStore::load(&path).expect("the committed store must parse");
-        assert_eq!(
-            store.len(),
-            3,
-            "every measured or visually confirmed file is stored"
+        // The store grows every time a type is measured, so this asserts a lower
+        // bound rather than an exact count: adding a measurement must never
+        // break the suite, while losing a confirmed entry still must.
+        assert!(
+            store.len() >= 3,
+            "the committed store must keep every confirmed entry, got {}",
+            store.len()
         );
 
         let raziel = store.for_sra("RAZIEL.SRA");
