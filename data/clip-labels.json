@@ -94,6 +94,36 @@
       "idle": "9",
       "updated": "2026-11-24T04:49:35Z",
       "walk": "19"
+    },
+    "WALBOSB.SRA": {
+      "assigned_at": "2026-11-24T04:54:07Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-24T04:54:07Z",
+        "walk": "2026-11-24T04:54:07Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "1",
+      "updated": "2026-11-24T04:54:07Z",
+      "walk": "8"
+    },
+    "WALBOSS.SRA": {
+      "assigned_at": "2026-11-24T04:54:07Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-24T04:54:07Z",
+        "walk": "2026-11-24T04:54:07Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "18",
+      "updated": "2026-11-24T04:54:07Z",
+      "walk": "3"
     }
   },
   "version": 1
