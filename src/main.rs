@@ -75,6 +75,9 @@ mod object_texture;
 // decode one frame through it.
 #[allow(dead_code)]
 mod packed_channel;
+// Read-only whole-archive census of the placed-object `flags` word; the
+// `--flag-census` arm supplies the per-unit reports.
+mod placed_census;
 // Pure one-bone pose math, wired into the `--mesh --pose` arm below.
 mod pose;
 // Pure procedural-slot rotation composition; not wired into the viewer yet.
@@ -212,6 +215,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--level-objects") {
         return run_level_objects(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--flag-census") {
+        return run_flag_census(&args[1..]);
+    }
     if args.first().is_some_and(|a| a == "--level-geometry") {
         return run_level_geometry(&args[1..]);
     }
@@ -266,6 +272,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-objects <.PCM file>");
         eprintln!("   or: soul-reaver-remaster-rs --level-objects --bigfile <BIGFILE.DAT> --entry <INDEX>");
         eprintln!("   or: soul-reaver-remaster-rs --level-objects --bigfile <BIGFILE.DAT> --group <PREFIX>");
+        eprintln!("   or: soul-reaver-remaster-rs --flag-census --bigfile <BIGFILE.DAT> [--name <NAME>]");
         eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file> --objects [--textures <TEXTURES.BIG>]");
         eprintln!("   or: soul-reaver-remaster-rs --actor-census --bigfile <BIGFILE.DAT> [--objects-dir <DIR>]");
         eprintln!("   or: soul-reaver-remaster-rs --actor-bestiary --bigfile <BIGFILE.DAT> [--objects-dir <DIR>] [--json]");
@@ -2667,6 +2674,69 @@ fn run_level_objects(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `--flag-census --bigfile <DAT> [--name <NAME>]`: a read-only, deterministic
+/// census of every placed record's `flags` word. It reports distinct values,
+/// per-name constancy and the name x bit cross-tab; it never interprets a bit.
+/// `--name` appends one line per matching record so a varying bit can be traced
+/// to concrete placements.
+fn run_flag_census(args: &[String]) -> ExitCode {
+    let usage = "expected --flag-census --bigfile <DAT> [--name <NAME>]";
+    let mut dat = None;
+    let mut wanted = None;
+    let mut index = 0;
+    while index < args.len() {
+        let value = args.get(index + 1).map(String::as_str);
+        match (args[index].as_str(), value) {
+            ("--bigfile", Some(value)) => dat = Some(value),
+            ("--name", Some(value)) => wanted = Some(value),
+            _ => {
+                eprintln!("error: {usage}");
+                return ExitCode::from(1);
+            }
+        }
+        index += 2;
+    }
+    let Some(dat) = dat else {
+        eprintln!("error: {usage}");
+        return ExitCode::from(1);
+    };
+    let rows = match level::scan_archive_objects(Path::new(dat)) {
+        Ok(rows) => rows,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let mut census = placed_census::FlagsCensus::new();
+    for (unit, report) in &rows {
+        census.record_unit(unit, report);
+    }
+    for line in census.render() {
+        outln!("{line}");
+    }
+    if let Some(wanted) = wanted {
+        for (unit, report) in &rows {
+            for object in &report.objects {
+                if object.name == wanted {
+                    outln!(
+                        "record name={} unit={} pos={},{},{} type={} archetype={} instance={} flags={:#010x}",
+                        object.name,
+                        unit,
+                        object.position[0],
+                        object.position[1],
+                        object.position[2],
+                        object.object_type,
+                        object.archetype,
+                        object.instance_id,
+                        object.flags
+                    );
+                }
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// `--level-render` arm: one `.PCM` unit through the existing mesh viewer.
 /// The geometry line prints before the window opens. `--objects` appends one
 /// small cube per object to the same buffers.
@@ -3644,7 +3714,7 @@ mod cli_tests {
         parse_direction, parse_fingerprint_key, pose_mode_conflict,
         resolve_texture_name, run_actor_census, run_audio, run_bigfile, dispatch, run_level_links,
         run_level_records, run_level_structure, run_mesh, run_mesh_all, run_level_geometry,
-        run_level_objects, run_level_render, run_mesh_textured, run_mesh_with, run_object_info,
+        run_level_objects, run_flag_census, run_level_render, run_mesh_textured, run_mesh_with, run_object_info,
         run_object_mesh, run_object_mesh_with, run_textures, scan_sra_directory,
         strip_launcher_noops, tshow_suffix, validation_expectations, FrameChoice, MatchScan,
     };
@@ -4918,6 +4988,36 @@ mod cli_tests {
             ExitCode::from(1)
         );
         assert_eq!(run_level_objects(&[]), ExitCode::from(1));
+    }
+
+    #[test]
+    fn flag_census_counts_a_synthetic_archive_and_rejects_bad_shapes() {
+        let tmp = tempfile::tempdir().expect("tempdir must succeed");
+        let dat = write_tmp(
+            &tmp,
+            "BIGFILE.DAT",
+            &synthetic_archive(&[synthetic_entry_pcm("under1"), synthetic_entry_pcm("under2")]),
+        );
+        let args = vec!["--bigfile".to_string(), dat.clone()];
+        assert_eq!(run_flag_census(&args), ExitCode::SUCCESS);
+        let named = vec![
+            "--bigfile".to_string(),
+            dat.clone(),
+            "--name".to_string(),
+            "nobody".to_string(),
+        ];
+        assert_eq!(run_flag_census(&named), ExitCode::SUCCESS);
+        assert_eq!(run_flag_census(&["--bigfile".to_string()]), ExitCode::from(1));
+        assert_eq!(run_flag_census(&[]), ExitCode::from(1));
+        assert_eq!(
+            run_flag_census(&["--name".to_string(), "x".to_string()]),
+            ExitCode::from(1)
+        );
+        let missing = tmp.path().join("missing.DAT").to_string_lossy().into_owned();
+        assert_eq!(
+            run_flag_census(&["--bigfile".to_string(), missing]),
+            ExitCode::from(1)
+        );
     }
 
     #[test]
