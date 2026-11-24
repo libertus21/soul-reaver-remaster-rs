@@ -374,16 +374,21 @@ impl SceneAssets {
         self.spawn.map(|point| self.transform.apply(point))
     }
 
-    /// Per-placement closed-door collision meshes for every interactable record.
+    /// Per-placement closed-door collision meshes for every **blocking**
+    /// interactable record.
     ///
-    /// Each interactable name resolves to its own archived model (see the gate
-    /// in `docs/notes/interactions.md`). The model's rest-pose triangles are
-    /// translated by the record position and rounded to integer world units, then
-    /// classified by the same [`CollisionMesh::from_room_triangles`] the room
-    /// uses. The result is keyed by `(lowercase name, position)` so the live
-    /// object the boot pass spawns attaches the exact mesh its placement owns.
-    /// Unresolved names are simply absent: the object still interacts and hides,
-    /// it just contributes no barrier, which the note records.
+    /// Each blocking name resolves to its own archived model (see the
+    /// classification and gate in `docs/notes/interactions.md`). The model's
+    /// rest-pose triangles are translated by the record position and rounded to
+    /// integer world units, then classified by the same
+    /// [`CollisionMesh::from_room_triangles`] the room uses. The result is keyed
+    /// by `(lowercase name, position)` so the live object the boot pass spawns
+    /// attaches the exact mesh its placement owns.
+    ///
+    /// `Passive` names are deliberately absent: they are activatable but never a
+    /// barrier, so no mesh is built for them at all. Unresolved blocking names are
+    /// simply absent too: the object still interacts and hides, it just
+    /// contributes no barrier, which the note records.
     pub fn interaction_collision(
         &mut self,
         world: &World,
@@ -391,7 +396,7 @@ impl SceneAssets {
         let mut map = BTreeMap::new();
         for record in world.placed.records_for_boot() {
             let name = record.name.to_ascii_lowercase();
-            if !interaction::is_interactable(&name) {
+            if !interaction::is_blocking(&name) {
                 continue;
             }
             let position = [
