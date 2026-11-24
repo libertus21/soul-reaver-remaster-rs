@@ -45,10 +45,13 @@ use crate::engine::actor::{ActorProfile, ActorRuntime};
 use crate::engine::axis::{HORIZONTAL_A, HORIZONTAL_B, UP};
 use crate::engine::class::{CLASS_TABLE, Hooks, Query, RenderClass, classify};
 use crate::engine::clock::{ObjectTick, SimClock};
-use crate::engine::collision::JUMP_IMPULSE_SUBUNITS_PER_TICK;
-use crate::engine::determinism::{WorldEntry, WorldState};
+use crate::engine::collision::{CollisionMesh, JUMP_IMPULSE_SUBUNITS_PER_TICK};
+use crate::engine::determinism::{WorldEntry, WorldState, world_state_hash_with_interactions};
 use crate::engine::events::{EngineEvent, EventQueue};
 use crate::engine::input::{InputButton, InputEvent, InputFrame, InputQueue};
+use crate::engine::interaction::{
+    ActivateTarget, InteractOutcome, InteractTrigger, InteractionLayer,
+};
 use crate::engine::live::{LiveArena, LiveId, LiveObject};
 use crate::engine::synthetic_locomotion::{self, SyntheticPatrol};
 use crate::engine::tracker::{ObjectTracker, TrackerError};
@@ -328,6 +331,9 @@ pub struct FrameState {
     /// deterministic fold of the tick history, not canonical state: only the
     /// resulting positions enter [`Self::world_state`].
     patrols: BTreeMap<LiveId, SyntheticPatrol>,
+    /// Player-driven open/closed state, closed-door collision and the activation
+    /// log. See [`crate::engine::interaction`].
+    interaction: InteractionLayer,
     spawn_queue: Vec<DeferredSpawn>,
     despawn_queue: Vec<LiveId>,
     scene: Vec<RenderItem>,
@@ -362,6 +368,7 @@ impl FrameState {
             scratch: FrameScratch::default(),
             npc_motion: true,
             patrols: BTreeMap::new(),
+            interaction: InteractionLayer::new(true),
             spawn_queue: Vec::new(),
             despawn_queue: Vec::new(),
             scene: Vec::new(),
@@ -498,6 +505,7 @@ impl FrameState {
         }
         self.tracker = ObjectTracker::new();
         self.patrols.clear();
+        self.interaction.enter_unit();
         self.spawn_queue.clear();
         self.despawn_queue.clear();
         self.events = EventQueue::new();
@@ -721,6 +729,78 @@ impl FrameState {
         (self.spawn_queue.len(), self.despawn_queue.len())
     }
 
+    /// Enable or disable the whole interaction layer (`--no-interactions`).
+    ///
+    /// Disabling clears every open flag and the closed-door collision overlay, so
+    /// the run reproduces the pre-interaction digests exactly.
+    pub fn set_interactions_enabled(&mut self, enabled: bool) {
+        self.interaction.set_enabled(enabled);
+    }
+
+    pub fn interactions_enabled(&self) -> bool {
+        self.interaction.enabled()
+    }
+
+    /// Install the per-placement closed-door collision meshes for the loaded
+    /// unit. The simulation never parses game data; `play.rs` builds them from
+    /// the shared [`SceneAssets`](crate::engine::scene::SceneAssets) resolver.
+    pub fn install_interaction_base(
+        &mut self,
+        base: BTreeMap<(String, [i32; 3]), CollisionMesh>,
+    ) {
+        self.interaction.set_base(base);
+    }
+
+    /// Install the `--interact-at` fixed-tick schedule.
+    pub fn set_interaction_schedule(
+        &mut self,
+        schedule: Vec<crate::engine::interaction::InteractAt>,
+    ) {
+        self.interaction.set_schedule(schedule);
+    }
+
+    /// Activate the nearest interactable within
+    /// [`INTERACT_RADIUS_UNITS`](crate::engine::interaction::INTERACT_RADIUS_UNITS)
+    /// of the player (the windowed `E` key).
+    pub fn activate_nearest(&mut self, trigger: InteractTrigger) -> Option<InteractOutcome> {
+        let player = self.player_position();
+        self.interaction
+            .activate(&self.live, ActivateTarget::Nearest, player, trigger)
+    }
+
+    /// Activate one live slot directly (tests and explicit scripted targets).
+    pub fn activate_live(
+        &mut self,
+        slot: u32,
+        generation: Option<u32>,
+        trigger: InteractTrigger,
+    ) -> Option<InteractOutcome> {
+        let player = self.player_position();
+        self.interaction.activate(
+            &self.live,
+            ActivateTarget::Id { slot, generation },
+            player,
+            trigger,
+        )
+    }
+
+    /// Drain the activation log so the caller can print one console line each.
+    pub fn take_interaction_log(&mut self) -> Vec<InteractOutcome> {
+        self.interaction.take_log()
+    }
+
+    /// The production digest, including the open interaction state.
+    ///
+    /// With no door open it is byte-identical to
+    /// [`world_state_hash`](crate::engine::determinism::world_state_hash) of
+    /// [`Self::world_state`], so `--no-interactions` and any idle run keep the
+    /// previous digests.
+    pub fn production_digest(&self) -> u64 {
+        let state = self.world_state();
+        let open = self.interaction.open_ordinals(&self.live);
+        world_state_hash_with_interactions(&state, &open)
+    }
+
     /// Canonical world state in the existing determinism fold shape.
     ///
     /// T8 does not change the fold: it reuses [`WorldState`] and
@@ -808,8 +888,19 @@ impl FrameState {
     }
 
     /// Stage 1 - fixed step: record the tick and sample input at the boundary.
+    ///
+    /// The interaction layer is registered and its `--interact-at` schedule is
+    /// applied here, before any stage reads the live set, so a scripted
+    /// activation is a pure function of the global tick index exactly like
+    /// `--warp-at`.
     fn stage_clock(&mut self, tick: ObjectTick) {
         self.tick_index = tick.index;
+        if self.interaction.enabled() {
+            self.interaction.register_live(&self.live);
+            let player = self.player_position();
+            self.interaction
+                .apply_schedule(&self.live, player, tick.index);
+        }
         self.current_input = self.input_queue.sample();
     }
 
@@ -840,7 +931,8 @@ impl FrameState {
             let Ok(position) = self.live.get(id).map(|object| object.position) else {
                 continue;
             };
-            let visible = within_radius(view.eye, position, view.radius);
+            let hidden = self.interaction.enabled() && self.interaction.is_open(id);
+            let visible = within_radius(view.eye, position, view.radius) && !hidden;
             if let Ok(object) = self.live.get_mut(id) {
                 object.visible = visible;
             }
@@ -914,7 +1006,13 @@ impl FrameState {
             let mut delta = [0i32; 3];
             delta[HORIZONTAL_A] = right.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK);
             delta[HORIZONTAL_B] = forward.saturating_mul(PLAYER_SPEED_UNITS_PER_TICK);
-            let collision = &self.world.collision;
+            // Closed doors add their walls to the room walls for the horizontal
+            // sweep only; open doors and the room-alone case keep the old path.
+            self.interaction.rebuild(&self.world.collision);
+            let collision = self
+                .interaction
+                .combined()
+                .unwrap_or(&self.world.collision);
             if let Ok(object) = self.live.get_mut(player) {
                 let before = object.position;
                 object.position = collision.sweep(object.position, delta, PLAYER_RADIUS_UNITS);
@@ -2764,5 +2862,115 @@ mod tests {
         }
         assert_eq!(frame.stats().events_queued, 0);
         assert_eq!(frame.stats().events_delivered, 0);
+    }
+
+    #[test]
+    fn a_scripted_activation_fires_at_its_tick_and_logs_one_line() {
+        use crate::engine::interaction::{ActivateTarget, InteractAt, InteractTrigger};
+        let mut frame = FrameState::new(world_with_raziel());
+        frame.queue_spawn("sudoor", [0, 0, 0]);
+        frame.set_interaction_schedule(vec![InteractAt {
+            tick: 3,
+            target: ActivateTarget::Nearest,
+        }]);
+
+        let mut seen = Vec::new();
+        for index in 0..6 {
+            tick(&mut frame, index);
+            seen.extend(frame.take_interaction_log());
+        }
+        assert_eq!(seen.len(), 1, "exactly one activation across the run");
+        assert_eq!(seen[0].name, "sudoor");
+        assert!(seen[0].open);
+        assert_eq!(seen[0].trigger, InteractTrigger::Proximity);
+        assert_eq!(
+            seen[0].line(),
+            "interact object=sudoor pos=0,0,0 state=open trigger=proximity"
+        );
+    }
+
+    #[test]
+    fn the_digest_changes_only_when_a_door_opens() {
+        use crate::engine::interaction::{ActivateTarget, InteractAt};
+        fn run(activate: bool, interactions: bool) -> (u64, u64) {
+            let mut frame = FrameState::new(world_with_raziel());
+            frame.set_interactions_enabled(interactions);
+            frame.queue_spawn("sudoor", [0, 0, 0]);
+            if activate {
+                frame.set_interaction_schedule(vec![InteractAt {
+                    tick: 2,
+                    target: ActivateTarget::Nearest,
+                }]);
+            }
+            for index in 0..5 {
+                tick(&mut frame, index);
+            }
+            (frame.production_digest(), world_state_hash(&frame.world_state()))
+        }
+
+        let (plain, plain_world) = run(false, true);
+        assert_eq!(
+            plain, plain_world,
+            "no activation must be byte-identical to the pre-interaction fold"
+        );
+        let (opened, _) = run(true, true);
+        assert_ne!(opened, plain, "opening a door must move the digest");
+
+        let (disabled, disabled_world) = run(true, false);
+        assert_eq!(
+            disabled, disabled_world,
+            "--no-interactions must keep the plain world fold"
+        );
+        assert_eq!(
+            disabled, plain,
+            "--no-interactions reproduces the no-activation digest exactly"
+        );
+    }
+
+    #[test]
+    fn a_closed_door_blocks_the_player_and_an_open_one_lets_it_through() {
+        use crate::engine::interaction::InteractTrigger;
+        // A vertical wall at world x=100, y -500..500, z 0..300.
+        let vertices = vec![
+            [100, -500, 0],
+            [100, 500, 0],
+            [100, 500, 300],
+            [100, -500, 300],
+        ];
+        let faces = vec![[0, 1, 2], [0, 2, 3]];
+        let door = CollisionMesh::from_room_triangles(&vertices, &faces);
+        assert!(!door.is_empty(), "the fixture door must carry walls");
+
+        let mut frame = FrameState::new(world_with_raziel());
+        let mut base = std::collections::BTreeMap::new();
+        base.insert(("sudoor".to_string(), [0, 0, 0]), door);
+        frame.install_interaction_base(base);
+        frame.queue_spawn("sudoor", [0, 0, 0]);
+        tick(&mut frame, 0);
+
+        frame.queue_input(InputEvent::press(InputButton::Right));
+        for index in 1..40 {
+            tick(&mut frame, index);
+        }
+        let blocked = frame.player_position().expect("the player is bound");
+        assert!(
+            blocked[0] < 100,
+            "the closed door must stop the player: {blocked:?}"
+        );
+
+        let door = id_of(&frame, "sudoor");
+        let outcome = frame
+            .activate_live(door.index, Some(door.generation), InteractTrigger::Script)
+            .expect("the door toggles open");
+        assert!(outcome.open);
+
+        for index in 40..160 {
+            tick(&mut frame, index);
+        }
+        let passed = frame.player_position().expect("the player is bound");
+        assert!(
+            passed[0] > 100,
+            "the open door must let the player through: {passed:?}"
+        );
     }
 }

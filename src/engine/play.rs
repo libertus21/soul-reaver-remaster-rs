@@ -30,9 +30,9 @@ use crate::engine::assets::{AssetRequest, AssetStore, ImmediateSource};
 use crate::engine::backend_wgpu::WgpuBackend;
 use crate::engine::class::RenderClass;
 use crate::engine::clock::ObjectTick;
-use crate::engine::determinism::world_state_hash;
 use crate::engine::frame::{FrameError, FrameState, PLAYER_NAME};
 use crate::engine::input::{InputButton, InputEvent};
+use crate::engine::interaction::{InteractAt, InteractTrigger};
 use crate::engine::live::LiveId;
 use crate::engine::render_backend::RenderBackend;
 use crate::engine::scene::{ActorPose, CameraView, PlayerFacing, SceneAssets};
@@ -358,6 +358,16 @@ pub struct PlayOptions {
     pub warp_at: Vec<WarpAt>,
     /// Windowed `--warp-cycle u1,u2,...`: `G` walks the list, one swap per press.
     pub warp_cycle: Option<Vec<String>>,
+    /// Whether the interaction layer runs (`--no-interactions` turns it off).
+    ///
+    /// On by default: doors start closed, hide when opened and contribute their
+    /// walls to the player sweep while closed. Turning it off clears every open
+    /// flag and the door collision overlay, reproducing the pre-interaction
+    /// digests exactly.
+    pub interactions: bool,
+    /// Repeatable `--interact-at <TICK>:<live-slot|nearest>` activations
+    /// (headless only).
+    pub interact_at: Vec<InteractAt>,
 }
 
 impl PlayOptions {
@@ -534,6 +544,8 @@ impl PlayOptions {
             warp_to: None,
             warp_at: Vec::new(),
             warp_cycle: None,
+            interactions: true,
+            interact_at: Vec::new(),
         };
         let mut bigfile = None;
         let mut unit_given = false;
@@ -663,6 +675,17 @@ impl PlayOptions {
                     options.warp_cycle =
                         Some(warp::parse_cycle(raw).map_err(PlayError::InvalidWarpCycle)?);
                 }
+                "--interact-at" => {
+                    let raw = value(args, index, "--interact-at")?;
+                    options
+                        .interact_at
+                        .push(InteractAt::parse(raw).map_err(PlayError::InvalidInteractAt)?);
+                }
+                "--no-interactions" => {
+                    options.interactions = false;
+                    index += 1;
+                    continue;
+                }
                 "--headless" => {
                     options.headless = true;
                     index += 1;
@@ -731,6 +754,9 @@ impl PlayOptions {
         }
         if !options.warp_at.is_empty() && !options.headless {
             return Err(PlayError::WarpAtRequiresHeadless);
+        }
+        if !options.interact_at.is_empty() && !options.headless {
+            return Err(PlayError::InteractAtRequiresHeadless);
         }
         if options.warp_cycle.is_some() && (options.headless || !options.clip_assign.is_empty()) {
             return Err(PlayError::WarpCycleRequiresWindow);
@@ -826,6 +852,8 @@ pub enum PlayError {
     WarpAtRequiresHeadless,
     WarpCycleRequiresWindow,
     WarpConflict { detail: String },
+    InvalidInteractAt(String),
+    InteractAtRequiresHeadless,
 }
 
 impl fmt::Display for PlayError {
@@ -919,6 +947,13 @@ impl fmt::Display for PlayError {
                 "--warp-cycle requires a window: it is the interactive G-key browse tool"
             ),
             Self::WarpConflict { detail } => write!(f, "{detail}"),
+            Self::InvalidInteractAt(message) => {
+                write!(f, "invalid --interact-at: {message}")
+            }
+            Self::InteractAtRequiresHeadless => write!(
+                f,
+                "--interact-at requires --headless: the schedule is a fixed-tick run"
+            ),
         }
     }
 }
@@ -1036,6 +1071,14 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
         SceneAssets::load(&options.bigfile, world.level.entry, textures).map_err(RunError::scene)?;
     let mut frame = FrameState::new(world);
     frame.set_npc_motion(options.npc_motion);
+    frame.set_interactions_enabled(options.interactions);
+    if options.interactions {
+        // Build every closed-door collision mesh once from the shared resolver;
+        // the simulation attaches them as the boot pass spawns the records.
+        let base = assets.interaction_collision(frame.world());
+        frame.install_interaction_base(base);
+        frame.set_interaction_schedule(options.interact_at.clone());
+    }
     if let Some(position) = options.player_pos {
         // Test aid: override the authored record before the first tick. The
         // result is still a pure function of the same argv.
@@ -1356,6 +1399,12 @@ pub fn swap_unit(
     frame.enter_unit(world, player);
     assets.reload(bigfile, entry).map_err(RunError::scene)?;
     let counts = boot_world(frame, bigfile)?;
+    if frame.interactions_enabled() {
+        // The swap released the old unit's door meshes; rebuild them for the new
+        // placements. The `--interact-at` schedule spans the whole run.
+        let base = assets.interaction_collision(frame.world());
+        frame.install_interaction_base(base);
+    }
     let reason = if placed_at_spawn {
         reason
     } else {
@@ -1422,7 +1471,7 @@ fn segment_report(frame: &FrameState, counts: SeedCounts, segment_ticks: u64) ->
         unresolved: counts.unresolved,
         live: frame.live().len(),
         ticks: segment_ticks,
-        digest: world_state_hash(&frame.world_state()),
+        digest: frame.production_digest(),
     }
 }
 
@@ -1513,6 +1562,7 @@ fn run_headless_warp(
     assets: &mut SceneAssets,
 ) -> Result<(), RunError> {
     let report = headless_warp_plan(&mut frame, ticks, options, assets)?;
+    print_interaction_lines(&mut frame);
     for line in report.lines() {
         outln!("{line}");
     }
@@ -1527,9 +1577,9 @@ fn run_headless_warp(
 ///
 /// Test-only plain variant: the production path is
 /// [`headless_run_with_actors`], which runs the same ticks plus the one-time
-/// actor load. The digest is computed with the same [`world_state_hash`] the
-/// determinism gate pins. Any tracker overflow becomes [`RunError::Invariant`]
-/// (exit 4).
+/// actor load. The digest is the frame's production digest, which folds the
+/// canonical world state plus the open interaction state. Any tracker overflow
+/// becomes [`RunError::Invariant`] (exit 4).
 #[cfg(test)]
 fn headless_run(
     frame: &mut FrameState,
@@ -1647,7 +1697,7 @@ fn finish_headless(
         unresolved: counts.unresolved,
         live: frame.live().len(),
         ticks: frame.ticks(),
-        digest: world_state_hash(&frame.world_state()),
+        digest: frame.production_digest(),
     })
 }
 
@@ -1659,11 +1709,22 @@ fn run_headless(
 ) -> Result<(), RunError> {
     let report =
         headless_run_with_actors(&mut frame, &options.bigfile, ticks, assets, options)?;
+    print_interaction_lines(&mut frame);
     outln!("{}", report.line());
     if options.cull_report {
         outln!("{}", cull_report(&frame).line());
     }
     Ok(())
+}
+
+/// Print one `interact` line per activation, in order.
+///
+/// Called after a run so the audit lines reach the console without changing the
+/// acceptance contract or the digest, which already folded the open state.
+fn print_interaction_lines(frame: &mut FrameState) {
+    for outcome in frame.take_interaction_log() {
+        outln!("{}", outcome.line());
+    }
 }
 
 /// Resolve the per-actor animation set for the current live list.
@@ -1813,6 +1874,7 @@ fn run_scripted(
     // one-time actor diagnostic here is still presentation-only and leaves the
     // movement report and state untouched.
     let _actors = load_actor_animations(&frame, assets, options)?;
+    print_interaction_lines(&mut frame);
     outln!("{}", report.line());
     if options.cull_report {
         outln!("{}", cull_report(&frame).line());
@@ -2935,6 +2997,13 @@ impl PlayApp {
                         return true;
                     }
                 }
+                Key::Character(text)
+                    if text.eq_ignore_ascii_case("e") && self.mode == CameraMode::Player =>
+                {
+                    // The activation is logged; `about_to_wait` drains and prints
+                    // it once, so the line is never duplicated here.
+                    let _ = self.frame.activate_nearest(InteractTrigger::Key);
+                }
                 _ => {}
             }
         }
@@ -3152,6 +3221,7 @@ impl ApplicationHandler for PlayApp {
             event_loop.exit();
             return;
         }
+        print_interaction_lines(&mut self.frame);
         // One-shot `--warp-to`: swap after the first completed tick, so the
         // normal boot path runs first instead of being bypassed.
         if self.warp_to.is_some() && self.frame.ticks() >= 1 {
@@ -3712,6 +3782,41 @@ mod tests {
     fn headless_defaults_to_sixty_ticks() {
         let options = parse(&["--bigfile", "B", "--headless"]).expect("headless must parse");
         assert_eq!(options.ticks, Some(60));
+    }
+
+    #[test]
+    fn interaction_options_parse_and_require_headless() {
+        let options = parse(&[
+            "--bigfile",
+            "B",
+            "--headless",
+            "--no-interactions",
+            "--interact-at",
+            "5:nearest",
+        ])
+        .expect("interaction options parse");
+        assert!(!options.interactions);
+        assert_eq!(options.interact_at.len(), 1);
+        assert_eq!(options.interact_at[0].tick, 5);
+        assert_eq!(
+            options.interact_at[0].target,
+            crate::engine::interaction::ActivateTarget::Nearest
+        );
+
+        assert_eq!(
+            parse(&["--bigfile", "B", "--interact-at", "5:nearest"]),
+            Err(PlayError::InteractAtRequiresHeadless)
+        );
+        assert_eq!(
+            parse(&["--bigfile", "B", "--headless", "--interact-at", "bad"]),
+            Err(PlayError::InvalidInteractAt(
+                "expected TICK:TARGET, got 'bad'".to_string()
+            ))
+        );
+
+        let defaults = parse(&["--bigfile", "B", "--headless"]).expect("defaults");
+        assert!(defaults.interactions, "interactions are on by default");
+        assert!(defaults.interact_at.is_empty());
     }
 
     #[test]

@@ -16,7 +16,10 @@ use std::fmt;
 use std::path::Path;
 
 use crate::engine::class::RenderClass;
+use crate::engine::collision::CollisionMesh;
+use crate::engine::interaction;
 use crate::engine::live::{LiveArena, LiveId};
+use crate::engine::world::World;
 use crate::level::{self, LevelError};
 use crate::object::{self, ModelResolver, ObjectError};
 use crate::object_texture::{self, PageBank};
@@ -369,6 +372,64 @@ impl SceneAssets {
     /// Fitted spawn position in render space.
     pub fn render_spawn(&self) -> Option<[f32; 3]> {
         self.spawn.map(|point| self.transform.apply(point))
+    }
+
+    /// Per-placement closed-door collision meshes for every interactable record.
+    ///
+    /// Each interactable name resolves to its own archived model (see the gate
+    /// in `docs/notes/interactions.md`). The model's rest-pose triangles are
+    /// translated by the record position and rounded to integer world units, then
+    /// classified by the same [`CollisionMesh::from_room_triangles`] the room
+    /// uses. The result is keyed by `(lowercase name, position)` so the live
+    /// object the boot pass spawns attaches the exact mesh its placement owns.
+    /// Unresolved names are simply absent: the object still interacts and hides,
+    /// it just contributes no barrier, which the note records.
+    pub fn interaction_collision(
+        &mut self,
+        world: &World,
+    ) -> BTreeMap<(String, [i32; 3]), CollisionMesh> {
+        let mut map = BTreeMap::new();
+        for record in world.placed.records_for_boot() {
+            let name = record.name.to_ascii_lowercase();
+            if !interaction::is_interactable(&name) {
+                continue;
+            }
+            let position = [
+                i32::from(record.position[0]),
+                i32::from(record.position[1]),
+                i32::from(record.position[2]),
+            ];
+            if map.contains_key(&(name.clone(), position)) {
+                continue;
+            }
+            let Some(mesh) = self.object_mesh(&name) else {
+                continue;
+            };
+            let vertices: Vec<[i32; 3]> = mesh
+                .positions
+                .iter()
+                .map(|point| {
+                    [
+                        point[0].round() as i32 + position[0],
+                        point[1].round() as i32 + position[1],
+                        point[2].round() as i32 + position[2],
+                    ]
+                })
+                .collect();
+            let faces: Vec<[u32; 3]> = mesh
+                .indices
+                .chunks_exact(3)
+                .map(|face| [face[0], face[1], face[2]])
+                .collect();
+            if faces.is_empty() {
+                continue;
+            }
+            map.insert(
+                (name, position),
+                CollisionMesh::from_room_triangles(&vertices, &faces),
+            );
+        }
+        map
     }
 
     /// Build the deterministic scene for `live`.

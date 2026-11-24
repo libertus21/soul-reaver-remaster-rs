@@ -150,6 +150,9 @@ fn error_tag(error: &PlayError) -> u8 {
         PlayError::WarpAtRequiresHeadless => 22,
         PlayError::WarpCycleRequiresWindow => 23,
         PlayError::WarpConflict { .. } => 24,
+        // Interaction options: appended, never renumbered.
+        PlayError::InvalidInteractAt(_) => 25,
+        PlayError::InteractAtRequiresHeadless => 26,
     }
 }
 
@@ -235,6 +238,13 @@ fn write_alternate(hasher: &mut StateHasher, alternate: Option<u8>) {
 /// the engine was launched is not state.
 pub fn world_state_hash(state: &WorldState) -> u64 {
     let mut hasher = StateHasher::new();
+    fold_world(&mut hasher, state);
+    hasher.finish()
+}
+
+/// The shared world fold. Split out so the interaction-aware digest below is the
+/// **same bytes** as [`world_state_hash`] whenever nothing is open.
+fn fold_world(hasher: &mut StateHasher, state: &WorldState) {
     hasher.write_u64(state.tick);
     for entry in &state.live {
         hasher.write_u8(entry.class);
@@ -246,8 +256,28 @@ pub fn world_state_hash(state: &WorldState) -> u64 {
         hasher.write_u8(entry.relation);
         hasher.write_u8(entry.current);
         hasher.write_u8(entry.queued);
-        write_alternate(&mut hasher, entry.alternate);
+        write_alternate(hasher, entry.alternate);
         hasher.write_u8(entry.entry_action);
+    }
+}
+
+/// Fold the open interaction state into the canonical digest.
+///
+/// `open_ordinals` are the live-list positions of the open interactables, in
+/// live order. When it is empty this returns exactly [`world_state_hash`], so a
+/// run with no activation — and any run with `--no-interactions` — reproduces
+/// the previous digest byte for byte. An activation adds one marker byte, the
+/// count and each ordinal, so opening or closing a door moves the digest while
+/// the per-entry world fold is unchanged.
+pub fn world_state_hash_with_interactions(state: &WorldState, open_ordinals: &[u32]) -> u64 {
+    let mut hasher = StateHasher::new();
+    fold_world(&mut hasher, state);
+    if !open_ordinals.is_empty() {
+        hasher.write_u8(0x49);
+        hasher.write_u32(open_ordinals.len() as u32);
+        for ordinal in open_ordinals {
+            hasher.write_u32(*ordinal);
+        }
     }
     hasher.finish()
 }
