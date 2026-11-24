@@ -232,6 +232,33 @@ struct WallTriangle {
     max_up: i32,
 }
 
+/// Axis-aligned bounds of the room geometry fed to [`CollisionMesh`].
+///
+/// This is the extent of every vertex the source faces reference, not only the
+/// walls: floors and ceilings are part of the room, and a synthetic patrol that
+/// had to stay inside a wall-only box would be free to walk off a ledge. The
+/// box is a coarse outer fence, not a substitute for the wall triangles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    pub min: [i32; 3],
+    pub max: [i32; 3],
+}
+
+impl Bounds {
+    /// True when a body of `radius` centred at `position` keeps its whole
+    /// horizontal footprint inside the box. The vertical component is ignored:
+    /// the patrol only moves horizontally, and a room may stack floors.
+    pub const fn contains_with_radius(self, position: [i32; 3], radius: i32) -> bool {
+        let radius = if radius < 0 { 0 } else { radius } as i64;
+        let a = position[HORIZONTAL_A] as i64;
+        let b = position[HORIZONTAL_B] as i64;
+        a - radius >= self.min[HORIZONTAL_A] as i64
+            && a + radius <= self.max[HORIZONTAL_A] as i64
+            && b - radius >= self.min[HORIZONTAL_B] as i64
+            && b + radius <= self.max[HORIZONTAL_B] as i64
+    }
+}
+
 /// Room collision mesh: wall triangles plus a deterministic uniform grid, and
 /// the horizontal (near-horizontal) triangles used by the vertical resolver.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -245,6 +272,8 @@ pub struct CollisionMesh {
     down_facing: usize,
     grid: BTreeMap<(i32, i32), Vec<u32>>,
     skipped_faces: usize,
+    /// Outer geometry fence, or `None` when the mesh was built without faces.
+    bounds: Option<Bounds>,
 }
 
 impl CollisionMesh {
@@ -328,6 +357,25 @@ impl CollisionMesh {
             }
         }
 
+        // The fence spans every vertex the faces reference, including faces
+        // this mesh does not classify as walls. A referenced vertex is part of
+        // the room even when its face was skipped.
+        let mut min = [i32::MAX; 3];
+        let mut max = [i32::MIN; 3];
+        let mut any_vertex = false;
+        for face in faces {
+            for index in face {
+                let Some(vertex) = vertices.get(*index as usize) else {
+                    continue;
+                };
+                any_vertex = true;
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(vertex[axis]);
+                    max[axis] = max[axis].max(vertex[axis]);
+                }
+            }
+        }
+
         Self {
             walls,
             surfaces,
@@ -335,6 +383,7 @@ impl CollisionMesh {
             down_facing,
             grid,
             skipped_faces,
+            bounds: any_vertex.then_some(Bounds { min, max }),
         }
     }
 
@@ -380,6 +429,46 @@ impl CollisionMesh {
     /// True when the mesh has no wall barrier at all.
     pub fn is_empty(&self) -> bool {
         self.walls.is_empty()
+    }
+
+    /// Outer fence of the geometry the mesh was built from, or `None` when the
+    /// source carried no referenced vertex.
+    pub fn bounds(&self) -> Option<Bounds> {
+        self.bounds
+    }
+
+    /// True when a straight horizontal step from `from` by `delta` would touch a
+    /// wall, using the same narrow phase as [`CollisionMesh::sweep`].
+    ///
+    /// This is the commit-or-not probe for a body that does not slide: the
+    /// caller only moves when the path is clear. The body span is
+    /// [`BodySpan::at`], so stacked floors keep their walls from becoming
+    /// phantom barriers. An empty mesh, or a delta with no horizontal
+    /// component, is never blocked.
+    pub fn blocked(&self, from: [i32; 3], delta: [i32; 3], radius: i32) -> bool {
+        let from_h = horizontal_of(from);
+        let delta_h = horizontal_of(delta);
+        if self.walls.is_empty() || (delta_h[0] == 0 && delta_h[1] == 0) {
+            return false;
+        }
+        let current = [
+            i64::from(from_h[0]) * SUBUNITS,
+            i64::from(from_h[1]) * SUBUNITS,
+        ];
+        let remaining = [
+            i64::from(delta_h[0]) * SUBUNITS,
+            i64::from(delta_h[1]) * SUBUNITS,
+        ];
+        let candidate = [current[0] + remaining[0], current[1] + remaining[1]];
+        let fixed_radius = i64::from(radius.max(0)) * SUBUNITS;
+        self.first_contact(
+            current,
+            candidate,
+            remaining,
+            fixed_radius,
+            BodySpan::at(from[UP]),
+        )
+        .is_some()
     }
 
     /// Deterministic broad phase: wall indices whose projected bounding box can
@@ -1095,6 +1184,43 @@ mod tests {
     fn an_empty_mesh_moves_freely() {
         let end = CollisionMesh::default().sweep([1, 2, 3], [4, -1, 4], 16);
         assert_eq!(end, [5, 1, 7]);
+        assert!(!CollisionMesh::default().blocked([1, 2, 3], [4, -1, 4], 16));
+        assert_eq!(CollisionMesh::default().bounds(), None);
+    }
+
+    #[test]
+    fn blocked_stops_at_the_wall_the_sweep_would_hit() {
+        let mesh = wall_mesh();
+        assert!(
+            !mesh.blocked([0, 0, 0], [4, 0, 0], 16),
+            "a short step far from the wall is clear"
+        );
+        assert!(
+            mesh.blocked([60, 0, 0], [40, 0, 0], 16),
+            "the committed step would reach the wall's radius"
+        );
+        assert!(
+            !mesh.blocked([0, 0, 0], [0, 4, 0], 16),
+            "a step parallel to the wall is clear"
+        );
+        assert!(
+            !mesh.blocked([0, 0, 0], [0, 0, 4], 16),
+            "a purely vertical delta is not a horizontal sweep"
+        );
+    }
+
+    #[test]
+    fn bounds_span_every_referenced_vertex_and_clamp_with_the_radius() {
+        let (mut vertices, mut faces) = vertical_wall(100, -500, 500, -300, 400);
+        let (floor_vertices, floor_faces) = floor_up(-300, -900, 100, -500, 500);
+        append(&mut vertices, &mut faces, floor_vertices, floor_faces);
+        let mesh = CollisionMesh::from_room_triangles(&vertices, &faces);
+        let bounds = mesh.bounds().expect("referenced vertices must produce a fence");
+        assert_eq!(bounds.min, [-900, -500, -300]);
+        assert_eq!(bounds.max, [100, 500, 400]);
+        assert!(bounds.contains_with_radius([0, 0, 0], 16));
+        assert!(!bounds.contains_with_radius([90, 0, 0], 16), "the +A face is too close");
+        assert!(!bounds.contains_with_radius([0, -490, 0], 16), "the -B face is too close");
     }
 
     #[test]
