@@ -202,7 +202,8 @@ Ordered by cost:
 
 1. A runtime trace of the portal handler that reads the link record, capturing
    which link record a given portal object uses (item 1 of the open UNKNOWN list
-   in `warp-level-selection.md`).
+   in `warp-level-selection.md`). The method and probe for this trace are defined
+   in `docs/notes/warp-trace.md`; it is awaiting a live run.
 2. A corpus unit with equal portal and link counts where the link-record order
    demonstrably follows the portal object order, plus a matching reverse edge.
 3. A placed-record field, in any shipped unit, that indexes the link table.
@@ -219,6 +220,11 @@ Ordered by cost:
 | L6 | `prelude[1]` cannot be an object index (69% exceed object count). | CONFIRMED |
 | L7 | The portal-to-link join is at chance level (12 vs ~9.1). | INFERRED |
 | L8 | The portal/link association is available only at runtime, not in authored data. | UNKNOWN |
+
+`docs/notes/warp-trace.md` defines the runtime probe that targets L8: it watches
+the resident link table and reports the reader and the entry index used when a
+portal is crossed, then prints that entry as a decoded unit edge. No live run has
+been recorded yet, so L8 stays UNKNOWN.
 
 ## Method box and legal
 
