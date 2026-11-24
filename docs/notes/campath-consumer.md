@@ -7,9 +7,13 @@ does it drive. It adds a scratch measurement probe and an offline cross-check
 against the shipped archive. It does not change production code, does not add a
 CLI mode, and does not move a digest.
 
-**Status: method defined, awaiting live run.** The probe is built and both of its
-self-tests pass. The archive scan below is real. The running-game trace has not
-been made, so the reader's identity and its consumer are still UNKNOWN.
+**Status: steady-state live run done; reader identity still open.** The probe is
+built and both of its self-tests pass. The archive scan below is real. A
+steady-state run in `oracle15` found 76 resident blocks and 0 reads in 60 s, so
+the runtime does not sample these blocks per frame; the load-time reader's
+identity was not captured. The offline placement test in `campath-route-test`
+refutes the NPC-route reading of the spline. See the UNKNOWN list for what
+remains.
 
 ## Verdict first
 
@@ -18,7 +22,7 @@ been made, so the reader's identity and its consumer are still UNKNOWN.
 | Q1 | Is the `+0x38` block a spline-set descriptor (channel slot table + one position-channel descriptor + source keys)? | Yes: 0x30 bytes of 4-byte channel slots, only slot 0 populated, followed by the 8-byte channel descriptor, then `numkeys * 0x20` source keys | CONFIRMED (offline, structural) |
 | Q2 | Can the descriptor at block `+0x30` hold a 64-bit pointer? | No. Bytes `+0x34..+0x37` are the u16 count and the stride/behaviour bytes, so the pointer field is 4 bytes wide by construction. Its value must be a container-relative offset. | CONFIRMED (field packing) |
 | Q3 | Does the scanner locate and join the shipped blocks offline? | Yes: 2,106 key-valid blocks, 1,976 campath records, 1,943 joins over 231 units | CONFIRMED (measured) |
-| Q4 | Which code reads `+0x38` in the running game? | Not yet observed | **UNKNOWN** |
+| Q4 | Which code reads `+0x38` in the running game? | Steady-state `oracle15`: 76 blocks resident, 0 reads in 60 s (no per-frame sampler). Reader identity not captured | **UNKNOWN** |
 | Q5 | What does the reader drive? | Prediction: a load-time consumer of this descriptor (the spline-set builder is the confirmed consumer of this shape), feeding the object-transform sampler. Refutable by the probe. | **PREDICTION** |
 
 Q1-Q3 are the new evidence. They narrow Q4 from "some consumer" to "a reader of
@@ -222,15 +226,23 @@ and clears it on each hit; it never writes game data.
 
 ## 9. UNKNOWN (explicit)
 
-1. **Which code reads `+0x38` in the running game.** Method defined, awaiting
-   live run. This is Q4 and the whole point of the slice.
-2. **Whether the read is load-time only.** Predicted yes; not observed.
+1. **Which code reads `+0x38` in the running game.** Method defined; the live
+   steady-state run in `oracle15` (76 blocks resident, monitor on 7, **0 reads in
+   60 s**) shows the runtime does not sample these blocks per frame, but no stack
+   was captured. Still awaiting a reader identity.
+2. **Whether the read is load-time only.** The steady-state 0-read result points
+   to a load-time reader, but it is not observed directly.
 3. **Which system consumes the animated object transform** (camera, the `paths`
-   system object, NPC patrol, or nothing). A second-order question; even a
-   confirmed builder does not answer it.
-4. **Whether the file-form blocks stay resident at runtime.** If the engine
-   copies a unit, expands keys and frees the copy, the gate will find no blocks
-   in steady state and the reload trace is the only route.
+   system object, NPC patrol, or nothing). The offline placement test in
+   `campath-route-test` now **REFUTES the NPC-route reading**: moving splines do
+   not start on placed enemies (only 10/520 within 500 units, none within 250,
+   median 3,193 units), static splines behave the same (2.41% within 500), and
+   the campath's own placed position gives the same distances. The remaining
+   candidates are camera, platform, door or another non-NPC consumer, or an NPC
+   patrol authored independently of enemy spawn points. Still UNKNOWN which.
+4. **Whether the file-form blocks stay resident at runtime.** The live
+   `oracle15` steady-state run found 76 blocks resident with 0 reads, so the
+   file-form blocks were resident but not sampled per frame.
 5. **The five far-first-key records (and their blocks).** They are real data; whether their first
    key is deliberately offset or whether the placed position is a separate
    anchor is not known.
