@@ -1,6 +1,36 @@
 {
   "conflicts": [],
   "entries": {
+    "ALUKA.SRA": {
+      "assigned_at": "2026-11-24T05:00:59Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-24T05:00:59Z",
+        "walk": "2026-11-24T05:00:59Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "13",
+      "updated": "2026-11-24T05:00:59Z",
+      "walk": "17"
+    },
+    "ALUKABSS.SRA": {
+      "assigned_at": "2026-11-24T05:01:38Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-24T05:01:38Z",
+        "walk": "2026-11-24T05:01:38Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "8",
+      "updated": "2026-11-24T05:01:38Z",
+      "walk": "10"
+    },
     "HUNTER.SRA": {
       "assigned_at": "2026-11-22T22:07:24Z",
       "evidence": "visual",
@@ -15,6 +45,21 @@
       "idle": "2",
       "updated": "2026-11-22T22:07:24Z",
       "walk": "7"
+    },
+    "KAIN.SRA": {
+      "assigned_at": "2026-11-24T05:01:06Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-24T05:01:06Z",
+        "walk": "2026-11-24T05:01:06Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "5",
+      "updated": "2026-11-24T05:01:06Z",
+      "walk": "11"
     },
     "MORLOCK.SRA": {
       "assigned_at": "2026-11-24T04:58:53Z",
@@ -71,6 +116,36 @@
       "idle": "29",
       "updated": "2026-11-24T04:58:46Z",
       "walk": "7"
+    },
+    "RONINBSS.SRA": {
+      "assigned_at": "2026-11-24T05:01:33Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-24T05:01:33Z",
+        "walk": "2026-11-24T05:01:33Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "4",
+      "updated": "2026-11-24T05:01:33Z",
+      "walk": "5"
+    },
+    "SKINBOS.SRA": {
+      "assigned_at": "2026-11-24T05:01:29Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-24T05:01:29Z",
+        "walk": "2026-11-24T05:01:29Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "13",
+      "updated": "2026-11-24T05:01:29Z",
+      "walk": "5"
     },
     "SKINNER.SRA": {
       "assigned_at": "2026-11-24T04:49:35Z",
@@ -169,6 +244,21 @@
       "idle": "11",
       "updated": "2026-11-24T04:59:00Z",
       "walk": "16"
+    },
+    "WRSHP.SRA": {
+      "assigned_at": "2026-11-24T05:01:11Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-24T05:01:11Z",
+        "walk": "2026-11-24T05:01:11Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "5",
+      "updated": "2026-11-24T05:01:11Z",
+      "walk": "11"
     }
   },
   "version": 1
