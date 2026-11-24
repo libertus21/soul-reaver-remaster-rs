@@ -16,6 +16,21 @@
       "updated": "2026-11-22T22:07:24Z",
       "walk": "7"
     },
+    "MORLOCK.SRA": {
+      "assigned_at": "2026-11-24T04:58:53Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-24T04:58:53Z",
+        "walk": "2026-11-24T04:58:53Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "24",
+      "updated": "2026-11-24T04:58:53Z",
+      "walk": "18"
+    },
     "RAZIEL.SRA": {
       "agreement": 0.7098591549295775,
       "evidence": "runtime-capture",
@@ -41,6 +56,21 @@
       "slots": 66,
       "updated": "2026-11-15T16:50:24Z",
       "walk": "2"
+    },
+    "RONIN.SRA": {
+      "assigned_at": "2026-11-24T04:58:46Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-24T04:58:46Z",
+        "walk": "2026-11-24T04:58:46Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "29",
+      "updated": "2026-11-24T04:58:46Z",
+      "walk": "7"
     },
     "SKINNER.SRA": {
       "assigned_at": "2026-11-24T04:49:35Z",
@@ -124,6 +154,21 @@
       "idle": "18",
       "updated": "2026-11-24T04:54:07Z",
       "walk": "3"
+    },
+    "WALLCR.SRA": {
+      "assigned_at": "2026-11-24T04:59:00Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-24T04:59:00Z",
+        "walk": "2026-11-24T04:59:00Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "11",
+      "updated": "2026-11-24T04:59:00Z",
+      "walk": "16"
     }
   },
   "version": 1
