@@ -241,6 +241,16 @@ mod tests {
                 &["--actor-census", "--bigfile", "BIGFILE.DAT", "--objects-dir", "OBJECT"],
             ),
             (
+                &[
+                    "mesh", "actor-bestiary", "--bigfile", "BIGFILE.DAT", "--objects-dir", "OBJECT",
+                    "--json",
+                ],
+                &[
+                    "--actor-bestiary", "--bigfile", "BIGFILE.DAT", "--objects-dir", "OBJECT",
+                    "--json",
+                ],
+            ),
+            (
                 &["mesh", "bone-hierarchy", "--bigfile", "BIGFILE.DAT"],
                 &["--bone-hierarchy", "--bigfile", "BIGFILE.DAT"],
             ),
