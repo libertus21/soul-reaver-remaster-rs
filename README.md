@@ -217,6 +217,11 @@ non-ASCII paths are out of scope across platforms. `--unit` defaults to
   object-container animation record; the root uses the object's live aim words.
   The staging array is not loadable at rest, and the per-slot producer split is
   still UNKNOWN; see `docs/notes/angle-array-source.md`.
+- **Level transitions are still UNKNOWN.** A `portal` record carries no target,
+  and the portal-to-link-table index is not in authored data
+  (`docs/notes/level-transitions.md`). `docs/notes/warp-trace.md` defines the
+  read-only probe that measures the runtime reader and the entry index at warp
+  time; it is awaiting a live run.
 - **No game logic.** `--play` is a deterministic skeleton: no actor AI,
   scripts, audio, streaming, particles, menus, warps or save. Only the player
   mesh can animate (`--sra`). Room
