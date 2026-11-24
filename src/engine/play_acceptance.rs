@@ -4,9 +4,14 @@
 //! room plus synthetic model containers) and runs the production
 //! `headless_run` path. No game bytes are read or written.
 
-use super::{HeadlessReport, RunError, boot_world, headless_run};
+use super::{
+    HeadlessReport, PlayOptions, RunError, boot_world, headless_run, headless_warp_plan,
+    swap_unit,
+};
 use crate::engine::clock::MAX_CATCH_UP;
 use crate::engine::frame::FrameState;
+use crate::engine::scene::SceneAssets;
+use crate::engine::warp::WarpReason;
 use crate::engine::world::World;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -511,3 +516,140 @@ fn boot_carries_a_loaded_actor_profile_into_the_live_object() {
         "the monster class reaches the carrier on the next per-object pass"
     );
 }
+
+/// Two synthetic units with distinct `raziel` spawns and actor sets, so a warp
+/// observes both the unit change and the live-actor rebuild.
+fn warp_fixture() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("BIGFILE.DAT");
+    let bytes = synthetic_archive(&[
+        (
+            suffix("under1"),
+            pcm_room(
+                "under1",
+                &[("raziel", [0, 0, 0]), ("capsule0", [10, 0, 0])],
+            ),
+        ),
+        (
+            suffix("cathy28"),
+            pcm_room(
+                "cathy28",
+                &[("raziel", [100, 0, 0]), ("capsule1", [110, 0, 0])],
+            ),
+        ),
+        (suffix("capsule0"), named_model("capsule0")),
+        (suffix("capsule1"), named_model("capsule1")),
+    ]);
+    std::fs::write(&path, bytes).expect("synthetic archive");
+    (dir, path)
+}
+
+fn warp_options(path: &Path, extra: &[&str]) -> PlayOptions {
+    let mut argv: Vec<String> = vec![
+        "--bigfile".to_string(),
+        path.display().to_string(),
+        "--unit".to_string(),
+        "under1".to_string(),
+        "--headless".to_string(),
+    ];
+    argv.extend(extra.iter().map(|token| token.to_string()));
+    PlayOptions::parse(&argv).expect("warp options must parse")
+}
+
+fn run_warp_plan(path: &Path, options: &PlayOptions) -> (super::WarpRunReport, FrameState) {
+    let ticks = options.ticks.unwrap_or(60);
+    let world = World::load(path, &options.unit).expect("the start unit must load");
+    let mut frame = FrameState::new(world);
+    let (mut assets, _bank) =
+        SceneAssets::load(path, frame.world().level.entry, None).expect("start assets");
+    let report = headless_warp_plan(&mut frame, ticks, options, &mut assets)
+        .expect("the warp schedule must run");
+    (report, frame)
+}
+
+#[test]
+fn a_scripted_warp_changes_the_unit_its_actors_and_keeps_the_player() {
+    let (_dir, path) = warp_fixture();
+    let options = warp_options(&path, &["--warp-at", "30:cathy28"]);
+    let (report, frame) = run_warp_plan(&path, &options);
+
+    assert_eq!(report.segments.len(), 2, "one segment per unit");
+    assert_eq!(report.swaps.len(), 1, "one swap between them");
+    assert_eq!(report.segments[0].unit, "under1");
+    assert_eq!(report.segments[1].unit, "cathy28");
+    assert_eq!(report.swaps[0].from, "under1");
+    assert_eq!(report.swaps[0].to, "cathy28");
+    assert_eq!(report.swaps[0].reason, WarpReason::Script);
+    assert_eq!(
+        report.segments[0].ticks + report.segments[1].ticks,
+        60,
+        "the segments partition the fixed tick schedule"
+    );
+
+    assert_eq!(frame.world().level.name, "cathy28");
+    let names: Vec<&str> = frame.live().iter().map(|(_, object)| object.name.as_str()).collect();
+    assert!(names.contains(&"capsule1"), "the new unit's actor is live");
+    assert!(
+        !names.contains(&"capsule0"),
+        "the old unit's actor must not leak into the new unit"
+    );
+    let position = frame.player_position().expect("the player survives the swap");
+    assert_eq!(
+        (position[0], position[1]),
+        (100, 0),
+        "the player lands on the target unit's raziel spawn"
+    );
+}
+
+#[test]
+fn warp_to_fires_after_the_first_completed_tick() {
+    let (_dir, path) = warp_fixture();
+    let options = warp_options(&path, &["--warp-to", "cathy28"]);
+    let (report, _frame) = run_warp_plan(&path, &options);
+
+    assert_eq!(report.segments.len(), 2);
+    assert_eq!(report.segments[0].unit, "under1");
+    assert_eq!(report.segments[0].ticks, 1, "the swap happens after tick 0");
+    assert_eq!(report.segments[1].unit, "cathy28");
+    assert_eq!(report.swaps[0].reason, WarpReason::Flag);
+}
+
+#[test]
+fn the_same_warp_script_replays_identical_segments_and_digests() {
+    let (_dir, path) = warp_fixture();
+    let options = warp_options(&path, &["--warp-at", "20:cathy28", "--warp-at", "40:under1"]);
+    let (first, _) = run_warp_plan(&path, &options);
+    let (second, _) = run_warp_plan(&path, &options);
+    assert_eq!(first, second, "the audit lines and digests must replay byte for byte");
+    assert_eq!(
+        first.segments.iter().map(|segment| segment.digest).collect::<Vec<_>>(),
+        second.segments.iter().map(|segment| segment.digest).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn an_unknown_warp_target_is_a_typed_error_with_examples() {
+    let (_dir, path) = warp_fixture();
+    let world = World::load(&path, "under1").expect("the start unit must load");
+    let mut frame = FrameState::new(world);
+    let (mut assets, _bank) =
+        SceneAssets::load(&path, frame.world().level.entry, None).expect("start assets");
+    let error = swap_unit(&mut frame, &mut assets, &path, "does-not-exist", WarpReason::Script)
+        .expect_err("an unknown unit must be refused");
+    match &error {
+        RunError::WarpUnitNotFound { name, examples } => {
+            assert_eq!(name, "does-not-exist");
+            assert!(!examples.is_empty(), "the error lists valid examples");
+            assert!(examples.iter().any(|unit| unit == "under1"));
+            assert!(examples.iter().any(|unit| unit == "cathy28"));
+        }
+        other => panic!("expected a typed unknown-unit error, got {other:?}"),
+    }
+    assert_eq!(error.exit_code(), 1);
+    assert!(error.to_string().contains("valid examples"));
+    assert_eq!(
+        frame.world().level.name, "under1",
+        "a refused swap leaves the current unit loaded"
+    );
+}
+

@@ -144,6 +144,12 @@ fn error_tag(error: &PlayError) -> u8 {
         PlayError::InvalidClipAssign { .. } => 17,
         PlayError::ClipAssignRequiresSraDir => 18,
         PlayError::ClipAssignWithInspect => 19,
+        // World-warp options: appended, never renumbered.
+        PlayError::InvalidWarpAt(_) => 20,
+        PlayError::InvalidWarpCycle(_) => 21,
+        PlayError::WarpAtRequiresHeadless => 22,
+        PlayError::WarpCycleRequiresWindow => 23,
+        PlayError::WarpConflict { .. } => 24,
     }
 }
 
