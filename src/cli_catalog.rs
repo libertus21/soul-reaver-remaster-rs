@@ -28,6 +28,9 @@ impl Capability {
         if token == "--validate" {
             return self.name == "clip-metrics";
         }
+        if token == "--json" {
+            return self.name == "actor-bestiary";
+        }
         token == "--list-clips" && self.name == "animate"
     }
 
@@ -78,6 +81,7 @@ impl Capability {
                 && matches!(token, "--bigfile" | "--group"))
             || (self.name == "reach" && matches!(token, "--bigfile" | "--start"))
             || (self.name == "actor-census" && matches!(token, "--bigfile" | "--objects-dir"))
+            || (self.name == "actor-bestiary" && matches!(token, "--bigfile" | "--objects-dir"))
     }
 }
 
@@ -85,7 +89,7 @@ impl Capability {
 pub const GROUPS: [&str; 6] = ["texture", "archive", "mesh", "audio", "level", "game"];
 
 /// Every existing mode, exactly once. This is the single source for help.
-pub const CAPABILITIES: [Capability; 39] = [
+pub const CAPABILITIES: [Capability; 40] = [
     Capability { group: "texture", name: "list", legacy: "--textures <BIG> --tlist [--map <MAP>]", summary: "List the remaster .BIG header and slot classes.", window: false },
     Capability { group: "texture", name: "show", legacy: "--textures <BIG> --tshow <SEL> [--map <MAP>]", summary: "Show one slot as its raw 256x256 image.", window: true },
     Capability { group: "texture", name: "file", legacy: "<FILE.DDS>", summary: "Show one .DDS texture file.", window: true },
@@ -99,6 +103,7 @@ pub const CAPABILITIES: [Capability; 39] = [
     Capability { group: "mesh", name: "object-mesh", legacy: "--object-mesh --bigfile <DAT> --entry <INDEX> [--textures <BIG>] [--pose <FILE>]", summary: "Show one archived object container's model, optionally skinned by a slot-pose file.", window: true },
     Capability { group: "mesh", name: "object-info-actors", legacy: "--object-info --bigfile <DAT> --entry <INDEX> --actors", summary: "Print one object container's counts and actor block.", window: false },
     Capability { group: "mesh", name: "actor-census", legacy: "--actor-census --bigfile <DAT> [--objects-dir <DIR>]", summary: "Print every actor container's entries, ids and state trios.", window: false },
+    Capability { group: "mesh", name: "actor-bestiary", legacy: "--actor-bestiary --bigfile <DAT> [--objects-dir <DIR>] [--json]", summary: "One row per actor type with its model entry and bones, the .SRA clip count, the top heuristic idle/walk candidates, the units that place it, and the hunter/sluagh fixture check; --objects-dir is scanned for <NAME>.SRA and nothing is written.", window: false },
     Capability { group: "mesh", name: "bone-hierarchy", legacy: "--bone-hierarchy --bigfile <DAT> [--entry <INDEX>]", summary: "Print the descriptor bone hierarchy census, or one entry's tree.", window: false },
     Capability { group: "mesh", name: "srl-info", legacy: "--srl-info <FILE.SRL>", summary: "Print one .SRL clip's tracks, frames, fps and duration.", window: false },
     Capability { group: "audio", name: "list", legacy: "--audio <SND> --alist", summary: "List the waves in a .SND bank.", window: false },
@@ -172,7 +177,7 @@ pub fn render_help(group: Option<&str>) -> String {
 mod tests {
     use super::{catalog, is_known_group, render_help, GROUPS};
 
-    const EXPECTED: [(&str, &str); 39] = [
+    const EXPECTED: [(&str, &str); 40] = [
         ("texture", "list"),
         ("texture", "show"),
         ("texture", "file"),
@@ -186,6 +191,7 @@ mod tests {
         ("mesh", "object-mesh"),
         ("mesh", "object-info-actors"),
         ("mesh", "actor-census"),
+        ("mesh", "actor-bestiary"),
         ("mesh", "bone-hierarchy"),
         ("mesh", "srl-info"),
         ("audio", "list"),

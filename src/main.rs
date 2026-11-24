@@ -45,6 +45,8 @@
 //! exits `0`.
 
 mod actor;
+// Offline actor-type bestiary: render only; `--actor-bestiary` supplies the data.
+mod bestiary;
 mod bigfile;
 // Bone hierarchy parsed from the descriptor `+18` word; the census command and
 // `--object-mesh --hierarchy` consume it. Some pure accessors stay test-only.
@@ -100,7 +102,7 @@ mod textures;
 mod textures_object;
 mod wav;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -219,6 +221,9 @@ fn dispatch(args: &[String]) -> ExitCode {
     if args.first().is_some_and(|a| a == "--actor-census") {
         return run_actor_census(&args[1..]);
     }
+    if args.first().is_some_and(|a| a == "--actor-bestiary") {
+        return run_actor_bestiary(&args[1..]);
+    }
     if args.first().is_some_and(|a| a == "--bone-hierarchy") {
         return run_bone_hierarchy(&args[1..]);
     }
@@ -263,6 +268,7 @@ fn dispatch(args: &[String]) -> ExitCode {
         eprintln!("   or: soul-reaver-remaster-rs --level-objects --bigfile <BIGFILE.DAT> --group <PREFIX>");
         eprintln!("   or: soul-reaver-remaster-rs --level-render <.PCM file> --objects [--textures <TEXTURES.BIG>]");
         eprintln!("   or: soul-reaver-remaster-rs --actor-census --bigfile <BIGFILE.DAT> [--objects-dir <DIR>]");
+        eprintln!("   or: soul-reaver-remaster-rs --actor-bestiary --bigfile <BIGFILE.DAT> [--objects-dir <DIR>] [--json]");
         eprintln!("   or: soul-reaver-remaster-rs --bone-hierarchy --bigfile <BIGFILE.DAT> [--entry <INDEX>]");
         eprintln!("   or: soul-reaver-remaster-rs --object-info --bigfile <BIGFILE.DAT> --entry <INDEX> [--actors]");
         eprintln!("   or: soul-reaver-remaster-rs --object-mesh --bigfile <BIGFILE.DAT> --entry <INDEX>");
@@ -3173,6 +3179,194 @@ fn actor_census_input<'a>(args: &'a [String], usage: &'static str) -> Result<(&'
         at += 2;
     }
     dat.map(|dat| (dat, directory)).ok_or(object::ObjectError::Usage(usage))
+}
+
+struct BestiaryInput<'a> {
+    dat: &'a str,
+    objects_dir: Option<&'a str>,
+    json: bool,
+}
+
+fn actor_bestiary_input<'a>(
+    args: &'a [String],
+    usage: &'static str,
+) -> Result<BestiaryInput<'a>, object::ObjectError> {
+    let (mut dat, mut objects_dir, mut json) = (None, None, false);
+    let mut at = 0;
+    while at < args.len() {
+        match args[at].as_str() {
+            "--json" => {
+                json = true;
+                at += 1;
+            }
+            token => {
+                let value = args
+                    .get(at + 1)
+                    .map(String::as_str)
+                    .ok_or(object::ObjectError::Usage(usage))?;
+                match token {
+                    "--bigfile" => dat = Some(value),
+                    "--objects-dir" => objects_dir = Some(value),
+                    _ => return Err(object::ObjectError::Usage(usage)),
+                }
+                at += 2;
+            }
+        }
+    }
+    dat.map(|dat| BestiaryInput { dat, objects_dir, json })
+        .ok_or(object::ObjectError::Usage(usage))
+}
+
+/// Distinct actor types from the census: name, container index and bone count.
+/// A duplicate name keeps its lowest entry so the table stays deterministic.
+fn bestiary_actors(dat: &Path) -> Result<Vec<(String, usize, usize)>, object::ObjectError> {
+    let entries = bigfile::load_index(dat)
+        .map_err(|error| object::ObjectError::ArchiveUnreadable(error.to_string()))?;
+    let mut by_name: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for index in 0..entries.len() {
+        let bytes = object::read_entry_bytes(dat, index)?;
+        let Some(block) = actor::parse_actor_block(&bytes)? else { continue };
+        if block.kind != actor::ActorKind::Monster {
+            continue;
+        }
+        let model = object::parse_object(&bytes)?;
+        by_name.entry(model.name).or_insert((index, model.bones.len()));
+    }
+    let mut actors: Vec<(String, usize, usize)> =
+        by_name.into_iter().map(|(name, (entry, bones))| (name, entry, bones)).collect();
+    actors.sort_by_key(|(_, entry, _)| *entry);
+    Ok(actors)
+}
+
+/// Decode one `.SRA` with the model's bone count. Any failure to produce a clip
+/// table is the documented `no-table` outcome, never a guess.
+fn bestiary_outcome(path: &Path, bones: usize) -> bestiary::SraOutcome {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("warning: cannot read {}: {error}", file_label(path));
+            return bestiary::SraOutcome::NoTable;
+        }
+    };
+    let Ok(animation) = sra::SraAnimation::load(bytes, bones) else {
+        return bestiary::SraOutcome::NoTable;
+    };
+    match clip_metrics::analyze_animation(&animation) {
+        Ok(report) => bestiary::SraOutcome::Decoded(report),
+        Err(_) => bestiary::SraOutcome::NoTable,
+    }
+}
+
+/// Best-effort placement scan over the level units the archive index declares.
+/// Returns `(actor -> sorted units, units scanned, units that failed to read)`.
+fn bestiary_sites(
+    dat: &Path,
+    actor_names: &BTreeSet<String>,
+) -> Result<(BTreeMap<String, Vec<String>>, usize, usize), level::LevelError> {
+    let scan = level::scan_archive_levels(dat)?;
+    let mut sites: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut failed = 0usize;
+    for unit in &scan.units {
+        match level::read_entry_objects(dat, unit.entry) {
+            Ok(rows) => {
+                for (_, report) in &rows {
+                    for object in &report.objects {
+                        let name = object.name.to_ascii_lowercase();
+                        if actor_names.contains(&name) {
+                            sites.entry(name).or_default().push(unit.name.clone());
+                        }
+                    }
+                }
+            }
+            Err(_) => failed += 1,
+        }
+    }
+    for units in sites.values_mut() {
+        units.sort();
+        units.dedup();
+    }
+    Ok((sites, scan.units.len(), failed))
+}
+
+/// `--actor-bestiary`: one row per actor type with its `.SRA`, clip count, the
+/// top heuristic idle/walk candidates, the units that place it and the known
+/// fixture check. Offline, deterministic, read-only; never writes a label.
+fn run_actor_bestiary(args: &[String]) -> ExitCode {
+    let usage = "expected --actor-bestiary --bigfile <DAT> [--objects-dir <DIR>] [--json]";
+    let input = match actor_bestiary_input(args, usage) {
+        Ok(input) => input,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return ExitCode::from(error.exit_code());
+        }
+    };
+    let dat = Path::new(input.dat);
+    let actors = match bestiary_actors(dat) {
+        Ok(actors) => actors,
+        Err(error) => {
+            eprintln!("error: {error}");
+            let code =
+                if matches!(error, object::ObjectError::ArchiveUnreadable(_)) { 3 } else { error.exit_code() };
+            return ExitCode::from(code);
+        }
+    };
+    let directory = match input.objects_dir {
+        Some(dir) => match engine::actors::SraDirectory::load(Path::new(dir)) {
+            Ok(directory) => Some(directory),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return ExitCode::from(1);
+            }
+        },
+        None => None,
+    };
+    let mut rows = Vec::with_capacity(actors.len());
+    let mut reports: BTreeMap<String, clip_metrics::ClipMetricsReport> = BTreeMap::new();
+    for (name, entry, bones) in &actors {
+        let resolved = directory.as_ref().and_then(|directory| directory.resolve(name));
+        let (sra_file, outcome) = match resolved {
+            Some((file, path)) => {
+                let outcome = bestiary_outcome(path, *bones);
+                if let bestiary::SraOutcome::Decoded(report) = &outcome {
+                    reports.insert(name.clone(), report.clone());
+                }
+                (Some(file.to_string()), outcome)
+            }
+            None => (None, bestiary::SraOutcome::Missing),
+        };
+        rows.push(bestiary::Row::new(
+            name.clone(),
+            *entry,
+            *bones,
+            sra_file.as_deref(),
+            &outcome,
+        ));
+    }
+    let actor_names: BTreeSet<String> = actors.iter().map(|(name, _, _)| name.clone()).collect();
+    let (sites, units_scanned, units_failed) = match bestiary_sites(dat, &actor_names) {
+        Ok((sites, scanned, failed)) => (sites, scanned, failed),
+        Err(error) => {
+            eprintln!("warning: level scan failed, there is no placement table: {error}");
+            (BTreeMap::new(), 0, 0)
+        }
+    };
+    let summary = bestiary::Summary::of(&rows, units_scanned);
+    let order: Vec<String> = rows.iter().map(|row| row.actor.clone()).collect();
+    let checks = bestiary::check_text(&reports);
+    if input.json {
+        let check_lines: Vec<String> = checks.lines().map(str::to_string).collect();
+        outln!(
+            "{}",
+            bestiary::json_text(&rows, &sites, &summary, &check_lines)
+        );
+    } else {
+        outln!("{}", bestiary::table_text(&rows));
+        outln!("{}", bestiary::scan_line(units_scanned, units_failed));
+        outln!("{}", bestiary::sites_text(&order, &sites));
+        outln!("{checks}");
+        outln!("{}", summary.render());
+    }
+    ExitCode::SUCCESS
 }
 
 fn bone_hierarchy_input<'a>(
