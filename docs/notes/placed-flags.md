@@ -220,7 +220,10 @@ What would settle it:
    realm setter (H1). The strongest leads are bit 3 (actor-only) and bit 7
    (effects/emitters): branch on `& 0x8` and `& 0x80`.
 2. **Two-realm capture of one object.** Trace one `portal`/`walsoul`/`dust`
-   instance before and after a realm shift and compare the consumed value.
+   instance before and after a realm shift and compare the consumed value. The
+   differential memory probe `sr1_realm_diff_probe.py` (scratch) automates the
+   capture-and-diff half; its method and operator protocol are in
+   `docs/notes/realm-diff.md`. Its live result is **pending**.
 3. **Live visibility/collision probe.** Compare a flagged and an unflagged
    instance of the same name in the same unit to see whether the bit changes
    rendering or collision.
