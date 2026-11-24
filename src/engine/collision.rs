@@ -437,6 +437,38 @@ impl CollisionMesh {
         self.bounds
     }
 
+    /// A mesh whose wall set is this mesh's walls followed by `other`'s walls.
+    ///
+    /// Surfaces, the fence and the diagnostic counts stay this mesh's, so
+    /// vertical movement and the synthetic-locomotion fence keep describing the
+    /// room. Used to add closed-door barriers to the horizontal player sweep
+    /// without letting a door's horizontal faces become a floor. The uniform
+    /// grid is rebuilt over the combined wall list; the result is deterministic
+    /// because both inputs are.
+    pub fn union_walls(&self, other: &CollisionMesh) -> CollisionMesh {
+        let mut walls = self.walls.clone();
+        walls.extend(other.walls.iter().cloned());
+        let mut grid: BTreeMap<(i32, i32), Vec<u32>> = BTreeMap::new();
+        for (index, wall) in walls.iter().enumerate() {
+            let (x0, x1) = (cell_of(wall.min[0]), cell_of(wall.max[0]));
+            let (z0, z1) = (cell_of(wall.min[1]), cell_of(wall.max[1]));
+            for x in x0..=x1 {
+                for z in z0..=z1 {
+                    grid.entry((x, z)).or_default().push(index as u32);
+                }
+            }
+        }
+        CollisionMesh {
+            walls,
+            surfaces: self.surfaces.clone(),
+            up_facing: self.up_facing,
+            down_facing: self.down_facing,
+            grid,
+            skipped_faces: self.skipped_faces,
+            bounds: self.bounds,
+        }
+    }
+
     /// True when a straight horizontal step from `from` by `delta` would touch a
     /// wall, using the same narrow phase as [`CollisionMesh::sweep`].
     ///
@@ -1229,6 +1261,30 @@ mod tests {
         let mesh = CollisionMesh::from_room_triangles(&vertices, &faces);
         assert!(mesh.is_empty());
         assert_eq!(mesh.sweep([0, 0, 0], [40, 0, 0], 16), [40, 0, 0]);
+    }
+
+    #[test]
+    fn union_walls_adds_a_barrier_and_keeps_the_room_surfaces() {
+        let (room_v, room_f) = vertical_wall(0, -500, 500, -100, 100);
+        let room = CollisionMesh::from_room_triangles(&room_v, &room_f);
+        let (door_v, door_f) = vertical_wall(200, -500, 500, -100, 100);
+        let door = CollisionMesh::from_room_triangles(&door_v, &door_f);
+
+        let union = room.union_walls(&door);
+        assert_eq!(union.wall_count(), 4, "room walls plus door walls");
+        assert_eq!(
+            union.surface_count(),
+            room.surface_count(),
+            "the overlay must not import door surfaces"
+        );
+        assert!(
+            !room.blocked([150, 0, 0], [40, 0, 0], 16),
+            "the room wall at x=0 is behind the probe"
+        );
+        assert!(
+            union.blocked([150, 0, 0], [40, 0, 0], 16),
+            "the union's door wall at x=200 blocks the sweep"
+        );
     }
 
     #[test]
