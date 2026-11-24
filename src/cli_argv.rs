@@ -300,6 +300,14 @@ mod tests {
                 &["--level-objects", "--bigfile", "BIGFILE.DAT", "--group", "under"],
             ),
             (
+                &["level", "flag-census", "--bigfile", "BIGFILE.DAT"],
+                &["--flag-census", "--bigfile", "BIGFILE.DAT"],
+            ),
+            (
+                &["level", "flag-census", "--bigfile", "BIGFILE.DAT", "--name", "portal"],
+                &["--flag-census", "--bigfile", "BIGFILE.DAT", "--name", "portal"],
+            ),
+            (
                 &[
                     "level", "geometry-entry", "--bigfile", "BIGFILE.DAT", "--entry", "115",
                 ],

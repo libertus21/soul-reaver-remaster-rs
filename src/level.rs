@@ -1270,6 +1270,40 @@ pub fn scan_archive_levels(path: &Path) -> Result<ArchiveScan, LevelError> {
     Ok(scan)
 }
 
+/// Every `.PCM` unit's placed-object report, in archive order.
+///
+/// This is the whole-archive variant of [`read_group_objects`]: the index is
+/// scanned once, each `.PCM` candidate is parsed once, and only its object array
+/// is decoded. Non-`.PCM` entries are skipped like [`scan_archive_levels`]; a
+/// `.PCM` whose object array lies outside the data region fails loud instead of
+/// being dropped.
+pub fn scan_archive_objects(path: &Path) -> Result<Vec<(String, ObjectReport)>, LevelError> {
+    let entries = bigfile::load_index(path)
+        .map_err(|error| LevelError::ArchiveUnreadable { detail: error.to_string() })?;
+    let mut rows = Vec::new();
+    for entry in &entries {
+        let bytes = bigfile::read_entry(path, entry).map_err(|error| match error {
+            error @ bigfile::BigfileError::BadEntry(_) => {
+                LevelError::EntryOutsideFile { detail: error.to_string() }
+            }
+            error => LevelError::ArchiveUnreadable { detail: error.to_string() },
+        })?;
+        if !pcm_candidate(&bytes) {
+            continue;
+        }
+        let mut unit = parse_pcm_bytes(&bytes).map_err(|error| LevelError::GroupParseFailed {
+            name: String::from_utf8_lossy(&entry.suffix).into_owned(),
+            detail: error.to_string(),
+        })?;
+        resolve_unit_name(&mut unit, &entry.suffix);
+        let report = object_report(&bytes[unit.structure.data_base..]).map_err(|error| {
+            LevelError::GroupParseFailed { name: unit.name.clone(), detail: error.to_string() }
+        })?;
+        rows.push((unit.name, report));
+    }
+    Ok(rows)
+}
+
 /// Resolve a unit name to its BIGFILE entry index.
 ///
 /// Reuses [`scan_archive_levels`] so the name rules (header name plus the

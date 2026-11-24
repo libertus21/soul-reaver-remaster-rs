@@ -86,6 +86,7 @@ impl Capability {
             || (self.name.ends_with("-group")
                 && matches!(token, "--bigfile" | "--group"))
             || (self.name == "reach" && matches!(token, "--bigfile" | "--start"))
+            || (self.name == "flag-census" && matches!(token, "--bigfile" | "--name"))
             || (self.name == "actor-census" && matches!(token, "--bigfile" | "--objects-dir"))
             || (self.name == "actor-bestiary" && matches!(token, "--bigfile" | "--objects-dir"))
     }
@@ -95,7 +96,7 @@ impl Capability {
 pub const GROUPS: [&str; 6] = ["texture", "archive", "mesh", "audio", "level", "game"];
 
 /// Every existing mode, exactly once. This is the single source for help.
-pub const CAPABILITIES: [Capability; 40] = [
+pub const CAPABILITIES: [Capability; 41] = [
     Capability { group: "texture", name: "list", legacy: "--textures <BIG> --tlist [--map <MAP>]", summary: "List the remaster .BIG header and slot classes.", window: false },
     Capability { group: "texture", name: "show", legacy: "--textures <BIG> --tshow <SEL> [--map <MAP>]", summary: "Show one slot as its raw 256x256 image.", window: true },
     Capability { group: "texture", name: "file", legacy: "<FILE.DDS>", summary: "Show one .DDS texture file.", window: true },
@@ -127,6 +128,7 @@ pub const CAPABILITIES: [Capability; 40] = [
     Capability { group: "level", name: "render-entry", legacy: "--level-render --bigfile <DAT> --entry <INDEX> [--textures <BIG>]", summary: "Show one archive entry's room geometry.", window: true },
     Capability { group: "level", name: "geometry-group", legacy: "--level-geometry --bigfile <DAT> --group <PREFIX>", summary: "Print every room in an archive level family with totals.", window: false },
     Capability { group: "level", name: "objects-group", legacy: "--level-objects --bigfile <DAT> --group <PREFIX>", summary: "Print every room's objects in an archive level family with a total.", window: false },
+    Capability { group: "level", name: "flag-census", legacy: "--flag-census --bigfile <DAT> [--name <NAME>]", summary: "Count every placed record's flags word: distinct values, per-name constancy and the name x bit cross-tab; --name appends one line per matching record; no bit is interpreted.", window: false },
     Capability { group: "level", name: "render-group", legacy: "--level-render --bigfile <DAT> --group <PREFIX> [--textures <BIG>]", summary: "Show a merged archive level family as one solid.", window: true },
     Capability { group: "level", name: "links-entry", legacy: "--level-links --bigfile <DAT> --entry <INDEX>", summary: "Print one archive entry's decoded link table.", window: false },
     Capability { group: "level", name: "links-group", legacy: "--level-links --bigfile <DAT> --group <PREFIX>", summary: "Print every archive level family member's link table.", window: false },
@@ -183,7 +185,7 @@ pub fn render_help(group: Option<&str>) -> String {
 mod tests {
     use super::{catalog, is_known_group, render_help, GROUPS};
 
-    const EXPECTED: [(&str, &str); 40] = [
+    const EXPECTED: [(&str, &str); 41] = [
         ("texture", "list"),
         ("texture", "show"),
         ("texture", "file"),
@@ -215,6 +217,7 @@ mod tests {
         ("level", "render-entry"),
         ("level", "geometry-group"),
         ("level", "objects-group"),
+        ("level", "flag-census"),
         ("level", "render-group"),
         ("level", "links-entry"),
         ("level", "links-group"),
