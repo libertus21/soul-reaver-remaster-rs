@@ -6,23 +6,32 @@
 //! player sweep only ever queries that mesh (`frame.rs`, stage 9). This module
 //! adds the missing interaction state without touching the room parser.
 //!
+//! # Classification
+//!
+//! Every interactable name carries an [`InteractKind`]. A `Blocking` name is a
+//! closed barrier that opens; a `Passive` name is activatable but is never a
+//! barrier. **The classification is our interpretation of the authored names,
+//! not decoded behaviour**; the original's open/closed semantics are UNKNOWN.
+//! See `docs/notes/interactions.md` for the table and the reasoning.
+//!
 //! # State model
 //!
 //! A registry entry is created per **live record** (by [`LiveId`]) whose authored
-//! name is one of [`INTERACTABLE_NAMES`]. The state is `open: bool` and defaults
-//! to `false` (closed), so two doors in one room open independently and the name
-//! is only a matching key, never the state key.
+//! name is in [`INTERACTABLES`]. The state is `open: bool` and defaults to
+//! `false` (closed), so two doors in one room open independently and the name is
+//! only a matching key, never the state key.
 //!
 //! # Collision
 //!
-//! All eleven names resolve to their own archived model, so each door's geometry
-//! is separable (see the note for the measured vertex/triangle counts). The
-//! player-facing entry point (`play.rs`) builds one [`CollisionMesh`] per placed
-//! door from that model's rest-pose triangles in world space and installs the
-//! map here. While a door is **closed**, its walls are unioned ahead of the room
-//! walls for the horizontal player sweep; while it is **open**, they are not.
-//! Vertical movement keeps using the room mesh only, so a door's horizontal
-//! faces can never become a phantom floor.
+//! Only `Blocking` names carry collision. Their archived models are separable
+//! (see the note for the measured vertex/triangle counts). The player-facing
+//! entry point (`play.rs`) builds one [`CollisionMesh`] per placed **blocking**
+//! door from that model's rest-pose triangles in world space and installs the map
+//! here. While a blocking door is **closed**, its walls are unioned ahead of the
+//! room walls for the horizontal player sweep; while it is **open**, they are
+//! not. `Passive` names register, toggle and fold into the digest, but contribute
+//! no walls in either state. Vertical movement keeps using the room mesh only, so
+//! a door's horizontal faces can never become a phantom floor.
 //!
 //! # Rendering
 //!
@@ -35,13 +44,40 @@ use std::collections::BTreeMap;
 use crate::engine::collision::CollisionMesh;
 use crate::engine::live::{LiveArena, LiveId};
 
-/// The door-like placed names this layer owns.
+/// Physical role this layer assigns to one interactable name.
 ///
-/// The list is the archive survey set from the gate note; membership is ASCII
-/// case-insensitive because placed names are compared the same way elsewhere.
-pub const INTERACTABLE_NAMES: [&str; 11] = [
-    "sudoor", "catdoor", "wrpdoor", "hatch", "valve", "plswtch", "bellsc", "dblgate", "catdora",
-    "skgate", "sugate",
+/// This is **our interpretation**, derived from the name and the shipped
+/// geometry, not decoded original behaviour. The archive does not say which
+/// records the player may open or what their authored state is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractKind {
+    /// A closed barrier that opens. Contributes walls while closed only.
+    Blocking,
+    /// Activatable, never a barrier. Contributes no walls in either state.
+    Passive,
+}
+
+/// Every interactable name and the role this layer assigns it.
+///
+/// Membership is ASCII case-insensitive because placed names are compared the
+/// same way elsewhere. The list is the archive survey set from the gate note; the
+/// kinds are our reading of each name's physical role:
+///
+/// - `Blocking`: doors and gates that stand across a passage.
+/// - `Passive`: wall-mounted switches and bell pulls that are activated, not
+///   walked through.
+pub const INTERACTABLES: [(&str, InteractKind); 11] = [
+    ("sudoor", InteractKind::Blocking),
+    ("catdoor", InteractKind::Blocking),
+    ("catdora", InteractKind::Blocking),
+    ("wrpdoor", InteractKind::Blocking),
+    ("hatch", InteractKind::Blocking),
+    ("dblgate", InteractKind::Blocking),
+    ("skgate", InteractKind::Blocking),
+    ("sugate", InteractKind::Blocking),
+    ("valve", InteractKind::Passive),
+    ("plswtch", InteractKind::Passive),
+    ("bellsc", InteractKind::Passive),
 ];
 
 /// Radius, in integer world units, within which the `E` key picks the nearest
@@ -58,11 +94,22 @@ pub const INTERACT_RADIUS_UNITS: i32 = 128;
 /// UNKNOWN and is deliberately not reproduced.
 pub const SYNTHETIC_OPEN_REPRESENTATION: &str = "hidden";
 
-/// True when `name` is one of [`INTERACTABLE_NAMES`].
-pub fn is_interactable(name: &str) -> bool {
-    INTERACTABLE_NAMES
+/// The kind assigned to `name`, or `None` when it is not interactable.
+pub fn kind_of(name: &str) -> Option<InteractKind> {
+    INTERACTABLES
         .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(name))
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, kind)| *kind)
+}
+
+/// True when `name` is one of [`INTERACTABLES`].
+pub fn is_interactable(name: &str) -> bool {
+    kind_of(name).is_some()
+}
+
+/// True when `name` is interactable **and** contributes walls while closed.
+pub fn is_blocking(name: &str) -> bool {
+    matches!(kind_of(name), Some(InteractKind::Blocking))
 }
 
 /// Why an activation happened, as the console contract spells it.
@@ -262,8 +309,11 @@ impl InteractionLayer {
             .collect()
     }
 
-    /// Register every live interactable not seen before, attaching its prebuilt
-    /// closed-door mesh when the placement matches.
+    /// Register every live interactable not seen before and, for a **blocking**
+    /// one, attach its prebuilt closed-door mesh when the placement matches.
+    ///
+    /// Passive names are registered with the same `open` state and log, but never
+    /// receive a mesh, so [`Self::rebuild`] cannot union them into the sweep.
     pub fn register_live(&mut self, live: &LiveArena) {
         if !self.enabled {
             return;
@@ -273,9 +323,11 @@ impl InteractionLayer {
                 continue;
             }
             self.open.insert(id, false);
-            let key = (object.name.to_ascii_lowercase(), object.position);
-            if let Some(mesh) = self.base.get(&key) {
-                self.meshes.insert(id, mesh.clone());
+            if is_blocking(&object.name) {
+                let key = (object.name.to_ascii_lowercase(), object.position);
+                if let Some(mesh) = self.base.get(&key) {
+                    self.meshes.insert(id, mesh.clone());
+                }
             }
             self.dirty = true;
         }
@@ -401,9 +453,11 @@ fn squared_distance(a: [i32; 3], b: [i32; 3]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivateTarget, InteractionLayer, InteractAt, InteractTrigger, is_interactable,
+        ActivateTarget, INTERACTABLES, InteractAt, InteractKind, InteractionLayer,
+        InteractTrigger, is_blocking, is_interactable, kind_of,
     };
     use crate::engine::class::RenderClass;
+    use crate::engine::collision::CollisionMesh;
     use crate::engine::live::{LiveArena, LiveObject};
 
     fn object(name: &str, position: [i32; 3]) -> LiveObject {
@@ -418,14 +472,102 @@ mod tests {
         }
     }
 
+    fn wall() -> CollisionMesh {
+        // A vertical wall at x=100, y -500..500, z 0..300.
+        let vertices = vec![
+            [100, -500, 0],
+            [100, 500, 0],
+            [100, 500, 300],
+            [100, -500, 300],
+        ];
+        let faces = vec![[0, 1, 2], [0, 2, 3]];
+        CollisionMesh::from_room_triangles(&vertices, &faces)
+    }
+
+    #[test]
+    fn the_classification_is_pinned_to_exact_name_sets() {
+        let mut blocking: Vec<&str> = INTERACTABLES
+            .iter()
+            .filter(|(_, kind)| *kind == InteractKind::Blocking)
+            .map(|(name, _)| *name)
+            .collect();
+        blocking.sort_unstable();
+        assert_eq!(
+            blocking,
+            [
+                "catdoor", "catdora", "dblgate", "hatch", "skgate", "sudoor", "sugate", "wrpdoor",
+            ],
+            "a deliberate edit must update this pinned Blocking set"
+        );
+
+        let mut passive: Vec<&str> = INTERACTABLES
+            .iter()
+            .filter(|(_, kind)| *kind == InteractKind::Passive)
+            .map(|(name, _)| *name)
+            .collect();
+        passive.sort_unstable();
+        assert_eq!(
+            passive,
+            ["bellsc", "plswtch", "valve"],
+            "a deliberate edit must update this pinned Passive set"
+        );
+
+        assert_eq!(INTERACTABLES.len(), 11);
+        assert_eq!(kind_of("doorh"), None, "doorh stays outside the corrected set");
+        assert!(is_blocking("sudoor"));
+        assert!(!is_blocking("valve"));
+    }
+
     #[test]
     fn the_eleven_names_are_matched_case_insensitively() {
-        for name in super::INTERACTABLE_NAMES {
+        for (name, kind) in INTERACTABLES {
             assert!(is_interactable(name));
-            assert!(is_interactable(&name.to_ascii_uppercase()));
+            assert_eq!(kind_of(&name.to_ascii_uppercase()), Some(kind));
         }
         assert!(!is_interactable("raziel"));
         assert!(!is_interactable("doorh"), "doorh is not in the surveyed set");
+    }
+
+    #[test]
+    fn a_passive_object_adds_no_wall_closed_or_open() {
+        let mesh = wall();
+        assert!(!mesh.is_empty(), "the fixture wall must carry walls");
+
+        let mut live = LiveArena::new();
+        let id = live.spawn(object("plswtch", [0, 0, 0]));
+        let mut base = std::collections::BTreeMap::new();
+        // Install a mesh under the passive name on purpose: the kind, not the
+        // absence of a base entry, must be what keeps it out of the sweep.
+        base.insert(("plswtch".to_string(), [0, 0, 0]), mesh);
+        let mut layer = InteractionLayer::new(true);
+        layer.set_base(base);
+        layer.register_live(&live);
+
+        let room = CollisionMesh::default();
+        layer.rebuild(&room);
+        assert!(
+            layer.combined().is_none(),
+            "a closed passive object must add no wall"
+        );
+
+        let outcome = layer
+            .activate(
+                &live,
+                ActivateTarget::Id {
+                    slot: id.index,
+                    generation: Some(id.generation),
+                },
+                None,
+                InteractTrigger::Script,
+            )
+            .expect("the passive switch still toggles");
+        assert!(outcome.open);
+
+        layer.rebuild(&room);
+        assert!(
+            layer.combined().is_none(),
+            "an open passive object must add no wall"
+        );
     }
 
     #[test]

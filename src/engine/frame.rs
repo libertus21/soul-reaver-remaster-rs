@@ -2928,6 +2928,31 @@ mod tests {
     }
 
     #[test]
+    fn a_passive_toggle_still_folds_into_the_digest() {
+        use crate::engine::interaction::{ActivateTarget, InteractAt};
+        fn digest(activate: bool) -> u64 {
+            let mut frame = FrameState::new(world_with_raziel());
+            frame.queue_spawn("plswtch", [0, 0, 0]);
+            if activate {
+                frame.set_interaction_schedule(vec![InteractAt {
+                    tick: 2,
+                    target: ActivateTarget::Nearest,
+                }]);
+            }
+            for index in 0..5 {
+                tick(&mut frame, index);
+            }
+            frame.production_digest()
+        }
+
+        assert_ne!(
+            digest(true),
+            digest(false),
+            "a passive toggle is observable state and must move the digest"
+        );
+    }
+
+    #[test]
     fn a_closed_door_blocks_the_player_and_an_open_one_lets_it_through() {
         use crate::engine::interaction::InteractTrigger;
         // A vertical wall at world x=100, y -500..500, z 0..300.
