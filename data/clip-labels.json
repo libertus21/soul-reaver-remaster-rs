@@ -42,6 +42,21 @@
       "updated": "2026-11-15T16:50:24Z",
       "walk": "2"
     },
+    "SKINNER.SRA": {
+      "assigned_at": "2026-11-24T04:49:35Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-24T04:49:35Z",
+        "walk": "2026-11-24T04:49:35Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "11",
+      "updated": "2026-11-24T04:49:35Z",
+      "walk": "6"
+    },
     "SLUAGH.SRA": {
       "agreement": 0.8233918128654971,
       "evidence": "runtime-motion",
@@ -64,6 +79,21 @@
       "slots": 24,
       "updated": "2026-11-22T03:24:01Z",
       "walk": "1"
+    },
+    "VWRAITH.SRA": {
+      "assigned_at": "2026-11-24T04:49:35Z",
+      "evidence": "visual",
+      "field_assigned_at": {
+        "idle": "2026-11-24T04:49:35Z",
+        "walk": "2026-11-24T04:49:35Z"
+      },
+      "field_method": {
+        "idle": "visual",
+        "walk": "visual"
+      },
+      "idle": "9",
+      "updated": "2026-11-24T04:49:35Z",
+      "walk": "19"
     }
   },
   "version": 1
