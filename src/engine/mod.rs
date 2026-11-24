@@ -45,6 +45,8 @@ pub mod spawn;
 #[allow(dead_code)]
 pub mod state;
 #[allow(dead_code)]
+pub mod synthetic_locomotion;
+#[allow(dead_code)]
 pub mod tracker;
 #[allow(dead_code)]
 pub mod world;

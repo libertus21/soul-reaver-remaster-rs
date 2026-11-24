@@ -118,6 +118,16 @@ the same `saved`/`failed`/version-control lines. A later normal run consumes the
 stored labels; playback is never special-cased. It is incompatible with
 `--clip-inspect`.
 
+Non-player actors have **no decoded pathing**. Stage 14 therefore runs our own
+**synthetic** bounce patrol on live `monster_` actors: an integer eight-way
+heading, a four-unit walking step, a walk/dwell duty cycle offset by live id,
+and a 90-degree turn when the existing collision mesh or the room fence blocks
+the step. The resulting real position delta is what makes the labelled `walk`
+clip observable; the player is never touched. This is not original behaviour and
+the retail actor AI is UNKNOWN. `--no-npc-motion` turns the stage off and
+reproduces the pre-locomotion digests. See
+`docs/notes/synthetic-locomotion.md`.
+
 Windowed mode needs `--textures` and a display:
 
 ```text
@@ -154,8 +164,12 @@ cargo run -- --play --headless --bigfile <BIGFILE.DAT> --unit under1 --ticks 60
 engine unit=under1 rooms=1 placed=95 admitted=3 tracked=3 skipped_markers=92 inert=0 unresolved=0 live=3 ticks=60 digest=ede39c540a10ee39
 
 cargo run -- --play --headless --bigfile <BIGFILE.DAT> --unit skinnr1 --ticks 60
-engine unit=skinnr1 rooms=1 placed=83 admitted=41 tracked=15 skipped_markers=42 inert=0 unresolved=0 live=41 ticks=60 digest=147cf200b042dbcd
+engine unit=skinnr1 rooms=1 placed=83 admitted=41 tracked=15 skipped_markers=42 inert=0 unresolved=0 live=41 ticks=60 digest=3ec0f457b5b1d0b4
 ```
+
+`skinnr1` moves eligible `monster_` actors, so its digest changed when the
+synthetic locomotion stage landed; `under1` has no eligible non-player actor and
+is unchanged. `--no-npc-motion` restores the pre-locomotion digest.
 
 Add `--cull-report` (headless only) to print a second, read-only line with the
 cull eye, radius and the number of live objects the last tick left visible:

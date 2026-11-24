@@ -458,7 +458,13 @@ mod tests {
     // the single folded actor `state` byte was replaced by all four state bytes
     // (`current`, `queued`, `alternate` as presence+value, `entry_action`).
     // This is a deliberate spec change, never a fix to make a test green.
-    const GOLDEN_WORLD_STATE_HASH: u64 = 0x043f_f933_4dfe_3b58;
+    //
+    // synthetic-locomotion moved it from `0x043f_f933_4dfe_3b58` to
+    // `0x09ab_2f05_ecb6_7cd8`: the fixture's `monster_wallcr` is a live actor,
+    // so stage 14 now changes its position over the 60 ticks. The fold itself
+    // did not change. The previous value is re-pinned by
+    // `disabling_synthetic_motion_reproduces_the_previous_world_digest`.
+    const GOLDEN_WORLD_STATE_HASH: u64 = 0x09ab_2f05_ecb6_7cd8;
 
     /// A real `FrameState` world: the player plus two deferred spawns, one of
     /// them outside the cull radius so the fold observes a `visible` change.
@@ -543,6 +549,29 @@ mod tests {
             world_state_hash(&first.world_state()),
             GOLDEN_WORLD_STATE_HASH,
             "world state hash moved: fold order, field set, live order, FNV or endianness changed"
+        );
+    }
+
+    /// The canonical world-state digest before synthetic locomotion existed.
+    ///
+    /// It is kept as a separate constant on purpose: turning the stage off must
+    /// reproduce the old bytes exactly, which proves the golden moved only
+    /// because actors now move and not because the fold changed.
+    const GOLDEN_WORLD_STATE_HASH_BEFORE_SYNTHETIC_MOTION: u64 = 0x043f_f933_4dfe_3b58;
+
+    #[test]
+    fn disabling_synthetic_motion_reproduces_the_previous_world_digest() {
+        let mut frame = real_world_seed();
+        frame.set_npc_motion(false);
+        for index in 0..60 {
+            frame
+                .run_tick(ObjectTick::step(index))
+                .expect("the real frame world must tick");
+        }
+        assert_eq!(
+            world_state_hash(&frame.world_state()),
+            GOLDEN_WORLD_STATE_HASH_BEFORE_SYNTHETIC_MOTION,
+            "with the synthetic stage off the pre-locomotion digest must replay"
         );
     }
 

@@ -6,10 +6,12 @@
 //! inputs. [`STAGE_ORDER`] is therefore the single ordered definition, and
 //! [`FrameState::run_tick`] is the only driver.
 //!
-//! Stages 1, 2, 6, 9, 12, 15 and 18 are implemented for this milestone. The
-//! remaining stages are **named no-ops** with the documented name, never
-//! `todo!()`: adding AI, animation, contact or streaming later is filling a body,
-//! not editing the loop.
+//! Stages 1, 2, 6, 9, 12, 14, 15 and 18 are implemented for this milestone.
+//! Stage 14 carries our own **synthetic** non-player locomotion
+//! ([`crate::engine::synthetic_locomotion`]); the original moving-object pass is
+//! UNKNOWN and is not claimed. The remaining stages are **named no-ops** with
+//! the documented name, never `todo!()`: adding AI, animation, contact or
+//! streaming later is filling a body, not editing the loop.
 //!
 //! Stage 8 (the four-step player move/collide/commit solver) stays a named
 //! no-op: the original's exact solver is UNKNOWN and is not claimed. The
@@ -35,6 +37,7 @@
 //! generic per-object pass (stage 12). The double update is original behaviour
 //! and must not be "fixed" here.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -47,6 +50,7 @@ use crate::engine::determinism::{WorldEntry, WorldState};
 use crate::engine::events::{EngineEvent, EventQueue};
 use crate::engine::input::{InputButton, InputEvent, InputFrame, InputQueue};
 use crate::engine::live::{LiveArena, LiveId, LiveObject};
+use crate::engine::synthetic_locomotion::{self, SyntheticPatrol};
 use crate::engine::tracker::{ObjectTracker, TrackerError};
 use crate::engine::world::World;
 use crate::pose;
@@ -317,6 +321,13 @@ pub struct FrameState {
     view: CullView,
     stats: FrameStats,
     scratch: FrameScratch,
+    /// Synthetic non-player locomotion switch (`--no-npc-motion` turns it off).
+    /// On by default; see [`crate::engine::synthetic_locomotion`].
+    npc_motion: bool,
+    /// Per-actor synthetic patrol state, keyed by live id. This is a
+    /// deterministic fold of the tick history, not canonical state: only the
+    /// resulting positions enter [`Self::world_state`].
+    patrols: BTreeMap<LiveId, SyntheticPatrol>,
     spawn_queue: Vec<DeferredSpawn>,
     despawn_queue: Vec<LiveId>,
     scene: Vec<RenderItem>,
@@ -349,6 +360,8 @@ impl FrameState {
             view: CullView::default(),
             stats: FrameStats::default(),
             scratch: FrameScratch::default(),
+            npc_motion: true,
+            patrols: BTreeMap::new(),
             spawn_queue: Vec::new(),
             despawn_queue: Vec::new(),
             scene: Vec::new(),
@@ -500,6 +513,20 @@ impl FrameState {
 
     pub fn set_view(&mut self, view: CullView) {
         self.view = view;
+    }
+
+    /// Enable or disable the synthetic non-player locomotion stage.
+    ///
+    /// The stage is on by default. `--no-npc-motion` turns it off, which leaves
+    /// every actor at its authored position and makes the pre-locomotion
+    /// digests reproducible. The switch never affects the player.
+    pub fn set_npc_motion(&mut self, enabled: bool) {
+        self.npc_motion = enabled;
+    }
+
+    /// Whether the synthetic non-player locomotion stage runs.
+    pub fn npc_motion(&self) -> bool {
+        self.npc_motion
     }
 
     /// The view stage 6 will use on the next tick.
@@ -950,9 +977,59 @@ impl FrameState {
         }
     }
 
-    /// Stage 14 - moving-object world/contact pass. Documented no-op until the
-    /// contact slice.
-    fn stage_moving_contact(&mut self) {}
+    /// Stage 14 - moving-object world/contact pass.
+    ///
+    /// The original body of this pass is UNKNOWN, so its documented no-op is
+    /// replaced by **our own** synthetic locomotion
+    /// ([`crate::engine::synthetic_locomotion`]): only here do non-player
+    /// `monster_` actors change position. The player is skipped explicitly, so
+    /// stage 9 and the input path are untouched.
+    ///
+    /// Each actor's patrol is a deterministic integer fold of its live id, its
+    /// authored start position and the tick. A step is committed only when the
+    /// existing [`CollisionMesh`](crate::engine::collision::CollisionMesh)
+    /// narrow phase reports no contact and the room fence keeps the body inside
+    /// the geometry bounds; otherwise the heading turns 90 degrees and nothing
+    /// moves this tick. The decoders gave no NPC pathing: this layer exists so
+    /// the authored `walk` clip reacts to a real position delta, and it is not a
+    /// reproduction of retail actor movement.
+    fn stage_moving_contact(&mut self) {
+        if !self.npc_motion {
+            return;
+        }
+        let tick = self.tick_index;
+        for id in self.live.order().to_vec() {
+            let from = match self.live.get(id) {
+                Ok(object) => {
+                    if !synthetic_locomotion::is_moving_actor(object, id, self.player) {
+                        continue;
+                    }
+                    object.position
+                }
+                Err(_) => continue,
+            };
+            let patrol = match self.patrols.get_mut(&id) {
+                Some(patrol) => patrol,
+                None => {
+                    self.patrols
+                        .insert(id, SyntheticPatrol::initial(id, from));
+                    self.patrols
+                        .get_mut(&id)
+                        .expect("the patrol was just inserted")
+                }
+            };
+            let next = patrol.step(tick, &self.world.collision, from);
+            if let Some(next) = next
+                && let Ok(object) = self.live.get_mut(id)
+            {
+                object.position = next;
+            }
+        }
+        // Drop patrol state for objects that left the live list. The snapshot
+        // keeps the retain closure from borrowing the arena.
+        let live_ids = self.live.order().to_vec();
+        self.patrols.retain(|id, _| live_ids.contains(id));
+    }
 
     /// Stage 15 - render submission as a CPU snapshot.
     ///
@@ -1081,6 +1158,9 @@ mod tests {
     use crate::engine::determinism::world_state_hash;
     use crate::engine::events::{ContactRecord, EngineEvent, HitRecord, Message};
     use crate::engine::input::{InputButton, InputEvent};
+    use crate::engine::synthetic_locomotion::{
+        SYNTHETIC_ACTOR_RADIUS_UNITS, SYNTHETIC_CYCLE_TICKS,
+    };
     use crate::engine::clock::ObjectTick;
     use crate::engine::live::LiveId;
     use crate::engine::world::World;
@@ -1402,13 +1482,16 @@ mod tests {
 
         let live: Vec<_> = frame.live().iter().map(|(_, object)| object).collect();
         assert_eq!(live.len(), 2);
+        // The class-keyed monster now carries the synthetic patrol, so its
+        // position is no longer the spawn point after tick 1. The carrier is the
+        // stable key that separates the two same-named objects.
         let keyed = live
             .iter()
-            .find(|object| object.position == [0, 0, 0])
+            .find(|object| object.actor.is_some())
             .expect("class-keyed spawn");
         let bare = live
             .iter()
-            .find(|object| object.position == [1, 0, 0])
+            .find(|object| object.actor.is_none())
             .expect("bare spawn");
         assert_eq!(
             keyed.class,
@@ -1610,6 +1693,92 @@ mod tests {
         assert_eq!(frame.queued_input_len(), 0);
         assert_eq!(frame.player_position(), Some(before));
         assert_eq!(frame.ticks(), 60);
+    }
+
+    fn monster_position(frame: &FrameState, name: &str) -> [i32; 3] {
+        let id = id_of(frame, name);
+        frame.live().get(id).expect("the monster is live").position
+    }
+
+    #[test]
+    fn synthetic_npc_motion_moves_a_monster_after_n_ticks() {
+        let mut frame = FrameState::new(world_with_raziel());
+        frame.queue_spawn("monster_wallcr", [500, 500, 0]);
+        tick(&mut frame, 0);
+        let start = monster_position(&frame, "monster_wallcr");
+        for index in 1..SYNTHETIC_CYCLE_TICKS * 2 {
+            tick(&mut frame, index);
+        }
+        assert_ne!(
+            monster_position(&frame, "monster_wallcr"),
+            start,
+            "a monster must change position once synthetic locomotion runs"
+        );
+    }
+
+    #[test]
+    fn synthetic_npc_motion_keeps_the_actor_inside_the_room_bounds() {
+        let mut frame = FrameState::new(world_with_wall_and_floor());
+        frame.queue_spawn("monster_wallcr", [-100, 0, 0]);
+        tick(&mut frame, 0);
+        let bounds = frame
+            .world()
+            .collision
+            .bounds()
+            .expect("the fixture carries geometry");
+        for index in 1..600 {
+            tick(&mut frame, index);
+            let position = monster_position(&frame, "monster_wallcr");
+            assert!(
+                bounds.contains_with_radius(position, SYNTHETIC_ACTOR_RADIUS_UNITS),
+                "tick {index} left the room: {position:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_npc_motion_replays_the_same_path() {
+        fn run() -> Vec<[i32; 3]> {
+            let mut frame = FrameState::new(world_with_wall_and_floor());
+            frame.queue_spawn("monster_wallcr", [-100, 0, 0]);
+            tick(&mut frame, 0);
+            let mut path = Vec::new();
+            for index in 1..400 {
+                tick(&mut frame, index);
+                path.push(monster_position(&frame, "monster_wallcr"));
+            }
+            path
+        }
+        assert_eq!(run(), run(), "the same start must reproduce the same path");
+    }
+
+    #[test]
+    fn disabling_synthetic_npc_motion_keeps_the_authored_positions() {
+        let mut frame = FrameState::new(world_with_wall_and_floor());
+        frame.set_npc_motion(false);
+        frame.queue_spawn("monster_wallcr", [-100, 0, 0]);
+        tick(&mut frame, 0);
+        let start = monster_position(&frame, "monster_wallcr");
+        for index in 1..400 {
+            tick(&mut frame, index);
+        }
+        assert_eq!(
+            monster_position(&frame, "monster_wallcr"),
+            start,
+            "--no-npc-motion must leave the actor where the level placed it"
+        );
+    }
+
+    #[test]
+    fn synthetic_npc_motion_never_moves_the_player() {
+        let mut frame = FrameState::new(world_with_raziel());
+        frame.queue_spawn("monster_wallcr", [100, 100, 0]);
+        let spawn = frame.player_position().expect("the player is bound");
+        for index in 0..300 {
+            tick(&mut frame, index);
+        }
+        assert_eq!(frame.player_position(), Some(spawn));
+        assert!(!frame.player_moving(), "no input, no player movement");
     }
 
     /// A zone whose spawn sits far from the world origin, like the real
