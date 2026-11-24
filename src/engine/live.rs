@@ -23,7 +23,7 @@ use crate::engine::class::RenderClass;
 /// `index` addresses the slot; `generation` distinguishes objects that reused
 /// the same slot. A [`LiveId`] from before a reuse carries the older generation
 /// and is rejected instead of silently addressing the new occupant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LiveId {
     pub index: u32,
     pub generation: u32,

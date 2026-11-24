@@ -114,6 +114,41 @@ fn run_report(path: &Path, ticks: u32) -> HeadlessReport {
     headless_run(&mut frame, path, ticks).expect("the synthetic world must tick")
 }
 
+fn run_report_with_motion(path: &Path, ticks: u32, motion: bool) -> HeadlessReport {
+    let world = World::load(path, "under1").expect("the synthetic world must load");
+    let mut frame = FrameState::new(world);
+    frame.set_npc_motion(motion);
+    headless_run(&mut frame, path, ticks).expect("the synthetic world must tick")
+}
+
+/// One room with a placed `monster_` model that carries the bit-19 class flag.
+/// The actor spawns safely inside the room fence so its patrol can move.
+fn monster_fixture() -> (tempfile::TempDir, PathBuf) {
+    let trios = [
+        [13, 31, 31],
+        [25, 16, 12],
+        [9, 5, 11],
+        [7, 13, 27],
+        [19, 2, 11],
+        [20, 3, 2],
+        [9, 0, 55],
+        [19, 8, 1],
+    ];
+    let room = pcm_room("under1", &[("monster_wal", [50, 50, 0])]);
+    let mut model = crate::actor::synthetic_actor("monster_wal", &[0x18, 0x25], trios);
+    let base = crate::level::data_base(1);
+    model[base + 0x2C..base + 0x30].copy_from_slice(&0x0008_0000u32.to_le_bytes());
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("BIGFILE.DAT");
+    let bytes = synthetic_archive(&[
+        (suffix("under1"), room),
+        (suffix("monster_wal"), model),
+    ]);
+    std::fs::write(&path, bytes).expect("synthetic archive");
+    (dir, path)
+}
+
 // Moved deliberately by the engine-actor-tick slice when the actor presence and
 // relation/state bytes entered the canonical fold: `0x8dd6_3315_4e26_f1c4` ->
 // `0x490c_8582_c297_df18`. The engine-actor-refresh slice moved it from
@@ -325,6 +360,53 @@ fn the_same_run_twice_yields_the_same_digest_and_golden() {
         first.digest, GOLDEN_HEADLESS_DIGEST,
         "headless digest moved: admitted set, live order, fold or FNV changed (observed {:#018x})",
         first.digest
+    );
+}
+
+// The digest before synthetic locomotion existed, for the capsule fixture. The
+// fixture has no `monster_` live object, so it must not move at all.
+const GOLDEN_CAPSULE_DIGEST_BEFORE_SYNTHETIC_MOTION: u64 = 0x56d6_79ea_3c48_6e14;
+
+#[test]
+fn the_capsule_fixture_is_unchanged_by_the_motion_stage() {
+    let (_dir, path) = fixture(
+        &[
+            ("raziel", [0, 0, 0]),
+            ("capsule0", [10, 0, 0]),
+            ("capsule1", [5000, 0, 0]),
+            ("ghost1", [4, 0, 0]),
+        ],
+        &["capsule0", "capsule1"],
+    );
+    let with_motion = run_report_with_motion(&path, 60, true);
+    let without_motion = run_report_with_motion(&path, 60, false);
+    assert_eq!(
+        with_motion.digest, without_motion.digest,
+        "no eligible non-player monster exists, so the stage must change nothing"
+    );
+    assert_eq!(
+        without_motion.digest, GOLDEN_CAPSULE_DIGEST_BEFORE_SYNTHETIC_MOTION,
+        "the pre-locomotion capsule digest must replay exactly"
+    );
+}
+
+// Static digest of the monster fixture, pinned while the locomotion stage is
+// off. Re-pin only with a deliberate acceptance-contract change.
+const GOLDEN_STATIC_MONSTER_DIGEST: u64 = 0xfb18_159c_57f1_386b;
+
+#[test]
+fn disabling_synthetic_motion_restores_the_static_monster_digest() {
+    let (_dir, path) = monster_fixture();
+    let with_motion = run_report_with_motion(&path, 60, true);
+    let without_motion = run_report_with_motion(&path, 60, false);
+    assert_ne!(
+        with_motion.digest, without_motion.digest,
+        "the monster fixture must observe actor movement"
+    );
+    assert_eq!(
+        without_motion.digest, GOLDEN_STATIC_MONSTER_DIGEST,
+        "the stage-off digest must match the pinned pre-locomotion bytes (observed {:#018x})",
+        without_motion.digest
     );
 }
 

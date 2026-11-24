@@ -10,7 +10,7 @@
 //! placed-object seed pass is shared by both modes and always runs before a
 //! window exists, so the window shows the same live world as the headless run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,6 +33,7 @@ use crate::engine::clock::ObjectTick;
 use crate::engine::determinism::world_state_hash;
 use crate::engine::frame::{FrameError, FrameState, PLAYER_NAME};
 use crate::engine::input::{InputButton, InputEvent};
+use crate::engine::live::LiveId;
 use crate::engine::render_backend::RenderBackend;
 use crate::engine::scene::{ActorPose, CameraView, PlayerFacing, SceneAssets};
 use crate::engine::spawn::{Admission, EngineNameTable};
@@ -334,6 +335,13 @@ pub struct PlayOptions {
     /// Explicit player position that overrides the authored record
     /// (`--player-pos`, a test aid).
     pub player_pos: Option<[i32; 3]>,
+    /// Synthetic non-player locomotion switch (`--no-npc-motion`).
+    ///
+    /// On by default. Turning it off leaves every actor at its authored
+    /// position, which reproduces the pre-locomotion digests. The player is
+    /// never affected either way. See
+    /// [`crate::engine::synthetic_locomotion`].
+    pub npc_motion: bool,
     /// Print the read-only per-object visibility line (`--cull-report`).
     ///
     /// Headless only: it reports the cull view and how many live objects the
@@ -478,6 +486,7 @@ impl PlayOptions {
             clip_assign: Vec::new(),
             input_script: None,
             player_pos: None,
+            npc_motion: true,
             cull_report: false,
             cam_distance: None,
             cam_height: None,
@@ -598,6 +607,13 @@ impl PlayOptions {
                 }
                 "--headless" => {
                     options.headless = true;
+                    index += 1;
+                    continue;
+                }
+                "--no-npc-motion" => {
+                    // Disables only the synthetic locomotion stage. The player
+                    // path and every other stage keep running.
+                    options.npc_motion = false;
                     index += 1;
                     continue;
                 }
@@ -894,6 +910,7 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
     let (mut assets, bank) =
         SceneAssets::load(&options.bigfile, world.level.entry, textures).map_err(RunError::scene)?;
     let mut frame = FrameState::new(world);
+    frame.set_npc_motion(options.npc_motion);
     if let Some(position) = options.player_pos {
         // Test aid: override the authored record before the first tick. The
         // result is still a pure function of the same argv.
@@ -1185,6 +1202,7 @@ fn headless_run_with_actors(
 ) -> Result<HeadlessReport, RunError> {
     let counts = boot_world(frame, bigfile)?;
     let mut start = 0;
+    let mut npc_start = Vec::new();
     if ticks > 0 {
         frame.cull_to_player();
         frame
@@ -1200,9 +1218,55 @@ fn headless_run_with_actors(
             )?;
         }
         let _actors = load_actor_animations(frame, assets, options)?;
+        npc_start = npc_positions(frame);
         start = 1;
     }
-    finish_headless(frame, counts, ticks, start)
+    let report = finish_headless(frame, counts, ticks, start)?;
+    if options.sra_dir.is_some() {
+        for line in npc_motion_lines(frame, &npc_start) {
+            outln!("{line}");
+        }
+    }
+    Ok(report)
+}
+
+/// Snapshot the eligible synthetic-patrol actors before movement begins.
+fn npc_positions(frame: &FrameState) -> Vec<(LiveId, String, [i32; 3])> {
+    frame
+        .live()
+        .iter()
+        .filter(|(id, object)| {
+            crate::engine::synthetic_locomotion::is_moving_actor(object, *id, frame.player())
+        })
+        .map(|(id, object)| (id, object.name.clone(), object.position))
+        .collect()
+}
+
+/// One bounded `npc-motion` line per distinct name, comparing start to end.
+///
+/// This is a diagnostic only: it never enters the acceptance line or the
+/// canonical digest, and it is printed only when `--sra-dir` already produces
+/// actor diagnostics.
+fn npc_motion_lines(
+    frame: &FrameState,
+    before: &[(LiveId, String, [i32; 3])],
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut lines = Vec::new();
+    for (id, name, start) in before {
+        let Ok(object) = frame.live().get(*id) else {
+            continue;
+        };
+        if !seen.insert(name.as_str()) {
+            continue;
+        }
+        lines.push(crate::engine::synthetic_locomotion::motion_line(
+            name,
+            *start,
+            object.position,
+        ));
+    }
+    lines
 }
 
 /// The fixed-tick tail shared by the plain and per-actor headless paths.
