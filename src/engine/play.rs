@@ -38,6 +38,7 @@ use crate::engine::render_backend::RenderBackend;
 use crate::engine::scene::{ActorPose, CameraView, PlayerFacing, SceneAssets};
 use crate::engine::spawn::{Admission, EngineNameTable};
 use crate::engine::world::{World, WorldError};
+use crate::engine::warp::{self, ScheduledWarp, WarpAt, WarpOutcome, WarpReason};
 use crate::object_texture::PageBank;
 use crate::pose;
 use crate::render::{self, FlyCamera, OrbitCamera};
@@ -351,10 +352,50 @@ pub struct PlayOptions {
     pub cam_distance: Option<f32>,
     /// Third-person eye height override in world units (`--cam-height`).
     pub cam_height: Option<f32>,
+    /// One-shot `--warp-to <UNIT>`: swap once after the first completed tick.
+    pub warp_to: Option<String>,
+    /// Repeatable `--warp-at <TICK>:<UNIT>` switches (headless only).
+    pub warp_at: Vec<WarpAt>,
+    /// Windowed `--warp-cycle u1,u2,...`: `G` walks the list, one swap per press.
+    pub warp_cycle: Option<Vec<String>>,
 }
 
 impl PlayOptions {
     pub const DEFAULT_UNIT: &'static str = "under1";
+
+    /// Whether any warp entry point is active.
+    ///
+    /// `--warp-cycle` is the windowed browse tool and carries no tick schedule,
+    /// so it is not part of the headless schedule check.
+    pub fn has_warp_schedule(&self) -> bool {
+        self.warp_to.is_some() || !self.warp_at.is_empty()
+    }
+
+    /// The headless warp schedule, sorted by tick.
+    ///
+    /// `--warp-to` becomes one entry at tick 1, so the swap happens after the
+    /// first completed tick instead of bypassing it. `--warp-at` entries keep
+    /// their global tick. The sort is stable, so two entries on the same tick
+    /// apply in argv order and the last one before that tick's stages wins.
+    pub fn headless_warp_schedule(&self) -> Vec<ScheduledWarp> {
+        let mut schedule = Vec::new();
+        if let Some(unit) = &self.warp_to {
+            schedule.push(ScheduledWarp {
+                tick: 1,
+                unit: unit.clone(),
+                reason: WarpReason::Flag,
+            });
+        }
+        for at in &self.warp_at {
+            schedule.push(ScheduledWarp {
+                tick: at.tick,
+                unit: at.unit.clone(),
+                reason: WarpReason::Script,
+            });
+        }
+        schedule.sort_by_key(|warp| warp.tick);
+        schedule
+    }
 
     /// Repository-relative copy of the measured label store.
     ///
@@ -490,6 +531,9 @@ impl PlayOptions {
             cull_report: false,
             cam_distance: None,
             cam_height: None,
+            warp_to: None,
+            warp_at: Vec::new(),
+            warp_cycle: None,
         };
         let mut bigfile = None;
         let mut unit_given = false;
@@ -605,6 +649,20 @@ impl PlayOptions {
                         .ok_or_else(|| PlayError::InvalidCamHeight(raw.to_string()))?;
                     options.cam_height = Some(height);
                 }
+                "--warp-to" => {
+                    options.warp_to = Some(value(args, index, "--warp-to")?.to_string());
+                }
+                "--warp-at" => {
+                    let raw = value(args, index, "--warp-at")?;
+                    options
+                        .warp_at
+                        .push(WarpAt::parse(raw).map_err(PlayError::InvalidWarpAt)?);
+                }
+                "--warp-cycle" => {
+                    let raw = value(args, index, "--warp-cycle")?;
+                    options.warp_cycle =
+                        Some(warp::parse_cycle(raw).map_err(PlayError::InvalidWarpCycle)?);
+                }
                 "--headless" => {
                     options.headless = true;
                     index += 1;
@@ -654,6 +712,38 @@ impl PlayOptions {
             if options.sra_dir.is_none() {
                 return Err(PlayError::ClipInspectRequiresSraDir);
             }
+        }
+        // World-warp selectors. `--warp-at` is a fixed-tick schedule (headless
+        // only); `--warp-cycle` is the windowed browse tool; the selectors are
+        // mutually exclusive and cannot ride on the scripted or clip-assign
+        // diagnostics, which own their own output contracts.
+        if options.warp_to.is_some() && !options.warp_at.is_empty() {
+            return Err(PlayError::WarpConflict {
+                detail: "--warp-to and --warp-at are mutually exclusive; use --warp-at TICK:UNIT for a scheduled swap".to_string(),
+            });
+        }
+        if options.warp_cycle.is_some()
+            && (options.warp_to.is_some() || !options.warp_at.is_empty())
+        {
+            return Err(PlayError::WarpConflict {
+                detail: "--warp-cycle cannot be combined with --warp-to or --warp-at".to_string(),
+            });
+        }
+        if !options.warp_at.is_empty() && !options.headless {
+            return Err(PlayError::WarpAtRequiresHeadless);
+        }
+        if options.warp_cycle.is_some() && (options.headless || !options.clip_assign.is_empty()) {
+            return Err(PlayError::WarpCycleRequiresWindow);
+        }
+        if options.has_warp_schedule() && options.input_script.is_some() {
+            return Err(PlayError::WarpConflict {
+                detail: "--input-script cannot be combined with a warp schedule".to_string(),
+            });
+        }
+        if options.has_warp_schedule() && !options.clip_assign.is_empty() {
+            return Err(PlayError::WarpConflict {
+                detail: "--clip-assign cannot be combined with a warp schedule".to_string(),
+            });
         }
         // `--clip-assign` is a windowless one-shot, so it resolves ticks like
         // the headless path even when the caller omits `--headless`.
@@ -731,6 +821,11 @@ pub enum PlayError {
     InvalidPlayerPos(String),
     InvalidCamDistance(String),
     InvalidCamHeight(String),
+    InvalidWarpAt(String),
+    InvalidWarpCycle(String),
+    WarpAtRequiresHeadless,
+    WarpCycleRequiresWindow,
+    WarpConflict { detail: String },
 }
 
 impl fmt::Display for PlayError {
@@ -807,6 +902,23 @@ impl fmt::Display for PlayError {
                 f,
                 "invalid value '{value}' for --cam-height: expected a number in 0..=5000"
             ),
+            Self::InvalidWarpAt(value) => write!(
+                f,
+                "invalid value '{value}' for --warp-at: expected TICK:UNIT such as 60:cathy28 ({value})"
+            ),
+            Self::InvalidWarpCycle(value) => write!(
+                f,
+                "invalid value '{value}' for --warp-cycle: expected a comma-separated list of unit names"
+            ),
+            Self::WarpAtRequiresHeadless => write!(
+                f,
+                "--warp-at requires --headless: the schedule is a fixed-tick run"
+            ),
+            Self::WarpCycleRequiresWindow => write!(
+                f,
+                "--warp-cycle requires a window: it is the interactive G-key browse tool"
+            ),
+            Self::WarpConflict { detail } => write!(f, "{detail}"),
         }
     }
 }
@@ -832,6 +944,8 @@ pub enum RunError {
     /// Engine invariant violated (tracker full, corrupt arena, impossible
     /// state). Exit code 4.
     Invariant(String),
+    /// A world-swap target the archive does not carry, with a few valid names.
+    WarpUnitNotFound { name: String, examples: Vec<String> },
 }
 
 impl RunError {
@@ -877,6 +991,17 @@ impl fmt::Display for RunError {
             Self::Window(detail) => write!(f, "cannot open the play window: {detail}"),
             Self::ClipAssign(detail) => write!(f, "{detail}"),
             Self::Invariant(detail) => write!(f, "engine invariant failed: {detail}"),
+            Self::WarpUnitNotFound { name, examples } => {
+                if examples.is_empty() {
+                    write!(f, "warp target unit '{name}' was not found in the archive")
+                } else {
+                    write!(
+                        f,
+                        "warp target unit '{name}' was not found in the archive; valid examples: {}",
+                        examples.join(", ")
+                    )
+                }
+            }
         }
     }
 }
@@ -949,6 +1074,9 @@ pub fn run(options: &PlayOptions) -> Result<(), RunError> {
         let ticks = options.ticks.unwrap_or(60);
         if let Some(script) = &options.input_script {
             return run_scripted(frame, script, ticks, options, &mut assets);
+        }
+        if options.has_warp_schedule() {
+            return run_headless_warp(frame, ticks, options, &mut assets);
         }
         return run_headless(frame, ticks, options, &mut assets);
     }
@@ -1164,10 +1292,236 @@ fn boot_world(frame: &mut FrameState, bigfile: &Path) -> Result<SeedCounts, RunE
         frame.queue_spawn_with_class(name, Some(class), position, actor);
     }
     if let (Some(player), Some(profile)) = (player, player_profile) {
-        let _attached = frame.attach_actor(player, profile);
+        let _ = frame.attach_actor(player, profile);
     }
     Ok(counts)
 }
+
+/// The world-swap seam: unload the current unit and load `target`, preserving
+/// the player.
+///
+/// This is the single function every warp entry point calls, and the named seam
+/// a future object-driven trigger would call. It performs the **complete** swap:
+///
+/// - loads the target [`World`] (placed records, collision mesh and level
+///   identity) through the ordinary [`World::load`] path;
+/// - replaces the render room through [`SceneAssets::reload`], clearing the
+///   per-name object-mesh cache so no geometry from the old unit survives;
+/// - moves the [`FrameState`] into the new world with [`FrameState::enter_unit`],
+///   which keeps the bound player's [`crate::engine::live::LiveId`] and the
+///   global tick count but releases the old live actors, tracker slots, patrols,
+///   events, input and CPU scene;
+/// - re-seeds the target unit's live actors through the same [`boot_world`] pass
+///   a fresh run uses (they materialize at the next stage 18), and re-attaches
+///   the player's actor profile;
+/// - places the player by [`warp::placement`]: the first `raziel` placed record
+///   when present, otherwise the first placed record, otherwise world origin
+///   `[0, 0, 0]` — a deterministic fallback, never a guess.
+///
+/// Per-actor `.SRA` animations are rebuilt by the caller once the new unit's
+/// actors are live, because the actor set only materializes in stage 18 of the
+/// first tick after the swap (exactly like a fresh boot). Headless rebuilds them
+/// after that tick; the window resets `actors_loaded` so its next tick reloads.
+///
+/// # Future trigger (the named seam)
+///
+/// A real object-driven transition would call this same function with the unit
+/// name its trigger resolves and a [`WarpReason`]. No such trigger is wired, and
+/// none is invented here: the `warpg` placed-object binding to a unit link is
+/// **UNKNOWN**. `warpg` appears in only nine units (`cathy58 cathy62 under3 city6
+/// oracle1 aluka43 out10 chrono17 stone15`), none reachable from the debug level
+/// menu, and the decoded 855-edge link graph carries no per-object binding. The
+/// caller must always supply the target; this seam never invents one.
+pub fn swap_unit(
+    frame: &mut FrameState,
+    assets: &mut SceneAssets,
+    bigfile: &Path,
+    target: &str,
+    reason: WarpReason,
+) -> Result<WarpOutcome, RunError> {
+    let from = frame.world().level.name.clone();
+    let world = match World::load(bigfile, target) {
+        Ok(world) => world,
+        Err(WorldError::UnitNotFound { name }) => {
+            return Err(RunError::WarpUnitNotFound {
+                name,
+                examples: warp::valid_examples(bigfile),
+            });
+        }
+        Err(error) => return Err(RunError::World(error)),
+    };
+    let (player, placed_at_spawn) = warp::placement(&world);
+    let entry = world.level.entry;
+    let to = world.level.name.clone();
+    frame.enter_unit(world, player);
+    assets.reload(bigfile, entry).map_err(RunError::scene)?;
+    let counts = boot_world(frame, bigfile)?;
+    let reason = if placed_at_spawn {
+        reason
+    } else {
+        WarpReason::SpawnMissing
+    };
+    Ok(WarpOutcome {
+        from,
+        to,
+        player,
+        reason,
+        placed: counts.placed,
+        admitted: counts.admitted,
+        skipped_markers: counts.skipped_markers,
+        inert: counts.inert,
+        unresolved: counts.unresolved,
+    })
+}
+
+/// One headless warp run: the per-segment acceptance reports and the swaps
+/// between them, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WarpRunReport {
+    segments: Vec<HeadlessReport>,
+    swaps: Vec<WarpOutcome>,
+}
+
+impl WarpRunReport {
+    /// The console lines in application order: each segment's `warp segment=`
+    /// header and contract line, then the swap that leaves it.
+    fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for (index, segment) in self.segments.iter().enumerate() {
+            lines.push(format!("warp segment={index} unit={}", segment.unit));
+            lines.push(segment.line());
+            if let Some(swap) = self.swaps.get(index) {
+                lines.push(swap.line());
+            }
+        }
+        lines
+    }
+}
+
+/// Extend the run to cover every scheduled warp plus one tick, so the last
+/// segment always spends at least one tick in its unit.
+fn effective_warp_ticks(ticks: u32, schedule: &[ScheduledWarp]) -> u32 {
+    let needed = schedule
+        .last()
+        .map_or(0, |warp| warp.tick.saturating_add(1));
+    ticks.max(u32::try_from(needed).unwrap_or(u32::MAX))
+}
+
+/// Build one segment's acceptance report from the live frame at its end.
+/// `segment_ticks` is the count spent in that unit, so the segments partition
+/// the whole run.
+fn segment_report(frame: &FrameState, counts: SeedCounts, segment_ticks: u64) -> HeadlessReport {
+    HeadlessReport {
+        unit: frame.world().level.name.clone(),
+        rooms: frame.world().level.rooms,
+        placed: counts.placed,
+        admitted: counts.admitted,
+        tracked: frame.tracker().ready_slots().count(),
+        skipped_markers: counts.skipped_markers,
+        inert: counts.inert,
+        unresolved: counts.unresolved,
+        live: frame.live().len(),
+        ticks: segment_ticks,
+        digest: world_state_hash(&frame.world_state()),
+    }
+}
+
+/// Run the warp schedule over the fixed tick loop and collect the audit lines.
+///
+/// The warp is a pure function of the tick schedule: a swap scheduled for tick
+/// `t` is applied at the start of tick `t`, before stage 1 samples input and
+/// before stage 6 culls, so replaying the same argv reproduces the same segments
+/// and digests. The initial unit is booted once, and each swap re-boots through
+/// [`swap_unit`]; per-actor animations are rebuilt after the first tick of every
+/// segment (headless discards them after printing nothing, since they are
+/// presentation-only and never enter the digest).
+fn headless_warp_plan(
+    frame: &mut FrameState,
+    ticks: u32,
+    options: &PlayOptions,
+    assets: &mut SceneAssets,
+) -> Result<WarpRunReport, RunError> {
+    let schedule = options.headless_warp_schedule();
+    let ticks = effective_warp_ticks(ticks, &schedule);
+    let mut counts = boot_world(frame, &options.bigfile)?;
+    let mut segments = Vec::new();
+    let mut swaps = Vec::new();
+    let mut segment_start = frame.ticks();
+    let mut first_tick_pending = true;
+    let mut schedule_index = 0usize;
+
+    for tick in 0..u64::from(ticks) {
+        while schedule
+            .get(schedule_index)
+            .is_some_and(|warp| warp.tick == tick)
+        {
+            let scheduled = &schedule[schedule_index];
+            segments.push(segment_report(
+                frame,
+                counts,
+                frame.ticks() - segment_start,
+            ));
+            let outcome = swap_unit(
+                frame,
+                assets,
+                &options.bigfile,
+                &scheduled.unit,
+                scheduled.reason,
+            )?;
+            counts = SeedCounts {
+                placed: outcome.placed,
+                admitted: outcome.admitted,
+                skipped_markers: outcome.skipped_markers,
+                inert: outcome.inert,
+                unresolved: outcome.unresolved,
+            };
+            swaps.push(outcome);
+            segment_start = frame.ticks();
+            first_tick_pending = true;
+            schedule_index += 1;
+        }
+
+        frame.cull_to_player();
+        frame
+            .run_tick(ObjectTick::step(tick))
+            .map_err(RunError::engine)?;
+
+        if first_tick_pending {
+            // Rebuild the new unit's per-actor animations once its actors are
+            // live. Headless discards them; the load itself keeps the rebuild
+            // path exercised without touching the digest.
+            if options.sra_dir.is_some() {
+                let _actors = resolve_actor_animations(frame, assets, options)?;
+            }
+            first_tick_pending = false;
+        }
+    }
+
+    segments.push(segment_report(
+        frame,
+        counts,
+        frame.ticks() - segment_start,
+    ));
+    Ok(WarpRunReport { segments, swaps })
+}
+
+/// Production headless warp path: run the plan and print its audit lines.
+fn run_headless_warp(
+    mut frame: FrameState,
+    ticks: u32,
+    options: &PlayOptions,
+    assets: &mut SceneAssets,
+) -> Result<(), RunError> {
+    let report = headless_warp_plan(&mut frame, ticks, options, assets)?;
+    for line in report.lines() {
+        outln!("{line}");
+    }
+    if options.cull_report {
+        outln!("{}", cull_report(&frame).line());
+    }
+    Ok(())
+}
+
 
 /// Run the fixed tick sequence and build the acceptance report.
 ///
@@ -1312,6 +1666,31 @@ fn run_headless(
     Ok(())
 }
 
+/// Resolve the per-actor animation set for the current live list.
+///
+/// Without `--sra-dir` this is an empty set and performs no I/O. The labels
+/// stores and the `--sra` exclusion are the same the single-file path uses, so
+/// a warp rebuild and a fresh boot resolve the identical set.
+fn resolve_actor_animations(
+    frame: &FrameState,
+    assets: &mut SceneAssets,
+    options: &PlayOptions,
+) -> Result<ActorAnimations, RunError> {
+    if options.sra_dir.is_none() {
+        return Ok(ActorAnimations::default());
+    }
+    let stores = options.labels_store_sources();
+    let exclude = options.sra.is_some().then(|| frame.player()).flatten();
+    ActorAnimations::load(
+        frame,
+        assets,
+        options.sra_dir.as_deref(),
+        &stores,
+        exclude,
+    )
+    .map_err(RunError::Scene)
+}
+
 /// Load per-actor animation when `--sra-dir` is active, printing the bounded
 /// load-time diagnostic. Without a directory this is an empty set and prints
 /// nothing, which keeps the default headless contract identical.
@@ -1323,19 +1702,7 @@ fn load_actor_animations(
     if options.sra_dir.is_none() {
         return Ok(ActorAnimations::default());
     }
-    let stores = options.labels_store_sources();
-    // `--sra` is the player's single-actor override: when it is present the
-    // per-actor set must not also bind the player, or the override wins only by
-    // chance of ordering. The player keeps the legacy selector.
-    let exclude = options.sra.is_some().then(|| frame.player()).flatten();
-    let actors = ActorAnimations::load(
-        frame,
-        assets,
-        options.sra_dir.as_deref(),
-        &stores,
-        exclude,
-    )
-    .map_err(RunError::Scene)?;
+    let actors = resolve_actor_animations(frame, assets, options)?;
     for line in actors.diagnostic_lines() {
         outln!("{line}");
     }
@@ -1560,6 +1927,11 @@ fn open_window(
         },
         inspect,
         base_title,
+        bigfile: options.bigfile.clone(),
+        warp_to: options.warp_to.clone(),
+        warp_cycle: options.warp_cycle.clone(),
+        warp_cycle_index: None,
+        actor_reload_after: None,
     };
     event_loop
         .run_app(&mut app)
@@ -2223,6 +2595,17 @@ struct PlayApp {
     inspect: Option<ClipInspector>,
     /// The window title before the inspector appends its status.
     base_title: String,
+    /// The archive, kept so a world swap can reload the target unit.
+    bigfile: PathBuf,
+    /// One-shot `--warp-to` still waiting for the first completed tick.
+    warp_to: Option<String>,
+    /// `--warp-cycle` unit list, walked by the `G` key.
+    warp_cycle: Option<Vec<String>>,
+    /// Next `--warp-cycle` index; `None` until the first press.
+    warp_cycle_index: Option<usize>,
+    /// Global tick at the last swap; the per-actor reload waits past it so the
+    /// new unit's boot actors are live before they are bound to animations.
+    actor_reload_after: Option<u64>,
 }
 
 impl PlayApp {
@@ -2231,6 +2614,62 @@ impl PlayApp {
             .as_ref()
             .map(|backend| backend.aspect())
             .unwrap_or(1.0)
+    }
+
+    /// Swap the window into `target` through the shared [`swap_unit`] seam and
+    /// reset the presentation state the new unit invalidates.
+    fn perform_warp(&mut self, target: &str, reason: WarpReason) -> Result<(), RunError> {
+        let outcome = swap_unit(
+            &mut self.frame,
+            &mut self.assets,
+            &self.bigfile,
+            target,
+            reason,
+        )?;
+        outln!("{}", outcome.line());
+        // The per-actor set and the inspector file list belong to the unit we
+        // left. Block the reload until the new unit's boot actors are live, then
+        // `load_actors_if_ready` rebuilds them for the new live list.
+        self.actors = ActorAnimations::default();
+        self.actors_loaded = true;
+        self.actor_reload_after = Some(self.frame.ticks());
+        if let Some(inspect) = self.inspect.as_mut() {
+            inspect.clear();
+        }
+        if let Some(spawn) = self.assets.render_spawn() {
+            let camera = FlyCamera::looking_at_with_up(spawn, [0.0; 3], true);
+            self.fly = camera;
+            self.start = camera;
+        }
+        self.base_title = format!("soul reaver - {}", self.frame.world().level.name);
+        self.title = self.base_title.clone();
+        if let Some(window) = &self.window {
+            window.set_title(&self.title);
+        }
+        Ok(())
+    }
+
+    /// Advance the `--warp-cycle` list by one unit. Returns `true` when the
+    /// caller must exit (a swap failure, reported through `init_error`).
+    fn cycle_warp(&mut self) -> bool {
+        let Some(list) = self.warp_cycle.clone() else {
+            return false;
+        };
+        if list.is_empty() {
+            return false;
+        }
+        let index = self.warp_cycle_index.unwrap_or(0);
+        let target = list[index % list.len()].clone();
+        match self.perform_warp(&target, WarpReason::Key) {
+            Ok(()) => {
+                self.warp_cycle_index = Some((index + 1) % list.len());
+                false
+            }
+            Err(error) => {
+                self.init_error = Some(error.to_string());
+                true
+            }
+        }
     }
 
     /// The player's produced root facing for the scene builder, if it has moved.
@@ -2491,6 +2930,11 @@ impl PlayApp {
                     self.orbit.reset();
                     self.fly = self.start;
                 }
+                Key::Character(text) if text.eq_ignore_ascii_case("g") => {
+                    if self.cycle_warp() {
+                        return true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -2708,6 +3152,24 @@ impl ApplicationHandler for PlayApp {
             event_loop.exit();
             return;
         }
+        // One-shot `--warp-to`: swap after the first completed tick, so the
+        // normal boot path runs first instead of being bypassed.
+        if self.warp_to.is_some() && self.frame.ticks() >= 1 {
+            let target = self.warp_to.take().expect("checked above");
+            if let Err(error) = self.perform_warp(&target, WarpReason::Flag) {
+                self.init_error = Some(error.to_string());
+                event_loop.exit();
+                return;
+            }
+        }
+        // Reload per-actor animations only after the swapped unit's boot actors
+        // have materialized in stage 18 of a real tick.
+        if let Some(since) = self.actor_reload_after {
+            if self.frame.ticks() > since {
+                self.actor_reload_after = None;
+                self.actors_loaded = false;
+            }
+        }
         if let Err(error) = self.load_actors_if_ready() {
             self.init_error = Some(error);
             event_loop.exit();
@@ -2900,6 +3362,70 @@ mod tests {
 
         let explicit = parse(&["--bigfile", "B", "--unit", "under2"]).expect("unit parses");
         assert_eq!(explicit.group, None);
+    }
+
+    #[test]
+    fn warp_flags_parse_into_a_sorted_schedule() {
+        let options = parse(&[
+            "--bigfile", "B", "--headless", "--warp-at", "60:cathy28", "--warp-at",
+            "120:skinnr4",
+        ])
+        .expect("warp-at schedule parses");
+        assert_eq!(options.warp_to, None);
+        assert_eq!(options.warp_at.len(), 2);
+        assert!(options.has_warp_schedule());
+        let schedule = options.headless_warp_schedule();
+        assert_eq!(
+            schedule.iter().map(|warp| warp.tick).collect::<Vec<_>>(),
+            vec![60, 120]
+        );
+        assert_eq!(schedule[0].reason.as_str(), "script");
+
+        let one_shot = parse(&["--bigfile", "B", "--headless", "--warp-to", "cathy28"])
+            .expect("warp-to parses");
+        let schedule = one_shot.headless_warp_schedule();
+        assert_eq!(schedule.len(), 1);
+        assert_eq!(
+            schedule[0].tick, 1,
+            "--warp-to must fire after the first completed tick, not before it"
+        );
+        assert_eq!(schedule[0].reason.as_str(), "flag");
+    }
+
+    #[test]
+    fn warp_flags_enforce_their_mode_and_exclusivity() {
+        assert_eq!(
+            parse(&["--bigfile", "B", "--warp-at", "1:under2"]),
+            Err(PlayError::WarpAtRequiresHeadless)
+        );
+        assert_eq!(
+            parse(&["--bigfile", "B", "--headless", "--warp-cycle", "a,b"]),
+            Err(PlayError::WarpCycleRequiresWindow)
+        );
+        assert!(matches!(
+            parse(&[
+                "--bigfile", "B", "--headless", "--warp-to", "a", "--warp-at", "1:b"
+            ]),
+            Err(PlayError::WarpConflict { .. })
+        ));
+        assert!(matches!(
+            parse(&[
+                "--bigfile", "B", "--headless", "--input-script", "forward:10",
+                "--warp-to", "a",
+            ]),
+            Err(PlayError::WarpConflict { .. })
+        ));
+        assert!(matches!(
+            parse(&["--bigfile", "B", "--headless", "--warp-at", "x:under2"]),
+            Err(PlayError::InvalidWarpAt(_))
+        ));
+        let windowed = parse(&["--bigfile", "B", "--textures", "T", "--warp-cycle", "a,b"])
+            .expect("warp-cycle parses without --headless");
+        assert_eq!(
+            windowed.warp_cycle.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
+        assert!(!windowed.has_warp_schedule(), "the browse tool has no tick schedule");
     }
 
     #[test]

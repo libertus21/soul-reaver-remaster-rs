@@ -442,6 +442,77 @@ impl FrameState {
         }
     }
 
+    /// Move this frame into a different unit, preserving the player's identity.
+    ///
+    /// This is the one-unit half of a world swap: [`crate::engine::play::swap_unit`]
+    /// loads the target [`World`] and calls this to replace the authored world.
+    /// The bound player keeps its [`LiveId`] and only changes position; every
+    /// other live object, the tracker slots, the synthetic patrol state, the
+    /// event and input queues and the CPU render snapshot belong to the unit
+    /// being left and are released here, so nothing leaks into the new unit.
+    ///
+    /// The global tick count and the clock are **kept**, so a warp is a pure
+    /// function of a global tick schedule and a segment keeps counting ticks
+    /// across the transition. The new unit re-seeds its live actors through the
+    /// ordinary boot pass; they materialize at the next stage 18 exactly like a
+    /// fresh run, so this method never invents a spawn.
+    ///
+    /// A frame with no bound player (the previous unit placed no `raziel` and
+    /// used the fallback elsewhere) spawns the player at `player_position`
+    /// instead of staying playerless.
+    pub fn enter_unit(&mut self, world: World, player_position: [i32; 3]) {
+        self.world = world;
+        match self.player {
+            Some(player) => {
+                let leaving: Vec<LiveId> = self
+                    .live
+                    .order()
+                    .iter()
+                    .copied()
+                    .filter(|id| *id != player)
+                    .collect();
+                for id in leaving {
+                    let _ = self.live.despawn(id);
+                }
+                if let Ok(object) = self.live.get_mut(player) {
+                    object.position = player_position;
+                    object.visible = true;
+                    object.slot = None;
+                    object.anim_index = 0;
+                    object.actor = None;
+                }
+            }
+            None => {
+                self.live = LiveArena::new();
+                let object = LiveObject {
+                    name: PLAYER_NAME.to_string(),
+                    class: RenderClass::Raziel,
+                    position: player_position,
+                    visible: true,
+                    slot: None,
+                    anim_index: 0,
+                    actor: None,
+                };
+                self.player = Some(self.live.spawn(object));
+            }
+        }
+        self.tracker = ObjectTracker::new();
+        self.patrols.clear();
+        self.spawn_queue.clear();
+        self.despawn_queue.clear();
+        self.events = EventQueue::new();
+        self.input_queue = InputQueue::new();
+        self.current_input = InputFrame::NONE;
+        self.scene.clear();
+        self.scratch = FrameScratch::default();
+        self.view = CullView::default();
+        self.player_vertical_velocity = 0;
+        self.player_grounded = false;
+        self.player_moving = false;
+        self.player_yaw = None;
+        self.player_yaw_binary = None;
+    }
+
     /// The player's facing yaw, produced by
     /// [`pose::yaw_rotation_from_direction`] from the committed movement delta.
     ///
@@ -1366,6 +1437,43 @@ mod tests {
         assert_eq!(frame.stage_trace(), STAGE_ORDER);
         assert_eq!(frame.stage_trace().len(), 18);
         assert_eq!(frame.ticks(), 1);
+    }
+
+    #[test]
+    fn enter_unit_keeps_the_player_and_releases_the_old_live_set() {
+        let mut frame = frame();
+        let player = frame.player().expect("the fixture binds a player");
+        frame.queue_spawn("capsule0", [10, 0, 0]);
+        tick(&mut frame, 0);
+        assert_eq!(frame.live().len(), 2, "player plus the spawned actor");
+
+        let world = World::from_report(
+            "under2".to_string(),
+            2,
+            &ObjectReport {
+                room_offset: 0,
+                count: 1,
+                array_offset: 0,
+                objects: vec![record("monster_wallcr", [5, 0, 0])],
+            },
+        );
+        frame.enter_unit(world, [7, 8, 9]);
+
+        assert_eq!(frame.player(), Some(player), "the player keeps its identity");
+        assert_eq!(frame.player_position(), Some([7, 8, 9]));
+        assert_eq!(frame.live().len(), 1, "the old unit's actors are released");
+        assert_eq!(frame.world().level.name, "under2");
+        assert_eq!(frame.ticks(), 1, "the global tick count survives the swap");
+        assert_eq!(frame.tracker().ready_slots().count(), 0);
+    }
+
+    #[test]
+    fn enter_unit_spawns_a_player_when_the_previous_unit_had_none() {
+        let mut frame = FrameState::new(empty_world());
+        assert!(frame.player().is_none());
+        frame.enter_unit(world_with_raziel(), [3, 4, 5]);
+        assert_eq!(frame.player_position(), Some([3, 4, 5]));
+        assert_eq!(frame.live().len(), 1);
     }
 
     #[test]

@@ -50,6 +50,8 @@ pub mod synthetic_locomotion;
 pub mod tracker;
 #[allow(dead_code)]
 pub mod world;
+#[allow(dead_code)]
+pub mod warp;
 
 /// Typed engine failures.
 ///

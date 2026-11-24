@@ -295,14 +295,7 @@ impl SceneAssets {
         entry: usize,
         textures: Option<&Path>,
     ) -> Result<(Self, Option<PageBank>), SceneError> {
-        let room = match level::read_entry_room_mesh_textured(path, entry, false, None) {
-            Ok((_, room)) => room,
-            Err(LevelError::RoomTexturesMissing) => {
-                let (_, room) = level::read_entry_room_mesh(path, entry, false, None)?;
-                room
-            }
-            Err(error) => return Err(SceneError::Level(error)),
-        };
+        let room = load_room(path, entry)?;
         let spawn = room.spawn;
         let level = SourceMesh::from_room(room);
         if level.positions.is_empty() || level.indices.is_empty() {
@@ -330,6 +323,33 @@ impl SceneAssets {
             },
             bank,
         ))
+    }
+
+    /// Replace the room geometry with another unit's, keeping the model resolver.
+    ///
+    /// This is the geometry half of a world swap: the render room, its fitted
+    /// transform and its raw spawn become the new unit's, and the per-name
+    /// object-mesh cache is cleared so no mesh from the old unit survives. The
+    /// archive-wide [`ModelResolver`] is reused because object models are keyed
+    /// by name, not by unit; nothing unit-specific is cached in it. Texture pages
+    /// are decoded lazily by the backend, so no page bank is touched here.
+    pub fn reload(&mut self, path: &Path, entry: usize) -> Result<(), SceneError> {
+        let room = load_room(path, entry)?;
+        let spawn = room.spawn;
+        let level = SourceMesh::from_room(room);
+        if level.positions.is_empty() || level.indices.is_empty() {
+            return Err(SceneError::Empty);
+        }
+        let (center, scale) =
+            render::fit_bounds(&level.positions).map_err(|_| SceneError::Empty)?;
+        self.level = level;
+        self.transform = SceneTransform { center, scale };
+        self.spawn = spawn;
+        self.cache.clear();
+        if self.resolver.is_none() {
+            self.resolver = Some(ModelResolver::load(path)?);
+        }
+        Ok(())
     }
 
     pub fn transform(&self) -> SceneTransform {
@@ -503,6 +523,22 @@ impl SceneAssets {
             resolver: None,
             cache,
         }
+    }
+}
+
+/// Read one archive entry's room mesh, textured when its pages resolve and flat
+/// geometry otherwise.
+///
+/// Shared by [`SceneAssets::load`] and [`SceneAssets::reload`] so the two cannot
+/// pick different room meshes for the same entry.
+fn load_room(path: &Path, entry: usize) -> Result<level::RoomMesh, SceneError> {
+    match level::read_entry_room_mesh_textured(path, entry, false, None) {
+        Ok((_, room)) => Ok(room),
+        Err(LevelError::RoomTexturesMissing) => {
+            let (_, room) = level::read_entry_room_mesh(path, entry, false, None)?;
+            Ok(room)
+        }
+        Err(error) => Err(SceneError::Level(error)),
     }
 }
 
